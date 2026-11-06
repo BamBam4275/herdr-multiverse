@@ -1,0 +1,43 @@
+{
+  "id": "board-herdr-blocked-pane-needs-recorded-agent-name",
+  "description": "A dispatched task from before `agent=` was recorded on its `event=dispatch` line (an old-format history entry, same shape history-board-reads-unrecorded-old-role.json exercises for UNRECORDED) still resolves to STALLED, not BLOCKED, even though its own live pane currently reads `agent_status: blocked`. board.py's `_split_dispatched` only promotes a STALLED/RUNNING task to BLOCKED when `t.agent and t.agent in herdr_blocked` — an empty recorded agent name can never satisfy that `and`, so the task renders as an ordinary IN PROGRESS card with the 'stalled, agent is live but not working' note instead, the same as it would for an idle/done/unknown pane. Found via conformance/diff_fuzz.py seed 50005.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-100002\tproject=sandbox\trole=fixer\taccount=explorer-seat\tpool=codex:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:00:00+00:00\tevent=started\ttask=20250101-fixer-100002\tpane=w1:p2\n",
+        ".multiverse/tasks/20250101-fixer-100002/brief.md": "# Task 20250101-fixer-100002\nRole: Fixer\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p2\", \"name\": \"sandbox-other-cx\", \"agent_status\": \"blocked\"}]}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "┌─ BLOCKED",
+          "(none)",
+          "┌─ IN PROGRESS",
+          "stalled,",
+          "agent is live but not working",
+          "┌─ BACKLOG"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

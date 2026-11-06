@@ -1,0 +1,53 @@
+{
+  "id": "start-reseed-reports-parked-dialog",
+  "description": "`start --reseed` probes the live orchestrator's pane before typing into it. A pane parked on a trust/approval dialog is reported distinctly from the plain-unreadable and RPC-failure re-point messages, and never sent the reseed prompt (card `20261106-b-d77644`; Python `cli.cmd_start`'s `dialog_or_menu_reason` branch, `cli.py:5682-5701`).",
+  "dirs": {
+    "claude-home": {},
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        "trust-banner.txt": "Do you trust this folder?\n› 1. Trust and continue\n2. Cancel\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:test\"\ninteractive = true\ncommand = \"claude-interactive\"\n\n[accounts.worker]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\ncommand = \"codex\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"worker\"]\nfixer = [\"worker\"]\nreviewer = [\"worker\"]\n"
+  },
+  "herdr_seed": [
+    ["workspace", "create", "--label", "sandbox", "--cwd", "{{PROJECT:sandbox}}", "--focus"],
+    ["script", "queue-text", "--file", "{{PROJECT:sandbox}}/trust-banner.txt"],
+    ["agent", "start", "sandbox-nexu-ne", "--kind", "claude", "--pane", "w100:p1"]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "--reseed", "sandbox"],
+      "env": {
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/herdr-calls.jsonl"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "RESEEDED",
+          "sandbox-nexu-ne is parked on a dialog (trust dialog), so the session was NOT re-pointed",
+          "clear it, then `multiverse start sandbox --reseed`",
+          "opened 0 of 1"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "herdr-calls.jsonl": {
+          "regex": "\\A(?=[\\s\\S]*\"agent\",\"read\")(?![\\s\\S]*\"agent\",\"prompt\")"
+        }
+      }
+    }
+  ]
+}

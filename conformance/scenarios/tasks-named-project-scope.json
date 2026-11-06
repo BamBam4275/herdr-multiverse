@@ -1,0 +1,67 @@
+{
+  "id": "tasks-named-project-scope",
+  "description": "`multiverse tasks alpha --reconcile` from inside beta still writes only alpha's routing log: named projects are the list/write scope (cli.py cmd_tasks). Beta's unrecorded done task stays unlogged. Explicit `--reconcile` prints first then records, so two `agent list` calls (listing + reconcile_project) and a `recorded N outcome(s)` trailer. Scout gap #2.",
+  "projects": {
+    "alpha": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=alpha\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result — task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n"
+      }
+    },
+    "beta": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-bbbbbb\tproject=beta\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n",
+        ".multiverse/tasks/20250101-fixer-bbbbbb/brief.md": "# Task 20250101-fixer-bbbbbb\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-bbbbbb/status": "done",
+        ".multiverse/tasks/20250101-fixer-bbbbbb/result.md": "# Result — task 20250101-fixer-bbbbbb\nRole: Fixer\nStatus: done\n\nthe finding\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.alpha]\npath = \"{{PROJECT:alpha}}\"\n\n[projects.beta]\npath = \"{{PROJECT:beta}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "beta",
+      "argv": ["tasks", "alpha", "--reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "alpha",
+          "unrecorded",
+          "recorded 1 outcome(s) that were finished but unlogged"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "alpha",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=alpha\\trole=fixer\\taccount=old-seat\\tpool=old:test\\toutcome=chain-primary\\treason=\\tbranch=main\\n<TIMESTAMP>\\tevent=result\\ttask=<ID>\\tstatus=done\\tstate=reconciled\\trevisions=0\\tpane=$"
+        }
+      }
+    },
+    {
+      "root": "beta",
+      "files": {
+        ".multiverse/routing.log": {
+          "equals": "<TIMESTAMP>\tevent=dispatch\ttask=<ID>\tproject=beta\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n"
+        }
+      }
+    }
+  ]
+}

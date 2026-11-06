@@ -1,0 +1,42 @@
+{
+  "id": "history-tasks-reads-old-role-names",
+  "description": "`multiverse tasks` reads routing.log dispatch records written with OLD (pre-rename) dispatch-path role names (fixer/oracle/reviewer, per spec-tests-harness.md's role-rename note) straight off disk, with no [roles.*] config table for any of them and zero live Herdr agents. Three hand-seeded tasks exercise three TaskState outcomes a history reader must reproduce byte-for-byte: a fully recorded (dispatch+started+result) done task, an unrecorded task (status file written but no event=result line yet — the dispatch process died or raced ahead of the agent), and a bare dispatch with no started/status/result at all. Every record predates the v=1/seq/crc32 envelope: event=dispatch/started/result lines never carried that envelope even in the current Python writer (accounts.py's dispatch_log_line/started_log_line/append_result_log), unlike message/backlog records.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n2020-01-01T01:00:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\n2020-02-01T00:00:00+00:00\tevent=dispatch\ttask=20250615-oracle-bbbbbb\tproject=sandbox\trole=oracle\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-02-01T00:05:00+00:00\tevent=started\ttask=20250615-oracle-bbbbbb\tpane=w2:p1\n2020-03-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-reviewer-cccccc\tproject=sandbox\trole=reviewer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result — task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n",
+        ".multiverse/tasks/20250615-oracle-bbbbbb/brief.md": "# Task 20250615-oracle-bbbbbb\nRole: Oracle\n",
+        ".multiverse/tasks/20250615-oracle-bbbbbb/status": "done",
+        ".multiverse/tasks/20250615-oracle-bbbbbb/result.md": "# Result — task 20250615-oracle-bbbbbb\nRole: Oracle\nStatus: done\n\nthe oracle's finding\n",
+        ".multiverse/tasks/20260101-reviewer-cccccc/brief.md": "# Task 20260101-reviewer-cccccc\nRole: Reviewer\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "(cwd is inside project 'sandbox' — scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n    <ID>      fixer      old-seat   recorded    done #3\n  * <ID>     oracle     old-seat   unrecorded  done\n      status file says 'done', but pane gone, status done — `--reconcile` leaves it alone until the pane settles.\n  * <ID>   reviewer   old-seat   awaiting    —\n      no status file and no agent recorded for this dispatch: uncertain, not dead. The result, if any, is in its pane.\n\n2 task(s) marked * need a look."
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,6 @@
+Update available! 0.153.4 -> 0.154.0
+> 1. Update now (runs `brew upgrade --cask codex`)
+  2. Skip
+  3. Skip until next version
+
+Press enter to continue

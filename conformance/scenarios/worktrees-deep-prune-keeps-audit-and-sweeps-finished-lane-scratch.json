@@ -1,0 +1,126 @@
+{
+  "id": "worktrees-deep-prune-keeps-audit-and-sweeps-finished-lane-scratch",
+  "description": "Deep prune preserves young task files and previews then removes only named caches from a clean finished lane retained by the ordinary result guard.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        ".gitignore": ".multiverse/\n",
+        "README.md": "hi\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "",
+        ".multiverse/tasks/20260101-builder-aaaaaa/brief.md": "audit\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/build/data": "young task cache\n",
+        ".multiverse/tasks/20260101-scout-bbbbbb/status": "working\n",
+        ".multiverse/tasks/20260101-scout-bbbbbb/notes": "unfinished\n"
+      },
+      "worktrees": {
+        "20260101-builder-aaaaaa": {
+          "files": {
+            ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+            ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "",
+            ".multiverse/tasks/20260101-builder-aaaaaa/brief.md": "audit\n",
+            ".multiverse/scratch/tmp/.cache/data": "cache\n",
+            ".multiverse/scratch/tmp/other/data": "keep\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--prune",
+        "--deep",
+        "--dry-run"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "deep would remove",
+          "\u2014 finished lane's scratch",
+          "deep kept <ID> \u2014 task is in progress or has no terminal outcome",
+          "deep cleanup: would free",
+          "in 1 path(s) \u2014 nothing was changed"
+        ]
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ]
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--prune",
+        "--deep"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "deep removed",
+          "\u2014 finished lane's scratch",
+          "deep kept <ID> \u2014 task is in progress or has no terminal outcome",
+          "deep cleanup: freed",
+          "in 1 path(s)"
+        ]
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ]
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/worktrees/20260101-builder-aaaaaa/.multiverse/scratch/tmp/.cache": {
+          "absent": true
+        },
+        ".multiverse/worktrees/20260101-builder-aaaaaa/.multiverse/scratch/tmp/other/data": {
+          "equals": "keep\n"
+        },
+        ".multiverse/tasks/20260101-builder-aaaaaa/brief.md": {
+          "equals": "audit\n"
+        },
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": {
+          "equals": "done\n"
+        },
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": {
+          "equals": ""
+        },
+        ".multiverse/tasks/20260101-builder-aaaaaa/build/data": {
+          "equals": "young task cache\n"
+        },
+        ".multiverse/tasks/20260101-scout-bbbbbb/notes": {
+          "equals": "unfinished\n"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "id": "tasks-convergence-keeps-corrected-ordinal",
+  "description": "Auto-supersede by lane reuse updates statuses before printing, retaining an existing blocked outcome ordinal and omitting a new ordinal on an awaiting task. The next invocation reads the new ordinals from history.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:00:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=blocked\tstate=blocked\trevisions=0\n2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-bbbbbb\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-cccccc\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-cccccc\n2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-dddddd\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-cccccc\n2020-01-01T00:00:00+00:00\tevent=result\ttask=20250101-fixer-dddddd\tstatus=done\tstate=completed\trevisions=0\n2020-01-01T00:00:00+00:00\tevent=result\ttask=20250101-fixer-bbbbbb\tstatus=done\tstate=completed\trevisions=0\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks",
+        "sandbox"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nsandbox\n    <ID>      fixer      old-seat   recorded    done #2\n    <ID>      fixer      old-seat   recorded    done #7\n    <ID>      fixer      old-seat   recorded    done\n    <ID>      fixer      old-seat   recorded    done #6"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks",
+        "sandbox"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nsandbox\n    <ID>      fixer      old-seat   recorded    done #8\n    <ID>      fixer      old-seat   recorded    done #7\n    <ID>      fixer      old-seat   recorded    done #9\n    <ID>      fixer      old-seat   recorded    done #6"
+      }
+    }
+  ]
+}

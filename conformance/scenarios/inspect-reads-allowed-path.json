@@ -1,0 +1,35 @@
+{
+  "id": "inspect-reads-allowed-path",
+  "description": "`inspect PATH --lines START:END --reason ...` (gateway.py's `_do_inspect`/`_open_regular_in_project`) reads a plain file inside the calling project by an openat-per-component walk, resolves PATH against cwd (not the project root), and appends one audit line to `.multiverse/inspect.log` naming the path, byte count, reason, and outcome — never the content itself.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "line one\nline two\nline three\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["inspect", "README.md", "--lines", "1:2", "--reason", "checking the readme"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "== README.md ==\nline one\nline two\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "README.md": { "equals": "line one\nline two\nline three\n" },
+        ".multiverse/inspect.log": {
+          "regex": "^<TIMESTAMP>\\tevent=inspect\\tproject=sandbox\\tpaths=README\\.md\\tbytes=34\\treason=checking the readme\\toutcome=ok$"
+        }
+      }
+    }
+  ]
+}

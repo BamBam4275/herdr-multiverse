@@ -1,0 +1,54 @@
+{
+  "id": "accounts-prefer-same-kind",
+  "description": "Preferring another seat clears only other same-kind preferences.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[accounts.second]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:second\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "prefer",
+        "explorer-seat"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "prefer",
+        "second"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "../../runtime/seat-state.json": {
+          "regex": "(?s)\"explorer-seat\".*\"prefer\": false.*\"second\".*\"prefer\": true"
+        }
+      }
+    }
+  ]
+}

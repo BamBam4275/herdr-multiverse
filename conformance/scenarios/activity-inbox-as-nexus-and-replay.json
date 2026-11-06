@@ -1,0 +1,73 @@
+{
+  "id": "activity-inbox-as-nexus-and-replay",
+  "description": "A process carrying a dispatched task id (`MULTIVERSE_TASK_ID`) is not the orchestrator, so a plain `activity inbox` there still shows new mail but refuses to advance the cursor and says so on stderr; `--as-nexus` authorizes that same process to acknowledge anyway, advancing the cursor exactly like an orchestrator-context read. `--replay-since`/`--replay-last` never acknowledge regardless of context (enforced by `clap`'s own `conflicts_with` on `--peek`/`--as-nexus`) and read straight off the log by physical position/seq.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "hello there", "--id", "fixed-msg-1"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "sent to sandbox2." }
+    },
+    {
+      "cwd": "sandbox2",
+      "env": { "MULTIVERSE_TASK_ID": "20261101-scout-abcdef" },
+      "argv": ["activity", "inbox"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "[<TIMESTAMP>] sandbox: hello there\ncurrent through event 1 as of <TIMESTAMP>\nlast peeked at <TIMESTAMP>, through event 1\nsequence numbers are per project and cannot be compared across projects.",
+        "stderr": "not acknowledged: this process carries a dispatched task id (<ID>), not sandbox2's orchestrator — a specialist must never advance the cursor the orchestrator's own mail read depends on. Pass --as-nexus if that is wrong, or --peek to look without it.\n"
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "env": { "MULTIVERSE_TASK_ID": "20261101-scout-abcdef" },
+      "argv": ["activity", "inbox", "--as-nexus"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "[<TIMESTAMP>] sandbox: hello there\ncurrent through event 1 as of <TIMESTAMP>\nlast read at <TIMESTAMP>, through event 1",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "inbox", "--replay-since", "1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "[<TIMESTAMP>] sandbox: hello there"
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "inbox", "--replay-last", "1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "[<TIMESTAMP>] sandbox: hello there"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox2",
+      "files": {
+        ".multiverse/activity.cursor": { "equals": "1" }
+      }
+    }
+  ]
+}

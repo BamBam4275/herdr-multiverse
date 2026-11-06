@@ -1,0 +1,70 @@
+{
+  "id": "sweep-reclaim-protects-live-adopted-occupant",
+  "description": "A clean lane with a recorded owner and a live adopted occupant lacking terminal status must retain its owner pane; both sweep and its preview use the same guard.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20260101-builder-aaaaaa\trole=builder\tbranch=multiverse/20260101-builder-aaaaaa\n2020-01-01T00:01:00Z\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\tpane=w1:p1\n2020-01-01T00:02:00Z\tevent=dispatch\ttask=20260101-builder-bbbbbb\trole=builder\tbranch=multiverse/20260101-builder-aaaaaa\n2020-01-01T00:03:00Z\tevent=started\ttask=20260101-builder-bbbbbb\tpane=w1:p2\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done",
+        ".multiverse/worktrees/20260101-builder-aaaaaa/.multiverse/tasks/20260101-builder-bbbbbb/brief.md": "adopted task\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"\"}, {\"pane_id\": \"w1:p2\", \"agent_status\": \"idle\", \"name\": \"\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "recorded 0, reclaimed 0"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"\"}, {\"pane_id\": \"w1:p2\", \"agent_status\": \"idle\", \"name\": \"\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "recorded 0, reclaimed 0"
+        ]
+      }
+    }
+  ]
+}

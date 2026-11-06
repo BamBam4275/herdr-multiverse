@@ -1,0 +1,131 @@
+{
+  "id": "dispatch-real-wait",
+  "description": "Live dispatch --yes --wait settles as done, reads the lane status/result, and records event=result. Like council-real-dispatch, this Rust-only scenario seeds stateful fake-herdr, whose brief-in-prompt shortcut writes a terminal status/result. It uses current role names directly and isolates HOME, config, fleet state, project, and Herdr via the harness.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        ".gitignore": ".multiverse/\nherdr-calls.jsonl\n",
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.builder-seat]\nkind = \"codex\"\nshort = \"bs\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nbuilder = [\"builder-seat\"]\n\n[roles.builder]\nwrite_scope = \"declared\"\neffort = \"low\"\nskills = []\n\n[roles.builder.models]\ncodex = \"gpt-test\"\n"
+  },
+  "herdr_seed": [
+    [
+      "pane",
+      "get",
+      "w52:p1"
+    ]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "dispatch",
+        "{{PROJECT:sandbox}}",
+        "check the scoped readme",
+        "--role",
+        "builder",
+        "--scope",
+        "README.md",
+        "--yes",
+        "--wait",
+        "--timeout",
+        "8"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w52:p1",
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/herdr-calls.jsonl"
+      },
+      "capture": {
+        "task": "  branch   multiverse/(\\d{8}-builder-[0-9a-f]{6})"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Dispatched builder on builder-seat (codex/gpt-test) in <PROJECT:sandbox>/.multiverse/worktrees/<ID>",
+          "  agent sandbox-buil-bs in pane w52:p100",
+          "  worktree <PROJECT:sandbox>/.multiverse/worktrees/<ID>",
+          "  branch   multiverse/<ID>",
+          "  settled as done\n  status done",
+          "  result <PROJECT:sandbox>/.multiverse/worktrees/<ID>/.multiverse/tasks/<ID>/result.md"
+        ],
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "inspect",
+        ".multiverse/worktrees/{{capture:task}}/.multiverse/tasks/{{capture:task}}/brief.md",
+        "--lines",
+        "1:40",
+        "--reason",
+        "verify live dispatch brief"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "# Task <ID>",
+          "Builder",
+          "builder-seat",
+          "check the scoped readme",
+          "README.md"
+        ],
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "inspect",
+        ".multiverse/worktrees/{{capture:task}}/.multiverse/tasks/{{capture:task}}/status",
+        "--lines",
+        "1:1",
+        "--reason",
+        "verify fake task completion"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "== .multiverse/worktrees/<ID>/.multiverse/tasks/<ID>/status ==\ndone"
+        ],
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "result",
+        "{{capture:task}}"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "# Fake Herdr result\n\nTask completed.\n",
+        "stderr": ""
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "README.md": {
+          "equals": "hi\n"
+        },
+        ".multiverse/routing.log": {
+          "regex": "(?=[\\s\\S]*event=dispatch\\ttask=<ID>\\t[^\\n]*role=builder\\taccount=builder-seat\\tpool=codex:test\\toutcome=chain-primary)(?=[\\s\\S]*event=started\\ttask=<ID>\\t[^\\n]*pane=w52:p100)(?=[\\s\\S]*event=result\\ttask=<ID>\\t[^\\n]*status=done\\tstate=done)"
+        },
+        "herdr-calls.jsonl": {
+          "regex": "\"pane\",\"split\"[\\s\\S]*\"agent\",\"start\"[\\s\\S]*\"agent\",\"prompt\""
+        }
+      }
+    }
+  ]
+}

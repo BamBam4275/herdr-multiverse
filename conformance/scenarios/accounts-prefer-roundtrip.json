@@ -1,0 +1,79 @@
+{
+  "id": "accounts-prefer-roundtrip",
+  "description": "`accounts prefer <seat>` is a silent state write (no herdr call, no stdout) that marks a seat preferred in `seatstate`; the next `accounts` listing shows a `\u26c1 prefer:` annotation line under that seat. `accounts prefer --clear` drops every seat's preference the same way, silently, and the annotation disappears from the next listing.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       available    CODEX_HOME=<DIR:codex-home>"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "prefer",
+        "explorer-seat"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "explorer-seat: ahead of every same-kind sibling in its chains now."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       available    CODEX_HOME=<DIR:codex-home>\n                   \u26c1 prefer: ahead of its same-kind siblings (`accounts prefer --clear` to drop this)"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "prefer",
+        "--clear"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "cleared every seat preference \u2014 chains follow config order again."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       available    CODEX_HOME=<DIR:codex-home>"
+      }
+    }
+  ]
+}

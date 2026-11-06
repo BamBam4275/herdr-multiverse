@@ -1,0 +1,43 @@
+{
+  "id": "notify-redacts-before-queue-and-flush",
+  "description": "`notify.py:832-838`'s `send` runs `redact_text` on `project`/`title`/`message`/`dedup_key` before any disk write or push — a credential-shaped title or message must never reach `notify-outbox.jsonl`, `notify-state.json`, or (once a topic exists) the ntfy payload. No topic file exists here, so `ntfy_push` short-circuits before any network call (same no-topic path as `notify-no-topic-queues-and-flush`), and the record is queued with exit 0. `--flush` replays the already-redacted record off disk, so its own stdout line is redacted too — the CLI-visible proof that redaction ran before the write, since the fleet state/runtime dir itself is outside this harness's `expect_tree` roots (see `mv-state::notify`'s own unit test for the direct on-disk assertion).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "notify",
+        "--project",
+        "sandbox",
+        "--title",
+        "token=supersecret1234",
+        "--message",
+        "api_key=anothersecret5678"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "notify: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["notify", "--flush"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: token=…[redacted]: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    }
+  ]
+}

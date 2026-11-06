@@ -1,0 +1,2 @@
+2026-02-01T00:00:00+00:00	v=1	seq=1	event=dispatch	task=20260201-fixer-cccccc	project=demo	role=fixer	account=claude	pool=claude:default	outcome=chain-primary	reason=ok line	crc32=245c3dd1
+2026-02-01T00:05:00+00:00	v=1	seq=2	event=result	task=20260201-fixer-cccccc	status=done	state=done	revisions=0	pane=w3:p1	crc32=deadbeef

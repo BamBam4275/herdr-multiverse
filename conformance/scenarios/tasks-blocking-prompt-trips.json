@@ -1,0 +1,56 @@
+{
+  "id": "tasks-blocking-prompt-trips",
+  "description": "`multiverse tasks --no-reconcile` against a stalled task whose live pane is idle (not WORKING) reads visible text and, on a Codex 429 retry-limit banner, trips the seat's pool breaker and appends `event=limit` unless `--read-only`. Transcript is one `agent list` plus one `agent read --source visible`. Scout gap #5.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=seat\tpool=codex:test\toutcome=chain-primary\treason=\tagent=codex-1\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat]\nkind = \"codex\"\nshort = \"st\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"idle\", \"cwd\": \"/tmp\", \"name\": \"codex-1\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": ["agent", "read", "w1:p1", "--source", "visible"],
+          "reply": {
+            "exit": 0,
+            "stdout": "exceeded retry limit, last status: 429 Too Many Requests\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["stalled"]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=sandbox\\trole=fixer\\taccount=seat\\tpool=codex:test\\toutcome=chain-primary\\treason=\\tagent=codex-1\\tbranch=main\\n<TIMESTAMP>\\tevent=started\\ttask=<ID>\\tpane=w1:p1\\n<TIMESTAMP>\\tevent=limit\\ttask=<ID>\\trule=codex_retry_limit_exceeded\\tkind=rolling$"
+        }
+      }
+    }
+  ]
+}

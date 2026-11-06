@@ -1,0 +1,76 @@
+{
+  "id": "backlog-reopen-reprioritize",
+  "description": "backlog reprioritize changes an open item's sort key (last-wins); backlog done closes it with evidence, moving it out of `backlog list`'s default (open-only) view into `--done`; backlog reopen records the transition back to open, moving it back out of `--done` and into the default view again. done/reopen are Orchestrator-only (refused for a dispatched task) — this harness's curated env never sets MULTIVERSE_TASK_ID, so cwd-at-project-root already qualifies.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "fix the thing", "--why", "it breaks"],
+      "transcript": [],
+      "capture": { "item_id": "added (\\S+) to sandbox" },
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "reprioritize", "{{capture:item_id}}", "--priority", "P1"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "done", "{{capture:item_id}}", "--evidence", "fixed in commit abc"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list", "--done"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["<ID> P1", "fix the thing"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "nothing in the backlog."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "reopen", "{{capture:item_id}}"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["<ID> P1", "fix the thing"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list", "--done"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "nothing in the backlog."
+      }
+    }
+  ]
+}

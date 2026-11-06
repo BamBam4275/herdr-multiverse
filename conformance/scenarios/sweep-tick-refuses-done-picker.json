@@ -1,0 +1,240 @@
+{
+  "id": "sweep-tick-refuses-done-picker",
+  "description": "Sweep must leave an AskUserQuestion picker alone even when Herdr reports done. Both apply and dry-run report skipped (menu). Strict transcript exhaustion rejects any prompt, send-keys, Esc, answer, or extra pane read.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "sandbox\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[accounts.alpha]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{HOME}}/.claude\"\ncommand = \"claude-interactive\"\ninteractive = true\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--tick"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-nexu-al\", \"pane_id\": \"w1:p1\", \"agent_status\": \"done\", \"state_change_seq\": 1}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"workspace_id\": \"w1\", \"label\": \"sandbox\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": [{\"pane_id\": \"w1:p1\", \"workspace_id\": \"w1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-nexu-al\", \"pane_id\": \"w1:p1\", \"agent_status\": \"done\", \"state_change_seq\": 1}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "sandbox-nexu-al",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "How should I finish?\n❯ 1. Commit it\n  2. Leave it open\nEnter to select · Esc to cancel\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"workspace_id\": \"w1\", \"label\": \"sandbox\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": [{\"pane_id\": \"w1:p1\", \"workspace_id\": \"w1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-nexu-al\", \"pane_id\": \"w1:p1\", \"agent_status\": \"done\", \"state_change_seq\": 1}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "sandbox-nexu-al",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "How should I finish?\n❯ 1. Commit it\n  2. Leave it open\nEnter to select · Esc to cancel\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox: skipped (menu)"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--tick",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-nexu-al\", \"pane_id\": \"w1:p1\", \"agent_status\": \"done\", \"state_change_seq\": 1}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"workspace_id\": \"w1\", \"label\": \"sandbox\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": [{\"pane_id\": \"w1:p1\", \"workspace_id\": \"w1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-nexu-al\", \"pane_id\": \"w1:p1\", \"agent_status\": \"done\", \"state_change_seq\": 1}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "sandbox-nexu-al",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "How should I finish?\n❯ 1. Commit it\n  2. Leave it open\nEnter to select · Esc to cancel\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"workspace_id\": \"w1\", \"label\": \"sandbox\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": [{\"pane_id\": \"w1:p1\", \"workspace_id\": \"w1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-nexu-al\", \"pane_id\": \"w1:p1\", \"agent_status\": \"done\", \"state_change_seq\": 1}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "sandbox-nexu-al",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "How should I finish?\n❯ 1. Commit it\n  2. Leave it open\nEnter to select · Esc to cancel\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox: skipped (menu)"
+        ]
+      }
+    }
+  ]
+}

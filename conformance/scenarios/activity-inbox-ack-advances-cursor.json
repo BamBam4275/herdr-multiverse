@@ -1,0 +1,54 @@
+{
+  "id": "activity-inbox-ack-advances-cursor",
+  "description": "`activity inbox` with no --peek, run outside any dispatched-task context (no MULTIVERSE_TASK_ID — this harness's curated base env never sets it unless a step adds it, so cwd-at-project-root already reads as orchestrator), advances the recipient's own activity.cursor (cli.py: will_acknowledge gates on is_orchestrator, written only via activity.acknowledge once read_inbox returns). A second call with nothing new prints the one generic 'nothing new' line — there is no separate wording for a repeated empty call.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "hello there", "--id", "fixed-msg-1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sent to sandbox2."
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "inbox"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "[<TIMESTAMP>] sandbox: hello there\ncurrent through event 1 as of <TIMESTAMP>\nlast read at <TIMESTAMP>, through event 1"
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "inbox"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "nothing new for sandbox2.\ncurrent through event 1 as of <TIMESTAMP>\nlast read at <TIMESTAMP>, through event 1"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox2",
+      "files": {
+        ".multiverse/activity.cursor": { "equals": "1" }
+      }
+    }
+  ]
+}

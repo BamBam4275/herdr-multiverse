@@ -1,0 +1,104 @@
+{
+  "id": "stop-refuses-unrescued-output-even-with-force",
+  "description": "Task safety contract: stop and stop --force keep a workspace holding unrescued lane output, including differing copies. This deliberately strengthens the frozen Python force behavior.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/worktrees/20260101-builder-aaaaaa/.multiverse/tasks/20260101-builder-aaaaaa/result.md": "unique result\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "stop"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"sandbox\", \"workspace_id\": \"ws1\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": [{\"workspace_id\": \"ws1\", \"pane_id\": \"w1:p1\", \"foreground_cwd\": \"{{PROJECT:sandbox}}\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"workspace_id\": \"ws1\", \"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"fixer-agent\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "  sandbox              KEPT \u2014 lane <ID> holds unrescued output\n\nclosed 0 of 1\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "stop",
+        "--force"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"sandbox\", \"workspace_id\": \"ws1\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": [{\"workspace_id\": \"ws1\", \"pane_id\": \"w1:p1\", \"foreground_cwd\": \"{{PROJECT:sandbox}}\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"workspace_id\": \"ws1\", \"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"fixer-agent\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "  sandbox              KEPT \u2014 lane <ID> holds unrescued output\n\nclosed 0 of 1\n"
+      }
+    }
+  ]
+}

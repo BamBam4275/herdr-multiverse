@@ -1,0 +1,104 @@
+{
+  "id": "start-non-claude-launch-bare",
+  "description": "A non-Claude interactive Nexus runs the configured command unchanged, including shell arguments, without Claude deny-list flags.",
+  "dirs": {
+    "claude-home": {},
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:test\"\ninteractive = true\ncommand = \"codex --flag\"\n\n[accounts.worker]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\ncommand = \"codex\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nscout = [\"worker\"]\nbuilder = [\"worker\"]\ncritic = [\"worker\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "sandbox"],
+      "transcript": [
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": []}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": []}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": []}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": []}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "create", "--label", "sandbox", "--cwd", "{{PROJECT:sandbox}}", "--no-focus"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspace\": {\"workspace_id\": \"w1\"}, \"root_pane\": {\"pane_id\": \"w1:p1\"}}}\n" }
+        },
+        {
+          "match_argv": ["pane", "rename", "w1:p1", "sandbox-nexu-ne · codex --flag ·  · nexus-seat · nexus sandbox"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["pane", "run", "w1:p1", "codex --flag"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\"}]}}\n" }
+        },
+        {
+          "match_argv": ["agent", "rename", "w1:p1", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["agent", "read", "w1:p1", "--source", "visible"],
+          "reply": { "exit": 0, "stdout": "Ready >" }
+        },
+        {
+          "match_argv": ["agent", "get", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 5}}}\n" }
+        },
+        {
+          "match_argv": ["agent", "prompt", "sandbox-nexu-ne", "Read `{{PROJECT:sandbox}}/.multiverse/orchestrator.md` now and follow it. You are the Nexus for sandbox. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route."],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {}}}\n" }
+        },
+        {
+          "match_argv": ["agent", "get", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 6}}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "w1  pane w1:p1",
+          "opened 1 of 1",
+          "sandbox-nexu-ne",
+          "codex --flag  sandbox-nexu-ne"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/orchestrator.md": {
+          "regex": "\\| Builder \\| worker \\|[\\s\\S]*\\| Critic \\| worker \\|[\\s\\S]*\\| Scout \\| worker \\|[\\s\\S]*- Cross-vendor review required for:"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "id": "accounts-usage-codex-fixture",
+  "description": "`accounts usage` for a codex-kind seat reads the seat's own CODEX_HOME session transcripts directly (limits.read_and_record_codex_usage, a `.jsonl` rollout file under sessions/YYYY/MM/DD/) — no herdr call, no prior dispatch needed. A single `token_count` record with the vendor's `rate_limits.primary.used_percent` is enough to classify remaining quota.",
+  "dirs": {
+    "codex-home": {
+      "files": {
+        "sessions/2026/09/27/rollout-1.jsonl": "{\"type\": \"token_count\", \"payload\": {\"rate_limits\": {\"primary\": {\"used_percent\": 40}}}}\n"
+      }
+    }
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.cx]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "usage"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "cx                 60% left · primary window"
+        ]
+      }
+    }
+  ]
+}

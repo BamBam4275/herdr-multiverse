@@ -1,0 +1,45 @@
+{
+  "id": "result-from-worktree-reads-sibling",
+  "description": "Worktree cwd resolves to the longest containing configured project, then reads a sibling task result from that project.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        ".multiverse/tasks/20261101-critic-fedcba/status": "done\n",
+        ".multiverse/tasks/20261101-critic-fedcba/result.md": "sibling finding\n"
+      },
+      "worktrees": {
+        "20261101-builder-abcdef": {
+          "files": {
+            ".multiverse/tasks/20261101-builder-abcdef/brief.md": "lane\n",
+            ".multiverse/tasks/20261101-critic-fedcba/result.md": "wrong lane copy\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.parent]\npath = \"{{PROJECT:sandbox}}/..\"\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261101-builder-abcdef",
+      "argv": [
+        "result",
+        "20261101-critic-fedcba"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sibling finding\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

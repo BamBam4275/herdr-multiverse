@@ -1,0 +1,35 @@
+{
+  "id": "activity-update-unknown-card",
+  "description": "`activity update` refuses an unknown card before write, exit 3 (activity.py:post_update, scout2-gaps #46).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "update", "not-a-card", "--phase", "working"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "no dispatched card 'not-a-card' found",
+          "nothing was posted"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": { "absent": true }
+      }
+    }
+  ]
+}

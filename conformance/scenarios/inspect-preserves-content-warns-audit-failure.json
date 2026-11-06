@@ -1,0 +1,36 @@
+{
+  "id": "inspect-preserves-content-warns-audit-failure",
+  "description": "Inspection returns original selected text; redaction is audit-only. Audit failure warns but preserves success.",
+  "projects": {
+    "sandbox": {
+      "files": {
+        "secret.txt": "SECRET_TOKEN=abcdef1234567890\n\u001b[31moriginal\u001b[0m\n",
+        ".multiverse/inspect.log/.keep": ""
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "inspect",
+        "secret.txt",
+        "--lines",
+        "1:2",
+        "--reason",
+        "reason: audit of fixture file"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "== secret.txt ==\nSECRET_TOKEN=abcdef1234567890\n\u001b[31moriginal\u001b[0m\n",
+        "stderr_contains": [
+          "warning: could not write inspect audit log:"
+        ]
+      }
+    }
+  ]
+}

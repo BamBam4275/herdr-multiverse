@@ -1,0 +1,27 @@
+# Card 20261103-b-1da16f: `cargo test`, run inside a live Herdr pane,
+# inherited that pane's own real `HERDR_BIN_PATH` (Herdr sets it for every
+# process it spawns) and reached the real fleet — splitting empty zsh
+# panes into the operator's tab.
+#
+# `force = true` means every `cargo build`/`test`/`run` in this workspace
+# starts with `HERDR_BIN_PATH` cleared, regardless of what the invoking
+# shell's own Herdr session had set, and with `MV_TEST_FORBID_REAL_HERDR`
+# on. A cleared `HERDR_BIN_PATH` makes `mv_herdr::argv::herdr_binary()`
+# fall back to the bare `herdr` PATH token (its documented "unset"
+# behavior); `mv_herdr::run::run` then refuses to exec that literal token
+# while the forbid var is set (`crates/mv-herdr/src/run.rs`), so a test
+# that never explicitly points `HERDR_BIN_PATH` at a fake errors instead
+# of silently reaching a real `herdr` on PATH. A test may still opt back
+# in, in-process, via `std::env::set_var("HERDR_BIN_PATH", <fake path>)`
+# or `Command::env` — this only removes the *ambient* value a cargo-driven
+# process would otherwise inherit for free.
+#
+# This also means a bare `cargo run -- dispatch ...` no longer reaches a
+# real Herdr pane by accident either, matching this repo's own standing
+# rule (`AGENTS.md`/Fixer role doc): any live CLI run that could reach
+# Herdr must set `HERDR_BIN_PATH` to a fake explicitly first. Production
+# use is unaffected — it runs the already-built `multiverse` binary
+# directly, never through `cargo`, so none of this is ever in effect for it.
+[env]
+HERDR_BIN_PATH = { value = "", force = true }
+MV_TEST_FORBID_REAL_HERDR = { value = "1", force = true }

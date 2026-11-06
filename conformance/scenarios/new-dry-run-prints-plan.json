@@ -1,0 +1,30 @@
+{
+  "id": "new-dry-run-prints-plan",
+  "description": "`new --dry-run <name>` prints the numbered plan (`_new_project_plan`: mkdir, git init, .gitignore, first commit, then add's and start's own logic) and creates nothing — `cmd_new` returns `EXIT_OK` immediately after printing it, before ever touching the filesystem or asking to proceed. Deliberately configured with no `[accounts.*]`/`[roles.*]` tables at all (`new --dry-run` never needs one to print its plan), so this is one of the few new scenarios in this batch that does not also exercise the Rust CLI's unrelated retired-role-key config-loader gap.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["new", "freshproj", "--dry-run"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Plan for new project 'freshproj' at <HOME>/Code/freshproj:",
+          "1. "
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

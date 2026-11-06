@@ -1,0 +1,662 @@
+# Herdr Multiverse — example configuration
+#
+# Run `herdr plugin config-dir multiverse` to find the directory the plugin
+# wrapper reads, copy this file to config.toml there, and fill in every
+# <<PLACEHOLDER: ...>> value. See docs/install.md. For a standalone
+# `bin/multiverse` invocation outside Herdr, copy to
+# ~/.config/multiverse/config.toml instead, or point MULTIVERSE_CONFIG at a
+# copy elsewhere.
+#
+# Multiverse will not guess any of these values. It does not fail quietly
+# when one is unfilled: `multiverse check` lists them, and a dry run prints
+# them verbatim in the card so you can see exactly what would reach the agent.
+#
+# This file ships with placeholders on purpose. It is not a working config.
+
+
+# Maximum in-flight specialists across the whole fleet. Tune empirically.
+#
+# This is one global number; it does not distinguish accounts, so a Critic on
+# Codex consumes the same slot a Claude agent needs — which is backwards,
+# since Codex draws on a different quota pool. Per-pool budgets are a later
+# refinement, not something this value tries to express.
+max_concurrent = 3
+
+# An AWAITING task with no result, status file, or live pane is lease-expired
+# only after this many minutes. Host sleep is subtracted from the elapsed
+# time, so a sleeping machine does not turn a healthy lane into an abandoned
+# one.
+# awaiting_lease_minutes = 60
+
+# Host-wide disk thresholds used by `multiverse sweep`; the critical
+# threshold must stay below the warning threshold. `check` remains read-only
+# and skips slower advisory scans unless you pass `multiverse check
+# --verbose`.
+# host_disk_warn_gb = 30
+# host_disk_critical_gb = 15
+
+# Board watch interval and the optional dashboard tab opened by `start --all`.
+# `dashboard_tab` may be true, false, or a list of project names.
+# [board]
+# refresh_seconds = 300
+# dashboard_tab = ["multiverse"]
+
+# Project state is private: Multiverse-created private-state directories are
+# mode 0700, and sensitive state files (including routing.log/index) are mode
+# 0600. `routing.log` is authoritative; `.multiverse/routing.log.index` is
+# only a derived reader index, rebuilt from the log if it is missing or
+# damaged.
+
+
+# Fleet-wide floor, applied to every role (the stricter, Critic-only floor
+# below under [review_policy] is separate). A seat whose last-read usage
+# gauge is at or below this percent is skipped — "draining: N% left (floor
+# N%)" — and dispatch falls through to the next seat in the chain, or refuses
+# with that reason if none is left. A vendor's primary and secondary
+# (e.g. weekly) windows are checked independently; either live window at or
+# below the floor drains the seat, while a reset/stale window is ignored.
+# Lanes already running on a draining seat are left alone; this only changes
+# which seat the *next* dispatch picks. An unknown gauge never blocks. 0
+# disables this floor entirely.
+# dispatch_min_quota_percent = 5
+
+# When true, a hand-written `[projects.<name>.chains]` table (or a
+# `.multiverse/roster.toml` override) may name an `interactive = true` seat on
+# a worker role. `add` and `new` never consult this flag: they skip every
+# interactive seat when they build a chain, even when this is true. Distinct
+# from `multiverse accounts lend SEAT on|off`, which is a runtime skip of a
+# seat already listed.
+# lend_interactive_to_workers = false
+
+
+# ---------------------------------------------------------------------------
+# Accounts — one seat per vendor login
+# ---------------------------------------------------------------------------
+#
+# An account is selected by the CLI's config-directory variable and NOTHING
+# ELSE. An auth token does not select an account — it selects a billing path,
+# and setting one makes the CLI bypass subscription auth entirely. That is
+# the most common way people think they have switched accounts and have not.
+#
+# Environment hygiene, all easy to get wrong:
+#
+#   - Never export ANTHROPIC_API_KEY. A spawned `claude` picks it up and
+#     bills the API instead of the subscription.
+#   - Keep ~/.claude/CLAUDE.md empty. When CLAUDE_CONFIG_DIR is set, Claude
+#     Code loads CLAUDE.md from BOTH the config dir and ~/.claude, so the
+#     default dir bleeds into every profile.
+#   - Absolute paths only. `~` is not expanded.
+#
+# Verify a seat once, by hand: CLAUDE_CONFIG_DIR=<dir> claude, then /status.
+
+[accounts.claude-personal]
+# Which CLI this seat runs — the Herdr agent kind, and the `--kind` value
+# when that route is used.
+#
+# A property of the SEAT, not of the job. It has to agree with
+# `config_dir_var` below, and Multiverse checks that it does: `claude` reads
+# CLAUDE_CONFIG_DIR and nothing else, so a seat declaring one while selecting
+# itself with the other would come up on whatever account was already the
+# default — with nothing to say so.
+kind = "claude"
+# The environment variable that selects this account for its CLI.
+# Claude Code: CLAUDE_CONFIG_DIR · Codex: CODEX_HOME · Grok: GROK_HOME
+config_dir_var = "CLAUDE_CONFIG_DIR"
+config_dir = "<<PLACEHOLDER: absolute path to the personal Claude config dir>>"
+# How to LAUNCH this seat. Every `claude` account needs one — dispatch
+# refuses a chain that reaches a `command`-less claude seat ("no command
+# wrapper configured"), even when this account is never `interactive`. Grok
+# and Codex do not need this; see `[accounts.claude-work]` below for the
+# full explanation of what to put here.
+# command = "claude-interactive"
+# Quota pool — decides CONCURRENCY. Two seats of one vendor are two pools.
+#
+# Multiverse refuses a config where two accounts share a `pool` but point at
+# DIFFERENT `config_dir` values. `vendor` derives from `pool`
+# (the part before the first `:`), and vendor drives Critic's vendor
+# exclusion and Council's one-seat-per-vendor rule — so grouping two
+# different config directories under one pool would, once a circuit breaker
+# keys on pool, trip both subscriptions at once. That collapses exactly the
+# redundancy a second subscription exists to buy, and it would happen
+# silently. (Two seats sharing both a pool AND a config_dir are unaffected —
+# that is one quota source recorded twice, not two collapsed into one.)
+pool = "claude:personal"
+# Vendor family — decides DIVERSITY. Defaults to the part of `pool` before
+# the colon, so it is usually redundant; declare it only when they differ.
+#
+# Pool and vendor are separate on purpose. Critic must exclude the *vendor*
+# that wrote the code — same family means same blind spots, and a
+# same-vendor review confidently approves its own failure modes. Council
+# shrinks rather than substituting within a vendor, because three Claude
+# councillors are one opinion rendered three times. Neither can be expressed
+# with pools alone.
+# vendor = "claude"
+# Set false to take a seat out of the rotation — a broken login, an
+# exhausted plan. The chain then falls through to the next entry and logs
+# why.
+available = true
+# Why it is unavailable. Optional, and only meaningful with available =
+# false — but worth setting, because this string is what appears in
+# routing.log and on the card when a fallback happens. Without it the log
+# says only "marked unavailable in config", which tells a reader next week
+# nothing about whether the seat is coming back.
+# unavailable_reason = "quota exhausted until 09:00"
+# A seat that comes back on schedule instead of one a human has to remember
+# to re-enable — a subscription window's reset, which is a real clock and has
+# no false positives. ISO-8601; a value with no offset is read as UTC. Once
+# past, the seat is available again with no edit and no cleanup.
+#
+# `available = false` above still wins over this: a human turning a seat off
+# is absolute, and an expired timer does not undo it. Set both and the seat
+# stays off until a human flips `available` back to true.
+# unavailable_until = "2026-09-08T09:00:00Z"
+# The seat the human talks to. `multiverse start` launches this one in each
+# project's root pane. A hand-written worker chain may name it only when the
+# top-level `lend_interactive_to_workers` switch is true — a background
+# writer and the person supervising it must never draw on the same budget,
+# except by that explicit switch. `add` and `new` never consult this flag;
+# they skip every interactive seat when they build a chain. At most one
+# account across the whole config may set this; Multiverse refuses to start
+# if two do.
+# interactive = true
+
+[accounts.claude-work]
+kind = "claude"
+config_dir_var = "CLAUDE_CONFIG_DIR"
+config_dir = "<<PLACEHOLDER: absolute path to the work Claude config dir>>"
+pool = "claude:work"
+available = true
+# How to LAUNCH this seat, when an environment variable is not enough.
+#
+# `claude` needs this and the other CLIs do not. Give the command that
+# selects the seat — typically a shell function that env-wraps the vendor
+# binary with its own config dir and auth. Nothing that `exec`s can call a
+# shell function, so this must be run in an interactive shell that already
+# has the function defined; Multiverse appends the model and effort
+# arguments to whatever you put here.
+#
+# Leave it out for `grok` and `codex`: they use `agent start --kind`, which
+# lets Herdr name the agent up front without a launch wrapper.
+# command = "claude-interactive"
+# Two- or three-letter code shown in agent names, so a sidebar tells you
+# which ACCOUNT an agent is spending — `example-build-cl` rather than
+# `example-builder`. Two agents doing the same job on different seats are
+# otherwise indistinguishable, and which seat is in use must never be
+# inferred.
+#
+# Declared rather than derived: two accounts can both start with the same two
+# characters under the default rule. Defaults to the first two characters of
+# the account name, which keeps an unconfigured account valid rather than
+# good.
+#
+# Multiverse refuses a config where two accounts share a `short`, declared or
+# derived — the sidebar must stay able to tell which subscription an agent is
+# spending, not just which project and role.
+short = "cw"
+
+[accounts.chatgpt-personal]
+kind = "codex"
+config_dir_var = "CODEX_HOME"
+config_dir = "<<PLACEHOLDER: absolute path to the personal Codex config dir>>"
+pool = "chatgpt:personal"
+available = true
+short = "gp"
+
+[accounts.chatgpt-work]
+kind = "codex"
+config_dir_var = "CODEX_HOME"
+config_dir = "<<PLACEHOLDER: absolute path to the work Codex config dir>>"
+pool = "chatgpt:work"
+available = true
+short = "gw"
+
+[accounts.grok]
+kind = "grok"
+config_dir_var = "GROK_HOME"
+# Herdr defaults to ~/.grok when GROK_HOME is unset; set it explicitly
+# anyway, because an unset variable means "whatever the Herdr server had".
+config_dir = "<<PLACEHOLDER: absolute path to the Grok config dir>>"
+pool = "grok"
+available = true
+# Grok's CLI keeps no real token counter, so `multiverse accounts usage`
+# instead reads its own session logs under `<config_dir>/sessions/` and
+# builds an ESTIMATE: sessions and estimated tokens for the last 24h/7d, plus
+# the busiest projects. `accounts usage --detail grok` breaks that down
+# further, per day and per project.
+#
+# `usage_warn_sessions_per_day` is how many sessions in the trailing 24h is
+# worth a WARN line from `accounts usage` and `check` — the cheap proxy for
+# "something is calling grok far more than usual", since there is no real
+# balance to check directly. Defaults to 60; uncomment to change it.
+# usage_warn_sessions_per_day = 60
+
+# Gemini is deliberately absent: Workspace requires a Code Assist license, a
+# GCP project, API enablement and an IAM role, and `gemini` has no
+# installable state integration in Herdr, so it could only ever run on
+# screen-pattern heuristics rather than authoritative state.
+#
+# The local floor seat: the correct terminal entry in a chain, because a
+# local model never rate-limits. It belongs at the end of Scout's chain —
+# tier fallback (e.g. a large model down to a small one within one vendor)
+# does almost nothing for the failure that actually happens, since
+# subscription limits are account-level and an exhausted seat is exhausted
+# at every tier.
+#
+# **It is not a new kind.** Herdr drives agent CLIs in panes; it cannot call
+# a model server directly. A local inference server has no agent loop — no
+# tool use, no file editing — so it cannot be a seat on its own. What it
+# needs in front of it is a CLI Herdr already knows, and `codex --oss
+# --local-provider <local-server>` is one: that keeps `kind = "codex"`, an
+# installed integration, and `CODEX_HOME` from the normal account shape.
+# Give it its own config dir so it never touches the cloud seat's auth.
+#
+# `model` on the account is what makes this expressible. A role's `models`
+# table is keyed by KIND, which is right when two accounts of a kind are the
+# same product on two subscriptions. A floor seat breaks that: it shares the
+# cloud seat's CLI but cannot run its model, and asking the local server for
+# a cloud-only model name is a startup failure rather than a degradation.
+# Eligibility is still keyed by kind — the role must declare a model for
+# `codex` to reach this seat at all; this only overrides which model it then
+# starts.
+#
+# [accounts.local]
+# kind = "codex"
+# config_dir_var = "CODEX_HOME"
+# config_dir = "<<PLACEHOLDER: a config dir separate from the cloud codex seat>>"
+# pool = "local"
+# command = "CODEX_OSS_BASE_URL=<<PLACEHOLDER: local inference server URL>> codex --oss --local-provider lmstudio"
+# model = "<<PLACEHOLDER: local model id>>"
+# health_url = "<<PLACEHOLDER: local inference server health endpoint>>"
+# Optional per-seat override for both launch routes' startup/readiness wait
+# and the missing-pane grace used by dispatch, tasks, board, accounts, and
+# sweep. A local model can be slow to read a new folder; while this grace is
+# active, a pane not yet visible to Herdr remains RUNNING, so sweep does not
+# expire or close it. Seats without it keep the existing timeout and
+# liveness behavior; zero disables the extra wait/grace.
+# startup_grace_seconds = 600
+#
+# A runtime cap for this seat — unlike the eligibility knobs below, this
+# bounds a lane *after* it is already running. Once a RUNNING/STALLED lane on
+# this seat has run longer than this many minutes, sweep's
+# `cap_long_running_lanes` sends it one canned "wrap up now" prompt instead
+# of waiting for `awaiting_lease_minutes` to notice a pane that never comes
+# back at all. Unset means uncapped.
+# max_runtime_minutes = 45
+#
+# This seat's own override of the top-level `awaiting_lease_minutes`
+# (default 60) — how long an AWAITING task (pane gone, no result) must sit
+# before sweep records it `failed`. A floor seat that crashes outright is
+# otherwise invisible for up to an hour; this lets the lease for just this
+# seat be much shorter without changing it for every other account. Unset
+# means this seat uses the global value unchanged.
+# awaiting_lease_minutes_override = 10
+#
+# "Route long work away from the local seat": a local model can run long
+# without ever producing a result. Two optional per-account knobs the
+# selector honours before ever treating this seat as a real candidate — the
+# same eligibility shape as an account with no model for the role's kind, not
+# an availability question, so a seat skipped for either reason falls
+# through the chain for free.
+#
+# `max_brief_chars`: a brief longer than this many characters skips this seat
+# outright, checked against the brief actually rendered for this seat (its
+# own stripped brief — no role/stage/skills prose, just the goal and the
+# fixed boilerplate below it). 5000 sits comfortably above a quick ask and
+# comfortably below anything carrying a real diff.
+# max_brief_chars = 5000
+#
+# `roles_allowed`: only these roles may land on this seat at all, regardless
+# of brief length. Scout and Archivist are the quick, bounded roles this
+# floor seat suits; Builder (sustained implementation) and the rest are left
+# off so a long-running role never reaches here by way of a short brief.
+# roles_allowed = ["scout", "archivist"]
+#
+# Keep the table name exactly `local`. Multiverse matches this seat by
+# account name, and gives it a shorter brief built for a small model instead
+# of the full role/stage/skills prose the other seats get. Renaming this
+# table is silent: the account still runs, it just goes back to the brief
+# that drifted.
+#
+# Three roles should NOT end in the floor seat, and the reasons are not
+# stylistic:
+#
+#   watcher — every entry must be multimodal. A text-only local model cannot
+#             see the screenshot it was dispatched to look at, and will
+#             answer confidently regardless.
+#   council — its chain is a CANDIDATE POOL, not an ordered fallback: one
+#             seat per vendor, all of them sit. Appending a floor seat does
+#             not give a council a floor, it permanently seats the weakest
+#             model in it.
+#   seer    — `on_exhausted = "queue"`. Seer takes the hardest questions;
+#             waiting beats a confident wrong answer from the smallest
+#             model.
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+#
+# The keys here are the stable config keys. Renaming a role's display name
+# changes it in one place, not these keys.
+#
+# Seven of nine roles dispatch directly: scout, builder, critic, seer,
+# archivist, artisan, watcher. Council is its own subcommand, not a `--role`;
+# Nexus is seeded by `multiverse start`, never dispatched.
+# `multiverse dispatch --role <either of those>` refuses and says why, rather
+# than half-working.
+
+[roles.scout]
+# `kind` is not a role setting — it lives on the account, because which CLI a
+# seat runs is a fact about the seat. The models table at the end of this
+# block is what replaces a role-level `kind` + `model` pair.
+#
+# Scout writes NOTHING. Its result and status files are the sole exception,
+# and they live under .multiverse/, not in your source tree.
+write_scope = "none"
+# Reasoning variant: low / medium / high / max. Most tuning happens here, not
+# in `model` — Scout is a compression task, so it wants the low end.
+effort = "low"
+# What to do when every seat in this role's chain is exhausted.
+#   degrade      — accept a weaker seat (compression and retrieval tolerate it)
+#   degrade_once — one step down, then wait
+#   queue        — wait for capacity; a late good answer beats a fast bad one
+#   warn         — never swap seats; warn and stop (Nexus's policy)
+#   shrink       — run a smaller council rather than substituting (Council only)
+# Omitted, each role gets the default for its kind of work.
+on_exhausted = "degrade"
+# Skill grants — see prompts/skills/.
+#
+# This is a PERMISSION LIST, not a menu: an agent can only activate skills it
+# has been given. A grant is a boundary — `simplify` belongs to the roles
+# that review, because a Builder reaching for it mid-implementation quietly
+# widens a bounded change into a refactor, which is exactly "execution, not
+# discovery."
+#
+#   ["*"]              every skill
+#   ["codemap"]        exactly these
+#   ["*", "!reflect"]  every skill except the denied ones
+#   ["!*"]             deny all, said out loud
+#   []                 no skills
+#
+# Order never matters and a denial always wins, so ["a", "!*"] grants
+# nothing. An unknown name is a config error rather than a silent no-op: a
+# typo that merely dropped a skill would leave the role running without the
+# discipline it was meant to have, and nothing in its output would say so.
+#
+# Omitting the field means no skills. That is a real answer: a role with a
+# narrow lane is better served by nothing than by a menu.
+skills = ["codemap"]
+
+# Which model to run on each kind of seat this role can use.
+#
+# Keyed by agent kind because a model name is vendor-specific. A role's chain
+# may name seats of different vendors — Critic requires exactly that, since
+# it must exclude the vendor that produced the work under review — so the
+# model has to say which kind of seat it is for.
+#
+# This table is also the eligibility rule: **an account is usable by this
+# role exactly when there is an entry here for that account's kind.** A
+# chain naming a seat with no entry is a config error, not a silent fallback
+# that would start one vendor's CLI with another vendor's model name.
+#
+# One entry is a complete answer — it means "this role runs on claude seats."
+#
+# Never invent a model identifier: leave the placeholder until you have the
+# real string.
+[roles.scout.models]
+claude = "<<PLACEHOLDER: model id for the fast/cheap tier>>"
+
+# Commented out for brevity, not because they are unavailable — builder,
+# critic, and archivist all dispatch in a working fleet. Uncomment whichever
+# your chains use, and fill in the placeholders; the shape below is the
+# whole of what each needs.
+#
+# [roles.builder]    # first writer — needs its own git worktree
+# Codex writer lanes also receive narrow write access to the user's build
+# and module-cache directories.
+# write_scope = "declared"
+# [roles.builder.models]
+# claude = "<<PLACEHOLDER: model id for the mid tier>>"
+#
+# [roles.critic]     # separate quota pool, free concurrency
+# write_scope = "none"
+# [roles.critic.models]
+#   Two entries is what makes "exclude the author's vendor" expressible:
+#   critic = ["codex", "grok"] can now fall back across vendors.
+# codex = "<<PLACEHOLDER: codex model id>>"
+# grok  = "<<PLACEHOLDER: grok model id>>"
+#
+# [roles.archivist]  # confirm vendor state-integration support before using
+# write_scope = "none"
+# [roles.archivist.models]
+# codex = "<<PLACEHOLDER>>"
+
+
+# ---------------------------------------------------------------------------
+# Projects and account chains
+# ---------------------------------------------------------------------------
+#
+# The rule that outranks everything else here:
+#
+#     Route by path. Never route by quota availability.
+#
+# All accounts may work on all repositories. Account assignment is a
+# configuration choice about quota and fit, NOT a permission boundary. Do not
+# build access restrictions between accounts and repos.
+#
+# A chain is an ordered list of account names. The selector takes the first
+# entry that is available, logs which one it took and why, and records it on
+# the card. If no chain is configured for a role, it ASKS — it does not
+# default. Silent defaults are the failure this file exists to prevent.
+#
+# The minimum viable config needs one project with one chain, naming any one
+# dispatchable role.
+
+[projects.example]
+# Absolute path to the project root, resolved through symlinks, so a project
+# reached via a symlink selects the same account as the same project reached
+# directly.
+#
+# A project whose path is still a placeholder is skipped entirely rather
+# than resolved against the current directory — so it matches nothing, and
+# the selector correctly reports "no configured project contains <path>".
+path = "<<PLACEHOLDER: absolute path to the project root>>"
+
+# Two-to-four character code shown in agent names in place of the project's
+# own (derived, truncated, hashed) slug — `example-build-cl` from a `short`
+# of "exam" reads the same way `Account.short` already lets an agent name
+# read which SEAT it is; this is the same idea one position over, for which
+# PROJECT it is. Optional: leave it out and a long project name is derived,
+# truncated to fit Herdr's 32-character limit, and disambiguated with a hash
+# exactly as it is today — nothing changes for a project that does not set
+# one.
+#
+# Validated at load: the agent-name charset, 2-4 characters, and unique
+# across every project in this file — Multiverse refuses to load two
+# projects that share a `short`, naming both, the same discipline
+# `[accounts.*].short` above already gets.
+#
+# NOT settable from a project's own `.multiverse/roster.toml`, even though
+# that file already lets a project retune its own chains. Uniqueness here is
+# a fact about the *whole fleet*, and a project reading only its own roster
+# cannot see what every other project has already taken. This file is where
+# every project's value is visible at once, so this is the only place the
+# check can be honest. A project that wants a short asks the hub that owns
+# this file for one.
+#
+# May equal an account's `short` without conflict: a project's short and an
+# account's short occupy different positions in
+# `<project-short>-<role>-<account-short>`, so the two could never make one
+# agent name collide with another the way two projects (or two accounts)
+# sharing a short would.
+# short = "exam"
+
+[projects.example.chains]
+# Ordered by preference; first available wins.
+#
+# A single-entry chain is the honest starting configuration when there is no
+# circuit breaker or automatic fallback across providers yet. Multi-entry
+# chains parse and resolve correctly, falling through on the static
+# `available` flag — but nothing detects an exhausted account at runtime to
+# trip it unless a breaker is wired up.
+scout = ["claude-personal"]
+
+# The full shape, for later. Chains may cross accounts and vendors freely.
+# nexus   = ["claude-personal", "claude-work"]
+# builder = ["claude-work", "claude-personal"]
+# seer    = ["claude-personal", "claude-work"]
+# critic  = ["codex-work"]
+
+# ---------------------------------------------------------------------------
+# Project-local chain overrides
+# ---------------------------------------------------------------------------
+#
+# A project's own nexus is forbidden from reading or writing outside its own
+# repository, so it cannot edit this file to tune its own routing.
+# `<project>/.multiverse/roster.toml` is where it can: a file inside the
+# project's own repo, read at load, that overrides the chains above for the
+# roles it names.
+#
+# CHAINS ONLY. Not accounts, not role models, not effort, not skills, not
+# max_concurrent, not projects, not activity pairs — an unknown table there
+# is refused, not ignored. An override REPLACES the named role's chain
+# entirely; a role the file does not mention keeps the chain configured here.
+#
+# Every refusal above still applies to a local chain (unknown account,
+# ineligible kind, empty chain), plus one that is specific to this file: a
+# worker role's chain may not name an account marked `interactive = true`,
+# unless the top-level `lend_interactive_to_workers` switch is true. A
+# project may tune which seat its own worker roles prefer — it may not grant
+# itself the human's seat without that switch. (The nexus role is exempt: a
+# project's own nexus chain may still name it.)
+#
+#     # <project>/.multiverse/roster.toml
+#     [chains]
+#     critic = ["grok-work", "codex-work"]
+#
+# `multiverse check` marks a chain overridden this way so a human debugging
+# routing does not read this file and believe it is the whole story.
+
+
+# ---------------------------------------------------------------------------
+# Review policy
+# ---------------------------------------------------------------------------
+#
+# The fleet's review rules as config, not a convention repeated in prose
+# across role prompts. A single fleet-wide table — not per-project, not
+# per-role. `multiverse check` and `multiverse review-policy` both print the
+# effective values below; the Critic brief and the nexus's own seed
+# (regenerated on every `multiverse start`/`--reseed`) are generated from the
+# same table, so editing it changes what every agent is told without editing
+# a prompt file.
+#
+# Commented out below with every default spelled out, because those are the
+# defaults you already get with no [review_policy] table at all — this block
+# documents the shape, it does not change behaviour by existing.
+#
+# [review_policy]
+# Risk areas that must get a cross-vendor Critic before merge. Everything
+# else may merge on verify-by-running evidence (full node ids, a revert
+# mutation, the full suite) and is tagged for optional batch review instead.
+# An entry outside this default six is accepted, not refused — a fleet may
+# invent its own risk label — but `check`/`review-policy` warn about it, in
+# case it is a typo rather than a real label.
+# require_cross_vendor_for = ["security", "auth", "migration", "deletion", "secrets", "release"]
+#
+# "diff": after a REVISE, the next review covers only the fix-round diff plus
+# the original findings, not the whole change again. "full" re-reviews the
+# whole change every round.
+# rereview = "diff"
+#
+# Whether low-risk merged lanes accumulate on a review list and get ONE
+# Critic over several lanes, rather than each lane getting its own.
+# batch_low_risk = true
+# How many low-risk lanes accumulate before a batch review is due. Also the
+# cap on how many lanes one `dispatch --reviewing` may name at once — the two
+# share this number.
+# batch_max_lanes = 6
+#
+# After this many REVISE rounds, stop asking for another review and escalate
+# to the nexus/human instead of dispatching one more.
+# max_rereviews = 2
+#
+# Make cross-vendor Critic dispatches cheap on a scarce seat. "diff":
+# `dispatch --role critic --reviewing <task-or-lane>` builds the brief from
+# the lane's diff against its merge base and tells the critic to read only
+# what it touches. "repo": no diff is built; the critic explores freely.
+# review_scope = "diff"
+# How many lines of the unified diff a scoped brief carries before
+# truncating (with a note saying so). Only meaningful under review_scope =
+# "diff".
+# review_max_diff_lines = 1500
+# Reasoning variant for the critic seat, applied the same way
+# roles.<role>.effort is — but as this one value regardless of which seat the
+# chain selects.
+# review_effort = "medium"
+# "terse": verdict plus numbered findings, no prose. "full": whatever the
+# finding needs.
+# review_output = "terse"
+# Recorded in the Critic's own brief; `multiverse sweep` flags a critic still
+# running past this many minutes.
+# review_timeout_minutes = 30
+# Below this percent left on a seat's last-read usage gauge, a Critic
+# dispatch falls through to the next seat in the chain instead of spending a
+# scarce seat's remaining quota. An unknown gauge never blocks.
+# review_min_quota_percent = 20
+#
+# JUDGMENT-ONLY: false tells a scoped Critic the nexus already ran the
+# mutations and the full suite, so it must read and reason only, never rerun
+# tests or the suite itself. true leaves it to the Critic's own judgement.
+# review_run_tests = false
+#
+# BUDGET: the most Critic dispatches one project may make in a rolling
+# 24-hour window before `dispatch` refuses another, counted straight off
+# that project's own routing log. 0 = unlimited. `multiverse review-policy`
+# shows used/limit per project.
+# review_budget_per_window = 3
+#
+# RISK AUTO-CLASSIFY: risk area -> path globs. `multiverse review-policy
+# --lane <task>` matches a lane's touched files against these and prints
+# which area(s) it hits, or "low" (batch list only) for none — an automatic
+# first pass before require_cross_vendor_for's own human-maintained list is
+# consulted.
+# [review_policy.review_risk_paths]
+# migration = ["migrations/**", "**/migrations/**", "prisma/migrations/**"]
+# auth = ["**/auth/**", "**/*auth*"]
+# mcp = ["**/mcp/**", "**/*mcp*"]
+# deletion = ["**/*delete*", "**/*retire*"]
+# secrets = ["**/*secret*", "**/.env*", "**/*env*"]
+
+
+# ---------------------------------------------------------------------------
+# Inter-project messaging (`multiverse activity send`)
+# ---------------------------------------------------------------------------
+#
+# DENY BY DEFAULT. With no [activity.pairs] table at all — or a sender simply
+# missing from it, or listed with an empty list — that project may send to
+# NOBODY. This is the same rule as an unconfigured chain (ask/refuse rather
+# than silently default), applied to a second kind of routing: "every
+# project may message every other project" would be exactly the silent
+# permissive default this file refuses everywhere else.
+#
+# DIRECTIONAL. Each entry is "sender = [recipients it may address]". Being
+# allowed to send to a project grants nothing about that project sending
+# back — those are two separate decisions, made with two separate entries.
+#
+# NO REPLY EXEMPTION. `activity send` is the only write this module has, and
+# `activity inbox` only ever reads — there is no "reply", so there is nothing
+# for a reply exemption to attach to. A two-way conversation between two
+# projects therefore needs BOTH directions listed below. Forgetting the
+# second one is not a bug in this file; it is the file working as designed —
+# but it is worth saying plainly here so nobody mistakes a one-way pairing
+# for an oversight.
+#
+# A pairing naming a project that isn't configured under [projects.*] above
+# fails at load, the same as an unknown account in a chain — never silently,
+# and never only once someone actually tries to send.
+#
+# [activity.pairs]
+# Uncomment and adapt once a second project exists — "example" above is the
+# only real project this file defines, so there is nothing yet to pair it
+# with. Two projects that need a full conversation both name each other:
+# example   = ["second-project"]
+# second-project = ["example"]

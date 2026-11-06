@@ -1,0 +1,45 @@
+{
+  "id": "directives-show-reads-standing-directive",
+  "description": "`directives show` reads a project's standing directives file straight off disk (directives.py's `read`): a file written with an `until:` header plus a blank line plus the body. `MULTIVERSE_DIRECTIVES` (directives.py's `directives_root`) is redirected to a scenario-seeded directory so the file can be pre-written statically, the same way other scenarios redirect CODEX_HOME to a fake account config dir. A second project with no file at all reads as 'no standing directives.' in the same invocation (projects omitted -> every configured project, cwd resolves to none since cwd is outside both).",
+  "dirs": {
+    "directives": {
+      "files": {
+        "sandbox.md": "until: 2099-01-01T00:00:00+00:00\n\nfreeze deploys until the migration lands\n"
+      }
+    }
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "quiet": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.quiet]\npath = \"{{PROJECT:quiet}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["directives", "show", "sandbox", "quiet"],
+      "env": { "MULTIVERSE_DIRECTIVES": "{{DIR:directives}}" },
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox: active, until <TIMESTAMP>",
+          "<DIR:directives>/sandbox.md",
+          "  freeze deploys until the migration lands",
+          "quiet: no standing directives."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    { "root": "quiet", "unchanged": true }
+  ]
+}

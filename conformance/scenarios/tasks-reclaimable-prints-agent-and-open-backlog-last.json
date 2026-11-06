@@ -1,0 +1,51 @@
+{
+  "id": "tasks-reclaimable-prints-agent-and-open-backlog-last",
+  "description": "`tasks --reclaimable` prints `open backlog:` after the --reclaimable write-leg report (`would close`/`stale bookkeeping`), not before it, and each candidate/stale line names `agent={!r}` ahead of `pane={!r}` — single-quoted like Python's repr, never `{:?}`'s always-double-quoted Debug form, and never missing the `agent=` field entirely. Found via `conformance/diff_fuzz.py` seed 50015 among others.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=seat-a\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n2020-01-01T01:00:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\tpane=w1:p1\n2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-bbbbbb\tproject=sandbox\trole=fixer\taccount=seat-a\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-bbbbbb\tpane=w1:p2\n2020-01-01T01:00:00+00:00\tevent=result\ttask=20250101-fixer-bbbbbb\tstatus=failed\tstate=abandoned: pane gone\trevisions=0\tpane=w1:p2\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result\nRole: Fixer\nStatus: done\n",
+        ".multiverse/tasks/20250101-fixer-bbbbbb/brief.md": "# Task 20250101-fixer-bbbbbb\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-bbbbbb/status": "failed",
+        ".multiverse/tasks/20250101-fixer-bbbbbb/result.md": "# Result\nRole: Fixer\nStatus: failed\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "fix the thing", "--why", "it breaks sometimes", "--priority", "P2"],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "--no-reconcile", "--reclaimable"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"idle\", \"cwd\": \"/tmp\", \"name\": \"\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "would close <ID> (fixer, agent='', pane='w1:p1')\n  dry run: nothing was closed. Add --yes to close these panes.\n  stale bookkeeping — pane already gone, holds no slot:\n    <ID> (fixer, agent='', pane='w1:p2')\n  open backlog:\n    <ID> P2 fix the thing\n"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": false }
+  ]
+}

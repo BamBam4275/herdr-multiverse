@@ -1,0 +1,37 @@
+{
+  "id": "add-empty-chain-refused",
+  "description": "`add` refuses with exit 3 and writes nothing when no available account can serve any role (`cli.py` `_cmd_add_locked` empty-chain check).",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "newrepo": {
+      "git": true,
+      "files": { "README.md": "new\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.down]\nkind = \"codex\"\nshort = \"dn\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:down\"\navailable = false\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.scout]\nwrite_scope = \"none\"\n[roles.scout.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["add", "{{PROJECT:newrepo}}"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "No role can be served"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    { "root": "newrepo", "unchanged": true }
+  ]
+}

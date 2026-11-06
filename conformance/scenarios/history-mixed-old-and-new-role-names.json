@@ -1,0 +1,46 @@
+{
+  "id": "history-mixed-old-and-new-role-names",
+  "description": "spec-tests-harness.md's role-rename finding, reproduced: a routing.log can legitimately hold an `event=backlog` record carrying a NEW role name (`builder`, free text — backlog.py validates only the identifier charset, never a closed RoleId enum) sitting right next to an `event=dispatch` record carrying an OLD role name (`fixer`, the closed dispatch-path vocabulary). Both `backlog list` and `tasks --no-reconcile` must read the mixed file without erroring or special-casing either vocabulary — a Rust reader that validated `role=` as a closed enum on every record kind would reject the live fleet's own history the moment it tried this.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-02T00:00:00+00:00\tv=1\tseq=1\tevent=backlog\titem=20200102-b-abc123\tstate=open\tpriority=P2\ttitle=\"port the role rename\"\twhy=\"old names only on the dispatch path\"\tby=sandbox\trole=builder\tcrc32=57ff5318\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "port the role rename"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "fixer"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "id": "backlog-add-show",
+  "description": "backlog add mints a random (secrets.token_hex) item id and appends one v=1/crc32 routing.log record; backlog show reads it back by that id. The id is captured from step 0's stdout and threaded into step 1's argv, since it cannot be predicted (unlike a dispatch task id, it is not content-hashed).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "fix the thing", "--why", "it breaks sometimes"],
+      "transcript": [],
+      "capture": { "item_id": "added (\\S+) to sandbox" },
+      "expect": {
+        "exit": 0,
+        "stdout": "added <ID> to sandbox."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "show", "{{capture:item_id}}"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "<ID> P2",
+          "title: fix the thing",
+          "why: it breaks sometimes",
+          "annotations: none"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\tv=1\tseq=1\tevent=backlog\titem=<ID>\tstate=open\tpriority=P2\ttitle=\"fix the thing\"\twhy=\"it breaks sometimes\"\tby=sandbox\tcrc32=<CRC32>$",
+          "mode": 384
+        }
+      }
+    }
+  ]
+}

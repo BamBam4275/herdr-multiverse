@@ -1,0 +1,56 @@
+{
+  "id": "activity-update-from-lane-worktree",
+  "description": "A dispatched writer inside `.multiverse/worktrees/<lane>` can `activity update`; cwd is a longest-prefix of the configured project (Python `config.project_for_path` / `cli.py:13838-13849`), not an exact root match.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20261101-builder-abcdef\tproject=sandbox\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tagent=sandbox-buil-st\tbranch=multiverse/20261101-builder-abcdef\n",
+        ".multiverse/tasks/20261101-builder-abcdef/brief.md": "lane\n"
+      },
+      "worktrees": {
+        "20261101-builder-abcdef": {
+          "files": {
+            ".multiverse/tasks/20261101-builder-abcdef/brief.md": "lane\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261101-builder-abcdef",
+      "argv": [
+        "activity",
+        "update",
+        "20261101-builder-abcdef",
+        "--phase",
+        "working",
+        "--note",
+        "x"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "posted update for <ID> as seq 1"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "(?s)event=dispatch\\ttask=<ID>.*event=update\\ttask=<ID>\\tphase=working\\tnote=\"x\""
+        }
+      }
+    }
+  ]
+}

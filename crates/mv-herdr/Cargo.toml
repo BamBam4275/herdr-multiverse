@@ -1,0 +1,22 @@
+[package]
+name = "mv-herdr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Herdr CLI client: argv builders, JSON envelopes, subprocess runner, and a fake-herdr test double."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fake-herdr"
+path = "src/bin/fake-herdr.rs"
+
+[dependencies]
+mv-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

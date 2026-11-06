@@ -1,0 +1,21 @@
+[package]
+name = "mv-board"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The board: a pure-text one-shot renderer, plus a ratatui --watch mode."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mv-core = { workspace = true }
+mv-engine = { workspace = true }
+mv-state = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+crc32fast = { workspace = true }
+unicode-width = "0.1"

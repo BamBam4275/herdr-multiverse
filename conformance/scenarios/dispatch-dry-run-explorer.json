@@ -1,0 +1,47 @@
+{
+  "id": "dispatch-dry-run-explorer",
+  "description": "dispatch --dry-run prints the full card for a configured Explorer chain and creates nothing: no task directory, no routing.log, no herdr call at all (spec-tests-harness.md calls this the single most important dispatch contract). Task id is content-hashed from the (project path, role, task text, UTC date) tuple, so normalize.py's <ID> placeholder stands in for it.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"explorer-seat\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "DRY RUN — nothing was created. No pane, no agent, no files, no log entry.",
+          "CARD  <ID>",
+          "role        Explorer",
+          "harness     codex",
+          "model       gpt-test",
+          "account     explorer-seat   (pool: codex:test)",
+          "cwd         <PROJECT:sandbox>",
+          "chain       explorer-seat",
+          "selected    explorer-seat",
+          "outcome     chain-primary",
+          "WOULD LOG  (not written — routing.log is untouched on a dry run)",
+          "event=dispatch\ttask=<ID>\tproject=sandbox\trole=explorer\taccount=explorer-seat\tpool=codex:test\toutcome=chain-primary",
+          "WOULD CREATE  (paths only — nothing was written)",
+          "<PROJECT:sandbox>/.multiverse/tasks/<ID>/brief.md",
+          "READY",
+          "Every value is resolved. This card is dispatchable."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

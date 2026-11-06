@@ -1,0 +1,42 @@
+{
+  "id": "history-result-status-tolerance",
+  "description": "`multiverse result <task-id>` refuses rather than guesses in two real-history shapes spec-on-disk-contract.md calls out: a task with no status file at all (ambiguous — still running, or the id never existed), and a task whose status file holds a value TaskStatus doesn't recognize (the live fleet has seen `donedone`/`donedonedone`/`doneblocked` from partial writes — gateway.py must not substring-match or guess at any of those). Both task ids carry an old pre-rename dispatch role name (`observer`), which this command never parses at all.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/tasks/20250101-observer-ffffff/brief.md": "# Task 20250101-observer-ffffff\nRole: Observer\n",
+        ".multiverse/tasks/20250202-observer-111111/brief.md": "# Task 20250202-observer-111111\nRole: Observer\n",
+        ".multiverse/tasks/20250202-observer-111111/status": "donedone",
+        ".multiverse/tasks/20250202-observer-111111/result.md": "# Result — task 20250202-observer-111111\nnever surfaced\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["result", "20250101-observer-ffffff"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "task '<ID>' has no status file. A running task has no status file at all, so this absence is ambiguous — it may still be running, or the task id may not exist"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["result", "20250202-observer-111111"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "task '<ID>' has an unrecognized status ('donedone'); refusing to guess whether it is finished"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

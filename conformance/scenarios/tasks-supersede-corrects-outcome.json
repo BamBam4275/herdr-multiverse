@@ -1,0 +1,56 @@
+{
+  "id": "tasks-supersede-corrects-outcome",
+  "description": "`multiverse tasks sandbox --supersede <task> --supersedes <ordinal> --status done --state reconciled-by-merge --reason <text> --yes` appends a corrected `event=supersede` line naming the right ordinal and leaves the original `event=result` line untouched (append-only, cli.py `_cmd_tasks_supersede`/accounts.py `append_supersede_if_absent`). Scout gap #2 (tasks `--supersede`).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=blocked\tstate=needs-review\trevisions=0\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks",
+        "sandbox",
+        "--supersede",
+        "20250101-fixer-aaaaaa",
+        "--supersedes",
+        "2",
+        "--status",
+        "done",
+        "--state",
+        "reconciled-by-merge",
+        "--reason",
+        "lane merged after rebase",
+        "--yes"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "<ID>@line 2",
+          "current:  when=<TIMESTAMP> status=blocked state=needs-review",
+          "proposed: status=done state=reconciled-by-merge reason='lane merged after rebase' revisions=0",
+          "recorded the correction for <ID>@line 2."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "equals": "<TIMESTAMP>\tevent=dispatch\ttask=<ID>\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n<TIMESTAMP>\tevent=result\ttask=<ID>\tstatus=blocked\tstate=needs-review\trevisions=0\n<TIMESTAMP>\tevent=supersede\ttask=<ID>\tsupersedes=2\tsupersedes_when=<TIMESTAMP>\tstatus=done\tstate=reconciled-by-merge\trevisions=0\treason=\"lane merged after rebase\"\n"
+        }
+      }
+    }
+  ]
+}

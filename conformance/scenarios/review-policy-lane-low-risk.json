@@ -1,0 +1,32 @@
+{
+  "id": "review-policy-lane-low-risk",
+  "description": "`review-policy --lane TASK_ID` (cli.py's cmd_review_policy, RISK AUTO-CLASSIFY) skips the fleet-wide policy/seat/budget dump and instead prints only which `[review_policy].review_risk_paths` area(s) the lane's diff hits, reading straight off a second git branch (`worktrees.lane_diff` / `mv_engine::lane_diff::lane_diff`) rather than any live Herdr pane. This scenario's lane (see `projects.sandbox.lanes` -- conformance/README.md 'Lane fixtures') only touches `docs/readme.md`, which hits none of the default `DEFAULT_RISK_PATH_GLOBS`/`default_risk_paths()` areas (migration, auth, mcp, deletion, secrets, release) on either side -- no `[review_policy.review_risk_paths]` override is configured here, so both implementations fall back to that same built-in table. Read-only: no Herdr call.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" },
+      "lanes": {
+        "20261101-fixer-abcdef": {
+          "files": { "docs/readme.md": "lane change\n" }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["review-policy", "--lane", "20261101-fixer-abcdef"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "<ID>: low (batch list only)"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

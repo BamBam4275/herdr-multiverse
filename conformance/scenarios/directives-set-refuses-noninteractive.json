@@ -1,0 +1,27 @@
+{
+  "id": "directives-set-refuses-noninteractive",
+  "description": "`directives set` (cli.py's cmd_directives) refuses unconditionally outside a real interactive terminal (directives.py's module docstring: this is Mike's own act, from Mike's own ordinary shell, never a pane's or a harness's). A subprocess launched by this conformance harness never has a tty on stdin/stdout, so this refusal is fully deterministic and needs no special setup — no project config, no `--yes`, nothing bypasses the tty check. Distinct from `InsidePaneError` (HERDR_PANE_ID set), which is not exercised here.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["directives", "set", "sandbox", "--body", "do not touch prod"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "directives set requires an interactive terminal; run it from your own terminal\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

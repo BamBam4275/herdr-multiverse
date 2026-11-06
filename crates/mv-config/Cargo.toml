@@ -1,0 +1,24 @@
+[package]
+name = "mv-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Config loading/validation, the two-tier roster, role wire/display maps, and the role-key migrator."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mv-core = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

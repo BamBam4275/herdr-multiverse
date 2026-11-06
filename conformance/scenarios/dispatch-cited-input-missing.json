@@ -1,0 +1,32 @@
+{
+  "id": "dispatch-cited-input-missing",
+  "description": "A brief that cites `` `.multiverse/input/<name>` `` with nothing that will actually stage there is refused before any worktree or pane is created (cli.py:295-381, backlog card 20260914-b-811e56: three real dispatches cited such a path with nothing behind it). Written against the current role names directly (`[roles.builder]`) for the same reason as `dispatch-read-only-input-refused`: new port behavior, no recorded Python transcript, and the role word here sits outside `role_translate.py`'s fixed rewrite positions.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.builder-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nbuilder = [\"builder-seat\"]\n\n[roles.builder]\nwrite_scope = \"declared\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.builder.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "--role", "builder", "{{PROJECT:sandbox}}", "read `.multiverse/input/spec.md` and follow it"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "the brief cites `.multiverse/input/spec.md`, but no --input landed at that basename (staged: none)."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,79 @@
+{
+  "id": "worktrees-prune-sweeps-orphans",
+  "description": "With no lane directories, prune reclaims recorded ancestors and keeps unique or unrecorded orphan branches.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\n2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-bbbbbb\tstatus=done\n"
+      },
+      "orphan_branches": [
+        "20260101-builder-aaaaaa",
+        "20260101-builder-cccccc"
+      ],
+      "lanes": {
+        "20260101-builder-bbbbbb": {
+          "files": {
+            "README.md": "unique\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--prune",
+        "--dry-run"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "reclaimed multiverse/<ID>",
+          "no recorded outcome",
+          "no patch-id or completed assessment retirement authority"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--prune"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "reclaimed multiverse/<ID>",
+          "no recorded outcome",
+          "no patch-id or completed assessment retirement authority"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".git/refs/heads/multiverse/20260101-builder-aaaaaa": {
+          "absent": true
+        },
+        ".git/refs/heads/multiverse/20260101-builder-bbbbbb": {
+          "regex": "^[0-9a-f]{40}"
+        },
+        ".git/refs/heads/multiverse/20260101-builder-cccccc": {
+          "regex": "^[0-9a-f]{40}"
+        }
+      }
+    }
+  ]
+}

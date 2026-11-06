@@ -1,0 +1,24 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Local Herdr plugin link/build artifacts
+/bin/
+
+# Live fleet state (briefs, routing log, worktrees, task audit files)
+/.multiverse/
+
+# Local config/secrets copies — never commit a real config. Anchored to the
+# repo root: an unanchored `config.toml` also matched `.cargo/config.toml`,
+# which must be committed (card 20261103-b-1da16f's HERDR_BIN_PATH guard).
+/config.toml
+config.local.toml
+*.local.toml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Do not ignore Cargo.lock (this is a binary) or committed assets.

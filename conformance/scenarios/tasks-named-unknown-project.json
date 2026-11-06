@@ -1,0 +1,27 @@
+{
+  "id": "tasks-named-unknown-project",
+  "description": "`multiverse tasks <name>` naming a project not in config refuses before any Herdr call (cli.py cmd_tasks: named args.projects is the write/list scope). Exit EXIT_NEEDS_CONFIG (3), naming the unknown project and listing what is configured. Empty transcript asserts no Herdr call. Scout gap #2.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "nope"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr": "config error: no such project: nope; configured: sandbox (see `multiverse projects`)\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

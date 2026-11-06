@@ -1,0 +1,98 @@
+{
+  "id": "dispatch-commits-pins-exact-commit-set-diff",
+  "description": "A real (non-dry-run) Critic dispatch with `--reviewing TASK --commits SHA` builds its '## What to review' brief section from exactly the named commit's own diff (`worktrees.commit_set_diff`, `dispatch.py:1001-1014`), not the lane's full cut-point diff — `RealDispatchStore::review_scope`'s own `explicit_commits` branch (task `20261106-fixer-fbf55c`). The reviewed lane is a fixture branch (`projects.sandbox.lanes`) with one commit touching `src/auth/login.rs`; `--commits` names that same commit by its branch ref. Like dispatch-real-builder/dispatch-real-wait, this Rust-only scenario seeds stateful fake-herdr and uses current role names directly.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        ".gitignore": ".multiverse/\nherdr-calls.jsonl\n",
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20261101-fixer-abcdef\tproject=sandbox\trole=builder\taccount=seat-a\tpool=chatgpt:excluded\toutcome=chain-primary\treason=\tbranch=main\n"
+      },
+      "lanes": {
+        "20261101-fixer-abcdef": {
+          "files": { "src/auth/login.rs": "fn login() {}\n" }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nvendor = \"chatgpt\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"chatgpt:excluded\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nvendor = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:floor\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\ncritic = [\"seat-a\", \"seat-b\"]\n\n[roles.critic]\nwrite_scope = \"none\"\nskills = []\n\n[roles.critic.models]\ncodex = \"gpt-test\"\n"
+  },
+  "herdr_seed": [
+    [
+      "pane",
+      "get",
+      "w52:p1"
+    ]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "dispatch",
+        "{{PROJECT:sandbox}}",
+        "review the fixer lane",
+        "--role",
+        "critic",
+        "--reviewing",
+        "20261101-fixer-abcdef",
+        "--commits",
+        "multiverse/20261101-fixer-abcdef",
+        "--yes"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w52:p1",
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/herdr-calls.jsonl"
+      },
+      "capture": {
+        "critic_task": "  task (\\d{8}-critic-[0-9a-f]{6})"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "  lease-expired 1 task(s) in sandbox before dispatching\nDispatched critic on seat-b (codex/gpt-test) in <PROJECT:sandbox>\n  agent sandbox-crit-sb in pane w52:p100\n  task <ID>\n  status file <PROJECT:sandbox>/.multiverse/tasks/<ID>/status\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "inspect",
+        ".multiverse/tasks/{{capture:critic_task}}/brief.md",
+        "--lines",
+        "1:200",
+        "--reason",
+        "verify --commits pins the explicit commit-set diff"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "## What to review",
+          "### Lane <ID>\nDiffed against `--commits`'s own explicit list, from `",
+          "`.\n\nTouched files:\n- src/auth/login.rs\n",
+          "\nDiff stat:\n```\nsrc/auth/login.rs | 1 +\n 1 file changed, 1 insertion(+)\n```\n",
+          "\nUnified diff:\n```diff\ndiff --git a/src/auth/login.rs b/src/auth/login.rs\n",
+          "+fn login() {}"
+        ],
+        "stderr": ""
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "README.md": {
+          "equals": "hi\n"
+        },
+        ".multiverse/routing.log": {
+          "regex": "(?=[\\s\\S]*task=<ID>\\t[^\\n]*role=builder\\taccount=seat-a)(?=[\\s\\S]*event=dispatch\\ttask=<ID>\\t[^\\n]*role=critic\\taccount=seat-b\\tpool=codex:floor\\toutcome=chain-fallback)"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "id": "accounts-usage-detail",
+  "description": "`accounts usage --detail ACCOUNT` (card 20260930-b-57dbff): detail is grok-only. A configured non-grok seat gets a one-line redirect instead of a table; a configured grok seat with no session home gets the same `no grok sessions found` line `usage` (bare) would reach too; an unconfigured name is a config error, exit 3.",
+  "dirs": {
+    "codex-home": {},
+    "grok-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[accounts.scout-seat]\nkind = \"grok\"\nconfig_dir_var = \"GROK_HOME\"\nconfig_dir = \"{{DIR:grok-home}}\"\npool = \"grok:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "usage", "--detail", "explorer-seat"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "explorer-seat is a \"codex\" seat — only grok has a per-day/per-project detail source today (card <ID>)."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "usage", "--detail", "scout-seat"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "scout-seat: no grok sessions found in the last 7d."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "usage", "--detail", "nosuchaccount"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr": "config error: unknown account \"nosuchaccount\"; configured accounts: explorer-seat, scout-seat\n"
+      }
+    }
+  ]
+}

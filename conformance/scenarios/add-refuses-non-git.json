@@ -1,0 +1,63 @@
+{
+  "id": "add-refuses-non-git",
+  "description": "Registering a non-git directory refuses before appending config, including in previews.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    },
+    "newrepo": {
+      "git": false,
+      "files": {
+        "README.md": "new\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:a\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "add",
+        "{{PROJECT:newrepo}}"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "is not a git repository",
+          "git init"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "add",
+        "{{PROJECT:newrepo}}",
+        "--dry-run"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "is not a git repository",
+          "git init"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "newrepo",
+      "unchanged": true
+    }
+  ]
+}

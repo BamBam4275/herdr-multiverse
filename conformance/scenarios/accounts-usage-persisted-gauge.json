@@ -1,0 +1,36 @@
+{
+  "id": "accounts-usage-persisted-gauge",
+  "description": "Grok usage reads its last persisted gauge without a pane read.",
+  "dirs": {
+    "codex-home": {},
+    "grok-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        "../../runtime/gauge-state.json": "{\"grok:test\": {\"percent_left\": 42, \"label\": \"daily window\"}}"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[accounts.scout-seat]\nkind = \"grok\"\nconfig_dir_var = \"GROK_HOME\"\nconfig_dir = \"{{DIR:grok-home}}\"\npool = \"grok:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "usage"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "42% left \u00b7 daily window"
+        ]
+      }
+    }
+  ]
+}

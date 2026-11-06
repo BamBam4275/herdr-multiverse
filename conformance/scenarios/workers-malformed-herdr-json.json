@@ -1,0 +1,32 @@
+{
+  "id": "workers-malformed-herdr-json",
+  "description": "A zero-exit Herdr reply that is non-JSON (or JSON lacking `result`) is a protocol error (runner.run's docstring: 'cannot mistake it for an empty listing'), and `workers` is one of the commands that fails open to it rather than crashing: every live count renders `?` and the exit code stays 0 ('an unreachable Herdr prints ? and still exits 0', cmd_workers's own docstring) — this is the malformed-reply slice of spec-tests-harness.md item 10's protocol matrix; a hung/timeout Herdr reply and the richer dispatch-path closed-error cases that item also names need a stateful fake Herdr this harness does not have.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:b\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["workers"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "not json at all\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "workers ?/3\nseats: seat-b ?\nprojects: sandbox ? open, ceiling 3\norchestrators ? (excluded from workers; they do not count against max_concurrent)"
+      }
+    }
+  ]
+}

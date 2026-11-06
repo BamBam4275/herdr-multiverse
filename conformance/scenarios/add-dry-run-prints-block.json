@@ -1,0 +1,41 @@
+{
+  "id": "add-dry-run-prints-block",
+  "description": "`add --dry-run <path>` prints the `[projects.<name>]` block (and a chain for every role some available, non-interactive account's kind can serve, per Q14's eligibility rule) it would append to the config, and writes nothing — `_cmd_add_locked`'s own early return right after building `text`, before the config file is ever opened for append. One role (`scout`) with one eligible seat is enough to exercise the real chain-building path without needing every rule in its docstring (reviewer/oracle vendor-lead swaps) to fire. The chain is rendered under the role's current config key, not its retired one, because this preview must match what a following real `add` actually appends (and what `multiverse check` will accept afterward).",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "newrepo": {
+      "git": true,
+      "files": { "README.md": "new\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:a\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["add", "{{PROJECT:newrepo}}", "--dry-run"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Would append to <STATE_DIR>/config.toml:",
+          "[projects.newrepo]",
+          "path = ",
+          "[projects.newrepo.chains]",
+          "scout = [\"seat-a\"]"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    { "root": "newrepo", "unchanged": true }
+  ]
+}

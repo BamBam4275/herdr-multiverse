@@ -1,0 +1,36 @@
+{
+  "id": "doctor-missing-accounts",
+  "description": "multiverse doctor against a config with a project but zero accounts: fails exactly the 'accounts configured' check, uses HERDR_BIN_PATH for its two herdr probes, and writes nothing (spec-tests-harness.md item 28).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["doctor"],
+      "transcript": [
+        {
+          "match_argv": ["plugin", "config-dir", "multiverse"],
+          "reply": { "exit": 0, "stdout": "{{STATE_DIR}}\n" }
+        },
+        {
+          "match_argv": ["--version"],
+          "reply": { "exit": 0, "stdout": "herdr 0.9.3\n" }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "fleet is not halted.\n✓ config file found: <STATE_DIR>/config.toml (resolved via $MULTIVERSE_CONFIG)\nstate directory: <RUNTIME_DIR>\n✓ herdr 0.9.3, minimum 0.9.0\n✗ accounts configured\n  Fix: Add at least one [accounts.<name>] table to the config.\n✓ project sandbox path exists: <PROJECT:sandbox>\n✓ project sandbox git repo\n✓ git user configured\n\nDoctor found 1 issue(s)."
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

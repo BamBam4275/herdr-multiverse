@@ -1,0 +1,46 @@
+{
+  "id": "dispatch-capacity-cap",
+  "description": "`accounts limit <seat> <cap>` writes seat-state.json persistently. Only a CAPPED seat ever triggers the one live `agent list` call `_open_counts` makes (accounts.py: an uncapped seat never reaches it). Card 20261102-b-15ee38: the one scripted call below fails (exit 1), so `default_open_agent_counts` returns None rather than raising — None is read as AT-CAPACITY for a capped seat, not as zero open, the fail-open answer stays only on an uncapped seat. dispatch --dry-run then falls to the next chain entry with the exact 'open-agent count unreadable' wording. Re-recorded from the Python oracle (`conformance/run_scenario.py --impl python --python-repo <frozen checkout>`), which makes this exact `agent list` call too — the transcript used to be empty, which (verified against the oracle, not just this port) was always a latent gap in this fixture rather than evidence the call never happens.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "limit", "seat-a", "1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 1, "stderr": "connection refused" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "account     seat-b   (pool: codex:b)",
+          "outcome     chain-fallback",
+          "selected    seat-b",
+          "skipped     seat-a: at cap: open-agent count unreadable (Herdr unreachable), cap is 1"
+        ]
+      }
+    }
+  ]
+}

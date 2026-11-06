@@ -1,0 +1,90 @@
+{
+  "id": "scratch-read-drives-a-live-pane",
+  "description": "`scratch read` drives a real pane through mv-herdr (`mv_state::scratch::HerdrPanes`: `pane get` to verify the task still owns the pane's label, then `pane read --source visible`) rather than touching only the filesystem record \u2014 it needs a live fake-herdr pane, not just an ordered call/reply transcript, so it is seeded against the real stateful `fake-herdr` binary via `herdr_seed` (card 20261103-b-64e792) rather than `fake_herdr.py`'s strict transcript player.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-11-02T00:00:00Z\tevent=dispatch\ttask=20261102-fixer-ab34cd\tbranch=multiverse/20261102-fixer-ab34cd\n2026-11-02T00:00:01Z\tevent=started\ttask=20261102-fixer-ab34cd\tpane=w52:p1\n"
+      },
+      "worktrees": {
+        "20261102-fixer-ab34cd": {
+          "files": {
+            ".multiverse/tasks/20261102-fixer-ab34cd/scratch-pane": "{\"name\": \"scratch-20261102-fixer-ab34cd\", \"pane\": \"w52:p100\", \"task\": \"20261102-fixer-ab34cd\"}\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "herdr_seed": [
+    [
+      "pane",
+      "split",
+      "--pane",
+      "w52:p1",
+      "--direction",
+      "right",
+      "--cwd",
+      "{{PROJECT:sandbox}}",
+      "--no-focus"
+    ],
+    [
+      "agent",
+      "start",
+      "scratch-read-probe",
+      "--kind",
+      "claude",
+      "--pane",
+      "w52:p100"
+    ],
+    [
+      "pane",
+      "rename",
+      "w52:p100",
+      "scratch-20261102-fixer-ab34cd"
+    ]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261102-fixer-ab34cd",
+      "argv": [
+        "scratch",
+        "read",
+        "w52:p100"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w52:p1",
+        "MULTIVERSE_TASK_ID": "wrong-env-task"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Ready >"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261102-fixer-ab34cd",
+      "argv": [
+        "scratch",
+        "read",
+        "w52:p999"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w52:p1"
+      },
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "recorded scratch pane"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "cap-only": {
+    "cap": 0
+  },
+  "empty": {},
+  "flags-only": {
+    "lend": false,
+    "prefer": true
+  },
+  "nulls-and-extra": {
+    "cap": null,
+    "future_flag": [],
+    "lend": null,
+    "prefer": null
+  }
+}

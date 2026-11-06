@@ -1,0 +1,35 @@
+{
+  "id": "check-unresolved-chain",
+  "description": "A Claude seat without the required command wrapper exhausts the chain that names it. check reports UNRESOLVED: ChainExhaustedError and exits 3.",
+  "dirs": {
+    "claude-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.primary]\nkind = \"claude\"\nshort = \"pr\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:primary\"\n\n[roles.scout]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.scout.models]\nclaude = \"m\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nscout = [\"primary\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["check"],
+      "env": { "HERDR_PANE_ID": "w1:p1" },
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout_contains": [
+          "UNRESOLVED: ChainExhaustedError",
+          "note: account primary",
+          "required command wrapper",
+          "accounts.primary.command"
+        ]
+      }
+    }
+  ]
+}

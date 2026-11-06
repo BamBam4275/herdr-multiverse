@@ -1,0 +1,27 @@
+{
+  "id": "check-missing-accounts",
+  "description": "multiverse check against a config with a project but zero accounts: EXIT_NEEDS_CONFIG (3), read-only, calls no herdr command at all. The host's pmset-derived idle-sleep warning line is host state, not CLI behavior, so normalize.py drops it rather than asserting on it.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["check"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config: <STATE_DIR>/config.toml\nstate directory: <RUNTIME_DIR>\naccounts: 0   projects: 1   roles: 0   max_concurrent: 3\n\nNo accounts configured. Add at least one [accounts.<name>] table to the config.\n\nprojects:\n  sandbox: short=(none — derived slug)  slots: 0 open, floor 0, ceiling 3\n\nadvisory scan: worktree pile check skipped; rerun `multiverse check --verbose` for details.\n\nadvisory scans skipped; use `multiverse check --verbose` for details.\n\nno unfilled placeholders.\n\nwarning: NOT inside a Herdr pane (HERDR_PANE_ID is unset).\n  `dispatch` would fail here — it splits the pane it runs in.\n  `multiverse start` works from anywhere; run dispatches from a project's pane."
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

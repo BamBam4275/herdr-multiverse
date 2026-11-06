@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "mv-history-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Checks a history corpus in an independent workspace, reusing mv-state fleet-store entry types."
+
+[dependencies]
+mv-state = { path = "../../../crates/mv-state" }
+serde_json = "1.0"
+crc32fast = "1.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

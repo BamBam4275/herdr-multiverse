@@ -1,0 +1,106 @@
+{
+  "id": "start-claude-launch-denies",
+  "description": "Claude Nexus pane run shell-quotes the configured command as one executable and adds only Edit denies, including both settings files under the account config_dir and the overridden fleet directives root. The printed seat summary keeps the bare command.",
+  "dirs": {
+    "codex-home": {},
+    "nexus config": {},
+    "directives root": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:nexus config}}\"\npool = \"claude:test\"\ninteractive = true\ncommand = \"claude seat's command\"\n\n[accounts.worker]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\ncommand = \"codex\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nscout = [\"worker\"]\nbuilder = [\"worker\"]\ncritic = [\"worker\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "sandbox"],
+      "env": {"MULTIVERSE_DIRECTIVES": "{{DIR:directives root}}"},
+      "transcript": [
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": []}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": []}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": []}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": []}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "create", "--label", "sandbox", "--cwd", "{{PROJECT:sandbox}}", "--no-focus"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspace\": {\"workspace_id\": \"w1\"}, \"root_pane\": {\"pane_id\": \"w1:p1\"}}}\n" }
+        },
+        {
+          "match_argv": ["pane", "rename", "w1:p1", "sandbox-nexu-ne · claude seat's command ·  · nexus-seat · nexus sandbox"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["pane", "run", "w1:p1", "'claude seat'\"'\"'s command' --disallowedTools 'Edit(/{{HOME}}/.claude/settings.json)' 'Edit(/{{HOME}}/.ssh/**)' 'Edit(/{{HOME}}/.gitconfig)' 'Edit(/{{DIR:directives root}}/**)' 'Edit(/{{DIR:nexus config}}/settings.json)' 'Edit(/{{DIR:nexus config}}/settings.local.json)'"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\"}]}}\n" }
+        },
+        {
+          "match_argv": ["agent", "rename", "w1:p1", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["agent", "read", "w1:p1", "--source", "visible"],
+          "reply": { "exit": 0, "stdout": "Ready >" }
+        },
+        {
+          "match_argv": ["agent", "get", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 5}}}\n" }
+        },
+        {
+          "match_argv": ["agent", "prompt", "sandbox-nexu-ne", "Read `{{PROJECT:sandbox}}/.multiverse/orchestrator.md` now and follow it. You are the Nexus for sandbox. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route."],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {}}}\n" }
+        },
+        {
+          "match_argv": ["agent", "get", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 6}}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "w1  pane w1:p1",
+          "opened 1 of 1",
+          "sandbox-nexu-ne",
+          "claude seat's command  sandbox-nexu-ne"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/orchestrator.md": {
+          "regex": "\\| Builder \\| worker \\|[\\s\\S]*\\| Critic \\| worker \\|[\\s\\S]*\\| Scout \\| worker \\|[\\s\\S]*- Cross-vendor review required for:"
+        }
+      }
+    }
+  ]
+}

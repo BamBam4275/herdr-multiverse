@@ -1,0 +1,82 @@
+{
+  "id": "sweep-tick-missing-orchestrators",
+  "description": "Sweep reuses its initial roster to skip missing named orchestrators before gauge and tick fleet queries, including with an interactive account and unrelated live specialists. One agent-list call serves both projects; exact output pins summary, host, and tick order. Exercises apply and dry-run paths without a real fleet.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n[accounts.nexus-seat]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{HOME}}\"\ninteractive = true\ncommand = \"fake-nexus\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--tick",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"unrelated-specialist\", \"pane_id\": \"w1:p1\", \"agent_status\": \"working\"}]}}\n"
+          }
+        }
+      ],
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/usr/bin/false",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\nsandbox2: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\nsandbox: skipped (no orchestrator)\nsandbox2: skipped (no orchestrator)\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--tick"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"unrelated-specialist\", \"pane_id\": \"w1:p1\", \"agent_status\": \"working\"}]}}\n"
+          }
+        }
+      ],
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/usr/bin/false",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\nsandbox2: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\nsandbox: skipped (no orchestrator)\nsandbox2: skipped (no orchestrator)\n",
+        "stderr": ""
+      }
+    }
+  ]
+}

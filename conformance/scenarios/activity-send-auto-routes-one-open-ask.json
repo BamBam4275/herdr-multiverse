@@ -1,0 +1,37 @@
+{
+  "id": "activity-send-auto-routes-one-open-ask",
+  "description": "A plain `activity send` that answers exactly one open ask from the recipient (`board._references_ask`) auto-routes through `reply()`: writes `re=` and closes the ask (cli.py:13325-13433, scout2-gaps #13).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "send", "sandbox", "please rotate the staging creds before 9am", "--ask", "--id", "ask-1"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "sent to sandbox." }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "rotated the staging creds before 9am", "--id", "answer-1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sent to sandbox2.",
+          "linked as reply to #1."
+        ]
+      }
+    }
+  ]
+}

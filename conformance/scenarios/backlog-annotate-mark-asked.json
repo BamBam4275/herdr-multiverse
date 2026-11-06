@@ -1,0 +1,50 @@
+{
+  "id": "backlog-annotate-mark-asked",
+  "description": "`backlog annotate ITEM --note` appends a timestamped project-authored note to a card (distinct from `answer`'s fixed `by == \"human\"` annotation); `backlog mark-asked ITEM --option --option --recommend N` moves an ordinary open card into `state=asked` with its own options/recommendation, the same shape `backlog ask` mints directly — `backlog show` reads both back.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "fix the thing", "--why", "it breaks sometimes"],
+      "transcript": [],
+      "capture": { "item_id": "added (\\S+) to sandbox" },
+      "expect": { "exit": 0, "stdout": "added <ID> to sandbox." }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "annotate", "{{capture:item_id}}", "--note", "still reproduces on main"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "recorded the annotation on <ID>." }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "mark-asked", "{{capture:item_id}}", "--option", "A", "--option", "B", "--recommend", "2"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "marked <ID> asked" }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "show", "{{capture:item_id}}"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "<ID>",
+          "fix the thing",
+          "still reproduces on main",
+          "asked",
+          "A",
+          "B"
+        ]
+      }
+    }
+  ]
+}

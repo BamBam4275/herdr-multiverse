@@ -1,0 +1,38 @@
+{
+  "id": "dispatch-fallback-unavailable",
+  "description": "dispatch --dry-run falls through a two-entry chain when the first seat is marked `available = false` in config (a human-flagged outage, checked first and absolutely — accounts.py's `_availability` check 1): outcome becomes chain-fallback, the card names the selected second seat, and a `skipped` line gives the first seat's `unavailable_reason` verbatim. This check is a pure config read — no extra herdr call beyond what a plain chain-primary dry-run already makes (none at all), so the transcript stays empty exactly like dispatch-dry-run-explorer.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\navailable = false\nunavailable_reason = \"codex quota exhausted\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "account     seat-b   (pool: codex:b)",
+          "outcome     chain-fallback",
+          "chain       seat-a → seat-b",
+          "selected    seat-b",
+          "skipped     seat-a: codex quota exhausted",
+          "READY"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

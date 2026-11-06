@@ -1,0 +1,74 @@
+{
+  "id": "workers-task-occupancy",
+  "description": "Live workers join routing history for project/task/age and count seat/project occupancy, including idle/done sessions. Stale task directories do not occupy slots.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-11-05T00:00:00+00:00\tevent=dispatch\ttask=20261105-builder-abcdef\tproject=sandbox\trole=fixer\taccount=seat-b\tagent=sandbox-expl-sb\n2026-11-05T00:00:00+00:00\tevent=started\ttask=20261105-builder-abcdef\tpane=w1:p1\n2026-11-05T00:00:00+00:00\tevent=result\ttask=20261105-builder-abcdef\tstatus=done\tstate=done\n",
+        ".multiverse/tasks/20261105-builder-aaaaaa/brief.md": "unrecorded stale directory\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:b\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "workers"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp/lane\", \"name\": \"sandbox-expl-sb\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox          <ID>",
+          "seats: seat-b 1",
+          "sandbox 1 open, ceiling 3"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "workers"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "(none)",
+          "seats: seat-b 0",
+          "sandbox 0 open, ceiling 3"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "start-refusal-unconfigured-project",
+  "description": "`start <name>` naming a project not in config refuses before any Herdr call (cli.py's cmd_start checks `wanted`/`unknown` against config.projects ahead of `herdr.workspace_list()`), exit EXIT_NEEDS_CONFIG (3), naming the unknown project and listing what is configured. Empty transcript asserts no Herdr call is made for this refusal.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "nosuchproject"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr": "no such project: nosuchproject; configured: sandbox (see `multiverse projects`)\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

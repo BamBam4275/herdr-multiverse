@@ -1,0 +1,32 @@
+{
+  "empty": {},
+  "legacy-secondary-and-extra": {
+    "future_window": {
+      "value": 1
+    },
+    "percent_left": -1,
+    "secondary_percent_left": 80
+  },
+  "nulls": {
+    "label": null,
+    "label_secondary": null,
+    "last_probe_at": null,
+    "observed_at": null,
+    "percent_left": null,
+    "percent_left_secondary": null,
+    "resets_at": null,
+    "resets_at_secondary": null,
+    "vendor": null,
+    "window_minutes": null,
+    "window_minutes_secondary": null
+  },
+  "partial-primary": {
+    "label": "Primary",
+    "percent_left": 42
+  },
+  "secondary": {
+    "label_secondary": "Weekly",
+    "percent_left_secondary": 80.5,
+    "window_minutes_secondary": 10080
+  }
+}

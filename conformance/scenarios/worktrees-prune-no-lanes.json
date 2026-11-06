@@ -1,0 +1,33 @@
+{
+  "id": "worktrees-prune-no-lanes",
+  "description": "`worktrees <path> --prune` on a project with zero lanes and zero orphan branches still runs the orphan sweep (card `20261102-b-dd1507`'s 'not a return') and prints the same `no worktrees under {project.name}` wording the bare listing does — never 'no lanes to prune', and the real (non-dry-run) path never prints the combined removed/reclaimed/archived/kept breakdown line, which is `--dry-run`'s own summary only. Found via `conformance/diff_fuzz.py` seeds 50001/50006/60014 among others.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["worktrees", "{{PROJECT:sandbox}}", "--prune", "--dry-run"],
+      "expect": {
+        "exit": 0,
+        "stdout": "no worktrees under sandbox\n\nremoved 0 of 0\n\ndry run: 0 removed, 0 reclaimed, 0 archived, 0 kept (0 lane(s), 0 orphaned branch(es)) — nothing was changed\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["worktrees", "{{PROJECT:sandbox}}", "--prune", "--yes"],
+      "expect": {
+        "exit": 0,
+        "stdout": "no worktrees under sandbox\n\nremoved 0 of 0\n"
+      }
+    }
+  ]
+}

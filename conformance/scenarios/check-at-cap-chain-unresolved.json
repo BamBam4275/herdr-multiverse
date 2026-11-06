@@ -1,0 +1,48 @@
+{
+  "id": "check-at-cap-chain-unresolved",
+  "description": "A chain whose only eligible seat is at cap (cap=1, one live agent) reports UNRESOLVED: ChainExhaustedError and check exits 3. Python's cmd_check feeds AccountSelector the real get_cap/_open_counts; selector step 5 only applies a cap when it is set.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.primary]\nkind = \"codex\"\nshort = \"pr\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:primary\"\n\n[roles.scout]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.scout.models]\ncodex = \"m\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nscout = [\"primary\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "limit", "primary", "1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["check"],
+      "env": { "HERDR_PANE_ID": "w1:p1" },
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-scou-pr\", \"agent_status\": \"working\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout_contains": [
+          "UNRESOLVED: ChainExhaustedError"
+        ]
+      }
+    }
+  ]
+}

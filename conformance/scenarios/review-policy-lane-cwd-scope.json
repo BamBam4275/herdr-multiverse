@@ -1,0 +1,55 @@
+{
+  "id": "review-policy-lane-cwd-scope",
+  "description": "A lane existing only in a different configured project must not be silently selected from the current project.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "current project\n"
+      }
+    },
+    "other": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      },
+      "lanes": {
+        "20261101-fixer-abcdef": {
+          "files": {
+            "docs/readme.md": "lane change\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.other]\npath = \"{{PROJECT:other}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "review-policy",
+        "--lane",
+        "20261101-fixer-abcdef"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "lane"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    },
+    {
+      "root": "other",
+      "unchanged": true
+    }
+  ]
+}

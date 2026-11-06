@@ -1,0 +1,43 @@
+{
+  "id": "activity-close-already-closed-is-noop",
+  "description": "A second local close is a no-op: prints `already closed #<seq>.` and writes no extra notice (cli.py:13524-13529, scout2-gaps #15).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "need a thing?", "--ask", "--id", "ask-1"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "close", "1", "--reason", "withdrawn"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["closed #1.", "told the asker why."]
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "close", "1", "--reason", "withdrawn again"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "already closed #1."
+      }
+    }
+  ]
+}

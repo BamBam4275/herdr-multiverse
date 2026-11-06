@@ -1,0 +1,58 @@
+{
+  "id": "backlog-list-fleet-scope",
+  "description": "backlog list (card 20261102-b-726fdf): cwd inside the hub project ('multiverse', HUB_PROJECT_NAME) widens to the whole fleet, grouped by project with a trailing N-items-total line; naming a project explicitly on the [projects...] positional overrides cwd scoping even when cwd is a different project.",
+  "projects": {
+    "multiverse": {
+      "git": true,
+      "files": { "README.md": "hub\n" }
+    },
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.multiverse]\npath = \"{{PROJECT:multiverse}}\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "multiverse",
+      "argv": ["backlog", "add", "hub task", "--why", "hub-side work"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "sandbox task", "--why", "sandbox-side work"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "multiverse",
+      "argv": ["backlog", "list"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nmultiverse\n  <ID> P2 hub task\n  1 item\n\nsandbox\n  <ID> P2 sandbox task\n  1 item\n\n2 items total"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nsandbox\n  <ID> P2 sandbox task\n  1 item"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "list", "multiverse"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nmultiverse\n  <ID> P2 hub task\n  1 item"
+      }
+    }
+  ]
+}

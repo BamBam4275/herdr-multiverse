@@ -1,0 +1,69 @@
+{
+  "id": "seat-show",
+  "description": "`seat show <name> --json` always makes one live `agent list` call (unconditional, unlike plain `accounts` listing) for the seat's current open-agent count, but fails open to '?' rather than crashing when herdr answers with something unusable — scripted here with a non-JSON reply.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "seat",
+        "show",
+        "explorer-seat",
+        "--json"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "not json\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "{\"auth_env_key\": null, \"base_url\": null, \"cap\": null, \"kind\": \"codex\", \"model\": null, \"open\": null, \"provider\": null, \"seat\": \"explorer-seat\"}"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "seat",
+        "show",
+        "explorer-seat"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 1,
+            "stderr": "unreachable\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "seat: explorer-seat\nkind: codex\nmodel: (none — this seat takes its model from the role)\ncap: none (uncapped)\nopen: ? (Herdr unreachable)"
+      }
+    }
+  ]
+}

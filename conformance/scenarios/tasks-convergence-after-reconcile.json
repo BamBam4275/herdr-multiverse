@@ -1,0 +1,66 @@
+{
+  "id": "tasks-convergence-after-reconcile",
+  "description": "A blocked status file is reconciled and then auto-superseded in the same invocation. The listing retains the reconciliation ordinal, not the later correction ordinal; the next invocation reads the correction.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:01:00+00:00\tevent=dispatch\ttask=20250101-fixer-bbbbbb\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:02:00+00:00\tevent=result\ttask=20250101-fixer-bbbbbb\tstatus=done\tstate=completed\trevisions=0\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "blocked",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result\nStatus: blocked\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks",
+        "sandbox"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nsandbox\n    <ID>      fixer      old-seat   recorded    done #4\n    <ID>      fixer      old-seat   recorded    done #3"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks",
+        "sandbox"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "\nsandbox\n    <ID>      fixer      old-seat   recorded    done #5\n    <ID>      fixer      old-seat   recorded    done #3"
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+       `done`, `blocked`, or `failed` to `.multiverse/tasks/20260910-builder-a2962d-2/status`.
+
+
+     Context is already done. Those extra half-retries are recorded by the breaker (the original is not), so one
+     budget-expired round of in-flight batches can open the process-wide breaker.
+
+     Two mediums sit next to that: log samples only run one redaction pass (query-string tokens and basic-auth
+     userinfo survive), and the advertised body cause is missing on a couple of malformed-response paths.
+
+     Locking, reason-code orthogonality, a worker-local precheck, and the 30s Retry-After cap checked out.
+     The lint, unit, and race-detector suites were all clean on the fixer branch.
+
+     Worked for 19m24s                                                                                                         █
+                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                        │
+  ╰──────────────────────────────────────────────────────────────────────────────── Weekly limit left: 3% · Grok 4.6 (high) ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

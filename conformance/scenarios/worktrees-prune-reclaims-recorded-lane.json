@@ -1,0 +1,100 @@
+{
+  "id": "worktrees-prune-reclaims-recorded-lane",
+  "description": "Prune removes a clean recorded lane and reclaims its merged branch; preview preserves both.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        ".gitignore": ".multiverse/\n",
+        "README.md": "hi\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\n"
+      },
+      "worktrees": [
+        "20260101-builder-aaaaaa"
+      ]
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--prune",
+        "--dry-run"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "reclaimed branch multiverse/<ID>"
+        ]
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ]
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--prune"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "reclaimed branch multiverse/<ID>"
+        ]
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ]
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/worktrees/20260101-builder-aaaaaa": {
+          "absent": true
+        },
+        ".git/refs/heads/multiverse/20260101-builder-aaaaaa": {
+          "absent": true
+        }
+      }
+    }
+  ]
+}

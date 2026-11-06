@@ -1,0 +1,35 @@
+{
+  "id": "check-dispatch-placeholders",
+  "description": "Dispatch-only readiness still validates placeholders and pane context; it cannot return before those checks.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"<<PLACEHOLDER: account home>>\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "check",
+        "--dispatch-only"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout_contains": [
+          "accounts.explorer-seat.config_dir",
+          "NOT inside a Herdr pane"
+        ]
+      }
+    }
+  ]
+}

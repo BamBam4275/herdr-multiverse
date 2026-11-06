@@ -1,0 +1,38 @@
+{
+  "id": "activity-nudge-parked-trust-dialog",
+  "description": "`activity nudge` must `agent read` and run `dialog_or_menu_reason` before typing. An idle orchestrator parked on a trust dialog is reported unreached ('parked on a dialog') and the composer is never sent keystrokes (cli.py:13734-13818, scout2-gaps #16).",
+  "projects": {
+    "multiverse": {
+      "git": true,
+      "files": { "README.md": "hub\n" }
+    },
+    "project-a": {
+      "git": true,
+      "files": {
+        "README.md": "a\n",
+        "trust-banner.txt": "Trust this folder?\n› 1. Trust and continue\n2. Cancel\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.multiverse]\npath = \"{{PROJECT:multiverse}}\"\n\n[projects.project-a]\npath = \"{{PROJECT:project-a}}\"\n\n[activity.pairs]\nmultiverse = [\"project-a\"]\n"
+  },
+  "herdr_seed": [
+    ["workspace", "create", "--label", "project-a", "--cwd", "{{PROJECT:project-a}}", "--focus"],
+    ["script", "queue-text", "--file", "{{PROJECT:project-a}}/trust-banner.txt"],
+    ["agent", "start", "project-a-nexu", "--kind", "claude", "--pane", "w100:p1"]
+  ],
+  "steps": [
+    {
+      "cwd": "multiverse",
+      "argv": ["activity", "nudge", "project-a"],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "unreached project-a — parked on a dialog",
+          "0 nudged, 0 unconfirmed, 0 unverifiable, 1 unreached, 0 skipped."
+        ]
+      }
+    }
+  ]
+}

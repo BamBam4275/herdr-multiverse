@@ -1,0 +1,37 @@
+{
+  "id": "worktrees-prune-live-lane-and-non-lane-entry",
+  "description": "`worktrees <path> --prune --dry-run` previews two cases in one project: a plain file sitting directly under .multiverse/worktrees/ fails `_is_lane_entry` (not a directory) and is reported up front as `ignored: not a lane`, never entered into lane discovery at all; a real lane directory whose sole occupant task is recorded DONE in routing.log but whose dispatch pane (`pane=w1:p1`) Herdr's `agent list` still reports live is kept by `live_guard_reason`/`live_occupant_pane_state` (worktrees.py) rather than pruned, naming the occupant and the live pane's agent_status. `lanes()` (worktrees.py) walks the worktrees directory itself rather than `git worktree list`, so the lane directory here is a plain committed directory, not a real registered git worktree — sufficient for this command's own discovery and merged/clean checks, which is exactly why a genuine `git worktree add` is unnecessary (and, per this harness's static 'files' fixtures with no post-sandbox-creation templating, would be unconstructable here anyway: its internal .git/worktrees/*/gitdir pointer needs the sandbox's own dynamic absolute path, known only after this scenario's JSON is already fixed).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=seat-a\tpool=claude:a\toutcome=chain-primary\treason=\tbranch=multiverse/20260101-fixer-aaaaaa\n2026-01-01T00:05:00+00:00\tevent=started\ttask=20260101-fixer-aaaaaa\tpane=w1:p1\n2026-01-01T01:00:00+00:00\tevent=result\ttask=20260101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\n",
+        ".multiverse/tasks/20260101-fixer-aaaaaa/brief.md": "# Task 20260101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20260101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20260101-fixer-aaaaaa/result.md": "# Result\nRole: Fixer\nStatus: done\n",
+        ".multiverse/worktrees/20260101-fixer-aaaaaa/.gitkeep": "",
+        ".multiverse/worktrees/stray-notes.txt": "not a lane\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["worktrees", "{{PROJECT:sandbox}}", "--prune", "--dry-run"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"fixer-seat\"}]}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "  <PROJECT:sandbox>/.multiverse/worktrees/stray-notes.txt: ignored: not a lane\n  <ID>  [clean]  holds nothing\n    kept — <ID> still has a live agent pane (idle); rerun with --force to remove it anyway.\n\nremoved 0 of 1\n\ndry run: 0 removed, 0 reclaimed, 0 archived, 1 kept (1 lane(s), 0 orphaned branch(es)) — nothing was changed\n"
+      }
+    }
+  ]
+}

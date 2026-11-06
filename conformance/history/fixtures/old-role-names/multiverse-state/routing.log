@@ -1,0 +1,2 @@
+2026-10-31T00:00:00+00:00	v=1	seq=1	event=dispatch	task=20261031-fixer-ab12cd	project=demo	role=fixer	account=claude	pool=claude:default	outcome=chain-primary	reason=first entry in Fixer chain for demo	crc32=797a5284
+2026-10-31T00:10:00+00:00	v=1	seq=2	event=result	task=20261031-fixer-ab12cd	status=done	state=done	revisions=0	pane=w2:p1	crc32=a2daeb52

@@ -1,0 +1,72 @@
+#!/bin/sh
+# Multiverse account wrapper — TEMPLATE. Not runnable as-is.
+#
+# One wrapper per Claude account:
+#
+#     Account is selected by the CLI's config-directory variable and nothing
+#     else: CLAUDE_CONFIG_DIR, CODEX_HOME, GROK_HOME.
+#
+#     An auth token does NOT select an account — it selects a billing path, and
+#     setting one makes the CLI bypass subscription auth entirely. This is the
+#     most common way people think they've switched accounts and haven't.
+#
+# Substitute the two markers below and install as e.g. ~/.local/bin/claude-work:
+#
+#     sed -e 's|{{CONFIG_DIR}}|/absolute/path/to/config/dir|' \
+#         -e 's|{{ACCOUNT_NAME}}|work|' \
+#         templates/claude-account.sh.template > ~/.local/bin/claude-work
+#     chmod +x ~/.local/bin/claude-work
+#
+# Real config-directory paths are yours to fill in — this ships as a template
+# with markers rather than a finished script with someone else's paths baked in.
+#
+# WHEN YOU NEED THIS
+#
+# `herdr pane split --env` does propagate into the agent process, so
+# Multiverse sets the variable at pane creation and a wrapper is optional for
+# any seat that reads it at launch. `codex` and `grok` do.
+#
+# `claude` does not, and that exception is why this template still exists. It
+# reads its config directory at launch from a process Herdr does not start in
+# the pane, so the variable arrives correctly and the session ignores it
+# anyway. A `claude` seat therefore needs this wrapper — or an equivalent
+# shell function — named by the account's `command`.
+#
+# They are still worth having for the other kinds:
+#   - they make a seat testable by hand (`claude-work` then `/status`);
+#   - anything registering per-account harnesses by argv needs a real binary
+#     path, because harness argv carries no environment of its own.
+
+set -eu
+
+# Absolute path. `~` is NOT expanded here or in JSON config.
+CONFIG_DIR="{{CONFIG_DIR}}"
+
+case "$CONFIG_DIR" in
+  '{{'*)
+    echo "claude-{{ACCOUNT_NAME}}: template not filled in — CONFIG_DIR is still a placeholder" >&2
+    exit 78   # EX_CONFIG
+    ;;
+  /*) ;;
+  *)
+    echo "claude-{{ACCOUNT_NAME}}: CONFIG_DIR must be an absolute path, got: $CONFIG_DIR" >&2
+    exit 78
+    ;;
+esac
+
+if [ ! -d "$CONFIG_DIR" ]; then
+  echo "claude-{{ACCOUNT_NAME}}: no config directory at $CONFIG_DIR" >&2
+  exit 78
+fi
+
+export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
+
+# Environment hygiene: a spawned `claude` that sees ANTHROPIC_API_KEY bills
+# the API instead of the subscription. Unset it rather than trusting the caller.
+unset ANTHROPIC_API_KEY
+
+# Identifies the seat to anything downstream that wants to log it. Advisory —
+# CLAUDE_CONFIG_DIR above is what actually selects the account.
+export MULTIVERSE_ACCOUNT="{{ACCOUNT_NAME}}"
+
+exec claude "$@"

@@ -1,0 +1,119 @@
+{
+  "id": "council-prefer",
+  "description": "Council reuses dispatch preference ordering: a preferred Codex sibling takes the configured first Codex seat while the Claude opinion remains. Clearing preference restores the preview roster. Real dispatch is isolated with stateful fake Herdr.",
+  "dirs": {
+    "claude-home": {},
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.claude-personal]\nkind = \"claude\"\nshort = \"cp\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:personal\"\ncommand = \"claude-personal\"\n\n[accounts.codex-work]\nkind = \"codex\"\nshort = \"cw\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:work\"\n\n[accounts.codex-preferred]\nkind = \"codex\"\nshort = \"cx\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:preferred\"\n\n[roles.council]\nwrite_scope = \"none\"\n\n[roles.council.models]\nclaude = \"opus\"\ncodex = \"gpt-x\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\ncouncil = [\"codex-work\", \"claude-personal\", \"codex-preferred\"]\n"
+  },
+  "herdr_seed": [
+    [
+      "pane",
+      "get",
+      "w52:p1"
+    ]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "council",
+        "{{PROJECT:sandbox}}",
+        "should we ship?",
+        "--dry-run"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "codex-work",
+          "claude-personal"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "prefer",
+        "codex-preferred"
+      ],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "council",
+        "{{PROJECT:sandbox}}",
+        "should we ship?",
+        "--yes",
+        "--timeout",
+        "8"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w52:p1",
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/herdr-calls.jsonl"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "claude-personal",
+          "councillors answered across",
+          "Nothing was synthesized",
+          "codex-preferred"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "prefer",
+        "--clear"
+      ],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "council",
+        "{{PROJECT:sandbox}}",
+        "should we ship?",
+        "--dry-run"
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "codex-work",
+          "claude-personal"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "(?=[\\s\\S]*event=dispatch\\ttask=<ID>\\t[^\\n]*role=council\\taccount=claude-personal)(?=[\\s\\S]*event=dispatch\\ttask=<ID>\\t[^\\n]*role=council\\taccount=codex-preferred)(?=[\\s\\S]*event=started)(?![\\s\\S]*account=codex-work)"
+        },
+        "herdr-calls.jsonl": {
+          "regex": "\"pane\",\"split\"[\\s\\S]*\"pane\",\"split\""
+        }
+      }
+    }
+  ]
+}

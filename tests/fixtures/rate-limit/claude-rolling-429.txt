@@ -1,0 +1,4 @@
+⏺ API Error: Request rejected (429) · {"type":"error","error":{"type":"rate_limit_error","message":"All 4 account(s) in
+  pool \"product\" exhausted. Retry in 60s."}}. Received Model Group=claude-sonnet-5
+  Available Model Group Fallbacks=None
+✻ Worked for 38m 3s · done 12:09 AM

@@ -1,0 +1,46 @@
+{
+  "id": "tasks-failed-agent-list-stays-running",
+  "description": "`multiverse tasks` treats a failed `agent list` as `live=None`, not a confirmed-empty fleet: an unfinished dispatch (started pane, no status file, no result event) stays RUNNING rather than being promoted to AWAITING. Auto-reconcile also refuses to guess while Herdr is down, so the routing log is unchanged. Scout gap #1.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 1, "stderr": "herdr: socket unavailable\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "running",
+          "<ID>"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "equals": "<TIMESTAMP>\tevent=dispatch\ttask=<ID>\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n<TIMESTAMP>\tevent=started\ttask=<ID>\tpane=w1:p1\n"
+        }
+      }
+    }
+  ]
+}

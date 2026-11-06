@@ -1,0 +1,33 @@
+{
+  "id": "review-policy-lane-merged",
+  "description": "`review-policy --lane TASK_ID` still classifies a lane whose branch is already gone -- `--prune` reclaims a cleanly merged lane's branch (`git branch -d`) once it lands, which would otherwise leave `worktrees.lane_diff`/`mv_engine::lane_diff::lane_diff` with nothing to diff against. This scenario's lane (see `projects.sandbox.lanes` -- conformance/README.md 'Lane fixtures', `\"merge\": true`) is `--no-ff` merged into the project's main branch (commit subject `Merge branch 'multiverse/<task_id>'`, git's own default message) and then its branch is deleted, simulating exactly that reclaim. `_merged_lane_tip`/`merged_lane_tip` must recover the lane's last commit from the merge commit's second parent rather than refusing with 'no branch to diff against', so the touched-file classification (the same `auth` risk-path override as review-policy-lane-risk-path.json) still resolves. Read-only: no Herdr call.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" },
+      "lanes": {
+        "20261101-fixer-abcdef": {
+          "files": { "src/auth/login.rs": "changed\n" },
+          "merge": true
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n[review_policy.review_risk_paths]\nauth = [\"src/auth/**\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["review-policy", "--lane", "20261101-fixer-abcdef"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "<ID>: auth"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,23 @@
+[package]
+name = "mv-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core primitives shared by every Multiverse crate: exit codes, typed errors, task ids, file locking, atomic writes, timestamps, redaction, and crc32."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+time = { workspace = true }
+regex = { workspace = true }
+# Not a workspace dependency: only `redact` needs lookaround and a
+# conditional backreference, which the `regex` crate cannot express.
+fancy-regex = "0.13"
+crc32fast = { workspace = true }
+rustix = { workspace = true }
+tempfile = { workspace = true }

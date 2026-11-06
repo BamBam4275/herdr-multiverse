@@ -1,0 +1,63 @@
+{
+  "id": "backlog-configured-prefix",
+  "description": "All cwd-scoped backlog verbs select the longest configured root, including from a lane with its own .multiverse directory.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        "src/deep/.keep": ""
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}/..\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "root work"
+      ],
+      "transcript": [],
+      "capture": {
+        "item": "added (\\S+) to sandbox"
+      },
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "show",
+        "{{capture:item}}"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "root work"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "deep work"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "to sandbox."
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "id": "history-result-reads-old-role-task",
+  "description": "`multiverse result <task-id>` returns a finished task's result.md verbatim (gateway.py's read_result: redacted, never rewritten) for a task id carrying an OLD pre-rename dispatch role name (`designer`) — the role substring in the task id is never parsed or validated by this command at all (gateway.py / cli.py never call RoleId(...) on it), only the generic task-id identifier shape and the status file's terminal state matter. Pure file read: no routing.log entry is even required for this command to work, and no herdr call is made.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/tasks/20250101-designer-eeeeee/brief.md": "# Task 20250101-designer-eeeeee\nRole: Designer\n",
+        ".multiverse/tasks/20250101-designer-eeeeee/status": "done",
+        ".multiverse/tasks/20250101-designer-eeeeee/result.md": "# Result — task 20250101-designer-eeeeee\nRole: Designer\nStatus: done\n\nthe designer's finding\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["result", "20250101-designer-eeeeee"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "# Result — task <ID>\nRole: Designer\nStatus: done\n\nthe designer's finding"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

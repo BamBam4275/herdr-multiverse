@@ -1,0 +1,34 @@
+
+  multiverse/demo-fixer-000000 worktree ~/C/demo/.m/worktrees/demo-fixer-000000           162K / 256K │ [Dashboard]
+
+
+     ❯ Read `/home/demo/code/multiverse/.multiverse/worktrees/demo-fixer-000000/.multiverse/          5:39 AM
+       tasks/demo-fixer-000000/brief.md` and execute it. Follow its write scope exactly. Write your
+       findings to `/home/demo/code/multiverse/.multiverse/worktrees/demo-fixer- …
+
+
+
+     ◈ Explored scratchpad, 26 files, 25 searches
+                                                                                                                         █
+     I have the classifier mapping and CLI shape. Next I’ll add tests that fail without the command, then      5:47 AM   █
+     implement health so those tests pass.                                                                               █
+                                                                                                                         █
+     ◈ Created health.py, explored 1 file, 2 searches +270                                                               █
+                                                                                                                         █
+     I’ll wire the new health subcommand into the parser, handler table, and module docstring.                 5:48 AM   █
+                                                                                                                         █
+     ◈ Edited 3 files, explored 2 files, ran 1 command +534 -13                                                          █
+                                                                                                                         █
+
+  ┃
+  ┃  You hit your weekly limit.
+  ┃
+  ┃
+  ┃  1 (○) Upgrade tier      Upgrade to a higher tier for more usage
+  ┃  2 (○) Buy more credits  Purchase credits to keep using Grok Build
+  ┃  3 (○) Try Again         Resubmit the last prompt once you have usage again
+  ┃
+  ┃  ↑/↓ navigate · y copy                                                                              Enter:submit
+  ┃
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss

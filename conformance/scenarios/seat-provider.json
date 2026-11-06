@@ -1,0 +1,140 @@
+{
+  "id": "seat-provider",
+  "description": "Seat inspection reads the selected provider in the seat's Codex config, reports public metadata in JSON and the Python human block, resolves short names, and counts even idle/done sessions through fake Herdr.",
+  "dirs": {
+    "codex-home": {
+      "files": {
+        "config.toml": "model_provider = \"local\"\n[model_providers.local]\nname = \"Local inference\"\nbase_url = \"http://localhost:1234/v1\"\nenv_key = \"LOCAL_API_KEY\"\n[model_providers.other]\nbase_url = \"http://localhost:9999/v1\"\n"
+      }
+    },
+    "minimal-home": {
+      "files": {
+        "config.toml": "model_provider = \"minimal\"\n[model_providers.minimal]\nname = \"Minimal\"\n"
+      }
+    }
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.local]\nkind = \"codex\"\nshort = \"lc\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\nmodel = \"local-model\"\n[accounts.minimal]\nkind = \"codex\"\nshort = \"mn\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:minimal-home}}\"\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "seat",
+        "show",
+        "lc",
+        "--json"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"mv-builder-1-lc\", \"agent_status\": \"done\"}, {\"name\": \"mv-scout-2-lc-2\", \"agent_status\": \"idle\"}, {\"name\": \"mv-scout-3-mn\", \"agent_status\": \"working\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "{\"auth_env_key\": \"LOCAL_API_KEY\", \"base_url\": \"http://localhost:1234/v1\", \"cap\": null, \"kind\": \"codex\", \"model\": \"local-model\", \"open\": 2, \"provider\": \"local\", \"seat\": \"local\"}"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "limit",
+        "local",
+        "2"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "seat",
+        "show",
+        "local"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"mv-builder-1-lc\", \"agent_status\": \"working\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "seat: local\nkind: codex\nmodel: local-model\nprovider: local\nbase_url: http://localhost:1234/v1\nauth: LOCAL_API_KEY\ncap: 2\nopen: 1/2"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "seat",
+        "show",
+        "minimal"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "seat: minimal\nkind: codex\nmodel: (none — this seat takes its model from the role)\nprovider: minimal\nbase_url: (not set)\nauth: none\ncap: none (uncapped)\nopen: 0"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "seat",
+        "show",
+        "minimal",
+        "--json"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "{\"auth_env_key\": null, \"base_url\": null, \"cap\": null, \"kind\": \"codex\", \"model\": null, \"open\": 0, \"provider\": \"minimal\", \"seat\": \"minimal\"}"
+      }
+    }
+  ]
+}

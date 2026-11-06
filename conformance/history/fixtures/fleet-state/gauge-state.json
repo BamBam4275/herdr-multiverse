@@ -1,0 +1,27 @@
+{
+  "claude:default": {
+    "label": "Claude default",
+    "last_probe_at": "2026-01-01T00:00:00+00:00",
+    "observed_at": "2026-01-01T00:00:00+00:00",
+    "percent_left": 42,
+    "resets_at": "2026-01-01T00:00:00+00:00",
+    "vendor": "claude",
+    "window_minutes": 300
+  },
+  "damaged-entry": [],
+  "damaged-label": {
+    "label": 42
+  },
+  "damaged-percent": {
+    "percent_left": "42"
+  },
+  "damaged-secondary-percent": {
+    "secondary_percent_left": {}
+  },
+  "damaged-secondary-window": {
+    "secondary_window_minutes": 4294967296
+  },
+  "damaged-window": {
+    "window_minutes": -1
+  }
+}

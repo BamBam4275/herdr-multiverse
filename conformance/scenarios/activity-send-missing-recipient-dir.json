@@ -1,0 +1,35 @@
+{
+  "id": "activity-send-missing-recipient-dir",
+  "description": "A permitted recipient whose configured directory is missing is a path-free refusal (exit 3); nothing is created (activity.py:1801-1804, scout2-gaps #14).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.ghost]\npath = \"{{PROJECT:sandbox}}/does-not-exist\"\n\n[activity.pairs]\nsandbox = [\"ghost\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "ghost", "hello"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "project 'ghost' is configured but its directory does not exist",
+          "Nothing was created and nothing was sent"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "does-not-exist": { "absent": true }
+      }
+    }
+  ]
+}

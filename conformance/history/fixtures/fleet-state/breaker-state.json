@@ -1,0 +1,23 @@
+{
+  "claude:default": {
+    "open": true
+  },
+  "damaged-entry": [],
+  "damaged-manual": {
+    "manual": "true"
+  },
+  "damaged-open": {
+    "open": "true"
+  },
+  "damaged-timestamp": {
+    "tripped_at": 1
+  },
+  "damaged-trip-count": {
+    "trip_count": -1
+  },
+  "grok": {
+    "close_reason": "manual",
+    "closed_at": "2026-01-01T00:00:00+00:00",
+    "open": false
+  }
+}

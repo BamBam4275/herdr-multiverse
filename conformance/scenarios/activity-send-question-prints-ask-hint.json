@@ -1,0 +1,31 @@
+{
+  "id": "activity-send-question-prints-ask-hint",
+  "description": "After a successful non-ask send, a `?` in the body prints the `--ask` board hint (cli.py:13446-13457, scout2-gaps #52).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "are you up?", "--id", "q-1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sent to sandbox2.",
+          "that reads like a question; resend with --ask"
+        ]
+      }
+    }
+  ]
+}

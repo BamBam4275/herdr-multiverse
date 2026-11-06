@@ -1,0 +1,72 @@
+{
+  "id": "dispatch-commits-reviewing-pairing",
+  "description": "`--commits SHA` (repeatable, oldest first) only applies with exactly one `--reviewing` id; any other count prints a warning and the flag is ignored for the rest of the run (`commands::dispatch::commits_warning`). Two `--commits` with zero `--reviewing` warns; one `--commits` paired with one valid `--reviewing` id (resolved against a routing-log dispatch record, excluding that task's author vendor) is silent and still a clean `--dry-run`: no pane, no agent, no files, no log entry.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20261101-explorer-aaaaaa\tproject=sandbox\trole=explorer\taccount=seat-a\tpool=chatgpt:excluded\toutcome=chain-primary\treason=\tbranch=main\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nvendor = \"chatgpt\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"chatgpt:excluded\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nvendor = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:floor\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "dispatch",
+        "--dry-run",
+        "--commits",
+        "abc123",
+        "--commits",
+        "def456",
+        "{{PROJECT:sandbox}}",
+        "map the repo"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stderr": "warning: --commits only applies with exactly one --reviewing id (0 given) — ignored.\n",
+        "stdout_contains": [
+          "DRY RUN — nothing was created. No pane, no agent, no files, no log entry.",
+          "CARD  <ID>",
+          "account     seat-a   (pool: chatgpt:excluded)"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "dispatch",
+        "--dry-run",
+        "--commits",
+        "abc123",
+        "--reviewing",
+        "20261101-explorer-aaaaaa",
+        "{{PROJECT:sandbox}}",
+        "map the repo"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stderr": "",
+        "stdout_contains": [
+          "DRY RUN — nothing was created. No pane, no agent, no files, no log entry.",
+          "CARD  <ID>",
+          "account     seat-b   (pool: codex:floor)",
+          "excluded    \"chatgpt\" — author of task \"<ID>\" (--reviewing)"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

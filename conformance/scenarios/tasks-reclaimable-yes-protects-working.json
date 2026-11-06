@@ -1,0 +1,51 @@
+{
+  "id": "tasks-reclaimable-yes-protects-working",
+  "description": "`multiverse tasks --no-reconcile --reclaimable --yes` re-lists before closing and never closes a WORKING pane (data-loss safety, cli.py `_reclaim_pane_confirmation`). Two `agent list` calls (listing shared with reclaimable_panes, then fresh confirmation list_checked) and no `pane close`. Scout gap #4.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n2020-01-01T01:00:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result — task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "--no-reconcile", "--reclaimable", "--yes"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp\", \"name\": \"\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp\", \"name\": \"\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "NOT closed",
+          "pane could not be confirmed idle under the same agent twice"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "id": "activity-send-inbox",
+  "description": "activity send durably appends one v=1/crc32 'event=message' record to the RECIPIENT's own routing.log (never the sender's), gated by a directional [activity.pairs] entry; activity inbox --peek reads it back without advancing the recipient's cursor. --peek is used rather than a bare inbox read because inbox's default acknowledge path refuses outside an orchestrator pane (MULTIVERSE_TASK_ID set means 'a dispatched specialist', never advance the cursor it depends on) — a real behavior worth a scenario of its own later, not this one.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "hello there", "--id", "fixed-msg-1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sent to sandbox2."
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "inbox", "--peek"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "[<TIMESTAMP>] sandbox: hello there",
+          "current through event 1 as of <TIMESTAMP>",
+          "last peeked at <TIMESTAMP>, through event 1",
+          "sequence numbers are per project and cannot be compared across projects."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox2",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\tv=1\tseq=1\tevent=message\tid=fixed-msg-1\tfrom=sandbox\tto=sandbox2\tbody=\"hello there\"\tcrc32=<CRC32>$",
+          "mode": 384
+        }
+      }
+    },
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": { "absent": true }
+      }
+    }
+  ]
+}

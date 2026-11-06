@@ -1,0 +1,47 @@
+{
+  "id": "board-asked-backlog-renders-as-blocked",
+  "description": "An item moved to state=asked (backlog ask) does not show up as an ordinary BACKLOG card: the board renders it as a BLOCKED card labeled 'asked' instead — a human owes it an answer, which board.py treats the same shape as a stuck dispatch. An open (not-yet-asked) item in the same project still renders as a plain BACKLOG card, confirming the two states take genuinely different board sections rather than asked items vanishing.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "fix the thing", "--why", "it breaks"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "ask", "which account should we use?", "--option", "A", "--option", "B", "--recommend", "1"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "┌─ BLOCKED",
+          "which account should we use?",
+          "└────────────── asked ──────────────┘",
+          "┌─ BACKLOG",
+          "fix the thing"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+[package]
+name = "mv-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Everything under a project's .multiverse/ directory: routing log, tasks, worktrees, scratch, activity, backlog, mail, notify, breaker/gauge/seatstate stores."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mv-core = { workspace = true }
+mv-config = { workspace = true }
+mv-herdr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+rustix = { workspace = true }
+regex = { workspace = true }
+crc32fast = { workspace = true }
+time = { workspace = true }
+sha2 = { workspace = true }

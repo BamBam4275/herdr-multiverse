@@ -1,0 +1,43 @@
+{
+  "id": "accounts-open-agent-cap",
+  "description": "Card `20261105-fixer-9d070c`: `multiverse accounts`'s STATE column reads the open-agent cap (`AccountSelector._availability` check 5 / `accounts.py`'s `_account_state`), not just config/breaker-file state. A seat capped at 1 whose one live agent is `working` must read `at cap: 1/1 open agents` in the STATE column, not `available` — a wrong `available` here is the same class of mistake the breaker read exists to rule out, just for capacity instead of a rate limit. Exactly one `agent list` call is scripted: the STATE column's own cap check and the adjacent `⛁ open: N/cap` line share one resolved live count rather than each asking Herdr separately.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "limit", "explorer-seat", "1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"working\", \"name\": \"mv-fixer-1-ex\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       at cap: 1/1 open agents CODEX_HOME=<DIR:codex-home>\n                   ⛁ open: 1/1"
+      }
+    }
+  ]
+}

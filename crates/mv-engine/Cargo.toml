@@ -1,0 +1,27 @@
+[package]
+name = "mv-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Selector, dispatch planner, runner, council, gateway, briefs, embedded prompts/skills, the Nexus seed, and usage/limits/health."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mv-core = { workspace = true }
+mv-config = { workspace = true }
+mv-herdr = { workspace = true }
+mv-state = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+regex = { workspace = true }
+toml_edit = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

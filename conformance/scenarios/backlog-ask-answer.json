@@ -1,0 +1,59 @@
+{
+  "id": "backlog-ask-answer",
+  "description": "backlog ask mints an item in state=asked with options/a recommendation, backlog answer records the answer once (and is idempotent on a second call), and backlog show reads the whole thing back. --role is recorded here with an OLD pre-rename dispatch role name (fixer): the frozen Python oracle treats this field as free text (backlog.py validates only the identifier charset, activity._IDENTIFIER_RE, never a closed RoleId enum), but Rust's write surfaces accept only current role names, backlog's --role included, so conformance's replay-time translation (role_translate.translate_role_argv) rewrites it to the current name (builder) before this reaches Rust. A backlog card that was written under the old name before the rename still reads back verbatim — see the history-* scenarios — only new writes require the current name.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "ask", "which account should we use?", "--option", "A", "--option", "B", "--recommend", "1", "--why", "it matters", "--role", "fixer"],
+      "transcript": [],
+      "capture": { "item_id": "asked (\\S+) in sandbox" },
+      "expect": {
+        "exit": 0,
+        "stdout": "asked <ID> in sandbox."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "answer", "{{capture:item_id}}", "--note", "we chose A"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "recorded the answer on <ID>."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "answer", "{{capture:item_id}}", "--note", "we chose A"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "already recorded; nothing written for <ID>."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "show", "{{capture:item_id}}"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "<ID>",
+          "which account should we use?",
+          "A",
+          "B",
+          "it matters",
+          "we chose A"
+        ]
+      }
+    }
+  ]
+}

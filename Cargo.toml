@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mv-core",
+    "crates/mv-config",
+    "crates/mv-herdr",
+    "crates/mv-state",
+    "crates/mv-engine",
+    "crates/mv-board",
+    "crates/mv-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/BamBam4275/herdr-multiverse"
+description = "A single Rust binary that coordinates Claude, Codex, and Grok through isolated Herdr worktrees."
+keywords = ["herdr-plugin", "cli", "agent-orchestration", "git-worktree", "multi-agent"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+mv-core = { path = "crates/mv-core", version = "0.1.0" }
+mv-config = { path = "crates/mv-config", version = "0.1.0" }
+mv-herdr = { path = "crates/mv-herdr", version = "0.1.0" }
+mv-state = { path = "crates/mv-state", version = "0.1.0" }
+mv-engine = { path = "crates/mv-engine", version = "0.1.0" }
+mv-board = { path = "crates/mv-board", version = "0.1.0" }
+
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+toml_edit = "0.22"
+thiserror = "1.0"
+anyhow = "1.0"
+ratatui = "0.29"
+crossterm = "0.28"
+rustix = { version = "0.38", features = ["fs"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+crc32fast = "1.4"
+regex = "1.10"
+sha2 = "0.10"
+tempfile = "3.10"
+libc = "0.2"
+dirs = "4.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

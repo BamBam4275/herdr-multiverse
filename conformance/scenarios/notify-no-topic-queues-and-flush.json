@@ -1,0 +1,35 @@
+{
+  "id": "notify-no-topic-queues-and-flush",
+  "description": "`notify` never calls `_load(args)` and never resolves a configured project by path — `--project` is a bare string ntfy_push never even reaches when no ntfy topic file exists (notify.py's `_read_topic`, backed by `MULTIVERSE_NTFY_TOPIC_FILE`/the config dir's `ntfy-topic`): `ntfy_push` returns `False` before any subprocess or network call, so `send` appends the message to the fleet outbox and reports `queued`, and the command still exits 0 (card 20261015-fixer-6e60a3's 'a caller of this command never sees a failure from the network itself'). A later `--flush` replays the same queued record through `send` again, hits the same no-topic short-circuit, and re-queues it — again with no network reached and exit 0.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["notify", "--project", "sandbox", "--title", "disk low", "--message", "92% full"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "notify: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["notify", "--flush"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: disk low: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    }
+  ]
+}

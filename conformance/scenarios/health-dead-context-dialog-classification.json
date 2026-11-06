@@ -1,0 +1,296 @@
+{
+  "id": "health-dead-context-dialog-classification",
+  "description": "Connection loss is DEAD only as the last event; input-bar chrome is ignored, progress is a later event, and context/trust/menu banners classify as Python.",
+  "projects": {
+    "sandbox": {
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "Connection lost\nbypass permissions on (shift+tab to cycle)"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "DEAD w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "Connection lost\nWorking (3s)"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "Do you trust this folder?"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "DIALOG w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "Choose a plan\nEnter to select \u00b7 Esc to cancel"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "DIALOG w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "prompt is too long"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "CONTEXT w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "request exceeds the available context"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "CONTEXT w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "context length exceeded"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "CONTEXT w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "Generic error traceback panic exception fatal"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    }
+  ]
+}

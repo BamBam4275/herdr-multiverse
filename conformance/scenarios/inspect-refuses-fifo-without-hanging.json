@@ -1,0 +1,37 @@
+{
+  "id": "inspect-refuses-fifo-without-hanging",
+  "description": "Secure final open is nonblocking and refuses FIFOs before reading.",
+  "projects": {
+    "sandbox": {
+      "files": {
+        "README.md": "hi\n"
+      },
+      "fifos": [
+        "pipe"
+      ]
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "inspect",
+        "pipe",
+        "--lines",
+        "1:1",
+        "--reason",
+        "checking FIFO safety"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "refusing a non-regular file"
+        ]
+      }
+    }
+  ]
+}

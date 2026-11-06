@@ -1,0 +1,53 @@
+{
+  "id": "add-config-sidecar-lock",
+  "description": "A real add serializes its load/validate/append transaction on config.toml.lock.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    },
+    "newrepo": {
+      "git": true,
+      "files": {
+        "README.md": "new\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:a\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "add",
+        "{{PROJECT:newrepo}}"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Added to <STATE_DIR>/config.toml:",
+          "[projects.newrepo]",
+          "[projects.newrepo.chains]",
+          "scout = [\"seat-a\"]"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "../../home/.config/multiverse/config.toml.lock": {
+          "equals": ""
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "id": "start-reseed-rewrites-live-orchestrator",
+  "description": "`start --reseed` rewrites a missing or stale seed and re-points the live Nexus, printing the Python success message. Repeating it with a current seed skips both the rewrite and re-point. Separate fake Herdr call logs assert that neither invocation creates another workspace or agent, and that only the first sends a prompt. Rust-only stateful fake Herdr lifecycle scenario (herdr_seed).",
+  "dirs": {
+    "claude-home": {},
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:test\"\ninteractive = true\ncommand = \"claude-interactive\"\n\n[accounts.worker]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\ncommand = \"codex\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"worker\"]\nfixer = [\"worker\"]\nreviewer = [\"worker\"]\n"
+  },
+  "herdr_seed": [
+    ["workspace", "create", "--label", "sandbox", "--cwd", "{{PROJECT:sandbox}}", "--focus"],
+    ["agent", "start", "sandbox-nexu-ne", "--kind", "claude", "--pane", "w100:p1"]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "--reseed", "sandbox"],
+      "env": {
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/herdr-calls.jsonl"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "reseeded and re-pointed (sandbox-nexu-ne)",
+          "opened 0 of 1"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "--reseed", "sandbox"],
+      "env": {
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/current-herdr-calls.jsonl"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "already current — not re-pointed",
+          "opened 0 of 1"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/orchestrator.md": {
+          "regex": "\\| Builder \\| worker \\|[\\s\\S]*\\| Critic \\| worker \\|[\\s\\S]*\\| Scout \\| worker \\|[\\s\\S]*- Cross-vendor review required for:"
+        },
+        "herdr-calls.jsonl": {
+          "regex": "\\A(?=[\\s\\S]*\"agent\",\"prompt\")(?![\\s\\S]*\"workspace\",\"create\")(?![\\s\\S]*\"agent\",\"start\")"
+        },
+        "current-herdr-calls.jsonl": {
+          "regex": "\\A(?=[\\s\\S]*\"agent\",\"list\")(?![\\s\\S]*\"agent\",\"prompt\")(?![\\s\\S]*\"workspace\",\"create\")(?![\\s\\S]*\"agent\",\"start\")"
+        }
+      }
+    }
+  ]
+}

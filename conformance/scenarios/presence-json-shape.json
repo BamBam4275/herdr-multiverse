@@ -1,0 +1,34 @@
+{
+  "id": "presence-json-shape",
+  "description": "`presence` loads no config (not even `_load(args)`) and reports Mike's local HID idle signal by shelling out to the real `ioreg -c IOHIDSystem` (cli.py's `_hid_idle_seconds`) with no env override and no test hook — unlike every other host-dependent probe this harness works around (the pmset idle-sleep line `check` drops, per README), `ioreg`'s actual idle counter is read for real here because the sandbox's curated PATH falls through to the real `/usr/sbin/ioreg` and there is no scenario-schema mechanism to shadow it (projects/dirs only populate their own trees, never the harness's own `sandbox/bin`). So `idle_seconds` and `status` (active/away/unknown) are genuinely non-deterministic from one run to the next, including within the same harness pass — this scenario therefore omits `exit` entirely (optional per run_scenario.py) and asserts only the stable, value-independent shape of both output modes, never a value. Same category of gap as the README's documented pmset-line and elapsed-time-display notes.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["presence", "--json"],
+      "transcript": [],
+      "expect": {
+        "stdout_contains": ["\"idle_seconds\":", "\"status\":"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["presence"],
+      "transcript": [],
+      "expect": {
+        "stdout_contains": ["Mike HID idle: "]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

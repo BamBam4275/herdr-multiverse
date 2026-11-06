@@ -1,0 +1,71 @@
+{
+  "id": "notify-tag-and-episode-state",
+  "description": "`--tag` (repeatable, joined with commas on the ntfy `Tags` header) and `--episode-state` (only recorded together with `--episode-key`) ride along on the same no-topic queue path `notify-no-topic-queues-and-flush` pins: no topic file exists, so `ntfy_push` short-circuits before any network call and the record is queued with exit 0 regardless of how many tags or which episode fields were given. `--episode-state` alone, without `--episode-key`, is dropped by the CLI before it ever reaches the queued record (`commands::notify::run_with_state`). `--flush` of the episode-backed first record requeues without attempting the transport when `episodes.json` is missing (`notify.py:1108-1122`, card `20261103-b-51b151`); the second record has no episode fields and still hits the no-topic short-circuit.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "notify",
+        "--project",
+        "sandbox",
+        "--title",
+        "host sleep",
+        "--message",
+        "going idle",
+        "--tag",
+        "warning",
+        "--tag",
+        "sleep",
+        "--episode-key",
+        "host-sleep",
+        "--episode-state",
+        "episodes.json"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "notify: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "notify",
+        "--project",
+        "sandbox",
+        "--title",
+        "solo state",
+        "--message",
+        "no key given",
+        "--episode-state",
+        "episodes.json"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "notify: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["notify", "--flush"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: host sleep: queued\nsandbox: solo state: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    }
+  ]
+}

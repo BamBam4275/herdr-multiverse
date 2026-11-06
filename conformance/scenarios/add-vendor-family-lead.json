@@ -1,0 +1,44 @@
+{
+  "id": "add-vendor-family-lead",
+  "description": "`add --dry-run` leads Critic on a vendor other than Builder's (`cli.py` `_cmd_add_locked` rules 1-3). Two vendors; Builder has only chatgpt so its lead is chatgpt, Critic prefers chatgpt too and is forced onto grok, Seer then moves off grok. Chains use current role keys. Writes nothing.",
+  "dirs": {
+    "codex-home": {},
+    "grok-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "newrepo": {
+      "git": true,
+      "files": { "README.md": "new\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.aa-grok]\nkind = \"grok\"\nshort = \"ag\"\nconfig_dir_var = \"GROK_HOME\"\nconfig_dir = \"{{DIR:grok-home}}\"\npool = \"grok\"\n\n[accounts.zz-chatgpt]\nkind = \"codex\"\nshort = \"zc\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:work\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.builder]\nwrite_scope = \"none\"\n[roles.builder.models]\ncodex = \"gpt-test\"\n\n[roles.critic]\nwrite_scope = \"none\"\n[roles.critic.models]\ncodex = \"gpt-test\"\ngrok = \"grok-test\"\n\n[roles.seer]\nwrite_scope = \"none\"\n[roles.seer.models]\ncodex = \"gpt-test\"\ngrok = \"grok-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["add", "{{PROJECT:newrepo}}", "--dry-run"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Would append to <STATE_DIR>/config.toml:",
+          "[projects.newrepo.chains]",
+          "builder = [\"zz-chatgpt\"]",
+          "critic = [\"aa-grok\", \"zz-chatgpt\"]",
+          "seer = [\"zz-chatgpt\", \"aa-grok\"]",
+          "leads on a vendor other than builder's",
+          "moved off grok"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    { "root": "newrepo", "unchanged": true }
+  ]
+}

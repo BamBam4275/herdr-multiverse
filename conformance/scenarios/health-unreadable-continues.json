@@ -1,0 +1,64 @@
+{
+  "id": "health-unreadable-continues",
+  "description": "Failed pane reads report UNREADABLE; scanning later panes continues and any problem exits 3.",
+  "projects": {
+    "sandbox": {
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"first\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}, {\"name\": \"second\", \"pane_id\": \"w1:p2\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p1",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 1,
+            "stderr": "read failed"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "read",
+            "w1:p2",
+            "--source",
+            "visible"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "Connection lost\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "UNREADABLE w1:p1 sandbox \u2014 \u2014\nDEAD w1:p2 sandbox \u2014 \u2014\n"
+      }
+    }
+  ]
+}

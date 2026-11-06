@@ -1,0 +1,52 @@
+{
+  "id": "council-real-dispatch",
+  "description": "`council --yes` (cli.py's cmd_council / council.py convene) seats two distinct vendors, splits a pane per seat, and appends one ordinary `event=dispatch` routing-log line per councillor with `role=council` (accounts.Selection.log_line — there is no `event=council` line). Scout gap #1. Each `task=` is Python `dispatch.task_id_for` `{date}-council-{seat}-{digest}`: after `normalize._ID_RE` that shape is a bare `<ID>` followed by a tab; the pre-parity Rust `{date}-council-{digest}-{seat}` would leave `-<short>` after the placeholder. This is a live pane/agent lifecycle (pane split, agent start/rename, prompt, wait), so it is seeded against the stateful `fake-herdr` binary via `herdr_seed` rather than `fake_herdr.py`'s ordered transcript player (same convention as scratch-close-drives-a-live-pane). `MV_FAKE_HERDR_CALLS` records every Herdr argv, including the two `pane split` calls. fake-herdr's brief.md-in-prompt shortcut writes each seat's `result.md`/`status` so the council is quorate. Only --impl rust supports `herdr_seed`.",
+  "dirs": {
+    "claude-home": {},
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.claude-personal]\nkind = \"claude\"\nshort = \"cp\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:personal\"\ncommand = \"claude-personal\"\n\n[accounts.codex-work]\nkind = \"codex\"\nshort = \"cw\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:work\"\n\n[roles.council]\nwrite_scope = \"none\"\n\n[roles.council.models]\nclaude = \"opus\"\ncodex = \"gpt-x\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\ncouncil = [\"claude-personal\", \"codex-work\"]\n"
+  },
+  "herdr_seed": [
+    ["pane", "get", "w52:p1"]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["council", "{{PROJECT:sandbox}}", "should we ship?", "--yes", "--timeout", "8"],
+      "env": {
+        "HERDR_PANE_ID": "w52:p1",
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/herdr-calls.jsonl"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "claude-personal",
+          "codex-work",
+          "councillors answered across",
+          "Nothing was synthesized"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "(?=[\\s\\S]*event=dispatch\\ttask=<ID>\\t[^\\n]*role=council\\taccount=claude-personal)(?=[\\s\\S]*event=dispatch\\ttask=<ID>\\t[^\\n]*role=council\\taccount=codex-work)(?=[\\s\\S]*event=started)"
+        },
+        "herdr-calls.jsonl": {
+          "regex": "\"pane\",\"split\"[\\s\\S]*\"pane\",\"split\""
+        }
+      }
+    }
+  ]
+}

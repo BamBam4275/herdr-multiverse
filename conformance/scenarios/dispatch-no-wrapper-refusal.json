@@ -1,0 +1,33 @@
+{
+  "id": "dispatch-no-wrapper-refusal",
+  "description": "A `kind = \"claude\"` seat with no `command` wrapper configured is refused by dispatch --dry-run before any card is printed — a pure config check (accounts.py candidates(), SkipCause.NO_COMMAND), identical whether or not --dry-run is given (tests/test_dispatch.py:133-183 pins the same check for a real dispatch). As the sole chain entry it exhausts the chain immediately with a message naming the exact config key to set.",
+  "dirs": {
+    "claude-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.claude-personal]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:personal\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"claude-personal\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\nclaude = \"claude-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "claude-personal",
+          "no command wrapper configured; set accounts.claude-personal.command to the Claude wrapper from docs/install.md"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

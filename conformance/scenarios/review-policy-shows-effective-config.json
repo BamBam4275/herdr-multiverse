@@ -1,0 +1,35 @@
+{
+  "id": "review-policy-shows-effective-config",
+  "description": "`review-policy` (cli.py's cmd_review_policy, no --lane) prints the effective [review_policy] values via config.render_review_policy -- the same rendering `check --verbose` shares -- plus a per-project reviewer-seat line and dispatch-budget line. No [review_policy] override and no reviewer chain here, so every value is the ReviewPolicy dataclass default, and the per-project sections fall back to their 'none configured' text. Read-only: no Herdr call.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["review-policy"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "config: <STATE_DIR>/config.toml",
+          "Re-review after REVISE: diff",
+          "Low-risk batching: on",
+          "reviewer seats:",
+          "(no project configures a reviewer chain)",
+          "reviewer dispatch budget:",
+          "sandbox: 0/3 in the last 24h"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

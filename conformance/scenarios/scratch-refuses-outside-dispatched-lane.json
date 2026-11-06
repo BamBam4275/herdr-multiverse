@@ -1,0 +1,37 @@
+{
+  "id": "scratch-refuses-outside-dispatched-lane",
+  "description": "`scratch` identifies its task purely from `HERDR_PANE_ID` plus a cwd that resolves to `<project>/.multiverse/worktrees/<lane-id>/...` (cli.py's `_scratch_context`, cli.py:2425-2496) — it never calls `_load(args)` and never consults a configured project by name. Step 0 has no `HERDR_PANE_ID` at all: the specific, earliest refusal names that. Step 1 sets `HERDR_PANE_ID` but runs from an ordinary project root (not nested under `.multiverse/worktrees/<lane-id>`), so pane detection succeeds but lane-root detection fails, producing the second, less specific refusal. The full open/read/close round trip (a real dispatched lane, with a routing-log record whose `pane`/`branch` match, and a task directory under the LANE's own `.multiverse/tasks/<id>/`) cannot be built through this harness: `run_scenario.py` resolves a step's `cwd` as `sandbox.projects[step[\"cwd\"]]` (run_scenario.py:133) — always exactly a declared project's own root, never a path nested inside it such as the lane directory `_scratch_context` requires. That is a schema limitation, not a gap in this scenario.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["scratch", "open"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "refusing scratch outside a dispatched lane: HERDR_PANE_ID is unset\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["scratch", "open"],
+      "env": { "HERDR_PANE_ID": "w1:p1" },
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "refusing scratch outside a dispatched lane\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "id": "tasks-close-stranded-reconciled-by-merge",
+  "description": "`multiverse tasks sandbox --close-stranded --yes` on an AWAITING fixer task whose lane branch was `--no-ff` merged into main and then pruned records it `done`/`reconciled-by-merge`, recovering the verdict from main's own merge-commit history even though the branch itself no longer exists (tasks.py `close_stranded`/`branch_disposition`, 'gone' + merge evidence -> 'landed'). Scout gap #6 (tasks `--close-stranded`, reconciled-by-merge).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n"
+      },
+      "lanes": {
+        "20250101-fixer-aaaaaa": {
+          "files": { "src/thing.txt": "changed and merged\n" },
+          "merge": true
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "sandbox", "--close-stranded", "--yes"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "closed <ID> as done (state=reconciled-by-merge)"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=sandbox\\trole=fixer\\taccount=old-seat\\tpool=old:test\\toutcome=chain-primary\\treason=\\tbranch=multiverse/<ID>\\n<TIMESTAMP>\\tevent=started\\ttask=<ID>\\tpane=w1:p1\\n<TIMESTAMP>\\tevent=result\\ttask=<ID>\\tstatus=done\\tstate=reconciled-by-merge\\trevisions=0\\tpane=w1:p1$"
+        }
+      }
+    }
+  ]
+}

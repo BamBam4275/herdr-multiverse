@@ -1,0 +1,43 @@
+{
+  "id": "notify-truncates-oversized-title",
+  "description": "`notify.py:251-358,603,406` (`_bound_notification`/`_truncate`) caps a notification's title at `TITLE_MAX_CHARS` (250) and its body at `BODY_MAX_BYTES` (4096), replacing whatever was cut with the `…[truncated]` marker, applied inside `send` before the record is queued or pushed. No topic file exists here, so `ntfy_push` short-circuits before any network call (same no-topic path as `notify-no-topic-queues-and-flush`), and the oversized title is still bounded by the time `--flush` prints it back — the CLI-visible proof that the cap runs at queue time, not only at push time (`mv-state::notify`'s own unit tests cover the body/byte-limit side directly, which this command never echoes to stdout).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "notify",
+        "--project",
+        "sandbox",
+        "--title",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "--message",
+        "disk still low"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "notify: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["notify", "--flush"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…[truncated]: queued",
+        "stderr": "notify: ntfy unreachable, queued to outbox\n"
+      }
+    }
+  ]
+}

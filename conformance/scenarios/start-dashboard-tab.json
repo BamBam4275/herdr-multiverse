@@ -1,0 +1,105 @@
+{
+  "id": "start-dashboard-tab",
+  "description": "`start <name> --dashboard` on a project with no open workspace creates one, seeds the interactive seat, then opens an unfocused dashboard tab (cli._ensure_dashboard_tab): tab list, tab create --no-focus, pane run of `multiverse --config PATH board NAME --watch`. Default `[board].dashboard_tab` is `[\"multiverse\"]`, so `--dashboard` is the operator override that turns this on for any project. Exit EXIT_OK (0).",
+  "dirs": {
+    "claude-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:test\"\ninteractive = true\ncommand = \"claude-interactive\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "sandbox", "--dashboard"],
+      "transcript": [
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": []}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": []}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": []}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": []}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "create", "--label", "sandbox", "--cwd", "{{PROJECT:sandbox}}", "--no-focus"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspace\": {\"workspace_id\": \"w1\"}, \"root_pane\": {\"pane_id\": \"w1:p1\"}}}\n" }
+        },
+        {
+          "match_argv": ["pane", "rename", "w1:p1", "sandbox-nexu-ne · claude-interactive ·  · nexus-seat · nexus sandbox"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["pane", "run", "w1:p1", "claude-interactive --disallowedTools 'Edit(/{{HOME}}/.claude/settings.json)' 'Edit(/{{HOME}}/.ssh/**)' 'Edit(/{{HOME}}/.gitconfig)' 'Edit(/{{RUNTIME_DIR}}/directives/**)' 'Edit(/{{DIR:claude-home}}/settings.json)' 'Edit(/{{DIR:claude-home}}/settings.local.json)'"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\"}]}}\n" }
+        },
+        {
+          "match_argv": ["agent", "rename", "w1:p1", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "" }
+        },
+        {
+          "match_argv": ["agent", "read", "w1:p1", "--source", "visible"],
+          "reply": { "exit": 0, "stdout": "Ready >" }
+        },
+        {
+          "match_argv": ["agent", "get", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 5}}}\n" }
+        },
+        {
+          "match_argv": ["agent", "prompt", "sandbox-nexu-ne", "Read `{{PROJECT:sandbox}}/.multiverse/orchestrator.md` now and follow it. You are the Nexus for sandbox. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route."],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {}}}\n" }
+        },
+        {
+          "match_argv": ["agent", "get", "sandbox-nexu-ne"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 6}}}\n" }
+        },
+        {
+          "match_argv": ["tab", "list", "--workspace", "w1"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"tabs\": []}}\n" }
+        },
+        {
+          "match_argv": ["tab", "create", "--workspace", "w1", "--cwd", "{{PROJECT:sandbox}}", "--label", "dashboard", "--no-focus"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"root_pane\": {\"pane_id\": \"w1:p2\"}}}\n" }
+        },
+        {
+          "match_argv": ["pane", "run", "w1:p2", "multiverse --config {{STATE_DIR}}/config.toml board sandbox --watch"],
+          "reply": { "exit": 0, "stdout": "" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "w1  pane w1:p1",
+          "dashboard tab running",
+          "opened 1 of 1",
+          "sandbox-nexu-ne"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "id": "worktrees-deep-requires-prune",
+  "description": "Reject --deep without --prune before any mutation, including with rescue or restore.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--deep"
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "--deep is only meaningful together with --prune\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--deep",
+        "--rescue"
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "--deep is only meaningful together with --prune\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--deep",
+        "--restore",
+        "20260101-builder-aaaaaa"
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "--deep is only meaningful together with --prune\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

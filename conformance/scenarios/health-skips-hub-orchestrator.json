@@ -1,0 +1,60 @@
+{
+  "id": "health-skips-hub-orchestrator",
+  "description": "The deterministic hub orchestrator is the human session and must not be read or classified.",
+  "projects": {
+    "hub": {
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.human]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{HOME}}/codex\"\nshort = \"hm\"\ninteractive = true\n[projects.multiverse]\npath = \"{{PROJECT:hub}}\"\nshort = \"mv\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "hub",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"mv-orch-hm\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:hub}}\"}]}}"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "cwd": "hub",
+      "argv": [
+        "health"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"mv-nexu-hm\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:hub}}\"}]}}"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    }
+  ]
+}

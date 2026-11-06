@@ -1,0 +1,7 @@
+Weekly limit left: 0%
+
+You hit your weekly limit.
+
+1 Upgrade tier
+2 Buy more credits
+3 Try Again

@@ -1,0 +1,76 @@
+{
+  "id": "sweep-reclaim-closes-clean-pane",
+  "description": "`multiverse sweep` (cli.py cmd_sweep/_sweep -> _reconcile_and_reclaim -> runner.reclaimable_panes) closes a RECORDED task's still-open pane: outcome already on record, a pane id recorded, the lane clean (branch=main, no worktree to dirty \u2014 a role that never gets a lane reads clean per reclaimable_panes condition 3), and the pane still present in `agent list` (condition 4). None of `reconcile`'s own preconditions apply here since the task is already RECORDED before sweep runs; only the reclaim leg should act.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n2020-01-01T01:00:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result \u2014 task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"done\", \"cwd\": \"/tmp\", \"name\": \"\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"done\", \"cwd\": \"/tmp\", \"name\": \"\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "close",
+            "w1:p1"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox: in progress 0 -> 0, recorded 0, reclaimed 1"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=sandbox\\trole=fixer\\taccount=old-seat\\tpool=old:test\\toutcome=chain-primary\\treason=\\tbranch=main\\n<TIMESTAMP>\\tevent=started\\ttask=<ID>\\tpane=w1:p1\\n<TIMESTAMP>\\tevent=result\\ttask=<ID>\\tstatus=done\\tstate=done\\trevisions=0\\tpane=w1:p1$"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,288 @@
+{
+  "id": "stop-defaults-to-fleet-outside-project",
+  "description": "Gap 3: bare stop closes all configured project workspaces from an unconfigured cwd and from within one project. Explicit project names still restrict the selection. The strict fake-Herdr transcript requires every selected workspace to be closed, with no real fleet access.",
+  "projects": {
+    "alpha": {
+      "git": true,
+      "files": {
+        "README.md": "unchanged\n"
+      }
+    },
+    "beta": {
+      "git": true,
+      "files": {
+        "README.md": "unchanged\n"
+      }
+    },
+    "outside": {
+      "git": true,
+      "files": {
+        "README.md": "unchanged\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.alpha]\npath = \"{{PROJECT:alpha}}\"\n\n[projects.beta]\npath = \"{{PROJECT:beta}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "outside",
+      "argv": [
+        "stop"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"alpha\", \"workspace_id\": \"ws-alpha\"}, {\"label\": \"beta\", \"workspace_id\": \"ws-beta\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"alpha\", \"workspace_id\": \"ws-alpha\"}, {\"label\": \"beta\", \"workspace_id\": \"ws-beta\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "close",
+            "ws-alpha"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "close",
+            "ws-beta"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "  alpha                closed (ws-alpha)\n  beta                 closed (ws-beta)\n\nclosed 2 of 2\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "stop",
+        "beta"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"alpha\", \"workspace_id\": \"ws-alpha\"}, {\"label\": \"beta\", \"workspace_id\": \"ws-beta\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "close",
+            "ws-beta"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "  beta                 closed (ws-beta)\n\nclosed 1 of 1\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "alpha",
+      "argv": [
+        "stop"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"alpha\", \"workspace_id\": \"ws-alpha\"}, {\"label\": \"beta\", \"workspace_id\": \"ws-beta\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"alpha\", \"workspace_id\": \"ws-alpha\"}, {\"label\": \"beta\", \"workspace_id\": \"ws-beta\"}]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"panes\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "close",
+            "ws-alpha"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "workspace",
+            "close",
+            "ws-beta"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "  alpha                closed (ws-alpha)\n  beta                 closed (ws-beta)\n\nclosed 2 of 2\n",
+        "stderr": ""
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "alpha",
+      "unchanged": true
+    },
+    {
+      "root": "beta",
+      "unchanged": true
+    },
+    {
+      "root": "outside",
+      "unchanged": true
+    }
+  ]
+}

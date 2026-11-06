@@ -1,0 +1,76 @@
+{
+  "id": "activity-ask-reply-close-and-update",
+  "description": "`activity send --ask` records an open ask in the recipient's own log, visible as an `ASK #<seq>` inbox line; `activity reply SEQ MESSAGE` resolves that open ask by its seq in the recipient's own log and sends the reply back into the original asker's log (`may_send_reverse` from `[activity.pairs]`); a second, unrelated ask is instead resolved with no reply via `activity close SEQ --reason ...` (local close prints `closed #<seq>.` and tells the asker why). `activity update CARD --phase --note` posts onto a dispatched card in the caller's own log, with a second post inside the default cooldown window suppressed instead of duplicated.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tv=1\tseq=1\tevent=dispatch\ttask=20261101-scout-abcdef\n"
+      }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "which account?", "--ask", "--id", "ask-1"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "sent to sandbox2." }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "inbox", "--peek"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["[<TIMESTAMP>] sandbox: ASK #1 which account?"]
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "reply", "1", "use seat-a", "--id", "reply-1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "replied to sandbox as seq 2\n  inbox still has unacked mail; run `multiverse activity inbox`."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "a second question?", "--ask", "--id", "ask-2"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sent to sandbox2.\n  inbox still has unacked mail; run `multiverse activity inbox`."
+      }
+    },
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "close", "3", "--reason", "withdrawn"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "closed #3.\ntold the asker why.\n  inbox still has unacked mail; run `multiverse activity inbox`."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "update", "20261101-scout-abcdef", "--phase", "finding", "--note", "found the bug"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "posted update for <ID> as seq 4" }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "update", "20261101-scout-abcdef", "--phase", "working"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "update for <ID> suppressed by cooldown" }
+    }
+  ]
+}

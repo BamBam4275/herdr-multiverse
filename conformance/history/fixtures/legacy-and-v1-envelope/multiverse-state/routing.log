@@ -1,0 +1,4 @@
+2026-01-01T00:00:00+00:00	event=dispatch	task=20260101-fixer-aaaaaa	project=demo	role=fixer	account=claude	pool=claude:default	outcome=chain-primary	reason=first entry
+2026-01-01T00:05:00+00:00	event=result	task=20260101-fixer-aaaaaa	status=done	state=done	revisions=0	pane=w1:p1
+2026-01-01T00:10:00+00:00	v=1	seq=1	event=dispatch	task=20260101-scout-bbbbbb	project=demo	role=scout	account=claude	pool=claude:default	outcome=chain-primary	reason=first entry	crc32=b165f550
+2026-01-01T00:12:00+00:00	v=1	seq=2	event=result	task=20260101-scout-bbbbbb	status=done	state=done	revisions=0	pane=w1:p2	crc32=b55a790c

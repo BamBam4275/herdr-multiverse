@@ -1,0 +1,213 @@
+{
+  "id": "backlog-extra-positionals",
+  "description": "All cwd-scoped verbs accept surplus positional tokens and explain the mistaken project scope in-handler with exit 1, before any Herdr probe or history write. Item diagnostics prefer the last full item id, falling back to the final token; text diagnostics use Python repr quoting.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "sandbox",
+        "actual text"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog add takes only a title; it acts on the project your cwd is inside, not one you name. Found 2 arguments \u2014 did you mean just 'actual text'? Quote the title if it has spaces."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "done",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog done takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "reopen",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog reopen takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "annotate",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus",
+        "--note",
+        "note"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog annotate takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "reprioritize",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus",
+        "--priority",
+        "P2"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog reprioritize takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "show",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog show takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "ask",
+        "sandbox",
+        "actual text",
+        "--option",
+        "one",
+        "--option",
+        "two",
+        "--recommend",
+        "1"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog ask takes only a question; it acts on the project your cwd is inside, not one you name. Found 2 arguments \u2014 did you mean just 'actual text'? Quote the question if it has spaces."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "mark-asked",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus",
+        "--option",
+        "one",
+        "--option",
+        "two",
+        "--recommend",
+        "1"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog mark-asked takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "answer",
+        "sandbox",
+        "20261106-b-123abc",
+        "surplus",
+        "--note",
+        "note"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog answer takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id '<ID>' among 3 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "show",
+        "sandbox",
+        "short-prefix"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog show takes only an item id; it acts on the project your cwd is inside, not one you name. Found item id 'short-prefix' among 2 arguments \u2014 drop the rest."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "sandbox",
+        "it's quoted"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "backlog add takes only a title; it acts on the project your cwd is inside, not one you name. Found 2 arguments \u2014 did you mean just \"it's quoted\"? Quote the title if it has spaces."
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

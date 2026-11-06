@@ -1,0 +1,106 @@
+{
+  "id": "sweep-summary-awaiting-expiry",
+  "description": "Sweep findings share a semicolon-separated summary per project, before host reports. Preview retains awaiting tasks and reports lease expiry without writing; apply expires the tasks and removes them from in-progress. Preview timestamp ages are intentionally unpinned; exact apply output pins both project lines, note separators, and host-report ordering. The transcript is a single shared empty fleet listing.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20200101-builder-aaaaa0\tproject=sandbox\trole=builder\taccount=old-seat\tbranch=main\n2020-01-01T00:01:00Z\tevent=started\ttask=20200101-builder-aaaaa0\tpane=w1:p9\n",
+        ".multiverse/tasks/20200101-builder-aaaaa0/brief.md": "# Task 20200101-builder-aaaaa0\nRole: Builder\n"
+      }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20200101-builder-aaaaa1\tproject=sandbox2\trole=builder\taccount=old-seat\tbranch=main\n2020-01-01T00:01:00Z\tevent=started\ttask=20200101-builder-aaaaa1\tpane=w2:p9\n",
+        ".multiverse/tasks/20200101-builder-aaaaa1/brief.md": "# Task 20200101-builder-aaaaa1\nRole: Builder\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/usr/bin/false",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox: in progress 1 -> 1, recorded 0, reclaimed 0; awaiting, pane gone: <ID> (",
+          "); expired: <ID> (abandoned: pane gone, no status file, lease expired after 60m); warning: process-cwd probe unknown\nsandbox2: in progress 1 -> 1, recorded 0, reclaimed 0; awaiting, pane gone: <ID> (",
+          "); expired: <ID> (abandoned: pane gone, no status file, lease expired after 60m); warning: process-cwd probe unknown\ndocker: unavailable"
+        ],
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/usr/bin/false",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      },
+      "expect": {
+        "exit": 0,
+        "stderr": "",
+        "stdout": "sandbox: in progress 1 -> 0, recorded 0, reclaimed 0; expired: <ID> (abandoned: pane gone, no status file, lease expired after 60m); warning: process-cwd probe unknown\nsandbox2: in progress 1 -> 0, recorded 0, reclaimed 0; expired: <ID> (abandoned: pane gone, no status file, lease expired after 60m); warning: process-cwd probe unknown\ndocker: unavailable\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "event=result\\ttask=<ID>\\tstatus=failed\\tstate=abandoned: pane gone, no status file, lease expired after 60m"
+        }
+      }
+    },
+    {
+      "root": "sandbox2",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "event=result\\ttask=<ID>\\tstatus=failed\\tstate=abandoned: pane gone, no status file, lease expired after 60m"
+        }
+      }
+    }
+  ]
+}

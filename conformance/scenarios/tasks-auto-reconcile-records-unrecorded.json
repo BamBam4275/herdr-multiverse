@@ -1,0 +1,48 @@
+{
+  "id": "tasks-auto-reconcile-records-unrecorded",
+  "description": "Plain `multiverse tasks` auto-reconciles: an UNRECORDED done task (status file, result.md, no event=result, no pane) is recorded as `state=reconciled` before the listing prints, so the row shows `recorded` rather than `unrecorded`. One empty `agent list` reply is shared by the listing and `reconcile_project`. `--no-reconcile` is already pinned by history-tasks-reads-old-role-names. Scout gap #3.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result — task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "recorded",
+          "done #2"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=sandbox\\trole=fixer\\taccount=old-seat\\tpool=old:test\\toutcome=chain-primary\\treason=\\tbranch=main\\n<TIMESTAMP>\\tevent=result\\ttask=<ID>\\tstatus=done\\tstate=reconciled\\trevisions=0\\tpane=$"
+        }
+      }
+    }
+  ]
+}

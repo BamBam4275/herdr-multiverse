@@ -1,0 +1,34 @@
+{
+  "id": "activity-nudge-reaches-live-orchestrator",
+  "description": "`activity nudge` (hub-only) types NUDGE_PROMPT into a permitted recipient's live orchestrator pane and confirms it landed — `mv_engine::fleet_start::FleetState::fetch`/`orchestrator_agent` to find the pane by name, `mv_engine::runner::deliver_prompt_to` to send and confirm. This needs a live fake-herdr pane/agent, not just an ordered call/reply transcript, so it is seeded against the real stateful `fake-herdr` binary via `herdr_seed` (card 20261103-b-64e792) rather than `fake_herdr.py`'s strict transcript player.",
+  "projects": {
+    "multiverse": {
+      "git": true,
+      "files": { "README.md": "hub\n" }
+    },
+    "project-a": {
+      "git": true,
+      "files": { "README.md": "a\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.multiverse]\npath = \"{{PROJECT:multiverse}}\"\n\n[projects.project-a]\npath = \"{{PROJECT:project-a}}\"\n\n[activity.pairs]\nmultiverse = [\"project-a\"]\n"
+  },
+  "herdr_seed": [
+    ["workspace", "create", "--label", "project-a", "--cwd", "{{PROJECT:project-a}}", "--focus"],
+    ["agent", "start", "project-a-nexu", "--kind", "claude", "--pane", "w100:p1"]
+  ],
+  "steps": [
+    {
+      "cwd": "multiverse",
+      "argv": ["activity", "nudge", "project-a"],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "nudged    project-a",
+          "1 nudged, 0 unconfirmed, 0 unverifiable, 0 unreached, 0 skipped."
+        ]
+      }
+    }
+  ]
+}

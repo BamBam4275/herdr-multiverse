@@ -1,0 +1,41 @@
+{
+  "id": "dispatch-lent-off-fallback",
+  "description": "`accounts lend <seat> off` writes seat-state.json persistently (a human's own toggle, kept outside config so it needs no edit/reload); a later dispatch --dry-run treats a lent-off seat exactly like a config-level outage — pulled from its chain as if not configured there at all — and falls to the next entry. Checked ahead of the breaker in accounts.py's `_availability` order (check 3), distinct from both `available = false` (dispatch-fallback-unavailable, a config edit) and a breaker trip (dispatch-breaker-open, machine-observed): this is the one human toggle that lives in state, not config.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "lend", "seat-a", "off"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "account     seat-b   (pool: codex:b)",
+          "outcome     chain-fallback",
+          "selected    seat-b",
+          "skipped     seat-a: lent off — not in chains right now (`accounts lend` to change it)"
+        ]
+      }
+    }
+  ]
+}

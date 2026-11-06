@@ -1,0 +1,34 @@
+{
+  "id": "check-no-projects",
+  "description": "A config with an account but no projects requires configuration.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "check"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout_contains": [
+          "No projects configured.",
+          "(none configured)"
+        ]
+      }
+    }
+  ]
+}

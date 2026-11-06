@@ -1,0 +1,44 @@
+{
+  "id": "dispatch-breaker-open",
+  "description": "`accounts trip <pool> --kind budget` writes breaker-state.json for real (no automatic reset — a human must run `accounts reset`, deliberately chosen over --kind rolling/weekly so the scenario needs no clock-dependent reset_at in its expected text); a later `dispatch --dry-run` against a chain whose first seat shares that pool reads the trip as a pure file check (accounts.py's `_availability` check 4, no herdr call) and falls back to the second seat with the exact breaker wording in its skip reason.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:solo\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:other\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "trip", "codex:solo", "--kind", "budget"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "account     seat-b   (pool: codex:other)",
+          "outcome     chain-fallback",
+          "selected    seat-b",
+          "skipped     seat-a: breaker open for pool 'codex:solo': no automatic reset — a human has to resolve this and run `accounts reset`"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,80 @@
+name: Feature request
+description: Propose a new capability or change for Herdr Multiverse
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement. Please describe the problem
+        before the solution — it's easier to evaluate a workflow gap than a
+        pre-chosen implementation.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the gap in your workflow today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed workflow or behavior
+      description: What would using this feature look like?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Affected role (if any)
+      description: Which role from the roles table would this change?
+      multiple: true
+      options:
+        - Nexus
+        - Scout
+        - Builder
+        - Archivist
+        - Critic
+        - Seer
+        - Council
+        - Artisan
+        - Watcher
+        - Not role-specific / CLI-wide
+    validations:
+      required: false
+
+  - type: textarea
+    id: side-effects
+    attributes:
+      label: Side effects and permissions
+      description: Would this change what a role can read, write, or execute? Would it create worktrees, send prompts, run vendor CLIs, or consume additional quota?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you considered and why you didn't pick them.
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How would we know this feature is done and working correctly?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and didn't find a duplicate
+          required: true

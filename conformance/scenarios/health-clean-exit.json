@@ -1,0 +1,46 @@
+{
+  "id": "health-clean-exit",
+  "description": "`health` (cli.py's cmd_health) does one `herdr agent list` and classifies every live pane's visible text; with zero live agents there is nothing to classify, so `health.scan_live_panes` returns no problems, nothing is printed, and it exits 0 (clean) rather than 3 (card 20261022-b-85d779). Read-only: never sends a prompt or keystroke to a pane.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["health"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["health", "--json"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "[]"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

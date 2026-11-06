@@ -1,0 +1,30 @@
+{
+  "id": "activity-config-error-is-path-free",
+  "description": "`activity` replaces a ConfigError with a path-free 'run `multiverse check`' line, exit 3 (cli.py:13315-13323, scout2-gaps #45).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "hello"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "config error: the multiverse config could not be loaded; run `multiverse check`"
+        ]
+      }
+    }
+  ]
+}

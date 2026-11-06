@@ -1,0 +1,38 @@
+{
+  "id": "config-migrate-dry-run-and-refusal",
+  "description": "`config migrate` is Rust-only (no Python oracle leaf to parity-check against), so this scenario pins Rust's own contract directly, parsing the config with plain `toml_edit` rather than the full loader (which would itself refuse a retired role name inside `roles_allowed`, card finding `a_retired_role_key_in_roles_allowed_is_also_refused_naming_the_migrator`). A retired role name inside an account's `roles_allowed` array (a VALUE, not a key — `[roles.<name>]` table headers are rewritten by conformance's own `role_translate.translate_config_toml` before this ever reaches Rust, so this is the one retired-spelling position that still reaches the binary unmodified) is enough to trigger a migration: `--dry-run` renders a unified-style diff and writes nothing; the same command with neither `--dry-run` nor `--backup` refuses outright rather than silently doing nothing or silently writing.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{HOME}}\"\npool = \"codex:test\"\nroles_allowed = [\"fixer\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["config", "migrate", "--dry-run"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "--- <STATE_DIR>/config.toml",
+          "+++ <STATE_DIR>/config.toml (migrated)",
+          "- roles_allowed = [\"fixer\"]",
+          "+ roles_allowed = [\"builder\"]"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["config", "migrate"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "config migrate requires --backup to write changes; use --dry-run to preview\n"
+      }
+    }
+  ]
+}

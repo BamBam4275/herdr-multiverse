@@ -1,0 +1,68 @@
+{
+  "id": "accounts-list-trip-reset",
+  "description": "`accounts` (listing) is a pure config/breaker-file read for an uncapped seat (no herdr call at all — accounts.py only triggers one when some seat has a cap set, which neither seat here does). trip prints the confirmation + MANUAL-fence warning (card 20261103-b-cad0bc). reset fail-open-calls `agent list` to snapshot stranded panes (card 20261103-b-09f3fc) then prints whether a breaker closed, and round-trips through the real breaker-state.json: tripped shows up on the next listing, and reset clears it again, even though the store started out missing entirely.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       available    CODEX_HOME=<DIR:codex-home>"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "trip", "codex:test", "--kind", "budget"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "tripped codex:test: no automatic reset (kind=budget) — a human has to resolve this and run `accounts reset`\ncodex:test: this is a MANUAL fence — a later gauge reading showing quota back will not reopen it; only `multiverse accounts reset codex:test` (or this trip's own --until passing) lifts it."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       FENCED (manual) — breaker open for pool 'codex:test': no automatic reset — a human has to resolve this and run `accounts reset`; kind=budget, vendor=codex, tripped by cmd_accounts CODEX_HOME=<DIR:codex-home>"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "reset", "codex:test"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "reset codex:test: closed an open breaker (was resetting at <TIMESTAMP>)."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "ACCOUNT            POOL             STATE        CONFIG DIR\nexplorer-seat      codex:test       available    CODEX_HOME=<DIR:codex-home>"
+      }
+    }
+  ]
+}

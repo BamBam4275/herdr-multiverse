@@ -1,0 +1,41 @@
+{
+  "id": "projects-lists-configured",
+  "description": "`projects` is a pure config read (cli.py's cmd_projects): no Herdr call, no network. Two configured projects list sorted by name, name and path in two aligned columns; `--names` prints bare names only, one per line, for scripting.",
+  "projects": {
+    "sandbox-b": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox-a": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox-b]\npath = \"{{PROJECT:sandbox-b}}\"\n\n[projects.sandbox-a]\npath = \"{{PROJECT:sandbox-a}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox-a",
+      "argv": ["projects"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox-a  <PROJECT:sandbox-a>\nsandbox-b  <PROJECT:sandbox-b>"
+      }
+    },
+    {
+      "cwd": "sandbox-a",
+      "argv": ["projects", "--names"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox-a\nsandbox-b"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox-a", "unchanged": true },
+    { "root": "sandbox-b", "unchanged": true }
+  ]
+}

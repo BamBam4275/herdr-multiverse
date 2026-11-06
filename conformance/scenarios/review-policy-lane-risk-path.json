@@ -1,0 +1,32 @@
+{
+  "id": "review-policy-lane-risk-path",
+  "description": "`review-policy --lane TASK_ID` classifies a lane against a configured `[review_policy.review_risk_paths]` override (cli.py's cmd_review_policy / `risk_areas_touched`, ported as `mv_engine::risk_paths::risk_areas_touched`). This scenario's lane (see `projects.sandbox.lanes` -- conformance/README.md 'Lane fixtures') touches `src/auth/login.rs`, which the configured `auth = [\"src/auth/**\"]` glob matches, so the one printed line names that area rather than 'low'. Read-only: no Herdr call.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" },
+      "lanes": {
+        "20261101-fixer-abcdef": {
+          "files": { "src/auth/login.rs": "changed\n" }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n[review_policy.review_risk_paths]\nauth = [\"src/auth/**\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["review-policy", "--lane", "20261101-fixer-abcdef"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "<ID>: auth"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

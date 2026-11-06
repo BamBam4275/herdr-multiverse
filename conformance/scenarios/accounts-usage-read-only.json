@@ -1,0 +1,54 @@
+{
+  "id": "accounts-usage-read-only",
+  "description": "The plugin read-only marker returns the passive Codex gauge without creating the shared gauge store or lock.",
+  "dirs": {
+    "codex-home": {
+      "files": {
+        "sessions/2026/09/27/rollout-1.jsonl": "{\"type\": \"token_count\", \"payload\": {\"rate_limits\": {\"primary\": {\"used_percent\": 40}}}}\n"
+      }
+    }
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.cx]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "usage"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "cx                 60% left \u00b7 primary window"
+        ]
+      },
+      "env": {
+        "MULTIVERSE_READ_ONLY": "1"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "../../runtime/gauge-state.json": {
+          "absent": true
+        },
+        "../../runtime/gauge-state.lock": {
+          "absent": true
+        }
+      }
+    }
+  ]
+}

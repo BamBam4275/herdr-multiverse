@@ -1,0 +1,47 @@
+{
+  "id": "sweep-reconcile-records-outcome",
+  "description": "`multiverse sweep` (cli.py cmd_sweep/_sweep, card 20260929-b-cfa8b4) runs tasklog.reconcile across every configured project in one pass: an UNRECORDED task (status file says done, no event=result line yet, and its dispatch pane is gone from `agent list`) gets its outcome recorded for real — the same write `tasks --reconcile` would make for one project, but fleet-wide and unprompted. The per-project summary line counts it out of in-progress (1 -> 0) and names it in `recorded`.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result — task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["sweep"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox: in progress 1 -> 0, recorded 1, reclaimed 0"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=sandbox\\trole=fixer\\taccount=old-seat\\tpool=old:test\\toutcome=chain-primary\\treason=\\tbranch=main\\n<TIMESTAMP>\\tevent=started\\ttask=<ID>\\tpane=w1:p1\\n<TIMESTAMP>\\tevent=result\\ttask=<ID>\\tstatus=done\\tstate=reconciled\\trevisions=0\\tpane=w1:p1$"
+        }
+      }
+    }
+  ]
+}

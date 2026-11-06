@@ -1,0 +1,88 @@
+{
+  "id": "board-flags-watch-limit-cards-status",
+  "description": "`--status` (repeatable column filter) narrows the rendered columns to the named ones; `--limit N` truncates a column's cards and appends a `+N more` footer line past the cutoff; `--cards-per-row` is accepted and does not change which cards appear, only how they are packed; `--watch` resolves one render (one `agent list` call, same as a plain board read) before it ever tries to enter raw mode, then fails fast off a real terminal rather than hanging (`mv_board::watch::run`'s `enable_raw_mode`, exercised without a controlling tty by this harness).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "fix the thing", "--why", "it breaks"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "add", "second thing", "--why", "also breaks"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["backlog", "ask", "which account should we use?", "--option", "A", "--option", "B", "--recommend", "1"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile", "--status", "backlog"],
+      "transcript": [
+        { "match_argv": ["agent", "list"], "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" } }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["┌─ BACKLOG", "fix the thing", "second thing"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile", "--status", "blocked"],
+      "transcript": [
+        { "match_argv": ["agent", "list"], "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" } }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["┌─ BLOCKED", "which account should we use?"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile", "--status", "backlog", "--limit", "1"],
+      "transcript": [
+        { "match_argv": ["agent", "list"], "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" } }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["┌─ BACKLOG", "+1 more"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile", "--status", "backlog", "--cards-per-row", "1"],
+      "transcript": [
+        { "match_argv": ["agent", "list"], "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" } }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["┌─ BACKLOG", "fix the thing", "second thing"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile", "--watch"],
+      "transcript": [
+        { "match_argv": ["agent", "list"], "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" } }
+      ],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": ["board --watch failed:"]
+      }
+    }
+  ]
+}

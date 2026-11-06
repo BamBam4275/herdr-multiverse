@@ -1,0 +1,32 @@
+{
+  "id": "dispatch-read-only-input-refused",
+  "description": "`--input` only ever lands in a writer's own worktree (cli.py:3308-3315): a read-only role already runs in the shared checkout, where every path `--input` would name is one it can open directly, so dispatch refuses before any card is built rather than silently accepting a flag that does nothing. Written against the current role names directly (`[roles.scout]`) rather than a pre-rename fixture: this check is new port behavior with no recorded Python transcript to replay, and none of `role_translate.py`'s fixed rewrite positions cover this sentence, so an old-named fixture would not translate correctly at Rust replay time.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.scout-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nscout = [\"scout-seat\"]\n\n[roles.scout]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.scout.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "--role", "scout", "--input", "notes.md", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "--input is for a writing role; Scout is read-only and runs in the shared checkout, where it can already open any of these paths directly. Drop --input, or dispatch a writing role."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

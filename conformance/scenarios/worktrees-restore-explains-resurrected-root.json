@@ -1,0 +1,65 @@
+{
+  "id": "worktrees-restore-explains-resurrected-root",
+  "description": "Restore explains a branch resurrected without its archived ancestry and preserves both refs.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      },
+      "orphan_branches": [
+        "20260101-builder-bbbbbb"
+      ],
+      "archived_lanes": {
+        "20260101-builder-aaaaaa": {
+          "unrelated_root": true
+        },
+        "20260101-builder-bbbbbb": {}
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--restore",
+        "20260101-builder-aaaaaa"
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr_contains": [
+          "multiverse/<ID> already exists but does NOT contain the archived commit",
+          "recreated at an unrelated root",
+          "Nothing is lost: the archived tip is reachable at refs/multiverse/archive/<ID>",
+          "Refusing rather than overwriting multiverse/<ID>"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--restore",
+        "20260101-builder-bbbbbb"
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout": "",
+        "stderr": "multiverse/<ID> already exists\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

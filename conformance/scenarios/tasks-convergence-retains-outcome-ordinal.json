@@ -1,0 +1,62 @@
+{
+  "id": "tasks-convergence-retains-outcome-ordinal",
+  "description": "Lease expiry records failed before printing but carries no new outcome ordinal in the same invocation. A later invocation shows the recorded line; pre-existing recorded outcomes retain their ordinals throughout.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tagent=old-agent\tbranch=main\n2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-bbbbbb\tproject=sandbox\trole=fixer\taccount=old-seat\tbranch=main\n2020-01-01T00:01:00+00:00\tevent=result\ttask=20250101-fixer-bbbbbb\tstatus=done\tstate=completed\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "(cwd is inside project 'sandbox' \u2014 scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n  * <ID>      fixer      old-seat   recorded    failed\n    <ID>      fixer      old-seat   recorded    done #3\n\n1 task(s) marked * need a look."
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "(cwd is inside project 'sandbox' \u2014 scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n  * <ID>      fixer      old-seat   recorded    failed #4\n    <ID>      fixer      old-seat   recorded    done #3\n\n1 task(s) marked * need a look."
+      }
+    }
+  ]
+}

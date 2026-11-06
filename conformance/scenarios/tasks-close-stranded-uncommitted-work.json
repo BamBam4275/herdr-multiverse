@@ -1,0 +1,55 @@
+{
+  "id": "tasks-close-stranded-uncommitted-work",
+  "description": "`multiverse tasks sandbox --close-stranded --yes` on an AWAITING fixer task whose lane branch has no commits of its own but a dirty working tree records it `blocked`/`stranded-uncommitted-work` (never `abandoned-empty-lane`) and writes nothing to the branch or lane (tasks.py `close_stranded`/`_stranded_uncommitted`: 'empty' branch + dirty porcelain). Scout gap #5 (tasks `--close-stranded`, stranded-uncommitted-work).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n"
+      },
+      "worktrees": {
+        "20250101-fixer-aaaaaa": {
+          "files": {
+            "notes.txt": "accidental uncommitted work\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "sandbox", "--close-stranded", "--yes"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "closed <ID> as blocked (state=stranded-uncommitted-work)",
+          "notes.txt"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "regex": "^<TIMESTAMP>\\tevent=dispatch\\ttask=<ID>\\tproject=sandbox\\trole=fixer\\taccount=old-seat\\tpool=old:test\\toutcome=chain-primary\\treason=\\tbranch=multiverse/<ID>\\n<TIMESTAMP>\\tevent=started\\ttask=<ID>\\tpane=w1:p1\\n<TIMESTAMP>\\tevent=result\\ttask=<ID>\\tstatus=blocked\\tstate=stranded-uncommitted-work\\trevisions=0\\tpane=w1:p1$"
+        },
+        ".multiverse/worktrees/20250101-fixer-aaaaaa/notes.txt": {
+          "equals": "accidental uncommitted work\n"
+        }
+      }
+    }
+  ]
+}

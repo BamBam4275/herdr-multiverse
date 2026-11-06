@@ -1,0 +1,40 @@
+{
+  "id": "add-appends-chain-block",
+  "description": "A real (non-`--dry-run`) `add <path>` appends the `[projects.<name>]` block to the resolved config file on disk — never rewrites the rest of it (`_cmd_add_locked`'s own docstring: 'Appends; never rewrites') — and prints the identical text under an `Added to ...:` header instead of `Would append to ...:`. The appended chain uses the role's current config key (`scout`, not the retired `explorer`), because this block is read straight back by the next `multiverse check`/`dispatch` — a retired key here made that next command refuse the file this one had just written. `expect_tree` here only covers project roots (the config file lives under `{{STATE_DIR}}`/`{{HOME}}`, which `expect_tree`'s `root` cannot target), so the written config itself is checked only by inference from the printed `Added to ...:` block, not a direct file-content assertion — the companion `add-dry-run-prints-block` scenario pins the identical block-building logic without this real write.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "newrepo": {
+      "git": true,
+      "files": { "README.md": "new\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:a\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["add", "{{PROJECT:newrepo}}"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Added to <STATE_DIR>/config.toml:",
+          "[projects.newrepo]",
+          "[projects.newrepo.chains]",
+          "scout = [\"seat-a\"]"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    { "root": "newrepo", "unchanged": true }
+  ]
+}

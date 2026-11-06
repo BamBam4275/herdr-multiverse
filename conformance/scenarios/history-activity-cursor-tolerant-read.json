@@ -1,0 +1,44 @@
+{
+  "id": "history-activity-cursor-tolerant-read",
+  "description": "`activity inbox` refuses rather than guesses when a project's own `.multiverse/activity.cursor` cannot be trusted: a malformed (non-integer) cursor, and a cursor ahead of the routing log's own high-water mark (the log looks like it was reset or replaced since the cursor was last written). Both are `ActivityReadError`s caught by `cmd_activity` itself (cli.py, the `# inbox` fall-through branch's `except activity.ActivityError`), so neither crashes or guesses — each exits 1 with a specific message naming the problem. Mirrors the conditions `conformance/history/fixtures/activity-cursor-ahead` and `activity-cursor-malformed` probe for the separate Rust-only history/runner harness, reproduced here through the ordinary `run_scenario.py` project/files format this task's write scope covers. Two independent projects (not two steps on one) so the first refusal's lock/cursor state cannot leak into the second.",
+  "projects": {
+    "malformed-cursor": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/activity.cursor": "not-a-number"
+      }
+    },
+    "ahead-cursor": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-04-01T00:00:00+00:00\tv=1\tseq=5\tevent=started\ttask=20260401-fixer-eeeeee\tpane=w1:p1\tcrc32=c0222a0b\n",
+        ".multiverse/activity.cursor": "10"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.malformed-cursor]\npath = \"{{PROJECT:malformed-cursor}}\"\n\n[projects.ahead-cursor]\npath = \"{{PROJECT:ahead-cursor}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "malformed-cursor",
+      "argv": ["activity", "inbox"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "the read cursor is corrupt (not a whole number); delete activity.cursor in the project's own .multiverse directory if you are sure everything already shown may be treated as seen, or restore it from backup"
+      }
+    },
+    {
+      "cwd": "ahead-cursor",
+      "argv": ["activity", "inbox"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "the read cursor (10) is ahead of the log's own high-water mark (5); the log looks like it was reset or replaced since the cursor was last written, so this reader will not guess which of its current records, if any, were already seen"
+      }
+    }
+  ]
+}

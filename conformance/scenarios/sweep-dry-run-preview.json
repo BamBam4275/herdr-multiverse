@@ -1,0 +1,120 @@
+{
+  "id": "sweep-dry-run-preview",
+  "description": "`multiverse sweep --dry-run` (cli.py cmd_sweep/_sweep) previews the same UNRECORDED task `sweep-reconcile-records-outcome` actually reconciles: `_reconcile_and_reclaim`'s dry-run branch just filters `found` for TaskState.UNRECORDED (cli.py:2686) rather than calling `tasklog.reconcile`, so `recorded` in the summary line still counts it as a would-be write but the task's own state, and the routing log on disk, are both left exactly as they were. Distinct from `sweep-under-halt-tick-skipped`: this exercises the --dry-run preview path itself, not the halted-fleet `--tick` skip. Exact stdout also pins the host-wide Docker block after the project summary and rejects extra healthy/unknown disk lines. Docker and df are explicit failing fakes, independent of installed host utilities. Plain shell fixtures exercise populated Docker facts without executing Docker; a successful empty probe must print no host lines. The tick preview must follow the host block.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "done",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/result.md": "# Result — task 20250101-fixer-aaaaaa\nRole: Fixer\nStatus: done\n\nthe finding\n",
+        "ps": "printf '%s\\n' '{\"Names\": \"stopped\", \"State\": \"exited\", \"Labels\": \"multiverse.owner=sandbox/orch\"}' '{\"Names\": \"managed\", \"State\": \"exited\", \"Labels\": \"com.docker.compose.project=sandbox\", \"Mounts\": \"shared\"}'\n",
+        "images": "printf '%s\\n' '{\"Repository\": \"local\", \"ID\": \"a\"}' '{\"Repository\": \"local\", \"ID\": \"b\"}' '{\"Repository\": \"local\", \"ID\": \"c\"}' '{\"Repository\": \"local\", \"ID\": \"c\"}' '{\"Repository\": \"ordinary\", \"ID\": \"x\"}' '{\"Repository\": \"ordinary\", \"ID\": \"y\"}' '{\"Repository\": \"<none>\", \"ID\": \"d\"}'\n",
+        "image": "printf '%s\\n' '[]' '[]' '[]'\n",
+        "system": "printf '%s\\n' '{\"Type\": \"Images\", \"Reclaimable\": \"2GB (50%)\"}' '{\"Type\": \"Build Cache\", \"Reclaimable\": \"3GB (100%)\"}' '{\"Type\": \"Local Volumes\", \"Size\": \"4GB\", \"Reclaimable\": \"1GB\"}'\n",
+        "volume": "printf '%s\\n' '{\"Name\": \"unowned\"}' '{\"Name\": \"shared\"}' '{\"Name\": \"labeled\", \"Labels\": \"com.docker.compose.project=sandbox\"}'\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: in progress 1 -> 1, recorded 1, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\n",
+        "stderr": ""
+      },
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/usr/bin/false",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--dry-run",
+        "--tick"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: in progress 1 -> 1, recorded 1, reclaimed 0; warning: process-cwd probe unknown\ndocker: stopped container stopped (unknown age) owner=sandbox/orch\ndocker: local keeps 3 images (deployed + previous is the rule)\ndocker: volume labeled project=sandbox (compose label)\ndocker: volume shared project=sandbox (via mount)\ndocker: volume unowned unattributed\ndocker: images 2GB (50%) reclaimable, build cache 3GB (100%) reclaimable, volumes 4GB total, 1GB reclaimable\nsandbox: skipped (no orchestrator)\n",
+        "stderr": ""
+      },
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/bin/sh",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "sweep",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "sandbox: in progress 1 -> 1, recorded 1, reclaimed 0; warning: process-cwd probe unknown\n",
+        "stderr": ""
+      },
+      "env": {
+        "MULTIVERSE_DOCKER_BIN": "/usr/bin/true",
+        "MULTIVERSE_DF_BIN": "/usr/bin/false",
+        "MULTIVERSE_PS_BIN": "/usr/bin/false"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

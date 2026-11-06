@@ -1,0 +1,34 @@
+[package]
+name = "mv-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The multiverse binary: clap argument parsing and the exception-to-exit-code boundary. No business rules."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "multiverse"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+mv-core = { workspace = true }
+mv-config = { workspace = true }
+mv-engine = { workspace = true }
+mv-state = { workspace = true }
+mv-board = { workspace = true }
+anyhow = { workspace = true }
+toml_edit = { workspace = true }
+time = { workspace = true }
+sha2 = { workspace = true }
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+mv-herdr = { workspace = true }

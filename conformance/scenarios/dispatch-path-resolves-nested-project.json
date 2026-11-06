@@ -1,0 +1,38 @@
+{
+  "id": "dispatch-path-resolves-nested-project",
+  "description": "Two configured projects overlap on disk — 'outer' at the repo root and 'inner' at a subdirectory of it (config.project_for_path matches by longest-prefix, not first-match). dispatch --dry-run against a path nested inside 'inner' resolves to 'inner', not 'outer', proving the match picks the most specific configured root rather than whichever one happens to be listed first or merely contains the path.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        "nested/dir/file.txt": "x\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.outer]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.inner]\npath = \"{{PROJECT:sandbox}}/nested\"\n\n[projects.inner.chains]\nexplorer = [\"explorer-seat\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}/nested/dir", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "project     inner  →  <PROJECT:sandbox>/nested",
+          "account     explorer-seat   (pool: codex:test)",
+          "outcome     chain-primary",
+          "READY"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

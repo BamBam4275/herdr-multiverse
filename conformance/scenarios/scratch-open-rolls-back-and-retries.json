@@ -1,0 +1,190 @@
+{
+  "id": "scratch-open-rolls-back-and-retries",
+  "description": "Scratch open reserves intent before split, closes failed renamed panes, removes failed intent, then permits a clean retry.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-11-02T00:00:00Z\tevent=dispatch\ttask=20261102-builder-ab34cd\tbranch=multiverse/20261102-builder-ab34cd\n2026-11-02T00:00:01Z\tevent=started\ttask=20261102-builder-ab34cd\tpane=w1:p1\n"
+      },
+      "worktrees": {
+        "20261102-builder-ab34cd": {
+          "files": {
+            ".multiverse/tasks/20261102-builder-ab34cd/brief.md": "lane\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261102-builder-ab34cd",
+      "argv": [
+        "scratch",
+        "open"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w1:p1"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "pane",
+            "split",
+            "--current",
+            "--direction",
+            "right",
+            "--cwd",
+            "{{PROJECT:sandbox}}/.multiverse/worktrees/20261102-builder-ab34cd",
+            "--no-focus"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"pane\": {\"pane_id\": \"w1:p9\"}}}"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "rename",
+            "w1:p9",
+            "scratch-20261102-builder-ab34cd"
+          ],
+          "reply": {
+            "exit": 1,
+            "stderr": "rename failed"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "close",
+            "w1:p9"
+          ],
+          "reply": {
+            "exit": 0
+          }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "rename failed"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261102-builder-ab34cd",
+      "argv": [
+        "scratch",
+        "open"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w1:p1"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "pane",
+            "split",
+            "--current",
+            "--direction",
+            "right",
+            "--cwd",
+            "{{PROJECT:sandbox}}/.multiverse/worktrees/20261102-builder-ab34cd",
+            "--no-focus"
+          ],
+          "reply": {
+            "exit": 1,
+            "stderr": "split failed"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "split failed"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261102-builder-ab34cd",
+      "argv": [
+        "scratch",
+        "open"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w1:p1"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "pane",
+            "split",
+            "--current",
+            "--direction",
+            "right",
+            "--cwd",
+            "{{PROJECT:sandbox}}/.multiverse/worktrees/20261102-builder-ab34cd",
+            "--no-focus"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"pane\": {\"pane_id\": \"w1:p9\"}}}"
+          }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "rename",
+            "w1:p9",
+            "scratch-20261102-builder-ab34cd"
+          ],
+          "reply": {
+            "exit": 0
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "opened scratch pane w1:p9\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "cwd_subdir": ".multiverse/worktrees/20261102-builder-ab34cd",
+      "argv": [
+        "scratch",
+        "open"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w1:p1"
+      },
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "already recorded"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/worktrees/20261102-builder-ab34cd/.multiverse/tasks/20261102-builder-ab34cd/scratch-pane": {
+          "mode": 384,
+          "regex": "\"pane\": \"w1:p9\""
+        }
+      }
+    }
+  ]
+}

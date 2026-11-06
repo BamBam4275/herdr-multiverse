@@ -1,0 +1,32 @@
+{
+  "id": "dispatch-degrade-once-budget",
+  "description": "Fixer's default fallback policy is degrade_once (config.py: roles fixer/designer default to it), which spends only one UNAVAILABLE/AT_CAPACITY skip before raising ChainExhaustedError — even when a later chain entry would otherwise be fine. A 3-entry chain with the first TWO entries unavailable proves the budget: the walk stops after the second skip and never reaches the third, available entry. Contrast with dispatch-fallback-unavailable's --role explorer (FALLBACK policy, no budget), where the walk would have kept going.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {},
+    "codex-home-c": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\navailable = false\nunavailable_reason = \"outage a\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\navailable = false\nunavailable_reason = \"outage b\"\n\n[accounts.seat-c]\nkind = \"codex\"\nshort = \"sc\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-c}}\"\npool = \"codex:c\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nfixer = [\"seat-a\", \"seat-b\", \"seat-c\"]\n\n[roles.fixer]\nwrite_scope = \"project\"\neffort = \"low\"\non_exhausted = \"degrade_once\"\nskills = []\n\n[roles.fixer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "--role", "fixer", "{{PROJECT:sandbox}}", "fix the thing"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr": "\nevery account in the Fixer chain for 'sandbox' is unavailable:\n  - seat-a: outage a\n  - seat-b: outage b\n\nFixer's fallback policy is degrade_once, which accepts only one step down the chain before refusing. That step is already spent on the seats above, so any seat further down the chain was never tried.\nMultiverse will not route to an account outside the chain (route by path, never by quota)."
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

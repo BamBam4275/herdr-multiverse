@@ -1,0 +1,4 @@
+2026-03-01T00:00:00+00:00	v=1	seq=1	event=backlog	item=20260301-b-aaaaaa	state=asked	priority=P2	title="valid ask"	options=["opt one", "opt two"]	recommendation=1	why="ok"	by=demo	crc32=4d079ea1
+2026-03-01T00:05:00+00:00	v=1	seq=2	event=backlog	item=20260301-b-bbbbbb	state=asked	priority=P2	title="bad recommendation"	options=["opt one", "opt two"]	recommendation=9	why="ok"	by=demo	crc32=954bba0c
+2026-03-01T00:10:00+00:00	v=1	seq=3	event=backlog	item=20260301-b-cccccc	state=asked	priority=P2	title="bad options"	options=not-json	recommendation=1	why="ok"	by=demo	crc32=32dccb09
+2026-03-01T00:15:00+00:00	v=1	seq=4	event=backlog	item=20260301-b-dddddd	state=open	priority=P1	title="free text role"	why="ok"	role=builder	by=demo	crc32=26079ea6

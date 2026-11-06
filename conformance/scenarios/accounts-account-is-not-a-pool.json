@@ -1,0 +1,52 @@
+{
+  "id": "accounts-account-is-not-a-pool",
+  "description": "Account names used as pool arguments refuse with exit 3 and a pool hint before any write or Herdr call.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.explorer-seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "trip",
+        "explorer-seat"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "is an account, not a pool",
+          "codex:test"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "accounts",
+        "reset",
+        "explorer-seat"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "is an account, not a pool",
+          "codex:test"
+        ]
+      }
+    }
+  ]
+}

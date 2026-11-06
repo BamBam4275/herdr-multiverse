@@ -1,0 +1,257 @@
+{
+  "id": "worktrees-prune-confirms-ignored-files",
+  "description": "Both --yes and --force confirm ignored-file disposal; previews preserve ignored data.",
+  "projects": {
+    "yes": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\nignored/\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\n"
+      },
+      "worktrees": {
+        "20260101-builder-aaaaaa": {
+          "files": {
+            "ignored/data": "confirmed disposal\n"
+          }
+        }
+      }
+    },
+    "force": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\nignored/\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\n"
+      },
+      "worktrees": {
+        "20260101-builder-aaaaaa": {
+          "files": {
+            "ignored/data": "confirmed disposal\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.yes]\npath = \"{{PROJECT:yes}}\"\n[projects.force]\npath = \"{{PROJECT:force}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "yes",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:yes}}",
+        "--prune",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "unrescued ignored file"
+        ]
+      }
+    },
+    {
+      "cwd": "yes",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:yes}}",
+        "--prune",
+        "--dry-run",
+        "--yes"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "would remove",
+          "reclaimed branch"
+        ]
+      }
+    },
+    {
+      "cwd": "yes",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:yes}}",
+        "--prune",
+        "--yes"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "removed",
+          "reclaimed branch"
+        ]
+      }
+    },
+    {
+      "cwd": "force",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:force}}",
+        "--prune",
+        "--dry-run"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "unrescued ignored file"
+        ]
+      }
+    },
+    {
+      "cwd": "force",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:force}}",
+        "--prune",
+        "--dry-run",
+        "--force"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "would remove",
+          "reclaimed branch"
+        ]
+      }
+    },
+    {
+      "cwd": "force",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:force}}",
+        "--prune",
+        "--force"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        },
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\":{\"agents\":[]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "removed",
+          "reclaimed branch"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "yes",
+      "files": {
+        ".multiverse/worktrees/20260101-builder-aaaaaa": {
+          "absent": true
+        },
+        ".git/refs/heads/multiverse/20260101-builder-aaaaaa": {
+          "absent": true
+        }
+      }
+    },
+    {
+      "root": "force",
+      "files": {
+        ".multiverse/worktrees/20260101-builder-aaaaaa": {
+          "absent": true
+        },
+        ".git/refs/heads/multiverse/20260101-builder-aaaaaa": {
+          "absent": true
+        }
+      }
+    }
+  ]
+}

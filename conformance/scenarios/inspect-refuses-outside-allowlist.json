@@ -1,0 +1,36 @@
+{
+  "id": "inspect-refuses-outside-allowlist",
+  "description": "`inspect` resolves PATH against cwd, then requires the normalized result to stay under the project root (gateway.py's `_relative_parts_within`) — a lexical `..` escape is refused before any file is opened, with a dedicated message distinct from a missing-file or symlink refusal, and the refusal itself is still audited to `.multiverse/inspect.log` (`outcome=refused: ...`) the same as a successful read.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n", "secret.txt": "do not read\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["inspect", "../../etc/passwd", "--lines", "1:1", "--reason", "checking an escape"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "../../etc/passwd: resolves outside the project\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "README.md": { "equals": "hi\n" },
+        "secret.txt": { "equals": "do not read\n" },
+        ".multiverse/inspect.log": {
+          "regex": "^<TIMESTAMP>\\tevent=inspect\\tproject=sandbox\\tpaths=\\.\\./\\.\\./etc/passwd\\tbytes=0\\treason=checking an escape\\toutcome=refused: \\.\\./\\.\\./etc/passwd: resolves outside the project$"
+        }
+      }
+    }
+  ]
+}

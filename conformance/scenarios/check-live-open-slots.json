@@ -1,0 +1,41 @@
+{
+  "id": "check-live-open-slots",
+  "description": "`check` reports per-project live open-slot counts (cli.py cmd_check / runner.project_open_agents, card 20260929-b-21b5ee) from one `agent list` call, asked only because this project's routing log still holds an unrecorded task. The live agent is attributed by exact match against that dispatch line's `agent=` field. A config with every task already recorded (check-missing-accounts) never touches Herdr and prints 0. Exit EXIT_OK (0).",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=sandbox\trole=builder\taccount=seat\tpool=codex:test\toutcome=chain-primary\treason=\tagent=sandbox-buil-st\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-builder-aaaaaa\tpane=w1:p1\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat]\nkind = \"codex\"\nshort = \"st\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["check"],
+      "env": { "HERDR_PANE_ID": "w1:p1" },
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"sandbox-buil-st\", \"agent_status\": \"working\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "slots: 1 open, floor 0, ceiling 3"
+        ]
+      }
+    }
+  ]
+}

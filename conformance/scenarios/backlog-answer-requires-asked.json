@@ -1,0 +1,65 @@
+{
+  "id": "backlog-answer-requires-asked",
+  "description": "Answering an open backlog item refuses before recording a human annotation.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "plain work"
+      ],
+      "transcript": [],
+      "capture": {
+        "item": "added (\\S+) to sandbox"
+      },
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "answer",
+        "{{capture:item}}",
+        "--note",
+        "answer"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "not asked",
+          "answer only applies"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "show",
+        "{{capture:item}}"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "annotations: none"
+        ]
+      }
+    }
+  ]
+}

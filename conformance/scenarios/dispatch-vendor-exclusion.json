@@ -1,0 +1,35 @@
+{
+  "id": "dispatch-vendor-exclusion",
+  "description": "dispatch --dry-run --exclude-vendor VENDOR drops every chain entry of that vendor before availability is even checked (accounts.py candidates(), SkipCause.VENDOR_EXCLUDED) and falls to the next entry for free: this skip cause is budget-exempt, so it never spends a role's degrade_once allowance (that is exercised separately by dispatch-degrade-once-budget). --exclude-vendor is repeatable (argparse append); one value is enough to show the mechanism.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nvendor = \"chatgpt\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"chatgpt:excluded\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nvendor = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:floor\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "--exclude-vendor", "chatgpt", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "account     seat-b   (pool: codex:floor)",
+          "outcome     chain-fallback",
+          "selected    seat-b"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

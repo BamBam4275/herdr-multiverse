@@ -1,0 +1,42 @@
+{
+  "id": "sweep-under-halt-tick-skipped",
+  "description": "`halt on` (cli.py cmd_halt, config.write_fleet_halt) writes the fleet-wide pause file beside the resolved config; a later `sweep --tick` still prints the reconcile/reclaim line for every project (the halt note in cmd_halt's own help: 'sweep still records and reclaims settled tasks') but takes the `elif args.tick` branch (cli.py ~13103-13105) instead of `_sweep_tick_orchestrator`, printing a flat `<project>: skipped (fleet halted)` per project with no orchestrator pane read or send at all — distinct from `sweep-dry-run-preview`, which previews the reconcile/reclaim leg itself rather than the tick-skip leg.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "on", "--reason", "testing a halted sweep"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["fleet halted since <TIMESTAMP>: testing a halted sweep"]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["sweep", "--tick"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "fleet halted since <TIMESTAMP>: testing a halted sweep",
+          "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0",
+          "sandbox: skipped (fleet halted)"
+        ]
+      }
+    }
+  ]
+}

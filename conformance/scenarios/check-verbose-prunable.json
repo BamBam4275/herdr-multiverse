@@ -1,0 +1,51 @@
+{
+  "id": "check-verbose-prunable",
+  "description": "Verbose check uses the real read-only prune preview to report prunable branches without deleting them.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\n2026-01-01T00:00:00+00:00\tevent=result\ttask=20260101-builder-bbbbbb\tstatus=done\n"
+      },
+      "orphan_branches": [
+        "20260101-builder-aaaaaa",
+        "20260101-builder-cccccc"
+      ],
+      "lanes": {
+        "20260101-builder-bbbbbb": {
+          "files": {
+            "README.md": "unique\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "check",
+        "--verbose"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout_contains": [
+          "1 prunable lane(s)/branch(es)",
+          "review policy:"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

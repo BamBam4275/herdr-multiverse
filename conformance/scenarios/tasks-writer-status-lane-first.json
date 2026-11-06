@@ -1,0 +1,41 @@
+{
+  "id": "tasks-writer-status-lane-first",
+  "description": "`multiverse tasks --no-reconcile` reads writer status from the lane worktree first (`read_writer_status` / Python `_safe_lane_root`): the main checkout's `blocked` status is ignored when `.multiverse/worktrees/<id>/.multiverse/tasks/<id>/status` says `done`. The listing therefore shows unrecorded/done, not unrecorded/blocked. Scout gap #32.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=multiverse/20250101-fixer-aaaaaa\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/tasks/20250101-fixer-aaaaaa/status": "blocked",
+        ".multiverse/worktrees/20250101-fixer-aaaaaa/.multiverse/tasks/20250101-fixer-aaaaaa/status": "done"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["tasks", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": []}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "unrecorded",
+          "finished as 'done' after its dispatch gave up. `--reconcile` records it."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

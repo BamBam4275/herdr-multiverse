@@ -1,0 +1,229 @@
+{
+  "id": "parser-requiredness-and-choices",
+  "description": "Argparse parity gaps 6, 7, 9\u201313: missing required values, conflicting selectors, and invalid choices exit 2 before any project/config lookup, state mutation, or Herdr call. Gap 15: bare seat prints usage and exits 1 without reading configuration. Uses an unconfigured cwd and empty fleet config.",
+  "projects": {
+    "outside": {
+      "files": {
+        "README.md": "unchanged\n"
+      }
+    }
+  },
+  "steps": [
+    {
+      "cwd": "outside",
+      "argv": [
+        "activity",
+        "close",
+        "1"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "--reason"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "activity",
+        "update",
+        "card"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "--phase"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "activity",
+        "update",
+        "card",
+        "--phase",
+        "unknown"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "unknown"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "inspect",
+        "--reason",
+        "checking",
+        "--lines",
+        "1:2"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "paths"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "inspect",
+        "README.md",
+        "--lines",
+        "1:2"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "--reason"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "inspect",
+        "README.md",
+        "--reason",
+        "checking"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "--lines"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "inspect",
+        "README.md",
+        "--reason",
+        "checking",
+        "--lines",
+        "1:2",
+        "--match",
+        "text"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "--match"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "dispatch",
+        "missing-project",
+        "task",
+        "--column",
+        "execute"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "execute"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "notify",
+        "--priority",
+        "normal"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "normal"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "accounts",
+        "trip",
+        "pool",
+        "--kind",
+        "usage"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "usage"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "backlog",
+        "mark-asked",
+        "card"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "--recommend"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "backlog",
+        "mark-asked",
+        "card",
+        "--recommend",
+        "first"
+      ],
+      "expect": {
+        "exit": 2,
+        "stdout": "",
+        "stderr_contains": [
+          "first"
+        ]
+      }
+    },
+    {
+      "cwd": "outside",
+      "argv": [
+        "seat"
+      ],
+      "expect": {
+        "exit": 1,
+        "stdout_contains": [
+          "usage: multiverse seat show"
+        ],
+        "stderr": ""
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "outside",
+      "unchanged": true
+    }
+  ]
+}

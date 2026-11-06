@@ -1,0 +1,22 @@
+{
+  "claude": {
+    "cap": 2
+  },
+  "damaged-cap": {
+    "cap": -1
+  },
+  "damaged-cap-overflow": {
+    "cap": 4294967296
+  },
+  "damaged-entry": false,
+  "damaged-lend": {
+    "lend": "true"
+  },
+  "damaged-prefer": {
+    "prefer": 1
+  },
+  "grok": {
+    "lend": true,
+    "prefer": false
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "empty": {},
+  "legacy-active": {
+    "tripped_at": "2026-01-01T00:00:00+00:00"
+  },
+  "legacy-metadata": {
+    "close_reason": "manual"
+  },
+  "nulls-and-extra": {
+    "future_evidence": [
+      1,
+      2
+    ],
+    "manual": null,
+    "open": null,
+    "trip_count": null,
+    "tripped_at": null
+  }
+}

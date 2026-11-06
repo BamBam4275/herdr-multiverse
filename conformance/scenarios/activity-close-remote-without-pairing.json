@@ -1,0 +1,33 @@
+{
+  "id": "activity-close-remote-without-pairing",
+  "description": "Remote `Project#SEQ` close is gated by `[activity.pairs]` before any write (cli.py:13510-13522, scout2-gaps #15).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2026-01-01T00:00:00+00:00\tv=1\tseq=1\tevent=message\tid=ask-1\tfrom=sandbox2\tto=sandbox\tbody=\"need a thing?\"\task=1\tcrc32=55ae6499\n"
+      }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox2",
+      "argv": ["activity", "close", "sandbox#1", "--reason", "retracted"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "may not close an ask in \"sandbox\"'s log"
+        ]
+      }
+    }
+  ]
+}

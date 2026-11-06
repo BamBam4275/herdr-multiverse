@@ -1,0 +1,49 @@
+{
+  "id": "tasks-acknowledge-marks-reviewed",
+  "description": "`multiverse tasks sandbox --acknowledge <task> --acknowledges <ordinal> --yes` appends an `event=acknowledged` line naming the right ordinal and changes no other field — the outcome record's own `status`/`state` stay exactly as recorded (cli.py `_cmd_tasks_acknowledge`/accounts.py `append_acknowledge_if_absent`). Scout gap #3 (tasks `--acknowledge`).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=complete\trevisions=0\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "tasks",
+        "sandbox",
+        "--acknowledge",
+        "20250101-fixer-aaaaaa",
+        "--acknowledges",
+        "2",
+        "--yes"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "<ID>@line 2",
+          "current: when=<TIMESTAMP> status=done state=complete",
+          "recorded the acknowledgement for <ID>@line 2."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/routing.log": {
+          "equals": "<TIMESTAMP>\tevent=dispatch\ttask=<ID>\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n<TIMESTAMP>\tevent=result\ttask=<ID>\tstatus=done\tstate=complete\trevisions=0\n<TIMESTAMP>\tevent=acknowledged\ttask=<ID>\tacknowledges=2\n"
+        }
+      }
+    }
+  ]
+}

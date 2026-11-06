@@ -1,0 +1,115 @@
+name: Bug report
+description: Report a problem with Herdr Multiverse
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Please redact** any API keys, tokens, prompts, file paths that
+        reveal private information, or other credentials before pasting
+        logs or config below. Herdr Multiverse does not handle your vendor
+        API keys, but your terminal logs might still contain sensitive
+        data from other tools.
+
+        For a security vulnerability, do not use this form — follow the
+        process in [SECURITY.md](https://github.com/BamBam4275/herdr-multiverse/blob/main/SECURITY.md)
+        instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear, concise description of the bug.
+      placeholder: Tell us what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, actions, or panes involved.
+      placeholder: |
+        1. Run `herdr plugin action invoke --plugin multiverse ...`
+        2. ...
+    validations:
+      required: true
+
+  - type: input
+    id: herdr-version
+    attributes:
+      label: Herdr version
+      description: Output of `herdr --version`.
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Herdr Multiverse version or commit
+      description: Release tag, `multiverse --version` output, or commit SHA.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-route
+    attributes:
+      label: Install route
+      options:
+        - herdr plugin install (release binary)
+        - herdr plugin link (local checkout)
+        - cargo install / cargo build --release
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: action
+    attributes:
+      label: Exact action or pane involved
+      description: e.g. `multiverse-doctor`, a Builder pane, `board --watch`.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Paste any relevant terminal output. This will be rendered as code, so no need for backticks. **Redact credentials, tokens, and prompts first.**
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and didn't find a duplicate
+          required: true
+        - label: I removed credentials, tokens, and sensitive prompt text from everything above
+          required: true

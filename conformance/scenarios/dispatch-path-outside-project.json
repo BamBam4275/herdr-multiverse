@@ -1,0 +1,30 @@
+{
+  "id": "dispatch-path-outside-project",
+  "description": "dispatch refuses before any herdr call or chain walk when its `path` argument resolves outside every configured project (accounts.py's NoProjectConfiguredError, raised first thing in _resolve_chain, strictly before any account is even looked at). EXIT_NEEDS_CONFIG (3), naming the configured projects so the fix is obvious.",
+  "dirs": {
+    "outside": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{DIR:outside}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr": "\nno configured project contains <DIR:outside>.\nConfigured projects:\n  - sandbox\nAdd a [projects.<name>] table with this path, and a chain for the role you want to dispatch."
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

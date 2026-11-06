@@ -1,0 +1,38 @@
+{
+  "id": "council-refusal-without-yes",
+  "description": "`council` (cli.py's cmd_council) seats a council (two distinct vendors, the floor `council.seat` needs — council.py's MINIMUM_COUNCILLORS), prints the roster, then refuses to convene without `--yes`: the heaviest path in the system is never a silent default. `--dry-run` takes the same roster but prints 'nothing was dispatched' instead; this scenario only exercises the refusal (`EXIT_ERROR`, dispatch.py's `cmd_council` never calls herdr at all before refusing).",
+  "dirs": {
+    "claude-home": {},
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.claude-personal]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:personal\"\ncommand = \"claude-personal\"\n\n[accounts.codex-work]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"chatgpt:work\"\n\n[roles.council]\nwrite_scope = \"none\"\n\n[roles.council.models]\nclaude = \"opus\"\ncodex = \"gpt-x\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\ncouncil = [\"claude-personal\", \"codex-work\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["council", "{{PROJECT:sandbox}}", "should we ship?"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stdout_contains": [
+          "should we ship?",
+          "claude-personal",
+          "codex-work"
+        ],
+        "stderr_contains": [
+          "refusing to convene 2 agents without --yes. This is the heaviest path in the system."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

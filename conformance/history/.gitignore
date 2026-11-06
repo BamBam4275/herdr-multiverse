@@ -1,0 +1,9 @@
+# Real fleet/project data collected by collect.sh. Never commit this —
+# it is a snapshot of live routing logs, task briefs/results, and fleet
+# state that may name real projects, accounts, and in-flight work.
+/corpus/
+
+# Build artifacts for runner/, which is its own Cargo workspace (see
+# runner/Cargo.toml and this directory's README) and therefore is not
+# covered by the repo root's /target/ ignore rule.
+/runner/target/

@@ -1,0 +1,111 @@
+{
+  "id": "backlog-dispatched-pane-refusal",
+  "description": "Only HERDR_PANE_ID is needed to refuse done and reopen from a dispatched worker; unresolvable identity fails open.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:b\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "worker card"
+      ],
+      "transcript": [],
+      "capture": {
+        "item": "added (\\S+) to sandbox"
+      },
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "done",
+        "{{capture:item}}"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w1:p1"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp/lane\", \"name\": \"sandbox-expl-sb\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "was refused",
+          "sandbox-expl-sb"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "reopen",
+        "{{capture:item}}"
+      ],
+      "env": {
+        "HERDR_PANE_ID": "w1:p1"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp/lane\", \"name\": \"sandbox-expl-sb\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "was refused",
+          "sandbox-expl-sb"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "show",
+        "{{capture:item}}"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "worker card",
+          "annotations: none"
+        ]
+      }
+    }
+  ]
+}

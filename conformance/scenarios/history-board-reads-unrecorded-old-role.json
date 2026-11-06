@@ -1,0 +1,47 @@
+{
+  "id": "history-board-reads-unrecorded-old-role",
+  "description": "`multiverse board --no-reconcile` renders an UNRECORDED task — status file written (role=librarian, an old pre-rename dispatch role name) but no event=result line in routing.log yet, e.g. the dispatch process died or raced ahead of the agent — as an IN PROGRESS card with the generic 'unrecorded, needs --reconcile' note. `--no-reconcile` only opts out of *writing* a reconciled outcome; board still makes its one `agent list` call to render live state, in both Python and Rust, so the transcript cannot be empty — it scripts that one call with a malformed (non-JSON) reply, the same 'herdr answered but untrustworthy' shape `workers-malformed-herdr-json.json` uses, so `live_agents` comes back `None` (herdr unreachable/untrustworthy) rather than an empty-but-trustworthy listing. tasks.resolve only reaches the generic wording when live_agents is None — when herdr answers with a trustworthy (if empty) listing, an UNRECORDED task whose recorded pane is absent from it instead gets the more specific 'pane gone, status done' reason and a BLOCKED card, a different, equally real history-reading case this scenario does not also cover. A genuinely RECORDED (done/failed) task is dropped from the board entirely (board.py's _split_dispatched) — not asserted here since it would render nothing, but worth knowing before trusting an absence on the board as 'nothing happened'.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-librarian-dddddd\tproject=sandbox\trole=librarian\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-librarian-dddddd\tpane=w1:p1\n",
+        ".multiverse/tasks/20250101-librarian-dddddd/brief.md": "# Task 20250101-librarian-dddddd\nRole: Librarian\n",
+        ".multiverse/tasks/20250101-librarian-dddddd/status": "done"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["board", "--no-reconcile"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "not json at all\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "project: sandbox only",
+          "┌─ BLOCKED",
+          "┌─ IN PROGRESS",
+          "<ID>",
+          "old-seat ",
+          "unrecorded,",
+          "needs --reconcile",
+          "librarian",
+          "┌─ BACKLOG"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

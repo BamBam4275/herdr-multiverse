@@ -1,0 +1,64 @@
+{
+  "id": "health-limit-rate-classification",
+  "description": "`health` classifies a credits/weekly-quota banner as LIMIT and a rolling 429/retry-limit banner as RATE (cli.py's cmd_health / health.classify_visible_text: LIMIT/RATE before CONTEXT/DEAD/DIALOG; limits.classify rule names `codex_usage_limit_reached` vs `codex_retry_limit_exceeded`). Scout gaps #11 and #12. Same agent-list then agent-read transcript shape as health-dead-context-dialog-classification; project is attributed from cwd, task/seat stay em-dashes because the agent name is not a dispatched fleet seat. Exit EXIT_NEEDS_CONFIG (3) when any problem pane is reported. Read-only: never prompts a pane.",
+  "projects": {
+    "sandbox": {
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["health"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": ["agent", "read", "w1:p1", "--source", "visible"],
+          "reply": {
+            "exit": 0,
+            "stdout": "Usage limit reached\nRequest a limit increase from your owner to continue using codex."
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "LIMIT w1:p1 sandbox \u2014 \u2014\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["health"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"name\": \"worker\", \"pane_id\": \"w1:p1\", \"cwd\": \"{{PROJECT:sandbox}}\"}]}}"
+          }
+        },
+        {
+          "match_argv": ["agent", "read", "w1:p1", "--source", "visible"],
+          "reply": {
+            "exit": 0,
+            "stdout": "[] exceeded retry limit, last status: 429 Too Many Requests"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 3,
+        "stdout": "RATE w1:p1 sandbox \u2014 \u2014\n"
+      }
+    }
+  ]
+}

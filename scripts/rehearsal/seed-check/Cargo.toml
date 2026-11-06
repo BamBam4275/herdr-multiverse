@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "seed-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "seed-check"
+path = "src/main.rs"
+
+[dependencies]
+mv-core = { path = "../../../crates/mv-core" }
+mv-config = { path = "../../../crates/mv-config" }
+mv-engine = { path = "../../../crates/mv-engine" }

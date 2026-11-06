@@ -1,0 +1,34 @@
+{
+  "id": "activity-close-remote-retracts-and-notices",
+  "description": "Remote `Project#SEQ` close with pairing: records the close, notices the holder, prints `retracted holder#seq; told holder.` (cli.py:13572-13598, scout2-gaps #15).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "sandbox2": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox2]\npath = \"{{PROJECT:sandbox2}}\"\n\n[activity.pairs]\nsandbox = [\"sandbox2\"]\nsandbox2 = [\"sandbox\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "send", "sandbox2", "need a thing?", "--ask", "--id", "ask-1"],
+      "transcript": [],
+      "expect": { "exit": 0 }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["activity", "close", "sandbox2#1", "--reason", "retracted"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": ["retracted sandbox2#1; told sandbox2."]
+      }
+    }
+  ]
+}

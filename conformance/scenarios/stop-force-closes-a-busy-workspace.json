@@ -1,0 +1,41 @@
+{
+  "id": "stop-force-closes-a-busy-workspace",
+  "description": "`stop --force` closes a workspace even while a busy agent is inside it, naming the forced agent before destroying it and issuing the real `workspace close` call — cli.cmd_stop's `--force` path (the busy/held refusal check still runs and is reported, but does not block the close). Exit EXIT_OK (0) since every open workspace closed.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["stop", "--force"],
+      "transcript": [
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"workspaces\": [{\"label\": \"sandbox\", \"workspace_id\": \"ws1\"}]}}\n" }
+        },
+        {
+          "match_argv": ["pane", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"panes\": [{\"workspace_id\": \"ws1\", \"pane_id\": \"w1:p1\", \"foreground_cwd\": \"{{PROJECT:sandbox}}\"}]}}\n" }
+        },
+        {
+          "match_argv": ["agent", "list"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"agents\": [{\"workspace_id\": \"ws1\", \"pane_id\": \"w1:p1\", \"agent_status\": \"working\", \"name\": \"fixer-agent\"}]}}\n" }
+        },
+        {
+          "match_argv": ["workspace", "close", "ws1"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {}}\n" }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "  sandbox              forcing: ending working agent fixer-agent\n  sandbox              closed (ws1)\n\nclosed 1 of 1\n"
+      }
+    }
+  ]
+}

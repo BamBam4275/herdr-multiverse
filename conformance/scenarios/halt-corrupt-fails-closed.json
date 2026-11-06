@@ -1,0 +1,59 @@
+{
+  "id": "halt-corrupt-fails-closed",
+  "description": "An existing corrupt halt marker fails closed; clearing it restores running state. No Herdr calls.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "runtime_files": {
+    "halt": "garbage\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "halt",
+        "status"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "fleet halted since",
+          "halt state is unreadable"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "halt",
+        "off"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "fleet halt cleared.\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "halt",
+        "status"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "fleet is not halted.\n"
+      }
+    }
+  ]
+}

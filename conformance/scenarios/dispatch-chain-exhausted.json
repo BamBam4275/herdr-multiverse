@@ -1,0 +1,31 @@
+{
+  "id": "dispatch-chain-exhausted",
+  "description": "dispatch --dry-run against a chain where every entry is unavailable raises ChainExhaustedError before any card is printed: EXIT_NEEDS_CONFIG (3), nothing created, a message naming every skip reason rather than a bare 'no seats'.",
+  "dirs": {
+    "codex-home-a": {},
+    "codex-home-b": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\navailable = false\nunavailable_reason = \"codex quota exhausted\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\navailable = false\nunavailable_reason = \"login expired\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nexplorer = [\"seat-a\", \"seat-b\"]\n\n[roles.explorer]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.explorer.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["dispatch", "--dry-run", "{{PROJECT:sandbox}}", "map the repo"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr": "\nevery account in the Explorer chain for 'sandbox' is unavailable:\n  - seat-a: codex quota exhausted\n  - seat-b: login expired\nMultiverse will not route to an account outside the chain (route by path, never by quota)."
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

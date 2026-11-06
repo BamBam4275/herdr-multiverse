@@ -1,0 +1,60 @@
+{
+  "id": "halt-on-off-status-roundtrip",
+  "description": "`multiverse halt` (cli.py cmd_halt, config.write_fleet_halt/read_fleet_halt/clear_fleet_halt) round trips the fleet-wide pause file beside the resolved config: `on --reason` writes it and echoes the same line `status` reads back, `off` removes it and reports whether anything was actually cleared, and a second `status` afterward reports the plain not-halted line. No project or Herdr call is needed for any of the four — halt is a pure fleet-state-dir read/write, read before any project config is even loaded.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "status"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "fleet is not halted.\n" }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "on", "--reason", "maintenance window"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "fleet halted since <TIMESTAMP>: maintenance window\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "status"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "fleet halted since <TIMESTAMP>: maintenance window\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "off"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "fleet halt cleared.\n" }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "off"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "fleet was not halted.\n" }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["halt", "status"],
+      "transcript": [],
+      "expect": { "exit": 0, "stdout": "fleet is not halted.\n" }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

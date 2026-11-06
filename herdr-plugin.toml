@@ -1,0 +1,97 @@
+# Herdr plugin manifest for Multiverse (Rust). See scripts/bootstrap-plugin.sh
+# for the [[build]] step and docs/install.md for the install/build-from-source
+# story.
+#
+# Deliberately excluded, and why:
+#   - `dispatch` and `council` as actions: both spend subscription quota and
+#     require `--yes` on the CLI precisely so a real run is never one click.
+#     A manifest action carrying `--yes` would erase that safety distinction.
+#   - [[events]] and [[startup]]: not needed yet; add only once a concrete,
+#     opt-in use case exists.
+#   - `dispatch --dry-run`: it needs the caller's path and task, so a fixed
+#     one-click command would be a misleading preview rather than a useful
+#     action. Use the CLI directly.
+#   - [[link_handlers]]: there is no Multiverse link type to handle.
+id = "multiverse"
+name = "Multiverse"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "A Herdr-native multi-agent system. Check config, list accounts, and read dispatch history — read-only."
+platforms = ["linux", "macos"]
+
+[[build]]
+# Runs on `herdr plugin install` only (after clone, before registration); a
+# nonzero exit aborts the install. Does not run on `herdr plugin link` — see
+# plugin-action.sh for the linked-checkout fallback.
+command = ["scripts/bootstrap-plugin.sh"]
+
+[[actions]]
+id = "multiverse-doctor"
+title = "Multiverse: Doctor"
+description = "Check first-run prerequisites without changing anything. Read-only."
+contexts = ["global"]
+# Herdr 0.9.5 runs runtime commands from the plugin directory; see
+# https://herdr.dev/tui/docs/plugins/#commands-and-environment
+# The wrapper owns config/state selection and the read-only marker.
+command = ["scripts/plugin-action.sh", "doctor"]
+
+[[actions]]
+id = "multiverse-check"
+title = "Multiverse: Check"
+description = "Validate config and report unfilled placeholders. Read-only — writes nothing."
+contexts = ["global"]
+command = ["scripts/plugin-action.sh", "check", "--read-only"]
+
+[[actions]]
+id = "multiverse-accounts"
+title = "Multiverse: Accounts"
+description = "List configured accounts and their current availability. Read-only — writes nothing."
+contexts = ["global"]
+command = ["scripts/plugin-action.sh", "accounts"]
+
+[[actions]]
+id = "multiverse-tasks"
+title = "Multiverse: Tasks"
+description = "Show what was dispatched and what became of it, from the routing log. Read-only — writes nothing."
+contexts = ["global"]
+command = ["scripts/plugin-action.sh", "tasks", "--read-only"]
+
+[[actions]]
+id = "multiverse-board"
+title = "Multiverse: Board"
+description = "Print the card board once and exit. Read-only — writes nothing."
+contexts = ["global"]
+command = ["scripts/plugin-action.sh", "board", "--all", "--read-only"]
+
+[[actions]]
+id = "multiverse-start"
+title = "Multiverse: Start"
+description = "Opens a Herdr workspace per configured project and launches the interactive Nexus agent session in each root pane. Dispatches nothing itself and spends no subscription quota directly, but it does open workspaces and start an interactive agent session in each — the account marked `interactive = true` in config, never a metered dispatch account."
+contexts = ["global"]
+# The wrapper derives and quotes the absolute binary invocation for Nexus
+# seeds, which are later used from each project directory.
+command = ["scripts/plugin-action.sh", "start", "--all"]
+
+[[actions]]
+id = "multiverse-workers"
+title = "Multiverse: Workers"
+description = "List live workers across configured projects. Read-only — writes nothing."
+contexts = ["global"]
+command = ["scripts/plugin-action.sh", "workers"]
+
+[[actions]]
+id = "multiverse-import-python"
+title = "Multiverse: Import Python config/state"
+description = "Copy a standalone Python install's config.toml, ntfy-topic, halt marker, directives, and fleet state into this plugin's config/state directories. Copies only — never moves or deletes the source — and refuses to overwrite a file already there."
+contexts = ["global"]
+# The one action that may run before config.toml exists in
+# HERDR_PLUGIN_CONFIG_DIR: copying it there is its job. See
+# plugin-action.sh's own exemption for this id.
+command = ["scripts/plugin-action.sh", "import-python"]
+
+[[panes]]
+id = "dashboard"
+title = "Multiverse Dashboard"
+description = "Live card board, redrawing until the pane is closed. Read-only — writes nothing."
+placement = "tab"
+command = ["scripts/plugin-action.sh", "board", "--all", "--watch", "--read-only"]

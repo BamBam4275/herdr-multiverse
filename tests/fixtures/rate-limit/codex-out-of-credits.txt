@@ -1,0 +1,68 @@
+    134 +    gen = iter_hosts(csv_path, profile, max_buffered_rows=1)
+    135      try:
+        ⋮
+    150
+    151 -    gen = iter_hosts(csv_path, profile, row_threshold=1)
+    151 +    gen = iter_hosts(csv_path, profile, max_buffered_rows=1)
+    152      next(gen)  # only partially consume
+
+• Ran git diff --check && .venv/bin/python -m pytest -q
+  └ ........................................................................ [ 63%]
+    .........................................                                [100%]
+    … +10 lines (ctrl + t to view transcript)
+    -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+    113 passed, 1 warning in 2.35s
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• All 113 tests pass, including the new synthetic review regressions. Before finalizing, I’m doing the
+  brief’s required evidence pass: compare pre-fix behavior using an isolated /tmp copy (without stash),
+  measure grouped/ungrouped memory, and run the specified real CSV and stdin checks with outputs kept in /
+  tmp and only aggregate counts recorded.
+
+• Ran baseline_dir=$(mktemp -d /tmp/demo-csv-baseline.XXXXXX)
+  │ git archive 5aa5199 | tar -xf - -C "$baseline_dir"
+  │ cp tests/test_review_fixes.py "$baseline_dir/tests/test_review_fixes.py"
+  │ … +3 lines
+  └
+    ==================================== ERRORS ====================================
+    … +14 lines (ctrl + t to view transcript)
+    baseline_dir=/tmp/demo-csv-baseline.VaP3zf
+    baseline_rc=2
+
+• Ran /usr/bin/time -l .venv/bin/demo-convert "/home/demo/code/DemoCSVConverter/samples/csv/Demo
+  │ Hosts Export_Aug 2026 (2) 2.csv" -o /tmp/demo-review-default.xml
+  │ --scan-start 2026-08-01T00:00:00 --scan-end 2026-08-01T01:00:00 --validate > /tmp/
+  │ … +3 lines
+  └ rc=1
+    hosts: 125
+    … +7 lines (ctrl + t to view transcript)
+            1.26 real         0.86 user         0.04 sys
+    time: sysctl kern.clockrate: Operation not permitted
+
+• Ran .venv/bin/python - <<'PY' > /tmp/demo-review-default-rss.log 2> /tmp/demo-review-default-rss.err
+  │ import resource, sys
+  │ from demo_csv_converter.cli import main
+  │ … +9 lines
+  └ hosts: 125
+    report_items: 18077
+    … +6 lines (ctrl + t to view transcript)
+    rc 0
+    maxrss_kb 116015104
+
+• Ran .venv/bin/python - <<'PY'
+  │ from demo_csv_converter.reader import _InputSource, iter_hosts
+  │ from demo_csv_converter.profiles import load_profile
+  │ … +17 lines
+  └ hosts 125 items 18077 passes 2 grouped_single_host_path True
+
+■ Your workspace is out of credits. Ask your workspace owner to refill in order to continue.
+
+
+  Usage limit reached
+  Request a limit increase from your owner to continue using codex. Request increase?
+
+  1. Yes (y)
+› 2. No (default) (n)
+
+  Press enter to confirm or esc to go back

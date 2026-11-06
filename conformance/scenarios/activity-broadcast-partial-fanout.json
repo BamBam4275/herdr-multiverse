@@ -1,0 +1,39 @@
+{
+  "id": "activity-broadcast-partial-fanout",
+  "description": "`activity broadcast` (hub-only — HUB_PROJECT_NAME is the literal string 'multiverse', not configurable) leaves one message in every project [activity.pairs] permits and reports a partial fan-out rather than refusing outright: a permitted leaf is marked 'sent', a leaf the hub cannot message is marked 'skipped — not permitted by [activity.pairs]', and the totals line counts both. Pure file I/O — no herdr call anywhere on this path.",
+  "projects": {
+    "multiverse": {
+      "git": true,
+      "files": { "README.md": "hub\n" }
+    },
+    "project-a": {
+      "git": true,
+      "files": { "README.md": "a\n" }
+    },
+    "project-b": {
+      "git": true,
+      "files": { "README.md": "b\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.multiverse]\npath = \"{{PROJECT:multiverse}}\"\n\n[projects.project-a]\npath = \"{{PROJECT:project-a}}\"\n\n[projects.project-b]\npath = \"{{PROJECT:project-b}}\"\n\n[activity.pairs]\nmultiverse = [\"project-a\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "multiverse",
+      "argv": ["activity", "broadcast", "hello all", "--id", "fixed-broadcast-1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sent      project-a",
+          "skipped   project-b — not permitted by [activity.pairs]",
+          "1 sent, 1 skipped."
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "project-b", "unchanged": true }
+  ]
+}

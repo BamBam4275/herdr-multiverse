@@ -1,0 +1,41 @@
+{
+  "id": "history-worktrees-reads-old-role-lane",
+  "description": "`multiverse worktrees <path>` reads `.multiverse/worktrees/` straight off disk (`worktrees.lanes`: a directory whose name validates as a task id enters lane discovery — no `git worktree` registration required, per that function's own docstring: 'a lane whose git registration was lost still shows up'). Seeded here with an OLD pre-rename dispatch role name (`fixer`) in the task id and routing.log, exactly like this repo's other `history-*` scenarios, alongside one foreign (non-task-id) entry under the same worktrees root that `_report_ignored_lane_entries` must name as 'ignored: not a lane' rather than folding into the lane listing. `--prune --dry-run` previews rather than mutates (per conformance/README.md's own worktrees guidance: predict, never run the destructive form in a scenario) and is used here specifically so the live lane's own 'kept' reasoning prints: the lane's one occupant (`lane_occupants` always includes the lane directory's own name) has no terminal status anywhere (`lane_outcome` reads both the project's and the lane's own `.multiverse/tasks/<id>/status`; neither exists here) and its dispatch's recorded pane (`routing.log`'s `event=started ... pane=w1:p1`) is still live per the scripted `agent list` reply, so `live_unsettled_occupant` refuses to treat it as safe to remove.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tproject=sandbox\trole=fixer\taccount=old-seat\tpool=old:test\toutcome=chain-primary\treason=\tbranch=multiverse/20250101-fixer-aaaaaa\n2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+        ".multiverse/worktrees/20250101-fixer-aaaaaa/brief.md": "# Task 20250101-fixer-aaaaaa\nRole: Fixer\n",
+        ".multiverse/worktrees/.DS_Store": ""
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["worktrees", "{{PROJECT:sandbox}}", "--prune", "--dry-run"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp/lane\", \"name\": \"sandbox-fixer-old-seat\", \"pane_id\": \"w1:p1\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          ".DS_Store: ignored: not a lane",
+          "<ID>  [clean]  holds nothing",
+          "<ID> has no terminal status and still has a live agent pane"
+        ]
+      }
+    }
+  ]
+}
