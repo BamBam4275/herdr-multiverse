@@ -17,7 +17,7 @@ time = { workspace = true }
 regex = { workspace = true }
 # Not a workspace dependency: only `redact` needs lookaround and a
 # conditional backreference, which the `regex` crate cannot express.
-fancy-regex = "0.13"
+fancy-regex = "0.20"
 crc32fast = { workspace = true }
 rustix = { workspace = true }
 tempfile = { workspace = true }

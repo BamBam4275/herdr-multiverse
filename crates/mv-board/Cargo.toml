@@ -18,4 +18,4 @@ mv-state = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 crc32fast = { workspace = true }
-unicode-width = "0.1"
+unicode-width = "0.2"
