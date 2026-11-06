@@ -57,7 +57,7 @@ class Sandbox:
             target.parent.mkdir(parents=True, exist_ok=True)
             os.mkfifo(target, 0o600)
         if spec.get("git"):
-            _run_git(["init", "-q"], cwd=path)
+            _run_git(["init", "-q", "-b", "main"], cwd=path)
             _run_git(["config", "user.email", "scenario@example.invalid"], cwd=path)
             _run_git(["config", "user.name", "Conformance Scenario"], cwd=path)
             _run_git(["add", "-A"], cwd=path)

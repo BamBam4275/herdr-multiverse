@@ -603,7 +603,11 @@ fn picker_alert_body(
 fn picker_message_id(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The hub activity post half of `notify.picker_alert` (`notify.py:1583-

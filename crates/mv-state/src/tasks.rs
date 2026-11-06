@@ -1702,20 +1702,28 @@ pub fn sweep_project_with_live(
     // saves: at fleet scale that is thousands of spawns for checks that
     // return false on `task.recorded` without touching git. Filter
     // sequentially; git round-trips stay rare.
-    let stale: Vec<&SweepTask> = tasks
+    let stale_indices: Vec<usize> = tasks
         .iter()
-        .filter(|task| is_reconcile_candidate(root, task, &is_working))
+        .enumerate()
+        .filter(|(_, task)| is_reconcile_candidate(root, task, &is_working))
+        .map(|(i, _)| i)
         .collect();
-    let recorded = stale.len();
+    let recorded = stale_indices.len();
 
+    // Mirrors Python's `_reconcile_and_reclaim`: `tasklog.reconcile` mutates
+    // `found`'s own Task objects in place, so the reclaim pass right below,
+    // which reads this same `tasks` list, already sees a task this pass
+    // just recorded as RECORDED rather than waiting a whole extra sweep
+    // pass to notice (card `20261106-b-6b0385`) — the same in-place update
+    // `auto_supersede` below already performs for its own writes.
     if !dry_run {
-        for task in &stale {
-            let _ = record_reconciled(
-                root,
-                &task.task_id,
-                task.file_status.expect("filtered to Some above"),
-                task.pane.as_deref(),
-            );
+        for i in stale_indices {
+            let status = tasks[i].file_status.expect("filtered to Some above");
+            if record_reconciled(root, &tasks[i].task_id, status, tasks[i].pane.as_deref()) {
+                tasks[i].recorded = true;
+                tasks[i].status = Some(status);
+                tasks[i].outcome_state = Some("reconciled".to_string());
+            }
         }
     }
     // Reuse the first pane listing and one status verdict per distinct
@@ -3644,6 +3652,36 @@ mod tests {
         let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Done);
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report.recorded, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_project_reclaims_a_task_it_just_reconciled_in_the_same_pass() {
+        // Card `20261106-b-6b0385`: Python's `_reconcile_and_reclaim` calls
+        // `reclaimable_panes` on the exact same `found` list `tasklog.
+        // reconcile` just mutated `task.state` on, so a task recorded this
+        // pass is reclaimed this same pass, not the next one.
+        // `sweep_project_with_live` used to build its candidates from the
+        // pre-record snapshot, leaving a just-recorded task's pane open for
+        // a whole extra sweep pass.
+        let root = temp_dir("sweep-reclaims-same-pass");
+        write(&root.join(".multiverse/routing.log"), UNRECORDED_LOG);
+        write(
+            &root.join(".multiverse/tasks/20250101-fixer-aaaaaa/status"),
+            "done",
+        );
+        write(
+            &root.join(".multiverse/tasks/20250101-fixer-aaaaaa/result.md"),
+            "# Result\ndone.\n",
+        );
+        let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Done);
+        let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
+        assert_eq!(report.recorded, 1);
+        assert_eq!(
+            report.reclaimed, 1,
+            "must reclaim the pane in this same pass"
+        );
+        assert_eq!(agents.closed, vec!["w1:p1".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -130,7 +130,11 @@ fn ensure_dashboard_tab(
     let created = {
         let mut hasher = Sha256::new();
         hasher.update(workspace_id.as_bytes());
-        let key = format!("{:x}", hasher.finalize());
+        let key: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let lock_path = path
             .join(".multiverse")
             .join(format!("dashboard-{key}.lock"));

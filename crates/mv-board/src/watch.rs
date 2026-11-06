@@ -44,12 +44,23 @@ pub fn should_redraw(last: Option<Fingerprint>, current: Fingerprint) -> bool {
 }
 
 /// Render `lines` as one `Paragraph` filling the frame.
-pub fn draw<B: Backend>(terminal: &mut Terminal<B>, lines: &[String]) -> io::Result<()> {
+///
+/// `ratatui` 0.30 made `Backend::Error` an associated type rather than
+/// fixing it to `io::Error` (`TestBackend`'s is `Infallible`), so this
+/// maps whatever the backend returns into an `io::Error` rather than
+/// widening every caller's return type to a generic error.
+pub fn draw<B>(terminal: &mut Terminal<B>, lines: &[String]) -> io::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let text = lines.join("\n");
-    terminal.draw(|frame| {
-        let paragraph = Paragraph::new(text);
-        frame.render_widget(paragraph, frame.area());
-    })?;
+    terminal
+        .draw(|frame| {
+            let paragraph = Paragraph::new(text);
+            frame.render_widget(paragraph, frame.area());
+        })
+        .map_err(io::Error::other)?;
     Ok(())
 }
 
@@ -81,11 +92,15 @@ fn is_quit(event: &Event) -> bool {
     classify_event(event) == WatchAction::Quit
 }
 
-fn watch_loop<B: Backend>(
+fn watch_loop<B>(
     terminal: &mut Terminal<B>,
     source: &mut impl BoardSource,
     tick: Duration,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     watch_loop_with(
         terminal,
         source,
@@ -101,13 +116,17 @@ fn watch_loop<B: Backend>(
     )
 }
 
-fn watch_loop_with<B: Backend>(
+fn watch_loop_with<B>(
     terminal: &mut Terminal<B>,
     source: &mut impl BoardSource,
     tick: Duration,
     mut read_event: impl FnMut(Duration) -> io::Result<Option<Event>>,
     mut now: impl FnMut() -> std::time::Instant,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let (lines, fingerprint) = source.poll();
     draw(terminal, &lines)?;
     let mut last_fingerprint = Some(fingerprint);

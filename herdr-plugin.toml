@@ -14,7 +14,7 @@
 #   - [[link_handlers]]: there is no Multiverse link type to handle.
 id = "multiverse"
 name = "Multiverse"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "A Herdr-native multi-agent system. Check config, list accounts, and read dispatch history — read-only."
 platforms = ["linux", "macos"]

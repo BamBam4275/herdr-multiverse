@@ -29,7 +29,7 @@ Role names on Rust **write** surfaces (config keys, `--role`, help text) use the
 
 ## Command inventory
 
-Python top-level subcommands: 27. Rust top-level subcommands: 28 (`config` is Rust-only). Nested leaves match one-for-one except `config migrate`.
+Python top-level subcommands: 27. Rust top-level subcommands: 29 (`config` and `import-python` are Rust-only). Counts exclude clap's generated `help` command. Nested leaves match one-for-one except `config migrate`.
 
 | Command | Python | Rust |
 |---|---|---|
@@ -73,6 +73,7 @@ Python top-level subcommands: 27. Rust top-level subcommands: 28 (`config` is Ru
 | `halt on` | yes | yes |
 | `halt status` | yes | yes |
 | `health` | yes | yes |
+| `import-python` | — | yes (Rust-only) |
 | `inspect` | yes | yes |
 | `new` | yes | yes |
 | `notify` | yes | yes |
@@ -865,6 +866,7 @@ Handlers already reject several of these at runtime; clap is looser than argpars
 - `dispatch --role` / `backlog add --role` / `backlog ask --role`: Python argparse still lists the retired keys (and treats `orchestrator`/`council` as undispatchable on `dispatch`). Rust write surfaces accept current worker names only; unknown and retired names exit 3.
 - `notify --priority` is a closed `{low, default, high, urgent}` choice on Python; Rust takes a string and treats `urgent` as the bypass, everything else as normal (`commands::notify`).
 - `config migrate` (`--dry-run`, `--backup`) is Rust-only. It rewrites retired role keys so an unmigrated Python `config.toml` can load.
+- `import-python` (`--from`, `--dry-run`, `--force`) is Rust-only. It copies a Python install's config and fleet state into this install's config/state directories.
 - Root `-V` / `--version` is Rust-only (clap).
 
 ## Sources

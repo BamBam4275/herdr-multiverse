@@ -3171,6 +3171,41 @@ mod tests {
     }
 
     #[test]
+    fn close_stranded_confirms_a_recorded_pane_idle_with_a_fresh_probe_before_closing() {
+        // Card `20261106-b-6b25fd`: the doc comment on `ObservedAgents`
+        // ("later probes still reach Herdr") and on `close_settled_panes`
+        // ("Close each just-recorded pane only when a *second* listing
+        // still shows it idle/done") both claim a genuine fresh Herdr
+        // round-trip immediately before the close, mirroring Python's
+        // `_close_settled_panes` re-check. `FakeAgents::probes` counts
+        // every `list`/`list_checked` call that actually reaches the
+        // scripted agent — including a second one that only repeats the
+        // first's own answer — so a regression that let `ObservedAgents`
+        // hand back its cached first snapshot a second time would drop
+        // this to 1 while still closing the pane.
+        let root = temp_dir("close-stranded-settle-probe");
+        seed_unrecorded_done(&root, "20261101-explorer-aaaaaa");
+        mv_state::log::ProjectLog::new(&root)
+            .append(
+                "2026-11-01T00:01:00+00:00\tevent=started\ttask=20261101-explorer-aaaaaa\t\
+                 pane=w1:p1",
+            )
+            .unwrap();
+        let args = matches(&["tasks", "--close-stranded", "--yes"]);
+        let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Idle);
+        list(&root, None, &args, &mut agents, None).unwrap();
+        assert_eq!(
+            agents.probes, 2,
+            "the top listing, reused once, plus one genuinely fresh re-check before the close"
+        );
+        assert!(
+            agents.panes.is_empty(),
+            "the settled pane must actually close"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn reclaimable_never_closes_a_pane_without_matching_dispatch_name() {
         let root = temp_dir("reclaim-no-name");
         write(

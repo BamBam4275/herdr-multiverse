@@ -11,11 +11,6 @@ targets = [
 [advisories]
 version = 2
 ignore = [
-    # paste is an unmaintained transitive dep of ratatui 0.29 (our pinned
-    # major); the advisory itself states no safe upgrade is available, and
-    # paste is a proc-macro with no runtime surface. Revisit on the next
-    # ratatui major bump.
-    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

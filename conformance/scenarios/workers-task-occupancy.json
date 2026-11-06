@@ -1,6 +1,6 @@
 {
   "id": "workers-task-occupancy",
-  "description": "Live workers join routing history for project/task/age and count seat/project occupancy, including idle/done sessions. Stale task directories do not occupy slots.",
+  "description": "Live workers join routing history for project/task/age. Project occupancy follows the live pane, including idle/done sessions; seat occupancy follows open_agent_counts (a recorded result frees the seat even if Herdr still lists the pane). Stale task directories do not occupy slots.",
   "dirs": {
     "codex-home": {}
   },
@@ -39,7 +39,7 @@
         "exit": 0,
         "stdout_contains": [
           "sandbox          <ID>",
-          "seats: seat-b 1",
+          "seats: seat-b 0",
           "sandbox 1 open, ceiling 3"
         ]
       }

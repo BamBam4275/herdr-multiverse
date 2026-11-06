@@ -83,7 +83,7 @@ impl Sandbox {
         }
         for project in [&sandbox.project, &sandbox.recipient] {
             let mut git = sandbox.command("git");
-            git.current_dir(project).args(["init", "-q"]);
+            git.current_dir(project).args(["init", "-q", "-b", "main"]);
             assert_code(&git.output().unwrap(), 0);
             fs::write(project.join("README.md"), "CLI integration fixture\n").unwrap();
             let mut git = sandbox.command("git");

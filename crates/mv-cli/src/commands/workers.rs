@@ -1,13 +1,16 @@
 //! `multiverse workers`: one live listing joined to project routing history.
-//! Task metadata supplies project, task, seat, role, and age; occupancy follows
-//! the live sessions, including idle/done sessions. Unreachable Herdr renders
-//! unknown counts and still exits successfully. Historical role names remain
-//! readable while current live role labels use the current vocabulary.
+//! Task metadata supplies project, task, seat, role, and age. The table follows
+//! live sessions, including idle/done panes; the seats line follows Python's
+//! `open_agent_counts` (working/blocked, plus unrecorded startup grace).
+//! Unreachable Herdr renders unknown counts and still exits successfully.
+//! Historical role names remain readable while current live role labels use
+//! the current vocabulary.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use clap::ArgMatches;
-use mv_config::load::Config;
+use mv_config::load::{Config, Project};
 use mv_config::roles::Role;
 
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
@@ -486,6 +489,110 @@ fn render_table(rows: &[WorkerRow]) -> String {
     out
 }
 
+/// Whether a Herdr `agent_status` holds a seat — Python's
+/// `_OPEN_AGENT_STATES` (`accounts.py:623-624`): only `working`/`blocked`.
+fn is_open_agent_status(status: &str) -> bool {
+    matches!(status, "working" | "blocked")
+}
+
+/// Python `accounts.open_agent_counts` (`accounts.py:686-861`), keyed by
+/// today's config account name so the seats line can look up
+/// `sorted(config.accounts)` the same way `board.workers_snapshot` does.
+///
+/// A recorded `event=result` frees the seat even if Herdr still lists the
+/// pane. An unrecorded task occupies when Herdr reports working/blocked, or
+/// for the account's startup grace after `started` (or `dispatch` when
+/// `started` has not landed yet). Idle/done past that grace do not occupy.
+fn open_seat_counts<'a>(
+    config: &'a Config,
+    history: &[(&'a Project, mv_state::tasks::SweepTask)],
+    agents: &[LiveAgent],
+) -> BTreeMap<&'a str, u32> {
+    let status_by_name: HashMap<&str, &str> = agents
+        .iter()
+        .filter(|agent| !agent.name.is_empty())
+        .map(|agent| (agent.name.as_str(), agent.status.as_str()))
+        .collect();
+    let mut project_root_status: HashMap<&str, &str> = HashMap::new();
+    for agent in agents {
+        if !agent.name.is_empty() || agent.cwd.is_empty() {
+            continue;
+        }
+        project_root_status.insert(agent.cwd.as_str(), agent.status.as_str());
+    }
+
+    let mut latest: HashMap<&str, usize> = HashMap::new();
+    for (index, (_, task)) in history.iter().enumerate() {
+        let Some(agent) = task.agent.as_deref() else {
+            continue;
+        };
+        let keep_existing = latest
+            .get(agent)
+            .copied()
+            .is_some_and(|existing| history[existing].1.dispatch_ordinal >= task.dispatch_ordinal);
+        if !keep_existing {
+            latest.insert(agent, index);
+        }
+    }
+
+    let now = mv_core::time::now_utc();
+    let mut nameless_root_claimed: HashSet<&str> = HashSet::new();
+    let mut counts = BTreeMap::<&str, u32>::new();
+    for &index in latest.values() {
+        let (project, task) = &history[index];
+        if task.recorded {
+            continue;
+        }
+        let Some(account) = super::dispatch::resolve_task_account(task, config) else {
+            continue;
+        };
+        let mut status = task
+            .agent
+            .as_deref()
+            .and_then(|name| status_by_name.get(name).copied())
+            .unwrap_or("");
+        let mut root_fallback = false;
+        let write_scope_none = Role::from_any_config_key(&task.role)
+            .ok()
+            .and_then(|role| config.roles.get(&role))
+            .is_some_and(|settings| settings.write_scope == "none");
+        if status.is_empty() && task.branch.is_empty() && write_scope_none {
+            if let Some(root) = project_path(project).and_then(Path::to_str) {
+                if let Some(fallback) = project_root_status.get(root).copied() {
+                    status = fallback;
+                    root_fallback = !fallback.is_empty();
+                }
+            }
+        }
+        let grace_secs = task
+            .account
+            .as_deref()
+            .and_then(|name| config.accounts.get(name))
+            .and_then(|account| account.startup_grace_seconds)
+            .unwrap_or(600);
+        let grace = time::Duration::seconds(grace_secs.into());
+        let started_open = match task.started_at {
+            Some(started_at) => now - started_at <= grace,
+            None => task
+                .dispatched_at
+                .is_some_and(|dispatched_at| now - dispatched_at <= grace),
+        };
+        if !is_open_agent_status(status) && !started_open {
+            continue;
+        }
+        if root_fallback {
+            let Some(root) = project_path(project).and_then(Path::to_str) else {
+                continue;
+            };
+            if !nameless_root_claimed.insert(root) {
+                continue;
+            }
+        }
+        *counts.entry(account.name.as_str()).or_default() += 1;
+    }
+    counts
+}
+
 /// Builds the full `workers` report. Takes already-fetched live agents
 /// (`None` means Herdr was unreachable or unparseable) so this stays unit
 /// testable without a subprocess; see the module docs for why a live
@@ -509,11 +616,12 @@ fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
                 .map(move |task| (project, task))
         })
         .collect();
-    let mut seat_counts = std::collections::BTreeMap::<&str, u32>::new();
-    let mut project_counts = std::collections::BTreeMap::<&str, u32>::new();
+    let mut seat_counts = BTreeMap::<&str, u32>::new();
+    let mut project_counts = BTreeMap::<&str, u32>::new();
 
     let (table, worker_count, orchestrator_count) = match agents {
         Some(agents) => {
+            seat_counts = open_seat_counts(config, &history, agents);
             let mut rows = Vec::new();
             let mut orchestrators = 0u32;
             for agent in agents {
@@ -553,7 +661,6 @@ fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
                     .max_by_key(|(_, task)| task.dispatch_ordinal);
                 if let Some((project, task)) = joined {
                     let seat = task.account.as_deref().unwrap_or(DASH);
-                    *seat_counts.entry(seat).or_default() += 1;
                     *project_counts.entry(&project.name).or_default() += 1;
                     let age = task
                         .dispatched_at
@@ -894,13 +1001,18 @@ orchestrators 0 (excluded from workers; they do not count against max_concurrent
         }];
         let text = render(&config, Some(&agents));
         assert!(text.contains(task), "{text}");
+        // Idle + unrecorded + started 2 min ago is still inside Python's
+        // 600s startup grace (`accounts.open_agent_counts`), so the seat
+        // stays occupied even though Herdr already reports idle.
         assert!(text.contains("seats: seat-b 1"), "{text}");
         assert!(text.contains("sandbox 1 open"), "{text}");
         // Python's `format_elapsed` (`tasks.py:335-349`, ported as
         // `mv_state::tasks::format_elapsed`) spells out the unit — "2 min",
         // never "2m". Found via `conformance/diff_fuzz.py` seed 50000.
         assert!(text.contains("2 min"), "{text}");
-        // A recorded result does not mean the session is closed.
+        // A recorded result does not mean the session is closed: project
+        // occupancy still follows the live pane. Seat occupancy does not —
+        // `open_agent_counts` skips RECORDED (`accounts.py:794-795`).
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
@@ -910,8 +1022,97 @@ orchestrators 0 (excluded from workers; they do not count against max_concurrent
                 format!("{stamp}\tevent=result\ttask={task}\tstatus=done\tstate=done\n").as_bytes(),
             )
             .unwrap();
-        assert!(render(&config, Some(&agents)).contains("sandbox 1 open"));
+        let after = render(&config, Some(&agents));
+        assert!(after.contains("sandbox 1 open"), "{after}");
+        assert!(after.contains("seats: seat-b 0"), "{after}");
         assert!(render(&config, Some(&[])).contains("sandbox 0 open"));
+    }
+
+    #[test]
+    fn recorded_done_task_does_not_occupy_its_seat_while_the_pane_is_still_listed() {
+        // Failing observation from `conformance/diff_fuzz.py` seed 60033:
+        // after a dispatched task finishes (`event=result` status=done),
+        // Python's seats line is 0 even when Herdr still lists the pane
+        // working. Counting every joined live session overcounted.
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.projects.get_mut("sandbox").unwrap().path =
+            mv_config::placeholder::MaybePlaceholder::parse(root.path().to_str().unwrap());
+        std::fs::create_dir(root.path().join(".multiverse")).unwrap();
+        let task = "20261105-builder-abcdef";
+        let stamp = mv_core::time::format_seconds_utc(mv_core::time::now_utc());
+        std::fs::write(
+            root.path().join(".multiverse/routing.log"),
+            format!(
+                "{stamp}\tevent=dispatch\ttask={task}\tproject=sandbox\trole=builder\taccount=seat-b\tagent=sandbox-scou-sb\n\
+                 {stamp}\tevent=started\ttask={task}\tpane=w1:p1\n\
+                 {stamp}\tevent=result\ttask={task}\tstatus=done\tstate=done\n"
+            ),
+        )
+        .unwrap();
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            status: "working".into(),
+            ..Default::default()
+        }];
+        let text = render(&config, Some(&agents));
+        assert!(text.contains(task), "{text}");
+        assert!(text.contains("seats: seat-b 0"), "{text}");
+        assert!(text.contains("sandbox 1 open"), "{text}");
+    }
+
+    #[test]
+    fn working_unrecorded_task_occupies_its_seat() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.projects.get_mut("sandbox").unwrap().path =
+            mv_config::placeholder::MaybePlaceholder::parse(root.path().to_str().unwrap());
+        std::fs::create_dir(root.path().join(".multiverse")).unwrap();
+        let task = "20261105-builder-abcdef";
+        let stamp = "2020-01-01T00:00:00Z";
+        std::fs::write(
+            root.path().join(".multiverse/routing.log"),
+            format!(
+                "{stamp}\tevent=dispatch\ttask={task}\tproject=sandbox\trole=builder\taccount=seat-b\tagent=sandbox-scou-sb\n\
+                 {stamp}\tevent=started\ttask={task}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            status: "working".into(),
+            ..Default::default()
+        }];
+        let text = render(&config, Some(&agents));
+        assert!(text.contains("seats: seat-b 1"), "{text}");
+        assert!(text.contains("sandbox 1 open"), "{text}");
+    }
+
+    #[test]
+    fn idle_unrecorded_task_past_grace_does_not_occupy_its_seat() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.projects.get_mut("sandbox").unwrap().path =
+            mv_config::placeholder::MaybePlaceholder::parse(root.path().to_str().unwrap());
+        std::fs::create_dir(root.path().join(".multiverse")).unwrap();
+        let task = "20261105-builder-abcdef";
+        let stamp = "2020-01-01T00:00:00Z";
+        std::fs::write(
+            root.path().join(".multiverse/routing.log"),
+            format!(
+                "{stamp}\tevent=dispatch\ttask={task}\tproject=sandbox\trole=builder\taccount=seat-b\tagent=sandbox-scou-sb\n\
+                 {stamp}\tevent=started\ttask={task}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            status: "idle".into(),
+            ..Default::default()
+        }];
+        let text = render(&config, Some(&agents));
+        assert!(text.contains("seats: seat-b 0"), "{text}");
+        assert!(text.contains("sandbox 1 open"), "{text}");
     }
 
     #[test]

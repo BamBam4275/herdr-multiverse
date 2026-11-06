@@ -39,7 +39,7 @@ What is on this tree today:
 - Seven crates (`mv-core`, `mv-config`, `mv-herdr`, `mv-state`,
   `mv-engine`, `mv-board`, `mv-cli`) and a `multiverse` binary, all with
   real implementations — none of the seven is a module-list stub.
-- Clap parsing for 28 subcommands, exit codes 0/1/2/3, and `--yes`
+- Clap parsing for 29 top-level subcommands, exit codes 0/1/2/3, and `--yes`
   authorization on `dispatch` / `council`.
 - 1978 crate unit/integration tests passing
   (`cargo test --workspace --all-features --locked`; counted as the

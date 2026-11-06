@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -21,27 +21,27 @@ keywords = ["herdr-plugin", "cli", "agent-orchestration", "git-worktree", "multi
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-mv-core = { path = "crates/mv-core", version = "0.1.0" }
-mv-config = { path = "crates/mv-config", version = "0.1.0" }
-mv-herdr = { path = "crates/mv-herdr", version = "0.1.0" }
-mv-state = { path = "crates/mv-state", version = "0.1.0" }
-mv-engine = { path = "crates/mv-engine", version = "0.1.0" }
-mv-board = { path = "crates/mv-board", version = "0.1.0" }
+mv-core = { path = "crates/mv-core", version = "0.1.1" }
+mv-config = { path = "crates/mv-config", version = "0.1.1" }
+mv-herdr = { path = "crates/mv-herdr", version = "0.1.1" }
+mv-state = { path = "crates/mv-state", version = "0.1.1" }
+mv-engine = { path = "crates/mv-engine", version = "0.1.1" }
+mv-board = { path = "crates/mv-board", version = "0.1.1" }
 
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-toml_edit = "0.22"
-thiserror = "1.0"
+toml = "1.1"
+toml_edit = "0.25"
+thiserror = "2.0"
 anyhow = "1.0"
-ratatui = "0.29"
-crossterm = "0.28"
-rustix = { version = "0.38", features = ["fs"] }
+ratatui = "0.30"
+crossterm = "0.29"
+rustix = { version = "1.1", features = ["fs"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 crc32fast = "1.4"
 regex = "1.10"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3.10"
 libc = "0.2"
 dirs = "4.0"

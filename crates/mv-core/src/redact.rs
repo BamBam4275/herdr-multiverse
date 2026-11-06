@@ -106,7 +106,7 @@ fn is_credential_key(key: &str) -> bool {
     }
     let normalized = camel_boundary_re().replace_all(&delimited, "_");
     camel_credential_suffix_re()
-        .is_match(&normalized)
+        .is_match(normalized.as_ref())
         .unwrap_or(false)
 }
 
@@ -124,22 +124,24 @@ pub fn redact_text(text: &str) -> String {
         return String::new();
     }
 
-    let text = pem_re().replace_all(text, |caps: &Captures| {
+    let text = pem_re().replace_all(text, |caps: &Captures<str>| {
         format!("{}\n{REDACTED_MARKER}\n{}", &caps["begin"], &caps["end"])
     });
 
-    let text = prefix_re().replace_all(&text, |caps: &Captures| {
+    let text = prefix_re().replace_all(&text, |caps: &Captures<str>| {
         format!("{}{REDACTED_MARKER}", &caps["prefix"])
     });
 
-    let text = aws_re().replace_all(&text, |caps: &Captures| {
+    let text = aws_re().replace_all(&text, |caps: &Captures<str>| {
         let whole = caps.get(0).expect("match always has group 0").as_str();
         format!("{}{REDACTED_MARKER}", &whole[..4])
     });
 
-    let text = bearer_re().replace_all(&text, |_: &Captures| format!("Bearer {REDACTED_MARKER}"));
+    let text = bearer_re().replace_all(&text, |_: &Captures<str>| {
+        format!("Bearer {REDACTED_MARKER}")
+    });
 
-    let text = assignment_re().replace_all(&text, |caps: &Captures| {
+    let text = assignment_re().replace_all(&text, |caps: &Captures<str>| {
         let whole = caps.get(0).expect("match always has group 0").as_str();
         let key = caps
             .get(2)

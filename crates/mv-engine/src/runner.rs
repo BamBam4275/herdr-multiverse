@@ -641,30 +641,141 @@ fn equalize(herdr: &mut impl Herdr, pane: &str) {
     }
 }
 
+/// Panes sharing `anchor`'s row, sorted left to right — Python's
+/// `_row_panes` (`runner.py:803-825`). Exact `y` equality, not the
+/// tolerance-based grouping `equalize` above uses for columns: Python reads
+/// the same rects a fresh `pane layout` or resize reply reports, with no
+/// slack of its own. `None` when `anchor` is not in `layout` at all,
+/// mirroring Python's own `anchor_pane not in rects` case.
+fn row_panes(layout: &[Rectangle], anchor: &str) -> Option<Vec<Rectangle>> {
+    let anchor_y = layout.iter().find(|r| r.pane == anchor)?.y;
+    let mut row: Vec<Rectangle> = layout
+        .iter()
+        .filter(|r| r.y == anchor_y)
+        .map(|r| Rectangle {
+            pane: r.pane.clone(),
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        })
+        .collect();
+    row.sort_by(|a, b| a.x.total_cmp(&b.x));
+    Some(row)
+}
+
+/// Evens out the widths of every pane sharing `anchor`'s row — Python's
+/// `equalize_row` (`runner.py:829-920`). Best-effort, same posture as
+/// `equalize` above: a bad reply, a row of one, or herdr itself missing is
+/// a silent no-op, never a reason to fail the dispatch this tidies up
+/// after. Never touches a pane outside `anchor`'s own row.
+///
+/// One `pane layout` read seeds the row; every pass after that reads the
+/// row straight back off each resize's own reply, never re-polling
+/// layout, same as Python. Each pass walks the row left to right one
+/// boundary at a time: the first resize on a boundary uses the whole
+/// row's width as its distance estimate (a deliberate undershoot per
+/// Python's own comment, since a boundary's containing split is narrower
+/// than the full row for every pane but the first), and each resize after
+/// that recalibrates from how far the previous one actually moved the
+/// divider. Stops once every width is within 1 column of an equal share,
+/// a resize comes back `changed: false`, or 10 passes have run.
+fn equalize_row(herdr: &mut impl Herdr, anchor: &str) {
+    let Ok(result) = checked(herdr, argv::pane_layout(anchor), COMMAND_TIMEOUT) else {
+        return;
+    };
+    let Some(layout) = rectangles(&result) else {
+        return;
+    };
+    let Some(mut row) = row_panes(&layout, anchor) else {
+        return;
+    };
+    if row.len() < 2 {
+        return;
+    }
+
+    for _ in 0..10 {
+        let count = row.len();
+        let left_edge = row[0].x;
+        let last = &row[count - 1];
+        let total_width = last.x + last.width - left_edge;
+        let target_share = total_width / count as f64;
+        if row.iter().all(|p| (p.width - target_share).abs() <= 1.0) {
+            return;
+        }
+
+        for i in 0..count - 1 {
+            let target_boundary = (left_edge + (i + 1) as f64 * total_width / count as f64).round();
+            let mut span = total_width;
+            for _ in 0..4 {
+                let delta = target_boundary - row[i + 1].x;
+                if delta.abs() <= 1.0 {
+                    break;
+                }
+                // `--amount` must be positive: `direction` alone says which
+                // way the divider goes. Move it with the pane on the side
+                // it travels toward, whose own edge it is.
+                let (pane, direction) = if delta > 0.0 {
+                    (row[i].pane.clone(), "right")
+                } else {
+                    (row[i + 1].pane.clone(), "left")
+                };
+                let amount = (delta.abs() / span).min(0.5);
+                let before = row[i + 1].x;
+                let Ok(resized) = checked(
+                    herdr,
+                    argv::pane_resize(&pane, direction, amount),
+                    COMMAND_TIMEOUT,
+                ) else {
+                    break;
+                };
+                let Some(resize) = resized.payload.as_ref().map(|p| &p["result"]["resize"]) else {
+                    break;
+                };
+                if resize["changed"].as_bool() == Some(false) {
+                    break;
+                }
+                let synthetic = CommandResult {
+                    payload: Some(serde_json::json!({"result": {"layout": resize["layout"]}})),
+                    ..resized.clone()
+                };
+                let Some(new_layout) = rectangles(&synthetic) else {
+                    break;
+                };
+                let Some(new_row) = row_panes(&new_layout, anchor) else {
+                    break;
+                };
+                if new_row.len() != count {
+                    break;
+                }
+                row = new_row;
+                let moved = (row[i + 1].x - before).abs();
+                if moved == 0.0 {
+                    break;
+                }
+                span = moved / amount;
+            }
+        }
+    }
+}
+
 /// Close `pane`, then best-effort tidy whatever row it leaves behind —
 /// Python's `DispatchRunner.teardown` + `equalize_row` (`runner.py:3208-3225`,
 /// `:829-920`), called once a `--wait` dispatch or council turn settles with
 /// a usable `done` result (`self.close_pane_when_done and live.status is
 /// TaskStatus.DONE`). `anchor` is the caller's own long-lived pane
 /// (`HERDR_PANE_ID`); an empty anchor skips the tidy read, the same way
-/// Python's own `if ":" in mine` guard does.
-///
-/// Only the read-and-bail half of `equalize_row` is ported: a closed pane
-/// that leaves its row genuinely uneven also gets resized toward an equal
-/// share in Python, via a multi-pass boundary search (`runner.py:867-920`).
-/// No seed this was fixed against ever reaches that path — every row here
-/// either drops to one surviving pane or is already within tolerance — so
-/// the resize loop is left unported rather than guessed at (card
-/// `20261106-b-724e9c` tracks the gap). Best-effort throughout, same as the
-/// vertical `equalize` above: a bad reply, a missing `--pane` match, or
-/// herdr being unreachable is a silent no-op, never a reason to fail the
-/// dispatch this tidies up after.
+/// Python's own `if ":" in mine` guard does. The closed pane's own row can
+/// no longer be read by its id once it is gone (`pane layout` takes
+/// `--pane`, and there is no `--tab`), so this equalizes from the
+/// orchestrator's own long-lived pane instead — the same anchor
+/// `_where_to_split` already trusts for the same reason.
 pub fn teardown(herdr: &mut impl Herdr, pane: &str, anchor: &str) {
     let _ = checked(herdr, argv::pane_close(pane), COMMAND_TIMEOUT);
     if anchor.is_empty() {
         return;
     }
-    let _ = checked(herdr, argv::pane_layout(anchor), COMMAND_TIMEOUT);
+    equalize_row(herdr, anchor);
 }
 
 /// Python's `_DIALOG_MENU_MARKERS`, verbatim: the fixed vocabulary an open
@@ -4017,6 +4128,187 @@ mod tests {
             placement("caller", &layout),
             (Some("right".into()), "down"),
             "a right-hand column already exists and must be reused, not grown rightward again"
+        );
+    }
+
+    // --- teardown's equalize_row (card 20261106-b-724e9c) -----------------
+
+    /// A minimal in-process [`Herdr`] for [`teardown`]'s row-equalize path
+    /// alone: `row` is the surviving row `anchor` sits in — by the time
+    /// `teardown` reads it, the just-closed pane is already gone from
+    /// Herdr's own layout, so these fixtures start from the row as it
+    /// looks post-close, never modelling the close itself removing an
+    /// entry. `other` sits on a different row entirely, to prove a resize
+    /// never reaches outside `anchor`'s own row. `pane resize` rescales
+    /// the "remainder" (every row pane right of the one being grown or
+    /// shrunk) in proportion to its members' own widths — the nested,
+    /// rightward-split topology `equalize_row`'s own doc comment assumes
+    /// every dispatch-built row has.
+    struct RowFake {
+        row: Vec<(String, f64)>,
+        other: (String, f64),
+        closed: Vec<String>,
+        resizes: Vec<(String, String, f64)>,
+    }
+
+    impl RowFake {
+        fn layout(&self) -> Value {
+            let mut x = 0.0;
+            let mut panes = Vec::new();
+            for (pane, width) in &self.row {
+                panes.push(json!({
+                    "pane_id": pane,
+                    "rect": {"x": x, "y": 0.0, "width": width, "height": 50.0},
+                }));
+                x += width;
+            }
+            panes.push(json!({
+                "pane_id": self.other.0,
+                "rect": {"x": 0.0, "y": 100.0, "width": self.other.1, "height": 50.0},
+            }));
+            json!({"panes": panes})
+        }
+
+        fn resize(&mut self, pane: &str, direction: &str, amount: f64) -> bool {
+            let Some(idx) = self.row.iter().position(|(p, _)| p == pane) else {
+                return false;
+            };
+            let i = match (direction, idx.checked_sub(1)) {
+                ("right", _) => idx,
+                ("left", Some(i)) => i,
+                _ => return false,
+            };
+            if i + 1 >= self.row.len() {
+                return false;
+            }
+            let remainder_before: f64 = self.row[i + 1..].iter().map(|(_, w)| *w).sum();
+            let span = self.row[i].1 + remainder_before;
+            let delta = amount * span;
+            let signed = if direction == "right" { delta } else { -delta };
+            let remainder_after = remainder_before - signed;
+            if remainder_after <= 0.0 || self.row[i].1 + signed <= 0.0 {
+                return false;
+            }
+            let scale = remainder_after / remainder_before;
+            self.row[i].1 += signed;
+            for (_, w) in self.row[i + 1..].iter_mut() {
+                *w *= scale;
+            }
+            true
+        }
+    }
+
+    impl Herdr for RowFake {
+        fn call(
+            &mut self,
+            command: &HerdrCommand,
+            _timeout: Duration,
+        ) -> Result<CommandResult, RunnerError> {
+            let ok = |payload: Option<Value>| CommandResult {
+                argv: command.argv.clone(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                payload,
+                protocol_error: None,
+            };
+            let flag = |name: &str| -> String {
+                command
+                    .argv
+                    .iter()
+                    .position(|a| a == name)
+                    .and_then(|i| command.argv.get(i + 1))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            match (command.argv[1].as_str(), command.argv[2].as_str()) {
+                ("pane", "close") => {
+                    self.closed.push(command.argv[3].clone());
+                    Ok(ok(None))
+                }
+                ("pane", "layout") => Ok(ok(Some(json!({"result": {"layout": self.layout()}})))),
+                ("pane", "resize") => {
+                    let pane = flag("--pane");
+                    let direction = flag("--direction");
+                    let amount: f64 = flag("--amount").parse().unwrap_or(0.0);
+                    self.resizes.push((pane.clone(), direction.clone(), amount));
+                    let changed = self.resize(&pane, &direction, amount);
+                    Ok(ok(Some(json!({"result": {"resize": {
+                        "changed": changed,
+                        "layout": self.layout(),
+                    }}}))))
+                }
+                _ => panic!("unexpected herdr call in RowFake: {:?}", command.argv),
+            }
+        }
+    }
+
+    /// A row already within `equalize_row`'s own 1-column tolerance must
+    /// come back untouched: the closed pane's row gets exactly one
+    /// `pane layout` read and no `pane resize` at all.
+    #[test]
+    fn teardown_leaves_an_already_even_row_unresized() {
+        let mut fake = RowFake {
+            row: vec![
+                ("left".into(), 100.0),
+                ("mid".into(), 100.0),
+                ("right".into(), 100.0),
+            ],
+            other: ("elsewhere".into(), 80.0),
+            closed: Vec::new(),
+            resizes: Vec::new(),
+        };
+        teardown(&mut fake, "closed-pane", "left");
+        assert_eq!(fake.closed, vec!["closed-pane".to_string()]);
+        assert!(
+            fake.resizes.is_empty(),
+            "a row already within tolerance must not be resized: {:?}",
+            fake.resizes
+        );
+    }
+
+    /// A three-pane row left uneven by a close converges toward an equal
+    /// share, and a pane sharing no row with the anchor is never touched —
+    /// the gap `teardown`'s own doc comment used to name (card
+    /// `20261106-b-724e9c`).
+    #[test]
+    fn teardown_equalizes_an_uneven_three_pane_row() {
+        let mut fake = RowFake {
+            row: vec![
+                ("left".into(), 60.0),
+                ("mid".into(), 100.0),
+                ("right".into(), 140.0),
+            ],
+            other: ("elsewhere".into(), 777.0),
+            closed: Vec::new(),
+            resizes: Vec::new(),
+        };
+        teardown(&mut fake, "closed-pane", "left");
+        assert_eq!(fake.closed, vec!["closed-pane".to_string()]);
+        assert!(
+            !fake.resizes.is_empty(),
+            "an uneven row must be resized toward an equal share"
+        );
+        assert!(
+            fake.resizes.iter().all(|(pane, _, _)| pane != "elsewhere"),
+            "never resize a pane outside the closed pane's own row: {:?}",
+            fake.resizes
+        );
+        assert_eq!(
+            fake.other.1, 777.0,
+            "a pane on another row must be untouched"
+        );
+        let widths: Vec<f64> = fake.row.iter().map(|(_, w)| *w).collect();
+        let total: f64 = widths.iter().sum();
+        assert!(
+            (total - 300.0).abs() <= 1e-6,
+            "resizing must not change the row's total width: {widths:?}"
+        );
+        let min = widths.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = widths.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            max - min <= 2.0,
+            "every pane in the row should end up within an equal share: {widths:?}"
         );
     }
 

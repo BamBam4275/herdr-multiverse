@@ -55,7 +55,11 @@ fn lock_path(path: &Path) -> PathBuf {
 pub fn fingerprint(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn load_claim_map(path: &Path) -> BTreeMap<String, String> {

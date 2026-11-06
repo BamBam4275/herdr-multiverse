@@ -33,7 +33,9 @@ fn action_line(outcome: &PruneOutcome) -> String {
         PruneOutcome::Kept { reason, .. } => format!("kept — {reason}"),
         PruneOutcome::WouldRemove { .. } => "would remove".to_string(),
         PruneOutcome::WouldArchive { .. } => "would archive".to_string(),
-        PruneOutcome::Removed { .. } => "removed".to_string(),
+        // Matches Python's own real-run wording (`cli.py`'s
+        // `print("    removed (held nothing)", file=out)`).
+        PruneOutcome::Removed { .. } => "removed (held nothing)".to_string(),
         PruneOutcome::Archived { tip, .. } => format!("archived at {tip}"),
     }
 }
@@ -65,6 +67,7 @@ pub fn run(args: &ArgMatches) -> Result<(), Failure> {
 fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     let force = args.get_flag("force");
     let dry_run = args.get_flag("dry-run");
+    let confirm_ignored = force || args.get_flag("yes");
 
     for ignored in worktrees.ignored_entries().map_err(fail)? {
         println!("  {}: ignored: not a lane", ignored.display());
@@ -76,12 +79,17 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     let found = worktrees.lanes().map_err(fail)?;
     let summaries: HashMap<String, String> = found
         .iter()
-        .map(|lane| (lane.task.clone(), worktrees.lane_summary(lane)))
+        .map(|lane| {
+            (
+                lane.task.clone(),
+                worktrees.lane_summary(lane, confirm_ignored),
+            )
+        })
         .collect();
 
     let mut observer = HerdrLaneObserver::new(worktrees.project());
     let outcomes = worktrees
-        .prune_with_ignored(&mut observer, force, dry_run, force || args.get_flag("yes"))
+        .prune_with_ignored(&mut observer, force, dry_run, confirm_ignored)
         .map_err(fail)?;
     if outcomes.is_empty() {
         // Matches Python's `cmd_worktrees`: not a return — the orphan
@@ -96,6 +104,18 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
         let task = outcome_task(outcome);
         if let Some(summary) = summaries.get(task) {
             println!("  {task}  {summary}");
+        }
+        // Matches Python's own `rescue(lane)` report: one line per artifact
+        // actually copied, printed right after the lane's summary line and
+        // before whatever `--prune` decided to do with the lane itself.
+        if let PruneOutcome::Removed { rescued, .. } | PruneOutcome::Archived { rescued, .. } =
+            outcome
+        {
+            for path in rescued {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let parent = path.parent().unwrap_or(path).display();
+                println!("    rescued {name} -> {parent}");
+            }
         }
         println!("    {}", action_line(outcome));
         match outcome {

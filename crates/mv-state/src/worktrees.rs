@@ -583,11 +583,13 @@ pub enum PruneOutcome {
         task: String,
         branch_refusal: Option<String>,
         retained_state: Option<PathBuf>,
+        rescued: Vec<PathBuf>,
     },
     Archived {
         task: String,
         tip: String,
         retained_state: Option<PathBuf>,
+        rescued: Vec<PathBuf>,
     },
 }
 
@@ -1290,16 +1292,19 @@ impl Worktrees {
         let _lock = lock(&self.project)?;
         let lane = self.lane(task, false)?;
         self.registered(&lane)?;
-        self.rescue_state(&lane.path.join(".multiverse"))
+        self.rescue_state(&lane.path.join(".multiverse"))?;
+        Ok(())
     }
 
-    fn rescue_state(&self, state: &Path) -> Result<()> {
+    /// Returns every artifact path actually copied — see
+    /// `copy_without_overwrite`, whose result this passes through unchanged.
+    fn rescue_state(&self, state: &Path) -> Result<Vec<PathBuf>> {
         match fs::symlink_metadata(state) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
                 copy_without_overwrite(state, &self.project.join(".multiverse"))
             }
             Ok(_) => Err(WorktreeError::Refused("unsafe lane state".into())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
     }
@@ -1378,13 +1383,22 @@ impl Worktrees {
                 observer.check(&lane, force)?;
                 self.terminal_statuses(&lane, force, false)?;
                 observer.record_prune(&lane)?;
-                self.rescue_state(&lane.path.join(".multiverse"))?;
+                // Rescue *before* removing, never after — see `remove_lane`'s
+                // own doc comment. This is the one call whose copied-path
+                // list a caller can report; `remove_lane`'s own internal
+                // `rescue_state` (on the already-quarantined copy) exists
+                // only to catch a late write in the swap race, and is never
+                // itself surfaced as "rescued" — Python's own CLI reports
+                // only its single `rescue()` call the same way.
+                let mut rescued = self.rescue_state(&lane.path.join(".multiverse"))?;
+                rescued.sort();
                 let retained_state = self.remove_lane(&lane, archiving, allow_ignored)?;
                 outcomes.push(if archiving {
                     PruneOutcome::Archived {
                         tip: self.archive_locked(&lane.task)?,
                         task: lane.task,
                         retained_state,
+                        rescued,
                     }
                 } else {
                     let branch_refusal = if has_terminal_outcome(&self.project, &lane.task) {
@@ -1396,6 +1410,7 @@ impl Worktrees {
                         task: lane.task,
                         branch_refusal,
                         retained_state,
+                        rescued,
                     }
                 });
             }
@@ -1919,32 +1934,120 @@ impl Worktrees {
         Ok(ignored)
     }
 
-    /// A one-line "[clean|dirty]  holds ..." label for a lane's own git
-    /// status and whatever it currently has sitting in its own
-    /// `.multiverse/`. Purely descriptive — unlike `clean()`/
-    /// `terminal_statuses()` this never gates prune, so a git failure (the
-    /// lane directory isn't a real registered worktree, say) degrades to
-    /// "clean" rather than aborting the caller's listing.
-    pub fn lane_summary(&self, lane: &Lane) -> String {
-        let dirty = git(
-            &lane.path,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-            None,
-        )
-        .map(|out| !out.trim().is_empty())
-        .unwrap_or(false);
-        let holds = match fs::read_dir(lane.path.join(".multiverse")) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    "holds state"
-                } else {
-                    "holds nothing"
+    /// A one-line "\[state\]  holds ..." label built from this lane's own git
+    /// status, its non-disposable ignored files, and whatever artifacts
+    /// under its `.multiverse/` the project does not already hold a copy
+    /// of — Python's own per-lane summary line in `cmd_worktrees`
+    /// (`cli.py:4388-4403`), built from `uncommitted_changes`,
+    /// `ignored_changes`, `unrescued_artifacts`, and `prunable`
+    /// (`worktrees.py:2073-3576`). `allow_ignored` is the same confirmation
+    /// `prune_with_ignored`'s own caller passes through (`--force`/`--yes`).
+    /// Purely descriptive — unlike `clean()`/`terminal_statuses()` this
+    /// never gates prune, so a git failure (the lane directory isn't a real
+    /// registered worktree, say, or its branch was never actually created —
+    /// `Lane.branch` is always the canonical `multiverse/<task>` name here,
+    /// unlike Python's own per-lane `symbolic-ref` read) degrades toward
+    /// "clean"/"holds nothing" rather than aborting the caller's listing.
+    pub fn lane_summary(&self, lane: &Lane, allow_ignored: bool) -> String {
+        let dirty = uncommitted_changes(&lane.path).unwrap_or_default();
+        let mut state = if dirty.is_empty() {
+            "clean".to_string()
+        } else {
+            format!("{} uncommitted", dirty.lines().count())
+        };
+        let ignored = lane_ignored_files(&lane.path);
+        if !ignored.is_empty() {
+            state += &format!(", {} ignored file(s)", ignored.len());
+        }
+        let pending = lane_pending_artifacts(&self.project, lane);
+        if pending > 0 {
+            state += &format!(", {pending} artifact(s) only here");
+        }
+        let merged = self
+            .tip(&lane.task)
+            .and_then(|tip| ancestor(&self.project, &tip))
+            .unwrap_or(true);
+        let holds = if merged
+            && dirty.is_empty()
+            && (allow_ignored || ignored.is_empty())
+            && pending == 0
+            && multiverse_commit_refusal(&self.project, &lane.task).is_none()
+        {
+            "nothing"
+        } else {
+            "work"
+        };
+        format!("[{state}]  holds {holds}")
+    }
+}
+
+/// Ignored paths in `lane_path` that are not known regenerable scaffolding
+/// — Python's `ignored_changes` (`worktrees.py:2137-2149`), narrowed to
+/// this module's own notion of safe-to-discard ([`disposable_ignored`])
+/// rather than porting `_ignored_path_is_safe`'s own-`.gitignore` probe.
+/// A git failure degrades to "no ignored files" rather than propagating,
+/// matching [`Worktrees::lane_summary`]'s own never-gate posture.
+fn lane_ignored_files(lane_path: &Path) -> Vec<String> {
+    git(
+        lane_path,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+        None,
+    )
+    .map(|out| {
+        out.split('\0')
+            .filter(|path| !path.is_empty() && !disposable_ignored(path))
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// How many files under `lane`'s `.multiverse/` the project's own
+/// `.multiverse/` does not already hold an identical copy of — Python's
+/// `unrescued_artifacts` (`worktrees.py:2898-2945`), minus its
+/// `_committed_and_clean` exemption for a tracked `roster.toml`: this
+/// module has no equivalent tracked-and-clean lookup at this call site, so
+/// a committed, byte-identical roster would be double-counted here if its
+/// lane copy ever diverged from the project's. Walks the same exclusions
+/// as [`copy_without_overwrite`]/`check_copy` ([`is_rescue_excluded`]), at
+/// every depth, so a conflict this flags is the same one `--prune` itself
+/// would refuse on.
+fn lane_pending_artifacts(project: &Path, lane: &Lane) -> usize {
+    fn count(source: &Path, destination: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(source) else {
+            return 0;
+        };
+        let mut pending = 0;
+        for entry in entries.flatten() {
+            if is_rescue_excluded(&entry.file_name()) {
+                continue;
+            }
+            let src = entry.path();
+            let dst = destination.join(entry.file_name());
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending += count(&src, &dst);
+            } else if file_type.is_file() {
+                let identical = fs::read(&src)
+                    .ok()
+                    .zip(fs::read(&dst).ok())
+                    .is_some_and(|(a, b)| a == b);
+                if !identical {
+                    pending += 1;
                 }
             }
-            Err(_) => "holds nothing",
-        };
-        format!("[{}]  {holds}", if dirty { "dirty" } else { "clean" })
+        }
+        pending
     }
+    count(&lane.path.join(".multiverse"), &project.join(".multiverse"))
 }
 
 /// Every task considered to occupy `lane`: the lane directory's own name
@@ -2444,9 +2547,15 @@ fn check_copy(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<()> {
+/// Returns every destination path actually written — mirrors Python's
+/// `rescue`'s own `copied` list, which only names a freshly-created file,
+/// never one already present with identical bytes (`rescue_plan`'s
+/// `to_copy`/conflict split). Directories are never themselves reported,
+/// matching `lane_artifacts`'s file-only `rglob`.
+fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
     check_copy(source, destination)?;
     private_dir(destination)?;
+    let mut copied = Vec::new();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         if is_rescue_excluded(&entry.file_name()) {
@@ -2455,7 +2564,7 @@ fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<()> {
         let src = entry.path();
         let dst = destination.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_without_overwrite(&src, &dst)?;
+            copied.extend(copy_without_overwrite(&src, &dst)?);
         } else {
             let mut input = File::open(&src)?;
             match OpenOptions::new()
@@ -2474,6 +2583,7 @@ fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<()> {
                             .set_modified(meta.modified()?),
                     )?;
                     output.sync_all()?;
+                    copied.push(dst);
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     if fs::read(&src)? != fs::read(&dst)? {
@@ -2485,7 +2595,7 @@ fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     fsync_dir(destination)?;
-    Ok(())
+    Ok(copied)
 }
 
 /// Process inspection fails closed on an unavailable probe. Individual gone
@@ -2493,6 +2603,15 @@ fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<()> {
 fn has_process_cwd(lane: &Path) -> Result<bool> {
     #[cfg(target_os = "linux")]
     {
+        // Our own effective uid: `/proc/<pid>/cwd` is only readable for a
+        // process owned by the reader (or root), so a shared host's own
+        // system daemons — sshd, cron, the container runtime, all root —
+        // deny it unconditionally, every time, not as a race. That denial
+        // is not "unknown"; a process we do not own could never be the one
+        // whose cwd this check is guarding against, so it is skipped like
+        // one already gone. A same-uid process still denies this rarely
+        // enough that it stays the one case this still fails closed on.
+        let own_uid = fs::metadata("/proc/self")?.uid();
         for entry in fs::read_dir("/proc")? {
             let entry = entry?;
             if !entry
@@ -2502,6 +2621,12 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
                 .all(|b| b.is_ascii_digit())
             {
                 continue;
+            }
+            match fs::metadata(entry.path()) {
+                Ok(meta) if meta.uid() != own_uid => continue,
+                Ok(_) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
             }
             match fs::read_link(entry.path().join("cwd")) {
                 Ok(path) if path.starts_with(lane) => return Ok(true),
@@ -4024,5 +4149,92 @@ pub(crate) mod tests {
     #[test]
     fn occupant_refusal_passes_a_settled_occupant_with_no_live_pane() {
         assert_eq!(occupant_refusal("t1", true, None, false, false), None);
+    }
+
+    #[test]
+    fn lane_summary_reports_clean_merged_lane_as_holding_nothing() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("clean", "HEAD").unwrap();
+        assert_eq!(store.lane_summary(&lane, false), "[clean]  holds nothing");
+    }
+
+    #[test]
+    fn lane_summary_counts_uncommitted_lines_and_holds_work() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("dirty", "HEAD").unwrap();
+        fs::write(lane.path.join("one.txt"), "one").unwrap();
+        fs::write(lane.path.join("two.txt"), "two").unwrap();
+        assert_eq!(
+            store.lane_summary(&lane, false),
+            "[2 uncommitted]  holds work"
+        );
+    }
+
+    #[test]
+    fn lane_summary_lists_non_disposable_ignored_files_and_holds_work() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("ignored", "HEAD").unwrap();
+        // `TempRepo::new` commits a top-level `.gitignore` with an `ignored/`
+        // rule; a file under it is ignored but not one of `disposable_ignored`'s
+        // known-regenerable prefixes.
+        fs::create_dir_all(lane.path.join("ignored")).unwrap();
+        fs::write(lane.path.join("ignored/secret"), "x").unwrap();
+        assert_eq!(
+            store.lane_summary(&lane, false),
+            "[clean, 1 ignored file(s)]  holds work"
+        );
+        assert_eq!(
+            store.lane_summary(&lane, true),
+            "[clean, 1 ignored file(s)]  holds nothing"
+        );
+    }
+
+    #[test]
+    fn lane_summary_counts_artifacts_the_project_does_not_already_hold() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("artifacts", "HEAD").unwrap();
+        let task = lane.path.join(".multiverse/tasks/artifacts");
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("brief.md"), "brief").unwrap();
+        fs::write(task.join("result.md"), "result").unwrap();
+        fs::write(task.join("status"), "done").unwrap();
+        assert_eq!(
+            store.lane_summary(&lane, false),
+            "[clean, 3 artifact(s) only here]  holds work"
+        );
+        let rescued = repo.0.join(".multiverse/tasks/artifacts");
+        fs::create_dir_all(&rescued).unwrap();
+        fs::write(rescued.join("brief.md"), "brief").unwrap();
+        fs::write(rescued.join("result.md"), "result").unwrap();
+        fs::write(rescued.join("status"), "done").unwrap();
+        assert_eq!(store.lane_summary(&lane, false), "[clean]  holds nothing");
+    }
+
+    #[test]
+    fn lane_summary_holds_work_for_an_unmerged_commit_even_when_git_clean() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("unmerged", "HEAD").unwrap();
+        fs::write(lane.path.join("new.txt"), "new").unwrap();
+        git(&lane.path, &["add", "new.txt"], None).unwrap();
+        git(&lane.path, &["commit", "-m", "lane work"], None).unwrap();
+        assert_eq!(store.lane_summary(&lane, false), "[clean]  holds work");
+    }
+
+    #[test]
+    fn lane_summary_degrades_to_holds_nothing_when_the_lane_branch_was_never_created() {
+        // A plain directory presented as a lane (`worktrees-prune-live-lane-
+        // and-non-lane-entry` in conformance/scenarios/): `Lane.branch` is
+        // always the canonical `multiverse/<task>` name here, so `tip()`
+        // fails outright rather than resolving to some other real branch.
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.lane("never-registered", true).unwrap();
+        fs::create_dir_all(&lane.path).unwrap();
+        assert_eq!(store.lane_summary(&lane, false), "[clean]  holds nothing");
     }
 }

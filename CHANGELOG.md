@@ -9,8 +9,22 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-06
+
+### Added
+
+- Release: `scripts/release/sync-public.sh` synchronizes public releases
+  without rewriting history.
+
 ### Changed
 
+- Dependencies: update `toml` to 1.1, `toml_edit` to 0.25, `thiserror` to 2,
+  `ratatui` to 0.30, `crossterm` to 0.29, `rustix` to 1.1, `sha2` to 0.11,
+  `fancy-regex` to 0.20, and `unicode-width` to 0.2.
+- CI: use `macos-15` for arm64 release builds and initialize conformance
+  and test fixture repositories with `git init -b main`.
+- Dependabot: group Cargo minor and patch updates separately from major
+  updates.
 - Docs: the public install command is `herdr plugin install
   BamBam4275/herdr-multiverse --ref vX.Y.Z --yes` in README,
   `docs/install.md`, and `docs/migrating-from-python.md`; the
@@ -31,6 +45,16 @@ changes.
 
 ### Fixed
 
+- Worktrees: skip other users' processes when checking `/proc` working
+  directories on Linux, retaining fail-closed behavior for unreadable
+  processes owned by the current user.
+- Sweep: reclaim a task's pane in the same pass that reconciles the task.
+- Workers: match Python's seat occupancy counts.
+- Worktrees: report each rescued artifact during `--prune --yes` and
+  include the rich per-lane summary labels.
+- Board: correct padding for agent short codes.
+- Dispatch: equalize the remaining panes' row sizes during teardown.
+- Runner: guard the bare-Enter nudge against ghost echoes of short prompts.
 - CLI: cwd-scoped backlog commands explain surplus project/title or
   project/item arguments in the handler with exit 1, matching Python.
 - CLI: task listings retain prior outcome ordinals during stale-task
@@ -128,4 +152,5 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.1]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.1
 [0.1.0]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.0

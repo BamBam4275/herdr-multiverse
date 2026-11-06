@@ -468,7 +468,7 @@ pub fn seat_provider(account: &Account) -> Option<SeatProvider> {
     }
     let dir = account.config_dir.value()?;
     let content = fs::read_to_string(Path::new(dir).join("config.toml")).ok()?;
-    let config: Value = content.parse().ok()?;
+    let config: toml::Table = content.parse().ok()?;
     let name = config.get("model_provider")?.as_str()?.to_string();
     let provider = config.get("model_providers")?.get(&name)?.as_table()?;
     Some(SeatProvider {
