@@ -235,8 +235,8 @@ cargo test --workspace --all-features --locked
 python3 conformance/run_all.py
 ```
 
-This tree currently has 2021 passing crate tests (sum of every
-`test result: … passed` line from `cargo test -j 4`) and 162 passing
+This tree currently has 2043 passing crate unit/integration tests (sum of
+the `passed` totals from the workspace test results above) and 162 passing
 conformance scenarios. `conformance/diff_fuzz.py` is a seeded
 Python-versus-Rust fuzzer that runs read probes after each write; four
 `dispatch --dry-run` rendering differences are accepted (role-rename
@@ -251,6 +251,32 @@ behavior.
 - **Configuration error (exit 3):** use `plugin config-dir multiverse`,
   create a readable `config.toml`, and retry through Herdr so both plugin
   directory variables are present. Global config is intentionally ignored.
+- **Missing command wrapper:** if `multiverse check` reports a Claude seat
+  "without the required command wrapper", set `accounts.<name>.command`
+  in the config located by `herdr plugin config-dir multiverse`. Every
+  Claude seat needs its actual launch command, for example
+  `command = "claude-interactive"` if that wrapper is defined in the seat's
+  interactive shell; installing the vendor CLI alone does not define it.
+  See the launch-command comments in
+  [`config.example.toml`](../config.example.toml) and
+  [account configuration](configuration.md#configtoml), then rerun
+  `herdr plugin action invoke --plugin multiverse multiverse-check`.
+- **Fleet halted:** `fleet halted since ...` or `skipped (fleet halted)`
+  means the halt marker is set. With `HERDR_PLUGIN_CONFIG_DIR` and
+  `HERDR_PLUGIN_STATE_DIR` set to the same plugin directories reported by
+  Doctor or Check (see [configuration setup](#configure-before-invoking-an-action)),
+  inspect the reason and clear the halt when ready to resume:
+
+  ```sh
+  export MULTIVERSE_STATE_DIR="$HERDR_PLUGIN_STATE_DIR"
+  multiverse --config "$HERDR_PLUGIN_CONFIG_DIR/config.toml" halt status
+  multiverse --config "$HERDR_PLUGIN_CONFIG_DIR/config.toml" halt off
+  ```
+- **Herdr not on PATH:** if `multiverse doctor` reports `herdr reachable`
+  as failed, install Herdr and put `herdr` on `PATH`, or set
+  `HERDR_BIN_PATH` to its absolute executable path. Retry
+  `herdr plugin action invoke --plugin multiverse multiverse-doctor` with
+  that environment; the wrapper preserves `HERDR_BIN_PATH`.
 - **No release binary and no Cargo:** install Rust from
   [rustup](https://rustup.rs) or choose a published tag for your platform.
   rustup alone is not sufficient: the source fallback also needs the pinned

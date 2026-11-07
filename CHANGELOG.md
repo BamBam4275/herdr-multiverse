@@ -9,6 +9,35 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-07
+
+### Added
+
+- Docs: replace the README demo placeholder with a real board capture in
+  `docs/assets/board-demo.svg`, reproducible against fake Herdr with
+  `scripts/docs/render-demo.sh`.
+
+### Changed
+
+- Dependencies: update `unicode-width` to 0.2.3.
+- Docs: reconcile the README status with the current release, link
+  `docs/parity.md` from the contribution guide, and document troubleshooting
+  for a missing plugin wrapper, a halted fleet, and Herdr not being on PATH.
+- CLI: point the `check` installation hint at `docs/install.md`.
+- Plugin: describe the read-only reports, explicit Start action that opens
+  live agent sessions, and Import Python action that copies config and state.
+
+### Fixed
+
+- Linux: skip `/proc` metadata checks denied with EACCES/EPERM while
+  retaining fail-closed handling for unreadable current-user working
+  directories.
+- Tests: close fake-Herdr script write handles before executing them to
+  avoid Linux ETXTBSY failures, and synchronize the council lock probe with
+  admission instead of relying on a fixed sleep.
+- CI: compile the presence idle-time parser and its tests only on macOS.
+- Docs: preserve board demo column alignment across SVG renderers.
+
 ## [0.1.1] - 2026-11-06
 
 ### Added
@@ -152,5 +181,6 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.2]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.2
 [0.1.1]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.1
 [0.1.0]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.0

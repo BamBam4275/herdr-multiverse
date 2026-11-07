@@ -2373,9 +2373,17 @@ mod tests {
             },
         ];
 
+        // The probe must not attempt its acquire on a blind guess at how
+        // long admission takes to start — under CI scheduling delays a
+        // fixed pre-sleep can land after admission (and the fleet lock
+        // with it) has already finished, passing for the wrong reason.
+        // Instead the probe waits for admission to actually begin, which
+        // is also the instant the fleet lock is known held.
+        let (admitting_tx, admitting_rx) = std::sync::mpsc::channel::<()>();
+
         let probe_path = lock_path.clone();
         let probe = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+            admitting_rx.recv().unwrap();
             mv_core::lock::acquire(&probe_path, "foreign", Duration::from_millis(80))
         });
 
@@ -2387,6 +2395,7 @@ mod tests {
             &timing(),
             Duration::from_secs(5),
             |_| {
+                admitting_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(200));
                 Ok::<(), std::convert::Infallible>(())
             },

@@ -25,6 +25,7 @@ const HID_IDLE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// IOHIDSystem`'s stdout, mirroring Python's
 /// `re.search(r'"HIDIdleTime"\s*=\s*(\d+)', result.stdout)`: the first
 /// match, any amount of whitespace around `=`, digits only.
+#[cfg(target_os = "macos")]
 fn parse_hid_idle_nanos(stdout: &str) -> Option<u64> {
     const KEY: &str = "\"HIDIdleTime\"";
     let after_key = &stdout[stdout.find(KEY)? + KEY.len()..];
@@ -159,6 +160,7 @@ mod tests {
         m.subcommand_matches("presence").unwrap().clone()
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn parses_the_first_hid_idle_time_regardless_of_surrounding_whitespace() {
         for (stdout, expected) in [
@@ -177,6 +179,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn missing_or_malformed_hid_idle_time_is_not_a_match() {
         for stdout in ["", "no such key here", "\"HIDIdleTime\" = \"not a number\""] {

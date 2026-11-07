@@ -7751,13 +7751,17 @@ review_scope = "repo"
     #[test]
     fn recheck_admission_settles_a_live_predecessor_and_frees_the_project_lock_before_prepare() {
         let marker = tempfile::NamedTempFile::new().unwrap();
+        // `.into_temp_path()` closes the `tempfile()` handle immediately:
+        // an open write fd on the script (Linux only; not a race) makes
+        // the later `execve` fail with `ETXTBSY` ("text file busy").
         let script = tempfile::Builder::new()
             .prefix("mv-cli-fake-herdr-")
             .suffix(".sh")
             .tempfile()
-            .unwrap();
+            .unwrap()
+            .into_temp_path();
         std::fs::write(
-            script.path(),
+            &script,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1 $2\" in\n  \
                  \"agent list\") printf '%s' '{{\"result\": {{\"agents\": \
@@ -7769,10 +7773,10 @@ review_scope = "repo"
             ),
         )
         .unwrap();
-        let mut perms = std::fs::metadata(script.path()).unwrap().permissions();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(script.path(), perms).unwrap();
-        let _guard = HerdrEnvGuard::set(script.path());
+        std::fs::set_permissions(&script, perms).unwrap();
+        let _guard = HerdrEnvGuard::set(&script);
 
         let repo = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(repo.path()).unwrap();

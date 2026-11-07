@@ -51,6 +51,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --lock
 cargo deny check
 ```
 
+See the [Python/Rust parity reference](docs/parity.md) when changing CLI
+behavior, and the install guide's
+[verification reference](docs/install.md#verification-and-troubleshooting)
+for current passing test and conformance counts.
+
 ## Commit and PR conventions
 
 - Use [Conventional Commits](https://www.conventionalcommits.org/) style

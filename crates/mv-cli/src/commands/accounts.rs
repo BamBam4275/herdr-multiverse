@@ -1938,21 +1938,25 @@ health_url = "http://100.100.24.245:1234/v1/models"
     #[test]
     fn listing_a_capped_seat_calls_herdr_agent_list_exactly_once() {
         let marker = tempfile::NamedTempFile::new().unwrap();
+        // `.into_temp_path()` closes the `tempfile()` handle immediately:
+        // an open write fd on the script (Linux only; not a race) makes
+        // the later `execve` fail with `ETXTBSY` ("text file busy").
         let script = tempfile::Builder::new()
             .prefix("mv-cli-fake-herdr-")
             .suffix(".sh")
             .tempfile()
-            .unwrap();
+            .unwrap()
+            .into_temp_path();
         std::fs::write(
-            script.path(),
+            &script,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s' '{{\"result\": {{\"agents\": [{{\"pane_id\": \"w1:p1\", \"agent_status\": \"working\", \"name\": \"mv-fixer-1-sc\"}}]}}}}'\n",
                 marker.path().display()
             ),
         )
         .unwrap();
-        chmod_script(script.path());
-        let _guard = HerdrEnvGuard::set(script.path());
+        chmod_script(&script);
+        let _guard = HerdrEnvGuard::set(&script);
 
         let dir = tempfile::tempdir().unwrap();
         // Two different-vendor seats (`two_seat_live_config`), never each
@@ -2083,23 +2087,27 @@ health_url = "http://100.100.24.245:1234/v1/models"
     #[test]
     fn reset_calls_herdr_agent_list_fail_open() {
         let marker = tempfile::NamedTempFile::new().unwrap();
+        // `.into_temp_path()` closes the `tempfile()` handle immediately:
+        // an open write fd on the script (Linux only; not a race) makes
+        // the later `execve` fail with `ETXTBSY` ("text file busy").
         let script = tempfile::Builder::new()
             .prefix("mv-cli-fake-herdr-")
             .suffix(".sh")
             .tempfile()
-            .unwrap();
+            .unwrap()
+            .into_temp_path();
         std::fs::write(
-            script.path(),
+            &script,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 99\n",
                 marker.path().display()
             ),
         )
         .unwrap();
-        let mut perms = std::fs::metadata(script.path()).unwrap().permissions();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(script.path(), perms).unwrap();
-        let _guard = HerdrEnvGuard::set(script.path());
+        std::fs::set_permissions(&script, perms).unwrap();
+        let _guard = HerdrEnvGuard::set(&script);
 
         let dir = tempfile::tempdir().unwrap();
         let live = two_codex_pools_live_config(dir.path());
@@ -2118,14 +2126,18 @@ health_url = "http://100.100.24.245:1234/v1/models"
         std::fs::set_permissions(path, perms).unwrap();
     }
 
-    fn fake_herdr_list_and_read(agent_status: &str, banner: &str) -> tempfile::NamedTempFile {
+    fn fake_herdr_list_and_read(agent_status: &str, banner: &str) -> tempfile::TempPath {
+        // `.into_temp_path()` closes the `tempfile()` handle immediately:
+        // an open write fd on the script (Linux only; not a race) makes
+        // the later `execve` fail with `ETXTBSY` ("text file busy").
         let script = tempfile::Builder::new()
             .prefix("mv-cli-fake-herdr-")
             .suffix(".sh")
             .tempfile()
-            .unwrap();
+            .unwrap()
+            .into_temp_path();
         std::fs::write(
-            script.path(),
+            &script,
             format!(
                 "#!/bin/sh\n\
                  case \" $* \" in\n\
@@ -2142,7 +2154,7 @@ health_url = "http://100.100.24.245:1234/v1/models"
             ),
         )
         .unwrap();
-        chmod_script(script.path());
+        chmod_script(&script);
         script
     }
 
@@ -2180,7 +2192,7 @@ path = {:?}
     #[test]
     fn reset_snapshots_a_parked_pane_and_prints_the_exemption_line() {
         let script = fake_herdr_list_and_read("idle", "Your workspace is out of credits");
-        let _guard = HerdrEnvGuard::set(script.path());
+        let _guard = HerdrEnvGuard::set(&script);
         let state_dir = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let live = project_with_parked_task(state_dir.path(), project.path());
@@ -2221,7 +2233,7 @@ path = {:?}
     #[test]
     fn reset_does_not_snapshot_a_working_pane() {
         let script = fake_herdr_list_and_read("working", "still computing");
-        let _guard = HerdrEnvGuard::set(script.path());
+        let _guard = HerdrEnvGuard::set(&script);
         let state_dir = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let live = project_with_parked_task(state_dir.path(), project.path());

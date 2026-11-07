@@ -2611,6 +2611,14 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
         // whose cwd this check is guarding against, so it is skipped like
         // one already gone. A same-uid process still denies this rarely
         // enough that it stays the one case this still fails closed on.
+        //
+        // Some hosts (hidepid-restricted procfs, a container's own pid
+        // namespace) deny even `stat`-ing `/proc/<pid>` itself for a
+        // process we do not own, as `EACCES`/`EPERM` rather than
+        // `ENOENT` — both land on `PermissionDenied`. We cannot learn
+        // that pid's uid at all in that case, but the same reasoning
+        // applies: a process a denial like this hides from us could
+        // never be a process we started, so it is skipped the same way.
         let own_uid = fs::metadata("/proc/self")?.uid();
         for entry in fs::read_dir("/proc")? {
             let entry = entry?;
@@ -2625,7 +2633,14 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
             match fs::metadata(entry.path()) {
                 Ok(meta) if meta.uid() != own_uid => continue,
                 Ok(_) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    continue
+                }
                 Err(e) => return Err(e.into()),
             }
             match fs::read_link(entry.path().join("cwd")) {

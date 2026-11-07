@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "mv-board"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crc32fast",
  "crossterm",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "mv-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "mv-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs",
  "mv-core",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "mv-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crc32fast",
  "fancy-regex 0.20.0",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "mv-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mv-config",
  "mv-core",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "mv-herdr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mv-core",
  "serde",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "mv-state"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crc32fast",
  "mv-config",
@@ -2003,9 +2003,9 @@ dependencies = [
 
 [[package]]
 name = "unicode-width"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "utf8parse"

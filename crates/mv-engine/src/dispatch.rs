@@ -11,13 +11,14 @@
 //! files (`brief.rs`, `runner.rs`) — this module only decides, it never
 //! touches disk or Herdr.
 //!
-//! The same dependencies [`crate::selector`] cannot yet take for granted —
-//! `mv-config`'s account/role types and `mv-state`'s routing log — are
-//! narrow traits here too: [`AccountLookup`] stands in for the fleet's
-//! account/vendor/kind config, [`RoutingLookup`] for one project's
-//! routing log, [`ReviewBudget`] for its rolling 24h reviewer-dispatch
-//! count, and [`HaltQuery`] for the fleet halt file. A caller wires real
-//! implementations in once those crates land.
+//! [`AccountLookup`] stands in for the fleet's account/vendor/kind config
+//! (`mv-config::load::Account`/`Config`, landed) and [`RoutingLookup`] for
+//! one project's routing log (`mv-state::log::parse`, landed); this
+//! module still takes them as narrow traits rather than those concrete
+//! types, so a caller wires either in — `mv-cli`'s dispatch command does,
+//! with `ConfigAccounts` and `ProjectRouting`. [`ReviewBudget`] and
+//! [`HaltQuery`] are the same seam for a project's rolling 24h
+//! reviewer-dispatch count and the fleet halt file.
 
 use std::time::Instant;
 
@@ -28,8 +29,8 @@ use crate::selector::{
 
 /// Every distinct vendor/account-name/account-kind the fleet knows about,
 /// narrowed to exactly what `--exclude-vendor` resolution and the
-/// cross-vendor rule need (`accounts.py`'s `Account`/`Config`, not yet
-/// landed in `mv-config`).
+/// cross-vendor rule need (`accounts.py`'s `Account`/`Config`, ported to
+/// `mv-config::load::Account`/`Config`).
 pub trait AccountLookup {
     /// Every distinct configured vendor, for an `UnknownVendor` error listing.
     fn all_vendors(&self) -> Vec<String>;
@@ -87,9 +88,10 @@ pub struct LoggedDispatch {
 }
 
 /// A project's own routing log, read-only, narrowed to the one lookup the
-/// cross-vendor rule needs (`tasks.read_log`, not yet landed in
-/// `mv-state`). A reviewed task is always looked up in *its own*
-/// project's log, never another project's.
+/// cross-vendor rule needs (`tasks.read_log`, ported — `mv-state::log`
+/// parses the file, and `mv-state::tasks`'s own `read_log` port joins it
+/// per task). A reviewed task is always looked up in *its own* project's
+/// log, never another project's.
 pub trait RoutingLookup {
     fn dispatch_for_task(&self, project: &str, task_id: &str) -> Option<LoggedDispatch>;
 }
@@ -170,7 +172,8 @@ pub fn author_exclusions(
 }
 
 /// The fleet's review policy, narrowed to the fields the reviewer-role
-/// preconditions need (`config.review_policy`, not yet landed).
+/// preconditions need (`config.review_policy`, landed as
+/// `mv-config::load::Config::review_policy`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReviewPolicy {
     /// `review_policy.batch_max_lanes` — the most lanes one `--reviewing`
@@ -185,8 +188,9 @@ pub struct ReviewPolicy {
 }
 
 /// A project's rolling 24h reviewer-dispatch count, narrowed from
-/// `accounts.reviewer_dispatch_count` (reads the routing log, not yet
-/// landed in `mv-state`).
+/// `accounts.reviewer_dispatch_count` (reads the routing log — landed,
+/// see [`recent_reviewer_dispatch_count`] below — though `mv-cli`'s own
+/// dispatch command does not wire it into this trait yet).
 pub trait ReviewBudget {
     fn reviewer_dispatch_count(&self, project: &str, now: Instant) -> u32;
 }
@@ -307,7 +311,8 @@ pub fn check_halt_before_pane_creation(
 /// counting behind `open_here`/`fleet_open`/`other_floor_gaps`
 /// (`runner.py`'s `_project_slots_grace_counts`) depends on a live Herdr
 /// read and the routing log, both outside this crate's narrow scope —
-/// this struct is the seam a caller fills in once those land.
+/// this struct is the seam a caller fills in; `mv-cli`'s
+/// `fleet_open_counts` does, for the real dispatch command.
 #[derive(Debug, Clone)]
 pub struct FleetCapacityInputs {
     /// `config.max_concurrent`.
@@ -410,7 +415,8 @@ pub struct DispatchRequest<'a> {
 /// Every typed refusal [`plan_dispatch`] and its helpers can raise.
 /// Mirrors the distinct exception classes in `dispatch.py`/`accounts.py`
 /// this module's brief covers; `mv-cli`'s exit-code boundary maps these
-/// to `EXIT_NEEDS_CONFIG`/`EXIT_ERROR` once it lands.
+/// to `EXIT_NEEDS_CONFIG`/`EXIT_ERROR` (`commands::dispatch`'s own match
+/// over this enum).
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DispatchError {
     #[error(

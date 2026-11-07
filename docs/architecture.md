@@ -222,12 +222,14 @@ The Python reference implementation is the frozen specification until
 cutover. A harness under `conformance/` runs identical scenarios through
 both binaries against a fake Herdr executable (`HERDR_BIN_PATH`) and
 compares exit code, stdout/stderr, and the resulting `.multiverse/` files
-on disk (`python3 conformance/run_all.py`). 69 scenarios ship in this
-tree, including seven history-reader scenarios for retired role names.
-All 69 currently pass against Rust. A deliberate behavioral drift in a
-wired-up command is expected to fail this harness.
-Narrower unit tests live next to the parsers and stateful logic they
-cover.
+on disk (`python3 conformance/run_all.py`), including history-reader
+scenarios for retired role names. See the install guide's
+[verification reference](install.md#verification-and-troubleshooting)
+for current passing test and scenario counts, and the
+[Python/Rust parity reference](parity.md) for the flag-by-flag comparison.
+A deliberate behavioral drift in a wired-up command is expected to fail
+this harness. Narrower unit tests live next to the parsers and stateful
+logic they cover.
 
 ## Design decisions we rejected
 

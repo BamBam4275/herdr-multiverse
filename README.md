@@ -9,10 +9,11 @@
 isolated Herdr worktrees — one binary, native vendor CLIs, no API-key
 proxy.**
 
-![Demo GIF placeholder: a recorded terminal session will replace this before release](docs/assets/demo-placeholder.svg)
+![Multiverse board, workers, and tasks output against a throwaway fixture fleet: two fake projects, a fake account, and the repository's own fake-herdr binary standing in for Herdr](docs/assets/board-demo.svg)
 
-A real `docs/assets/demo.gif` of the orchestration flow will replace the
-placeholder above before the first public release.
+Rendered by `scripts/docs/render-demo.sh` from a real `multiverse board`,
+`workers`, and `tasks` run — reproduce it yourself with
+`sh scripts/docs/render-demo.sh`.
 
 ## Features
 
@@ -29,9 +30,9 @@ placeholder above before the first public release.
 
 ## Status
 
-Herdr Multiverse is a **pre-1.0 rewrite**, preparing for its first tagged
-release (`v0.1.0`). It is a from-scratch Rust port of a Python reference
-implementation, built so the two can be checked against each other for
+Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.1`.
+It is a from-scratch Rust port of a Python reference implementation, built
+so the two can be checked against each other for
 behavioral parity before the Rust binary becomes the only implementation.
 
 What is on this tree today:
@@ -41,14 +42,14 @@ What is on this tree today:
   real implementations — none of the seven is a module-list stub.
 - Clap parsing for 29 top-level subcommands, exit codes 0/1/2/3, and `--yes`
   authorization on `dispatch` / `council`.
-- 1978 crate unit/integration tests passing
-  (`cargo test --workspace --all-features --locked`; counted as the
-  sum of every `test result: … passed` line from `cargo test -j 4`).
-- A 154-scenario conformance harness under `conformance/` that replays
+- Crate unit/integration tests and verification commands, with current
+  passing counts recorded in [`docs/install.md`](docs/install.md#verification-and-troubleshooting).
+- A conformance harness under `conformance/` that replays
   identical CLI invocations through this binary and the frozen Python
   reference and diffs exit code, stdout/stderr, and the resulting
-  `.multiverse/` files; all 154 currently pass against Rust
-  (`python3 conformance/run_all.py`).
+  `.multiverse/` files; see the same
+  [verification reference](docs/install.md#verification-and-troubleshooting)
+  for the current scenario count and how to run it.
 - `conformance/diff_fuzz.py`, a seeded differential fuzzer: random
   write sequences plus a fixed battery of read probes after each
   write (`board`, `tasks`, `dispatch --dry-run` for Scout / Builder /
@@ -70,7 +71,7 @@ What is on this tree today:
   role names (`orchestrator`, `explorer`, `fixer`, `librarian`,
   `reviewer`, `oracle`, `designer`, `observer`) still read correctly —
   see [`docs/roles.md`](docs/roles.md#legacy-on-disk-names) for the
-  mapping. All seven `history-*` conformance scenarios pass.
+  mapping. The `history-*` conformance scenarios cover these readers.
 - Directory-trust handling for the two agent kinds that need it before a
   seat can start: Codex's `trust_level = "trusted"` is written into that
   seat's `CODEX_HOME/config.toml` automatically, immediately before launch

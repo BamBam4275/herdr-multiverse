@@ -1053,7 +1053,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
             placeholders.push(format!("accounts.{}.model = {model}", account.name));
         }
         if account.kind == "claude" && account.command.trim().is_empty() {
-            blocks.push(format!("note: account {} is a Claude seat without the required command wrapper. Set accounts.{}.command to the wrapper from INSTALL.md before dispatching.", account.name, account.name));
+            blocks.push(format!("note: account {} is a Claude seat without the required command wrapper. Set accounts.{}.command to the wrapper from docs/install.md before dispatching.", account.name, account.name));
         }
     }
     for (role, settings) in &config.roles {
