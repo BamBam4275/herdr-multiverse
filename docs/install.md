@@ -77,7 +77,7 @@ There is no `herdr plugin state-dir`-equivalent lookup command for
 resolves the config directory. `multiverse doctor` and `multiverse check`
 both print the resolved state directory alongside the config path, so
 running either once through its plugin action
-(`herdr plugin action invoke --plugin multiverse multiverse-doctor`) is how
+(`herdr plugin action invoke multiverse-doctor --plugin multiverse`) is how
 to learn the real path: export it as `MULTIVERSE_STATE_DIR` for a CLI-only
 command with no managed action of its own (`config migrate`, `halt`,
 `sweep`) run bare, alongside the same `--config` those commands already
@@ -102,7 +102,7 @@ this lane verifies the documented 0.9.5 contract, not every earlier release.
 ```sh
 herdr plugin list --plugin multiverse --json
 herdr plugin action list --plugin multiverse
-herdr plugin action invoke --plugin multiverse multiverse-doctor
+herdr plugin action invoke multiverse-doctor --plugin multiverse
 herdr plugin pane open --plugin multiverse --entrypoint dashboard
 ```
 
@@ -248,6 +248,10 @@ from 6.94 s to 2.50 s. Those timings are a single-host measurement, not
 an install requirement, and none of these checks validate live fleet
 behavior.
 
+- **Action output isn't on the screen that ran it:** `plugin action invoke`
+  runs the action asynchronously and returns before it finishes. Read its
+  stdout/stderr with `herdr plugin log list --plugin multiverse`, which
+  reports one JSON log entry per invocation.
 - **Configuration error (exit 3):** use `plugin config-dir multiverse`,
   create a readable `config.toml`, and retry through Herdr so both plugin
   directory variables are present. Global config is intentionally ignored.
@@ -260,7 +264,7 @@ behavior.
   See the launch-command comments in
   [`config.example.toml`](../config.example.toml) and
   [account configuration](configuration.md#configtoml), then rerun
-  `herdr plugin action invoke --plugin multiverse multiverse-check`.
+  `herdr plugin action invoke multiverse-check --plugin multiverse`.
 - **Fleet halted:** `fleet halted since ...` or `skipped (fleet halted)`
   means the halt marker is set. With `HERDR_PLUGIN_CONFIG_DIR` and
   `HERDR_PLUGIN_STATE_DIR` set to the same plugin directories reported by
@@ -275,7 +279,7 @@ behavior.
 - **Herdr not on PATH:** if `multiverse doctor` reports `herdr reachable`
   as failed, install Herdr and put `herdr` on `PATH`, or set
   `HERDR_BIN_PATH` to its absolute executable path. Retry
-  `herdr plugin action invoke --plugin multiverse multiverse-doctor` with
+  `herdr plugin action invoke multiverse-doctor --plugin multiverse` with
   that environment; the wrapper preserves `HERDR_BIN_PATH`.
 - **No release binary and no Cargo:** install Rust from
   [rustup](https://rustup.rs) or choose a published tag for your platform.

@@ -166,7 +166,7 @@ invocation reads. Nothing copies that split for you automatically.
 `multiverse import-python` does, once, before you touch `config.toml`:
 
 ```sh
-herdr plugin action invoke --plugin multiverse multiverse-import-python
+herdr plugin action invoke multiverse-import-python --plugin multiverse
 ```
 
 or, equivalently, from the CLI directly — the plugin action only wires

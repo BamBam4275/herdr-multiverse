@@ -41,7 +41,7 @@ body:
       label: Steps to reproduce
       description: The exact commands, actions, or panes involved.
       placeholder: |
-        1. Run `herdr plugin action invoke --plugin multiverse ...`
+        1. Run `herdr plugin action invoke <action-id> --plugin multiverse`
         2. ...
     validations:
       required: true

@@ -2647,6 +2647,15 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
                 Ok(path) if path.starts_with(lane) => return Ok(true),
                 Ok(_) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                // A same-uid process can still deny this: the kernel's
+                // ptrace rules hide a non-dumpable process's `cwd` link
+                // (`PR_SET_DUMPABLE` 0, e.g. a setuid binary or a runner
+                // helper) behind `EACCES`, even from its own uid. The
+                // agents multiverse starts are ordinary dumpable
+                // processes, so a process hidden this way cannot be a
+                // lane's agent, and is skipped the same as one already
+                // gone.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => (),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -3475,6 +3484,32 @@ pub(crate) mod tests {
         assert!(
             matches!(&result.unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("live process"))
         );
+    }
+
+    // A same-uid process that has made itself non-dumpable (e.g. a runner
+    // helper under `PR_SET_DUMPABLE` 0) hides its `/proc/<pid>/cwd` link
+    // behind `EACCES` even from its own uid; only `root` is exempt, so this
+    // only reproduces the gap when the test itself runs unprivileged, which
+    // is how `cargo test --workspace` runs on `ubuntu-latest`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cwd_skips_a_same_uid_non_dumpable_process() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("owner", "HEAD").unwrap();
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import ctypes,time;ctypes.CDLL(None).prctl(4, 0, 0, 0, 0);time.sleep(20)",
+            ])
+            .current_dir(&lane.path)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let result = has_process_cwd(&lane.path);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.unwrap();
     }
 
     #[test]
