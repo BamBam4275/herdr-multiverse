@@ -14,7 +14,7 @@
 #   - [[link_handlers]]: there is no Multiverse link type to handle.
 id = "multiverse"
 name = "Multiverse"
-version = "0.1.3"
+version = "0.1.4"
 min_herdr_version = "0.9.0"
 description = "A Herdr-native multi-agent system: read-only reports, an explicit Start action that opens live agent sessions, and an Import Python action that copies config and state."
 platforms = ["linux", "macos"]
@@ -66,11 +66,11 @@ command = ["scripts/plugin-action.sh", "board", "--all", "--read-only"]
 [[actions]]
 id = "multiverse-start"
 title = "Multiverse: Start"
-description = "Opens a Herdr workspace per configured project and launches the interactive Nexus agent session in each root pane. Dispatches nothing itself and spends no subscription quota directly, but it does open workspaces and start an interactive agent session in each — the account marked `interactive = true` in config, never a metered dispatch account."
+description = "Opens your home `multiverse` workspace (home Nexus chat + live board pane); other projects are opened with `multiverse start <project>` or by asking the home Nexus. Dispatches nothing itself and spends no subscription quota directly, but it does open a workspace and start an interactive agent session in it — the account marked `interactive = true` in config, never a metered dispatch account."
 contexts = ["global"]
 # The wrapper derives and quotes the absolute binary invocation for Nexus
 # seeds, which are later used from each project directory.
-command = ["scripts/plugin-action.sh", "start", "--all"]
+command = ["scripts/plugin-action.sh", "start", "multiverse"]
 
 [[actions]]
 id = "multiverse-workers"

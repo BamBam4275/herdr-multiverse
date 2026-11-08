@@ -3771,7 +3771,7 @@ mod tests {
         let dir = task_dir(&root, done);
         std::fs::write(dir.join("status"), "done").unwrap();
         std::fs::write(dir.join("result.md"), "Useful result\n").unwrap();
-        std::fs::write(root.join(".multiverse/routing.log"), format!("2000-01-01T00:00:00Z\tevent=dispatch\ttask={done}\trole=scout\taccount=seat\n2000-01-01T00:01:00Z\tevent=started\ttask={done}\tpane=w1:p1\n2000-01-01T00:00:00Z\tevent=dispatch\ttask={awaiting}\trole=scout\taccount=seat\n")).unwrap();
+        std::fs::write(root.join(".multiverse/routing.log"), format!("2000-01-01T00:00:00Z\tevent=dispatch\ttask={done}\trole=scout\taccount=seat\tagent=scout\n2000-01-01T00:01:00Z\tevent=started\ttask={done}\tpane=w1:p1\n2000-01-01T00:00:00Z\tevent=dispatch\ttask={awaiting}\trole=scout\taccount=seat\n")).unwrap();
         let config = mv_config::load::load_config_str(
             &format!("[projects.demo]\npath = {:?}\n", root.to_str().unwrap()),
             Path::new("config.toml"),
@@ -3807,6 +3807,52 @@ esac"#,
             panic!("one project")
         };
         assert!(snapshot.project.tasks.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Sibling to the test above, pinned by 47d6342: a legacy dispatch line
+    /// with no recorded `agent=` field must leave the pane open rather than
+    /// guessing it belongs to the live `scout` agent.
+    /// `close_settled_panes`' identity check reads
+    /// `current.name != recorded_agent.unwrap_or("")`, and an empty string
+    /// never matches a real agent name, so the pane is never closed.
+    #[test]
+    fn row7_legacy_dispatch_without_agent_leaves_pane_open() {
+        let root = temp_project("board-reconcile-legacy");
+        let done = "20000101-scout-aaaaaa";
+        let awaiting = "20000101-scout-bbbbbb";
+        let dir = task_dir(&root, done);
+        std::fs::write(dir.join("status"), "done").unwrap();
+        std::fs::write(dir.join("result.md"), "Useful result\n").unwrap();
+        std::fs::write(root.join(".multiverse/routing.log"), format!("2000-01-01T00:00:00Z\tevent=dispatch\ttask={done}\trole=scout\taccount=seat\n2000-01-01T00:01:00Z\tevent=started\ttask={done}\tpane=w1:p1\n2000-01-01T00:00:00Z\tevent=dispatch\ttask={awaiting}\trole=scout\taccount=seat\n")).unwrap();
+        let config = mv_config::load::load_config_str(
+            &format!("[projects.demo]\npath = {:?}\n", root.to_str().unwrap()),
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        let mut source = live_source(config, &root.join("state"));
+        source.reconcile = true;
+        let fake = fake_board_herdr(
+            &root,
+            r#"case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"scout","agent_status":"idle"}]}}' ;;
+'pane close') printf '%s\n' "$3" >> "$(dirname "$0")/closed" ;;
+*) exit 1 ;;
+esac"#,
+        );
+        source
+            .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
+            .unwrap();
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            log.contains(&format!("event=result\ttask={done}\tstatus=done")),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("event=result\ttask={awaiting}\tstatus=failed")),
+            "{log}"
+        );
+        assert!(!root.join("closed").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

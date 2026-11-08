@@ -3198,7 +3198,16 @@ mod tests {
     }
 
     #[test]
-    fn post_picker_activity_is_refused_without_an_activity_pairs_grant() {
+    fn post_picker_activity_succeeds_via_the_implicit_hub_grant() {
+        // Decided change 2 (`20261108-b-81cb2b`): a configured `multiverse`
+        // project is implicitly activity-paired with every other project,
+        // so a project -> hub send needs no explicit `[activity.pairs]`
+        // grant anymore. This replaces
+        // `post_picker_activity_is_refused_without_an_activity_pairs_grant`,
+        // whose premise (no grant exists) is now false for any config that
+        // configures a hub project at all — `write_sandbox_config_with_hub`
+        // writes no `[activity.pairs]` table, so the grant here is entirely
+        // implicit.
         let project_root = sandbox_project_root();
         let hub_root = sandbox_project_root();
         let config_path =
@@ -3207,9 +3216,41 @@ mod tests {
 
         let posted = post_picker_activity(&config, &hub_root, "sandbox", "key", "body");
         assert!(
-            !posted,
-            "no [activity.pairs] grant for sandbox -> multiverse"
+            posted,
+            "a configured hub implicitly grants sandbox -> multiverse"
         );
+        let hub_log = mv_state::activity::ProjectLog::open(HUB_PROJECT_NAME, &hub_root);
+        assert_eq!(hub_log.inbox_messages().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&project_root);
+        let _ = std::fs::remove_dir_all(&hub_root);
+    }
+
+    #[test]
+    fn post_picker_activity_is_refused_when_no_hub_project_is_configured() {
+        // `merge_hub_activity_pairs` (`mv-config`) only grants the implicit
+        // pairing when `[projects.multiverse]` is configured at all; once it
+        // is, every other project gets the grant unconditionally — there is
+        // no longer a way to configure a hub and still have `may_send` read
+        // false for some other project. The one refusal path
+        // `post_picker_activity`'s own `may_send` check still supports is
+        // this one: no `[projects.multiverse]` table, so
+        // `config.activity_pairs` carries nothing for `sandbox` at all.
+        let project_root = sandbox_project_root();
+        let hub_root = sandbox_project_root();
+        let config_path = project_root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[projects.sandbox]\npath = \"{}\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+        let config = load_sandbox(&config_path);
+
+        let posted = post_picker_activity(&config, &hub_root, "sandbox", "key", "body");
+        assert!(!posted, "no multiverse project is configured at all");
         let hub_log = mv_state::activity::ProjectLog::open(HUB_PROJECT_NAME, &hub_root);
         assert!(hub_log.inbox_messages().unwrap().is_empty());
 

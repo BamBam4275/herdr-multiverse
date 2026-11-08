@@ -169,6 +169,54 @@ fn classify_envelope(payload: &Option<Value>, command: &HerdrCommand) -> Option<
     }
 }
 
+/// Attempts (including the first) and the delay between them for the
+/// `ExecutableFileBusy` retry below. Linux clears the busy window as soon
+/// as the other thread's `open`-for-write returns, which is microseconds
+/// in practice; a handful of short sleeps absorbs that without making a
+/// genuinely-busy binary (e.g. mid-upgrade) wait long before surfacing
+/// `MissingBinary`.
+const SPAWN_BUSY_RETRIES: u32 = 8;
+const SPAWN_BUSY_DELAY: Duration = Duration::from_millis(15);
+
+/// Spawn `command`, retrying a bounded number of times when the OS
+/// reports `ExecutableFileBusy` (Linux ETXTBSY): `binary` is still open
+/// for writing in another process at the instant of `exec`. In this
+/// workspace that other process is almost always a concurrent test
+/// thread's own fake-binary helper — it `fs::write`s a `#!/bin/sh`
+/// script and `fork()`s to exec it, and any *other* thread's `fork()` in
+/// that same window inherits the first thread's still-open write fd,
+/// which keeps the file busy until that child execs or exits, regardless
+/// of which binary the child itself is about to run. Renaming the script
+/// into place after closing it would not help: the race is on the
+/// inherited fd, not on the path, so a second `open` under the final name
+/// can still land inside someone else's write window. A real Herdr
+/// install mid-upgrade hits the identical error for the identical
+/// reason, so retrying here protects both. Any other spawn error returns
+/// immediately.
+fn spawn_with_busy_retry(
+    command: &mut Command,
+    binary: &str,
+) -> Result<std::process::Child, HerdrError> {
+    for attempt in 1..=SPAWN_BUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(source)
+                if attempt < SPAWN_BUSY_RETRIES
+                    && source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+            {
+                thread::sleep(SPAWN_BUSY_DELAY);
+            }
+            Err(source) => {
+                return Err(HerdrError::MissingBinary {
+                    binary: binary.to_string(),
+                    source,
+                })
+            }
+        }
+    }
+    unreachable!("loop always returns on its last iteration")
+}
+
 /// Run one Herdr command and capture its result.
 ///
 /// No shell, ever: the argv vector goes straight to `exec`, so nothing
@@ -232,12 +280,7 @@ pub fn run(command: &HerdrCommand, timeout: Option<Duration>) -> Result<CommandR
     // signalling this process's group.
     let _ = child_command.process_group(0);
 
-    let mut child = child_command
-        .spawn()
-        .map_err(|source| HerdrError::MissingBinary {
-            binary: binary.clone(),
-            source,
-        })?;
+    let mut child = spawn_with_busy_retry(&mut child_command, &binary)?;
 
     if let Some(input) = command.stdin.clone() {
         if let Some(mut stdin) = child.stdin.take() {
@@ -598,6 +641,38 @@ mod tests {
         let error = run(&command, None).unwrap_err();
         assert!(matches!(error, HerdrError::MissingBinary { .. }));
         assert!(error.to_string().contains("/no/such/binary-xyz"));
+    }
+
+    /// Reproduces the ETXTBSY window directly — holding the script open
+    /// for writing is exactly what makes Linux's `execve` return
+    /// `ExecutableFileBusy`, the same condition a racing `fork()` leaves
+    /// behind by inheriting another thread's write fd. Linux-only: unlike
+    /// Linux, opening a file for writing does not make `exec` of it fail
+    /// on macOS, so this would pass vacuously (never observe the busy
+    /// error at all) on the non-Linux hosts this workspace develops on,
+    /// which is why CI's `rust:*` Linux container is what actually
+    /// exercises `spawn_with_busy_retry`'s retry arm.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn run_retries_past_a_transient_executable_file_busy_and_still_succeeds() {
+        let script = fake_herdr_script("printf 'ok\\n'");
+        let held_open = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(held_open);
+        });
+
+        let command = HerdrCommand::new(vec![script.to_string_lossy().into_owned()]);
+        let result = run(&command, None);
+        closer.join().unwrap();
+        std::fs::remove_file(&script).ok();
+
+        let result = result.unwrap();
+        assert!(result.ok(), "{result:?}");
+        assert_eq!(result.stdout, "ok\n");
     }
 
     /// Card 20261103-b-1da16f's structural fix: the bare `herdr` token

@@ -70,7 +70,7 @@ class PluginTests(unittest.TestCase):
             "multiverse-accounts": ["accounts"],
             "multiverse-tasks": ["tasks", "--read-only"],
             "multiverse-board": ["board", "--all", "--read-only"],
-            "multiverse-start": ["start", "--all"],
+            "multiverse-start": ["start", "multiverse"],
             "multiverse-workers": ["workers"],
             "multiverse-import-python": ["import-python"],
             "dashboard": ["board", "--all", "--watch", "--read-only"],

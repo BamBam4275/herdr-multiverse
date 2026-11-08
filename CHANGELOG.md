@@ -9,6 +9,43 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-08
+
+### Changed
+
+- Config: `[projects.multiverse]` is now the home hub project — its `path`
+  defaults to `<state dir>/home` when omitted, it is implicitly paired with
+  every other project for activity in both directions, and the default
+  `[board].dashboard_tab` no longer names it (empty by default).
+- CLI: `multiverse start multiverse` opens a single `multiverse` workspace
+  holding the home Nexus plus a read-only `board --all --watch --read-only`
+  pane split beside it, creating `<state dir>/home` (mode `0700`) when it
+  does not exist yet. An already-open hub workspace is left as is, and the
+  hub never opens a `--dashboard` tab.
+- Plugin: the `Multiverse: Start` action now runs `start multiverse` instead
+  of `start --all`; open an individual project with `multiverse start
+  <project>` or by asking the home Nexus.
+- Breaking: an existing `config.toml` must add a `[projects.multiverse]`
+  section (a `short` is enough; `path` is optional) for `multiverse start`
+  and the plugin's Start action to open anything.
+
+### Fixed
+
+- Herdr: spawn retries on `ETXTBSY` instead of surfacing `MissingBinary`,
+  closing a Linux fork-race window where a forked child inherited a
+  fake-binary script's still-open write fd and any exec of it failed.
+- Engine: dispatch placement now splits a tab's tallest pane instead of its
+  newest, and refuses to split a pane whose halves would drop below a
+  12-row minimum, opening a new tab instead of squashing a worker's pane.
+- State/CLI: reclaim and reconcile now verify a pane's live agent identity
+  before offering or closing it, so a pane id reused after a Herdr restart
+  can no longer be mistaken for a different project's live agent.
+- CLI: dispatch's unit tests are isolated from the live fleet state dir
+  instead of reaching a dev machine's ambient `$MULTIVERSE_STATE_DIR`.
+- CLI: board panes launch via the plugin's `multiverse_invocation()` instead
+  of a bare `multiverse` token, so they work for a plugin user with no
+  `multiverse` on `PATH`.
+
 ## [0.1.3] - 2026-11-07
 
 ### Changed
@@ -195,6 +232,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.4]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.4
 [0.1.3]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.3
 [0.1.2]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.2
 [0.1.1]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.1

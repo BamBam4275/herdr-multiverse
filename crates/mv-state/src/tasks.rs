@@ -1259,7 +1259,7 @@ pub fn reconcile_project(
     let tasks = sweep_tasks(root);
 
     let mut recorded_ids = Vec::new();
-    let mut recorded_panes: Vec<(String, Option<AgentState>)> = Vec::new();
+    let mut recorded_panes: Vec<(String, Option<AgentState>, Option<String>)> = Vec::new();
     for task in &tasks {
         if let Some(only) = req.only_task {
             if task.task_id != only {
@@ -1279,7 +1279,7 @@ pub fn reconcile_project(
                     .iter()
                     .find(|agent| agent.pane_id == pane)
                     .and_then(|agent| agent.status);
-                recorded_panes.push((pane.to_string(), first));
+                recorded_panes.push((pane.to_string(), first, task.agent.clone()));
             }
         }
     }
@@ -1326,21 +1326,27 @@ pub fn reconcile_project(
 }
 
 /// Close each just-recorded pane only when a *second* listing still shows
-/// it idle/done — never WORKING/BLOCKED, never an unknown status.
-/// Python `_close_settled_panes`.
+/// it idle/done — never WORKING/BLOCKED, never an unknown status — and
+/// still hosts the same agent this task was dispatched under. Python
+/// `_close_settled_panes`. The pane id a task was recorded under is
+/// reusable: by the time this second listing lands, Herdr may have handed
+/// that id to an unrelated agent, and closing on the id alone would
+/// destroy that agent's session instead of merely freeing a slot nobody
+/// needs anymore (card 20261108-b-37df85, mirroring `reclaim_pane_is_safe`/
+/// `reclaim_stale_panes`'s own same-agent-name confirmation).
 fn close_settled_panes(
     agents: &mut impl AgentPanes,
-    recorded_panes: &[(String, Option<AgentState>)],
+    recorded_panes: &[(String, Option<AgentState>, Option<String>)],
 ) -> usize {
-    let eligible: Vec<&str> = recorded_panes
+    let eligible: Vec<(&str, Option<&str>)> = recorded_panes
         .iter()
-        .filter(|(_, status)| {
+        .filter(|(_, status, _)| {
             !matches!(
                 status,
                 Some(AgentState::Working) | Some(AgentState::Blocked)
             )
         })
-        .map(|(pane, _)| pane.as_str())
+        .map(|(pane, _, agent)| (pane.as_str(), agent.as_deref()))
         .collect();
     if eligible.is_empty() {
         return 0;
@@ -1349,10 +1355,13 @@ fn close_settled_panes(
         return 0;
     };
     let mut closed = 0;
-    for pane in eligible {
+    for (pane, recorded_agent) in eligible {
         let Some(current) = fresh.iter().find(|agent| agent.pane_id == pane) else {
             continue;
         };
+        if current.name.as_deref().unwrap_or("") != recorded_agent.unwrap_or("") {
+            continue;
+        }
         if !current.status.is_some_and(AgentState::is_ready_for_input) {
             continue;
         }
@@ -3148,16 +3157,30 @@ pub fn append_stale_pane_if_absent(root: &Path, task: &str, pane: &str) -> bool 
 /// Which of `root`'s RECORDED tasks hold a pane nobody needs anymore
 /// (`reclaimable`), and which merely look like they do (`stale` —
 /// terminal, recorded, clean lane, but the pane it names is already gone
-/// from `agents.list()` by some other route). Mirrors
-/// `runner.reclaimable_panes`'s four conditions, with one status read per
-/// lane and a live-unsettled-occupant guard for adopted lanes.
+/// from `agents.list_checked()` by some other route, or now answers to a
+/// different agent). Mirrors `runner.reclaimable_panes`'s four conditions,
+/// with one status read per lane and a live-unsettled-occupant guard for
+/// adopted lanes.
 pub fn reclaimable_panes(
     root: &Path,
     agents: &mut impl AgentPanes,
 ) -> (Vec<ReclaimCandidate>, Vec<ReclaimCandidate>) {
     let tasks = sweep_tasks(root);
-    let live = agents.list();
+    let live = agents.list_checked().unwrap_or_default();
     let is_live = |pane: &str| live.iter().any(|agent| agent.pane_id == pane);
+    // A pane id is reusable — after a Herdr restart, a finished task's old
+    // pane id can belong to an unrelated live agent. Matching by pane id
+    // alone (the bug behind card 20261108-b-37df85) would hand that
+    // agent's live pane to this task's reclaim; a pane only counts as this
+    // task's own occupant when the live listing's agent name at that pane
+    // id still matches what this task was dispatched under. A differing
+    // name, or no name at all, is treated exactly like the pane being
+    // gone — the same fallthrough to `stale` bookkeeping below.
+    let occupant_matches = |pane: &str, agent: Option<&str>| {
+        live.iter()
+            .find(|current| current.pane_id == pane)
+            .is_some_and(|current| current.name.as_deref().unwrap_or("") == agent.unwrap_or(""))
+    };
     let already_marked = stale_pane_marked_tasks(root);
     let lane_checks = reclaim_lane_checks(root, &tasks, &is_live);
 
@@ -3179,7 +3202,7 @@ pub fn reclaimable_panes(
             pane: pane.clone(),
             agent: task.agent.clone(),
         };
-        if is_live(&pane) {
+        if occupant_matches(&pane, task.agent.as_deref()) {
             reclaimable.push(candidate);
         } else if !already_marked.contains(&task.task_id) {
             stale.push(candidate);
@@ -4886,6 +4909,41 @@ mod tests {
     }
 
     #[test]
+    fn reclaimable_panes_treats_a_pane_reused_by_a_different_agent_as_gone() {
+        // Card 20261108-b-37df85: pane ids are reused after a Herdr
+        // restart, so a recorded task's old pane id can now belong to a
+        // different, unrelated live agent. That must never be offered as
+        // this task's own reclaimable pane — it is treated exactly like
+        // the pane being gone, falling to `stale` instead.
+        let root = temp_dir("reclaimable-reused-agent");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-111111\tbranch=main\t\
+             role=fixer\tagent=x-fix-cl\n\
+             2026-01-01T00:01:00+00:00\tevent=result\ttask=20260101-fixer-111111\tstatus=done\t\
+             state=done\trevisions=0\tpane=w1:p1\n",
+        );
+
+        let mut agents = FakeAgents::new_idle(&[("w1:p1", "y-buil-cl")]);
+        let (reclaimable, stale) = reclaimable_panes(&root, &mut agents);
+        assert!(
+            reclaimable.is_empty(),
+            "a pane now owned by a different agent must never be reclaimable"
+        );
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].task_id, "20260101-fixer-111111");
+
+        // The agent matching the task's own recorded dispatch still
+        // reclaims normally.
+        let mut same_agent = FakeAgents::new_idle(&[("w1:p1", "x-fix-cl")]);
+        let (reclaimable, stale) = reclaimable_panes(&root, &mut same_agent);
+        assert_eq!(reclaimable.len(), 1);
+        assert!(stale.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn reclaimable_panes_marks_a_dead_pane_stale_once() {
         let root = temp_dir("reclaimable-stale");
         write(
@@ -5440,6 +5498,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn reconcile_project_never_closes_a_pane_reused_by_a_different_agent() {
+        // Card 20261108-b-37df85: `w1:p1` is this task's own recorded
+        // pane id, but Herdr now reports a different agent answering
+        // there — the id was handed to someone else's session. Reconcile
+        // still records this task's own terminal status (that read is
+        // off the local status file, not the live listing), but must
+        // never close a pane it does not actually own.
+        let root = temp_dir("reconcile-reused-pane");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-dddddd\t\
+             branch=\trole=explorer\tagent=x-fix-cl\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-dddddd\tpane=w1:p1\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20260101-explorer-dddddd/status"),
+            "done",
+        );
+        write(
+            &root.join(".multiverse/tasks/20260101-explorer-dddddd/result.md"),
+            "# Result\ndone.\n",
+        );
+
+        let empty = HashMap::new();
+        let mut reused = FakeAgents::new_idle(&[("w1:p1", "y-buil-cl")]);
+        let outcome = reconcile_project(
+            &root,
+            ReconcileRequest {
+                only_task: None,
+                close_panes: true,
+                expire_stale: false,
+                lease_minutes: 60,
+                lease_overrides: &empty,
+                now: now_utc(),
+                require_live: true,
+            },
+            &mut reused,
+        );
+        assert_eq!(
+            outcome.recorded,
+            vec!["20260101-explorer-dddddd".to_string()]
+        );
+        assert_eq!(
+            outcome.closed_panes, 0,
+            "a pane id reused by a different live agent must never be closed"
+        );
+        assert!(reused.closed.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

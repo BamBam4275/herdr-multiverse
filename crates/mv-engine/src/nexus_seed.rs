@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use mv_state::activity::HUB_PROJECT_NAME;
 use mv_state::backlog;
 
 use crate::directives::{self, content_digest, NO_DIRECTIVE_DIGEST};
@@ -188,13 +189,17 @@ fn cell(value: &str) -> String {
     value.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
-fn directive_state(context: &SeedContext<'_>) -> (String, Option<String>) {
-    let result = directives::read(context.directives_root, context.project)
-        .and_then(|_| directives::digest(context.directives_root, context.project));
+fn directive_state_for(directives_root: &Path, project: &str) -> (String, Option<String>) {
+    let result = directives::read(directives_root, project)
+        .and_then(|_| directives::digest(directives_root, project));
     match result {
         Ok(digest) => (digest, None),
         Err(error) => (NO_DIRECTIVE_DIGEST.into(), Some(error.to_string())),
     }
+}
+
+fn directive_state(context: &SeedContext<'_>) -> (String, Option<String>) {
+    directive_state_for(context.directives_root, context.project)
 }
 
 fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
@@ -350,14 +355,19 @@ pub fn seed_digest(context: &SeedContext<'_>) -> String {
     content_digest(seed_body(context, &multiverse_invocation()).as_bytes())
 }
 
-pub fn render_seed(context: &SeedContext<'_>) -> String {
-    let body = seed_body(context, &multiverse_invocation());
-    // `seed_body` always starts with `# Nexus — …\n`.
+/// Wrap a rendered body (always starting with `# Nexus — …\n`) in the
+/// seed-digest marker that `seed_is_stale`-style checks read back. Shared by
+/// every renderer so the marker convention cannot drift between them.
+fn finalize_seed(body: String) -> String {
     let (title, rest) = body.split_once('\n').expect("seed has a title");
     format!(
         "{title}\n{MARKER}{} -->\n{rest}",
         content_digest(body.as_bytes())
     )
+}
+
+pub fn render_seed(context: &SeedContext<'_>) -> String {
+    finalize_seed(seed_body(context, &multiverse_invocation()))
 }
 
 fn marker_digest(line: &str) -> Option<&str> {
@@ -387,14 +397,16 @@ fn without_marker(text: &str) -> String {
 }
 
 /// None is never started. Existing unreadable files are errors, never None.
-pub fn seed_is_stale(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<bool>> {
+fn digest_is_stale(path: &Path, digest: &str) -> io::Result<Option<bool>> {
     match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(
-            stored_digest(&text) != Some(seed_digest(context).as_str()),
-        )),
+        Ok(text) => Ok(Some(stored_digest(&text) != Some(digest))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+pub fn seed_is_stale(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<bool>> {
+    digest_is_stale(path, &seed_digest(context))
 }
 
 /// Preserve human edits based on the seed's own digest, not today's config.
@@ -436,9 +448,10 @@ pub fn backup_if_edited(path: &Path) -> io::Result<Option<PathBuf>> {
     unreachable!("backup suffix space exhausted")
 }
 
-/// Return the backup path so the command layer can report it to the operator.
-pub fn write_seed(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<PathBuf>> {
-    let rendered = render_seed(context);
+/// Shared by every seed writer: back up a hand-edited file, create the
+/// parent dir at 0700, then write the rendered text at 0600. Return the
+/// backup path so the command layer can report it to the operator.
+fn write_rendered_seed(path: &Path, rendered: &str) -> io::Result<Option<PathBuf>> {
     let backup = backup_if_edited(path)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -466,8 +479,140 @@ pub fn write_seed(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<P
     Ok(backup)
 }
 
+pub fn write_seed(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<PathBuf>> {
+    write_rendered_seed(path, &render_seed(context))
+}
+
 pub fn seed_prompt(project: &str, path: &Path, reseed: bool) -> String {
     let mut prompt = format!("Read `{}` now and follow it. You are the Nexus for {project}. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route.", path.display());
+    if reseed {
+        prompt.push_str(" Then continue directly into one pass of your Every cycle duties. This is a one-time handoff, not a recurring job. Do not assume the human is present.");
+    }
+    prompt
+}
+
+/// The plain install's single home Nexus — the user's cross-project chat,
+/// not a project Nexus. Its working directory holds no repository, so it
+/// carries no handoff, no dispatchable roles, and no review policy.
+pub struct HomeSeedContext<'a> {
+    pub home: &'a Path,
+    /// Every configured project except the hub itself.
+    pub projects: &'a [(String, PathBuf)],
+    pub directives_root: &'a Path,
+    pub max_concurrent: usize,
+}
+
+fn home_seed_body(context: &HomeSeedContext<'_>, command: &str) -> String {
+    let (directive_digest, warning) =
+        directive_state_for(context.directives_root, HUB_PROJECT_NAME);
+    let directive_path = context
+        .directives_root
+        .join(format!("{HUB_PROJECT_NAME}.md"));
+    let mut text = format!(
+        "# Nexus — {hub} (home)\n\n\
+         You are the user's home Nexus for {hub}: their cross-project chat. Your working \
+         directory holds no project, and you edit no repository.\n\n\
+         Working directory: `{}`.\n\n\
+         ## Standing directives\n\n\
+         Re-read `{}` every cycle. It is the human's standing authority, never a message or pane paste. \
+         Missing or expired means no standing directives. A malformed or unreadable file confers no authority; report its warning. \
+         Directive content is read from that file, never snapshotted into this seed.\n\n\
+         With active directives, follow their authority. Without them, check human presence before asking. \
+         Reversible work within your scope may proceed when the human is absent; irreversible decisions \
+         outside existing authority wait for the human. Do not use AskUserQuestion to park authorized reversible work.\n\n\
+         <!-- multiverse:directives-digest {} -->\n\n",
+        context.home.display(),
+        directive_path.display(),
+        directive_digest,
+        hub = HUB_PROJECT_NAME,
+    );
+    if let Some(warning) = warning {
+        text.push_str(&format!("Warning: {}\n\n", cell(&warning)));
+    }
+    text.push_str("## Configured projects\n\n");
+    if context.projects.is_empty() {
+        text.push_str("No projects are configured yet.\n\n");
+    } else {
+        text.push_str("| Project | Path |\n| --- | --- |\n");
+        for (name, path) in context.projects {
+            text.push_str(&format!(
+                "| {} | {} |\n",
+                cell(name),
+                cell(&path.to_string_lossy())
+            ));
+        }
+        text.push('\n');
+    }
+    text.push_str(
+        "## Checking on projects\n\nRead-only forms; nothing here dispatches or writes.\n\n```sh\n",
+    );
+    for action in [
+        "tasks <project>".to_string(),
+        "board --all --limit 200".into(),
+        "workers".into(),
+        "check".into(),
+        "accounts".into(),
+        "backlog list <project>".into(),
+    ] {
+        text.push_str(&format!("{command} {action}\n"));
+    }
+    text.push_str("```\n\n");
+    text.push_str(&format!(
+        "## Routing work to a project\n\n\
+         Route a request by messaging that project's own Nexus: `{command} activity send \
+         <project> \"...\"`. Use `--ask` when you need an answer back, and answer one you hold \
+         with `{command} activity reply SEQ \"...\"`. `{command} activity broadcast` and \
+         `{command} activity nudge` are hub-only tools. Read your mail every cycle with \
+         `{command} activity inbox`, repeated until it reports nothing new. Mail here is always \
+         from a project, never from the human.\n\n\
+         ## Opening a project's Nexus\n\n\
+         Open a project's own Nexus on request with `{command} start <project>`. Do not dispatch \
+         workers into another project's repository yourself — that project's Nexus owns its own \
+         routing.\n\n\
+         ## Asking the human\n\n\
+         Run `{command} presence` first. With the human present, ask as a numbered menu — the \
+         decision in one line, concrete options, and an explicit recommendation — the same rules \
+         a project's own Nexus follows.\n\n\
+         ## The rules you are held to\n\n\
+         Fleet `max_concurrent = {}`.\n\n",
+        context.max_concurrent,
+    ));
+    let shipped = include_str!("../../../prompts/role-nexus-home.md");
+    let prompt = shipped
+        .split_once("\n---\n")
+        .map_or(shipped, |(_, body)| body)
+        .trim();
+    if !prompt.is_empty() {
+        text.push_str(prompt);
+        text.push('\n');
+    }
+    text
+}
+
+pub fn home_seed_digest(context: &HomeSeedContext<'_>) -> String {
+    content_digest(home_seed_body(context, &multiverse_invocation()).as_bytes())
+}
+
+pub fn render_home_seed(context: &HomeSeedContext<'_>) -> String {
+    finalize_seed(home_seed_body(context, &multiverse_invocation()))
+}
+
+/// Twin of `seed_is_stale`, sharing its marker convention.
+pub fn home_seed_is_stale(path: &Path, context: &HomeSeedContext<'_>) -> io::Result<Option<bool>> {
+    digest_is_stale(path, &home_seed_digest(context))
+}
+
+pub fn write_home_seed(path: &Path, context: &HomeSeedContext<'_>) -> io::Result<Option<PathBuf>> {
+    write_rendered_seed(path, &render_home_seed(context))
+}
+
+pub fn home_seed_prompt(path: &Path, reseed: bool) -> String {
+    let mut prompt = format!(
+        "Read `{}` now and follow it. You are the home Nexus for {HUB_PROJECT_NAME}: the \
+         user's cross-project chat, not a project Nexus. Report, in two lines, which projects \
+         you can see and how you route to each.",
+        path.display()
+    );
     if reseed {
         prompt.push_str(" Then continue directly into one pass of your Every cycle duties. This is a one-time handoff, not a recurring job. Do not assume the human is present.");
     }
@@ -815,5 +960,83 @@ mod tests {
         let file = Handoff::File(PathBuf::from(".multiverse/handoff.md"));
         assert!(handoff_instruction(&file).contains(".multiverse/handoff.md"));
         assert!(handoff_instruction(&Handoff::None).contains("recorded no handoff"));
+    }
+
+    // --- HomeSeedContext --------------------------------------------------
+
+    fn home_context<'a>(root: &'a Path, projects: &'a [(String, PathBuf)]) -> HomeSeedContext<'a> {
+        HomeSeedContext {
+            home: Path::new("/state/home"),
+            projects,
+            directives_root: root,
+            max_concurrent: 4,
+        }
+    }
+
+    #[test]
+    fn home_seed_names_routing_and_every_project_without_isolation_text() {
+        let dir = TempDir::new();
+        let projects = [
+            ("alpha".to_string(), PathBuf::from("/projects/alpha")),
+            ("beta".to_string(), PathBuf::from("/projects/beta")),
+        ];
+        let seed = render_home_seed(&home_context(&dir.0, &projects));
+        assert!(seed.contains("activity send"));
+        assert!(seed.contains("start <"));
+        assert!(seed.contains("alpha"));
+        assert!(seed.contains("/projects/alpha"));
+        assert!(seed.contains("beta"));
+        assert!(seed.contains("/projects/beta"));
+        assert!(!seed.contains("Never read, list, or search another project's repository"));
+        assert!(!seed.contains("assigned to repository"));
+    }
+
+    #[test]
+    fn home_seed_digest_changes_with_the_project_list() {
+        let dir = TempDir::new();
+        let none: [(String, PathBuf); 0] = [];
+        let baseline = home_seed_digest(&home_context(&dir.0, &none));
+        let one = [("alpha".to_string(), PathBuf::from("/projects/alpha"))];
+        assert_ne!(home_seed_digest(&home_context(&dir.0, &one)), baseline);
+        let two = [
+            ("alpha".to_string(), PathBuf::from("/projects/alpha")),
+            ("beta".to_string(), PathBuf::from("/projects/beta")),
+        ];
+        assert_ne!(home_seed_digest(&home_context(&dir.0, &two)), baseline);
+        assert_ne!(
+            home_seed_digest(&home_context(&dir.0, &two)),
+            home_seed_digest(&home_context(&dir.0, &one))
+        );
+    }
+
+    #[test]
+    fn write_home_seed_matches_write_seed_mode_and_backup_behavior() {
+        let dir = TempDir::new();
+        let projects = [("alpha".to_string(), PathBuf::from("/projects/alpha"))];
+        let context = home_context(&dir.0, &projects);
+        let parent = dir.0.join("nested").join("home");
+        let path = parent.join(SEED_FILENAME);
+        assert_eq!(home_seed_is_stale(&path, &context).unwrap(), None);
+        assert!(write_home_seed(&path, &context).unwrap().is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600);
+            let dir_mode = fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+        }
+
+        let original = fs::read_to_string(&path).unwrap();
+        assert_eq!(home_seed_is_stale(&path, &context).unwrap(), Some(false));
+
+        fs::write(&path, format!("{original}Human edit.\n")).unwrap();
+        let backup = write_home_seed(&path, &context).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(backup).unwrap(),
+            format!("{original}Human edit.\n")
+        );
+        assert_eq!(home_seed_is_stale(&path, &context).unwrap(), Some(false));
     }
 }

@@ -253,6 +253,22 @@ pub fn config_state_dir_from_env(configured: &Path) -> PathBuf {
     config_state_dir(configured, &default, over.as_deref())
 }
 
+/// The literal project name reserved for the home hub (backlog
+/// `20261108-b-81cb2b`). Must stay equal to `mv_state::activity::
+/// HUB_PROJECT_NAME` — duplicated here, not imported, because `mv-config`
+/// sits below `mv-state` in this workspace's one-way dependency order.
+const HUB_PROJECT_NAME: &str = "multiverse";
+
+/// Where `[projects.multiverse]`'s `path` defaults to when the table
+/// omits it: a fixed subdirectory of the fleet state directory, so the
+/// hub always has a real repository to seed a Nexus into without the
+/// user cloning or naming one (decided change 1, `20261108-b-81cb2b`).
+/// `start` creates this directory; a missing one still loads, like any
+/// other project's not-yet-cloned path (`a_project_path_that_does_not_exist_yet_is_accepted`).
+pub fn default_home_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("home")
+}
+
 // ---------------------------------------------------------------------
 // TOML value helpers — the shared "must be a {type}" validators
 // (regression `f801276`: one message template, not ad hoc per field).
@@ -860,13 +876,30 @@ fn parse_project(
     name: &str,
     value: &Value,
     warnings: &mut Vec<String>,
+    hub_default_path: Option<&Path>,
 ) -> Result<Project, ConfigError> {
     let scope = format!("projects.{name}");
     let table = require_table(value, &scope)?;
     warn_unknown_keys(table, &scope, PROJECT_KEYS, warnings);
 
-    let path_raw = require_str(table, &scope, "path")?;
-    let path = MaybePlaceholder::parse(path_raw);
+    // Only `[projects.multiverse]` may omit `path` (decided change 1,
+    // `20261108-b-81cb2b`): every other project still requires it exactly
+    // as before. `hub_default_path` is `Some` only when the caller has
+    // already resolved `<state dir>/home` for this project.
+    let path_raw = if name == HUB_PROJECT_NAME {
+        optional_str(table, &scope, "path")?
+    } else {
+        Some(require_str(table, &scope, "path")?)
+    };
+    let path = match path_raw {
+        Some(raw) => MaybePlaceholder::parse(raw),
+        None => {
+            let default = hub_default_path.expect(
+                "load_config_str resolves hub_default_path whenever projects.multiverse omits path",
+            );
+            MaybePlaceholder::parse(default.to_string_lossy().into_owned())
+        }
+    };
     if let Some(p) = path.value() {
         validate_absolute_usable_string(&scope, "path", p)?;
     }
@@ -1255,8 +1288,11 @@ pub enum DashboardTab {
 }
 
 impl Default for DashboardTab {
+    /// Empty, not `["multiverse"]` (decided change 3, `20261108-b-81cb2b`):
+    /// the hub's board is now a split pane `start.rs` opens directly, not a
+    /// dashboard tab, so no project opens one by default.
     fn default() -> Self {
-        Self::Projects(vec!["multiverse".to_string()])
+        Self::Projects(Vec::new())
     }
 }
 
@@ -1450,8 +1486,20 @@ pub fn load_config_str(content: &str, path: &Path) -> Result<Config, ConfigError
     if let Some(projects_value) = root.get("projects") {
         let projects_table = require_table(projects_value, "projects")
             .map_err(|e| ConfigError::at(path, e.message()))?;
+        // Resolved once, only when `[projects.multiverse]` is present and
+        // omits `path` — `config_state_dir_from_env` reads real process
+        // environment, so this stays untouched for every config that
+        // either has no hub project or gives it an explicit `path`.
+        let hub_default_path = projects_table
+            .get(HUB_PROJECT_NAME)
+            .and_then(Value::as_table)
+            .filter(|t| !t.contains_key("path"))
+            .map(|_| default_home_path(&config_state_dir_from_env(path)));
         for (name, value) in projects_table {
-            let project = parse_project(name, value, &mut warnings)
+            let hub_default = (name == HUB_PROJECT_NAME)
+                .then_some(hub_default_path.as_deref())
+                .flatten();
+            let project = parse_project(name, value, &mut warnings, hub_default)
                 .map_err(|e| ConfigError::at(path, e.message()))?;
             projects.insert(name.clone(), project);
         }
@@ -1554,11 +1602,49 @@ fn validate_cross_cutting(mut config: Config, path: &Path) -> Result<Config, Con
     at(validate_interactive_seats(&config), path)?;
     at(validate_project_paths_and_shorts(&config), path)?;
     merge_project_rosters(&mut config)?;
+    merge_hub_activity_pairs(&mut config);
     at(validate_chains(&config), path)?;
     at(validate_slots(&config), path)?;
     at(validate_activity_mail_referential(&config), path)?;
     at(validate_dashboard_tab_projects(&config, path), path)?;
     Ok(config)
+}
+
+/// Decided change 2 (`20261108-b-81cb2b`): a configured `multiverse`
+/// project is implicitly paired with every other project for activity —
+/// `<project> -> multiverse` and `multiverse -> <project>` both permitted
+/// without the user writing either direction in `[activity.pairs]`.
+/// Merged into whatever the user did write, never replacing it: an
+/// explicit pair naming the hub is left as configured (this only adds a
+/// missing direction, it never removes one), and a pair between two
+/// ordinary projects is untouched — deny-by-default still holds there.
+/// `mail_pairs` is not touched; this task's brief scopes the implicit
+/// pairing to activity only.
+fn merge_hub_activity_pairs(config: &mut Config) {
+    if !config.projects.contains_key(HUB_PROJECT_NAME) {
+        return;
+    }
+    let others: Vec<String> = config
+        .projects
+        .keys()
+        .filter(|name| name.as_str() != HUB_PROJECT_NAME)
+        .cloned()
+        .collect();
+    for other in &others {
+        let recipients = config.activity_pairs.entry(other.clone()).or_default();
+        if !recipients.iter().any(|r| r == HUB_PROJECT_NAME) {
+            recipients.push(HUB_PROJECT_NAME.to_string());
+        }
+    }
+    let from_hub = config
+        .activity_pairs
+        .entry(HUB_PROJECT_NAME.to_string())
+        .or_default();
+    for other in &others {
+        if !from_hub.contains(other) {
+            from_hub.push(other.clone());
+        }
+    }
 }
 
 /// Merges each project's `<path>/.multiverse/roster.toml` chain
@@ -1773,17 +1859,16 @@ fn validate_activity_mail_referential(config: &Config) -> Result<(), ConfigError
 /// Refuses a `dashboard_tab` entry naming a project this config does
 /// not have — but only when `dashboard_tab` was written explicitly.
 ///
-/// Python (`config.py:2482-2503`) hard-refuses with a `ConfigError`
-/// only when `dashboard_tab` is present in the raw `[board]` table and
-/// names an unknown project; when the key is absent and the default
-/// (`dashboard_tab = ["multiverse"]`) applies, Python never validates
-/// it at all. `Board::default()`'s own default names a project that
-/// most configs — including this repo's own `config.example.toml`,
-/// whose only project is `example` — do not define, so validating the
-/// default here would make the shipped example fail to load with zero
-/// edits; skipping the default case entirely (no warning, no error)
-/// matches Python and keeps the default harmless, while an explicit,
-/// wrong `dashboard_tab` still fails loudly.
+/// Python (`config.py:2482-2503`) hard-refuses with a `ConfigError` only
+/// when `dashboard_tab` is present in the raw `[board]` table and names
+/// an unknown project; when the key is absent, Python's own default
+/// (`dashboard_tab = ["multiverse"]`) is never validated at all.
+/// `Board::default()` here now defaults to an empty project list instead
+/// (decided change 3, `20261108-b-81cb2b`: the hub's board is a split
+/// pane `start.rs` opens, not a dashboard tab), so the default case is
+/// harmless either way — skipping it entirely (no warning, no error)
+/// still matches Python's "never validate an unset key" rule, while an
+/// explicit, wrong `dashboard_tab` still fails loudly.
 fn validate_dashboard_tab_projects(config: &Config, _path: &Path) -> Result<(), ConfigError> {
     if !config.board.dashboard_tab_explicit {
         return Ok(());
@@ -1891,8 +1976,17 @@ mod tests {
     /// `config.example.toml`").
     #[test]
     fn the_shipped_example_config_loads() {
+        // An absolute `config_path` — not the relative literal this test
+        // used before decided change 1 (`20261108-b-81cb2b`) added
+        // `[projects.multiverse]`: resolving its default `<state
+        // dir>/home` path needs an absolute `path` argument to be
+        // absolute in turn (`validate_absolute_usable_string`), and a
+        // bare relative literal has no real parent directory to anchor
+        // that resolution to.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.example.toml");
         let content = include_str!("../../../config.example.toml");
-        let config = load_config_str(content, Path::new("config.example.toml")).unwrap();
+        let config = load_config_str(content, &config_path).unwrap();
 
         assert_eq!(config.accounts.len(), 5);
         assert!(config.accounts["claude-personal"]
@@ -1900,18 +1994,31 @@ mod tests {
             .is_placeholder());
         assert_eq!(config.roles.len(), 1);
         assert!(config.roles.contains_key(&Role::Scout));
-        assert_eq!(config.projects.len(), 1);
+        assert_eq!(config.projects.len(), 2);
         assert!(config.projects["example"].path.is_placeholder());
         assert_eq!(
             config.projects["example"].chains.get(&Role::Scout),
             Some(&vec!["claude-personal".to_string()])
         );
-        // The default `dashboard_tab` (`["multiverse"]`) names a
-        // project this example does not define (its only project is
-        // `example`), but the key is absent from the example's
-        // `[board]` table, so `validate_dashboard_tab_projects` skips
-        // it entirely — no warning, matching Python's own behavior of
-        // never validating an unset `dashboard_tab`.
+        // `[projects.multiverse]` ships with no `path` line (decided
+        // change 1): it resolves to `<state dir>/home` rather than
+        // staying a placeholder, and is implicitly paired with `example`
+        // for activity (decided change 2) with no `[activity.pairs]`
+        // table in the shipped example at all.
+        assert!(!config.projects["multiverse"].path.is_placeholder());
+        assert_eq!(config.projects["multiverse"].short.as_deref(), Some("mv"));
+        assert_eq!(
+            config.activity_pairs.get("example"),
+            Some(&vec!["multiverse".to_string()])
+        );
+        assert_eq!(
+            config.activity_pairs.get("multiverse"),
+            Some(&vec!["example".to_string()])
+        );
+        // The default `dashboard_tab` is now empty (decided change 3), so
+        // there is no default project name to validate against this
+        // example's projects at all, and no `[board]` table is present
+        // either way — `validate_dashboard_tab_projects` never runs.
         assert_eq!(config.warnings, Vec::<String>::new());
     }
 
@@ -2610,6 +2717,12 @@ short = "exam"
         assert_eq!(config.host_disk_critical_gb, 15);
         assert!(!config.lend_interactive_to_workers);
         assert!(config.accounts.is_empty());
+        // Decided change 3 (`20261108-b-81cb2b`): no longer `["multiverse"]`
+        // — the hub's board is a split pane `start.rs` opens, not a tab.
+        assert_eq!(
+            config.board.dashboard_tab,
+            DashboardTab::Projects(Vec::new())
+        );
     }
 
     #[test]
@@ -2630,6 +2743,101 @@ pairs = {{ a = ["ghost"] }}
         let config_path = dir.path().join("config.toml");
         let err = load_config_str(&content, &config_path).unwrap_err();
         assert!(err.message().contains("ghost"));
+    }
+
+    // -- decided change 2: implicit hub activity pairing (`20261108-b-81cb2b`) --
+
+    #[test]
+    fn a_configured_hub_is_implicitly_paired_with_every_other_project() {
+        let dir = tempdir().unwrap();
+        let hub = dir.path().join("hub");
+        fs::create_dir_all(&hub).unwrap();
+        let a = dir.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        let content = format!(
+            "[projects.multiverse]\npath = \"{hub}\"\n\n[projects.a]\npath = \"{a}\"\n",
+            hub = hub.display(),
+            a = a.display()
+        );
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(&content, &config_path).unwrap();
+
+        assert_eq!(
+            config.activity_pairs.get("a"),
+            Some(&vec!["multiverse".to_string()])
+        );
+        assert_eq!(
+            config.activity_pairs.get("multiverse"),
+            Some(&vec!["a".to_string()])
+        );
+    }
+
+    /// The hub pairing never leaks into a pair between two *ordinary*
+    /// projects — only the hub gets the implicit grant in either
+    /// direction.
+    #[test]
+    fn hub_pairing_does_not_imply_a_pair_between_two_ordinary_projects() {
+        let dir = tempdir().unwrap();
+        let mut content = String::new();
+        for name in ["a", "b", "multiverse"] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            content.push_str(&format!(
+                "[projects.{name}]\npath = \"{}\"\n\n",
+                root.display()
+            ));
+        }
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(&content, &config_path).unwrap();
+
+        assert!(config
+            .activity_pairs
+            .get("a")
+            .is_none_or(|to| !to.iter().any(|p| p == "b")));
+        assert!(config
+            .activity_pairs
+            .get("b")
+            .is_none_or(|to| !to.iter().any(|p| p == "a")));
+    }
+
+    /// The implicit grant merges into whatever `[activity.pairs]` the
+    /// user already wrote rather than replacing it.
+    #[test]
+    fn hub_pairing_merges_into_a_user_configured_pair_without_dropping_it() {
+        let dir = tempdir().unwrap();
+        let mut roots = Vec::new();
+        for name in ["multiverse", "a", "b"] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            roots.push((name, root));
+        }
+        let mut content = String::new();
+        for (name, root) in &roots {
+            content.push_str(&format!(
+                "[projects.{name}]\npath = \"{}\"\n\n",
+                root.display()
+            ));
+        }
+        content.push_str("[activity]\npairs = { a = [\"b\"] }\n");
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(&content, &config_path).unwrap();
+
+        // The user's own pair is kept, with the implicit hub grant
+        // appended rather than overwriting it.
+        assert_eq!(
+            config.activity_pairs.get("a"),
+            Some(&vec!["b".to_string(), "multiverse".to_string()])
+        );
+        // The implicit reverse direction, and the other project's own
+        // implicit grant, are both still present.
+        assert_eq!(
+            config.activity_pairs.get("multiverse"),
+            Some(&vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            config.activity_pairs.get("b"),
+            Some(&vec!["multiverse".to_string()])
+        );
     }
 
     #[test]
@@ -2761,6 +2969,85 @@ path = "{path}"
         let config_path = dir.path().join("config.toml");
         let err = load_config_str(&content, &config_path).unwrap_err();
         assert!(err.message().contains("same path"));
+    }
+
+    // -- decided change 1: the hub project's default path (`20261108-b-81cb2b`) --
+
+    /// Guards `MULTIVERSE_STATE_DIR` for
+    /// [`the_hub_projects_path_defaults_to_state_dir_slash_home`] (a lock
+    /// plus restore-on-drop, same shape as `HomeEnvGuard` below) — kept
+    /// local since no other test in this file touches this variable.
+    struct StateDirEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StateDirEnvGuard {
+        fn set(value: &Path) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("MULTIVERSE_STATE_DIR");
+            std::env::set_var("MULTIVERSE_STATE_DIR", value);
+            Self {
+                previous,
+                _lock: held,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_hub_projects_path_defaults_to_state_dir_slash_home() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let _state = StateDirEnvGuard::set(&state_dir);
+
+        let a = dir.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        let content = format!(
+            "[projects.multiverse]\n\n[projects.a]\npath = \"{a}\"\n",
+            a = a.display()
+        );
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(&content, &config_path).unwrap();
+
+        // `<state dir>/home` itself does not exist — the same tolerance
+        // `a_project_path_that_does_not_exist_yet_is_accepted` already
+        // covers for an ordinary project's path.
+        assert_eq!(
+            config.projects["multiverse"].path.value(),
+            Some(state_dir.join("home").to_str().unwrap())
+        );
+        assert!(!config.projects["multiverse"].path.is_placeholder());
+    }
+
+    /// Every other project's missing/placeholder `path` is unaffected —
+    /// only a project literally named `multiverse` gets the default.
+    #[test]
+    fn only_the_project_named_multiverse_gets_the_default_path() {
+        let dir = tempdir().unwrap();
+        let content = "[projects.not-the-hub]\npath = \"<<PLACEHOLDER: x>>\"\n";
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(content, &config_path).unwrap();
+        assert!(config.projects["not-the-hub"].path.is_placeholder());
+    }
+
+    #[test]
+    fn omitting_path_for_a_non_hub_project_is_still_refused() {
+        let dir = tempdir().unwrap();
+        let content = "[projects.not-the-hub]\nshort = \"nth\"\n";
+        let config_path = dir.path().join("config.toml");
+        let err = load_config_str(content, &config_path).unwrap_err();
+        assert!(err.message().contains("path"));
     }
 
     // -- finding 4: a project's local roster.toml is merged in --------

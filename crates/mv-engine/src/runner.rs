@@ -557,29 +557,94 @@ fn rectangles(result: &CommandResult) -> Option<Vec<Rectangle>> {
         .collect()
 }
 
-/// `None` means "split `--current`", matching Python's own `None` return
-/// from `_where_to_split` (`runner.py:728-794`) for both of its own
-/// believe-neither-the-layout-nor-our-id cases: the origin pane missing
-/// from the layout here mirrors Python's `mine not in rects`.
-fn placement(current: &str, layout: &[Rectangle]) -> (Option<String>, &'static str) {
+/// A new pane below this many rows leaves Codex start-up failing with "did
+/// not become readable and ready" (card `20261108-b-35a7f8`): five or more
+/// dispatches were lost to a right column that kept splitting its own
+/// most-recently-created (and already smallest) pane, squashing it toward
+/// nothing with every new worker.
+const MIN_PANE_ROWS: f64 = 12.0;
+
+/// [`placement`]'s decision: split an existing pane in two, or give up on
+/// this tab's column and open a new tab instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Placement {
+    /// `None` pane means "split `--current`", matching Python's own `None`
+    /// return from `_where_to_split` (`runner.py:728-794`) for both of its
+    /// own believe-neither-the-layout-nor-our-id cases: the origin pane
+    /// missing from the layout here mirrors Python's `mine not in rects`.
+    Split(Option<String>, &'static str),
+    /// No pane in the target column can be split without a half dropping
+    /// below [`MIN_PANE_ROWS`].
+    NewTab,
+}
+
+/// Where to put the next pane. Reuses the nearest specialist column to the
+/// right, stacking below its **tallest** pane rather than its most
+/// recently created one — splitting the smallest pane in the column over
+/// and over is exactly what squashed a live builder to 4 rows (card
+/// `20261108-b-35a7f8`). With no such column yet, make the first
+/// right-hand split: a width split, so no pane's row count is ever at
+/// risk. If the column's tallest pane cannot be split in half without
+/// either half dropping below [`MIN_PANE_ROWS`], no pane in it is safe to
+/// split at all, so a new tab is called for instead.
+fn placement(current: &str, layout: &[Rectangle]) -> Placement {
     let Some(origin) = layout.iter().find(|r| r.pane == current) else {
-        return (None, "right");
+        return Placement::Split(None, "right");
     };
-    // Reuse the nearest specialist column to the right, stacking below its
-    // lowest pane. With no such column, make the first right-hand split.
     let right = layout
         .iter()
         .filter(|r| r.x >= origin.x + origin.width - 1.0)
         .min_by(|a, b| a.x.total_cmp(&b.x));
     let Some(column) = right else {
-        return (Some(current.into()), "right");
+        return Placement::Split(Some(current.into()), "right");
     };
-    let bottom = layout
+    let tallest = layout
         .iter()
         .filter(|r| (r.x - column.x).abs() <= 1.0)
-        .max_by(|a, b| (a.y + a.height).total_cmp(&(b.y + b.height)))
+        .max_by(|a, b| a.height.total_cmp(&b.height))
         .unwrap_or(column);
-    (Some(bottom.pane.clone()), "down")
+    if tallest.height >= 2.0 * MIN_PANE_ROWS {
+        Placement::Split(Some(tallest.pane.clone()), "down")
+    } else {
+        Placement::NewTab
+    }
+}
+
+/// The Herdr calls needed to open a new tab in `current`'s own workspace,
+/// as [`placement`]'s fallback once no pane in its target column can be
+/// split without dropping below [`MIN_PANE_ROWS`] — card
+/// `20261108-b-35a7f8`. Returns the new tab's root pane.
+fn open_overflow_tab(
+    herdr: &mut impl Herdr,
+    current: &str,
+    cwd: &Path,
+    label: &str,
+    env: &[(&str, &str)],
+) -> Result<String, RunnerError> {
+    let got = checked(herdr, argv::pane_get(current), COMMAND_TIMEOUT)?;
+    let workspace = got
+        .payload
+        .as_ref()
+        .and_then(|payload| payload["result"]["pane"]["workspace_id"].as_str())
+        .ok_or_else(|| {
+            RunnerError::Refused(format!(
+                "pane {current:?} has no workspace_id; cannot open an overflow tab for it"
+            ))
+        })?
+        .to_string();
+    let created = checked(
+        herdr,
+        argv::tab_create(&workspace, cwd, label, env, false),
+        COMMAND_TIMEOUT,
+    )?;
+    created
+        .payload
+        .as_ref()
+        .and_then(|payload| payload["result"]["root_pane"]["pane_id"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            RunnerError::Refused("new tab created, but its pane was not returned".into())
+        })
 }
 
 fn equalize(herdr: &mut impl Herdr, pane: &str) {
@@ -1703,39 +1768,61 @@ pub fn start_dispatch(
         let layout = checked(herdr, argv::pane_layout(current_pane), COMMAND_TIMEOUT)
             .ok()
             .and_then(|r| rectangles(&r));
-        let (split_pane, direction) = layout
+        let decision = layout
             .as_ref()
-            .map_or((None, "right"), |panes| placement(current_pane, panes));
+            .map_or(Placement::Split(None, "right"), |panes| {
+                placement(current_pane, panes)
+            });
         // The fleet could have been halted since planning; this is the last
         // check before a pane is actually created (finding 5).
         store.check_halt_before_pane_creation()?;
-        let split = checked(
-            herdr,
-            argv::pane_split(
-                &launch.cwd,
-                &env,
-                split_pane.as_deref(),
-                split_pane.is_none(),
-                Some(direction),
-                false,
-            ),
-            COMMAND_TIMEOUT,
-        )?;
-        let pane = pane_id_from(&split)?;
-        if pane.trim().is_empty()
-            || pane == current_pane
-            || split_pane.as_deref() == Some(pane.as_str())
-            || layout
-                .as_ref()
-                .is_some_and(|panes| panes.iter().any(|p| p.pane == pane))
-        {
-            return Err(RunnerError::Refused(
-                "split did not return a new pane id".into(),
-            ));
-        }
+        let pane = match decision {
+            Placement::Split(split_pane, direction) => {
+                let split = checked(
+                    herdr,
+                    argv::pane_split(
+                        &launch.cwd,
+                        &env,
+                        split_pane.as_deref(),
+                        split_pane.is_none(),
+                        Some(direction),
+                        false,
+                    ),
+                    COMMAND_TIMEOUT,
+                )?;
+                let pane = pane_id_from(&split)?;
+                if pane.trim().is_empty()
+                    || pane == current_pane
+                    || split_pane.as_deref() == Some(pane.as_str())
+                    || layout
+                        .as_ref()
+                        .is_some_and(|panes| panes.iter().any(|p| p.pane == pane))
+                {
+                    return Err(RunnerError::Refused(
+                        "split did not return a new pane id".into(),
+                    ));
+                }
+                equalize(herdr, &pane);
+                pane
+            }
+            Placement::NewTab => {
+                let pane = open_overflow_tab(
+                    herdr,
+                    current_pane,
+                    &launch.cwd,
+                    &pane_label(&launch),
+                    &env,
+                )?;
+                if pane.trim().is_empty() || pane == current_pane {
+                    return Err(RunnerError::Refused(
+                        "new tab did not return a usable pane id".into(),
+                    ));
+                }
+                pane
+            }
+        };
         owned_pane = Some(pane.clone());
         owned_agent = Some(launch.agent_name.clone());
-        equalize(herdr, &pane);
         checked(
             herdr,
             argv::pane_rename(&pane, &pane_label(&launch)),
@@ -4074,6 +4161,12 @@ mod tests {
         assert_eq!(fake.called("pane", "close").len(), 1);
     }
 
+    /// Updated for card `20261108-b-35a7f8`: `placement` now returns the
+    /// `Placement` enum (to make room for the `NewTab` fallback) instead of
+    /// a bare `(Option<String>, &str)` tuple. The panes chosen are
+    /// unchanged — `top` and `bottom` are equally tall here, and a tie
+    /// still resolves to the later pane, same as the old bottom-of-column
+    /// pick — only the wrapping type is new.
     #[test]
     fn split_placement_stacks_in_the_nearest_right_column() {
         let rectangle = |pane: &str, x, y, height| Rectangle {
@@ -4091,13 +4184,72 @@ mod tests {
         ];
         assert_eq!(
             placement("caller", &layout),
-            (Some("bottom".into()), "down")
+            Placement::Split(Some("bottom".into()), "down")
         );
-        assert_eq!(placement("far", &layout), (Some("far".into()), "right"));
+        assert_eq!(
+            placement("far", &layout),
+            Placement::Split(Some("far".into()), "right")
+        );
         // Origin pane missing from the layout: `None` means "split
         // `--current`" (the fallback matching Python's own `_where_to_split`
         // `mine not in rects` case), not an explicit (wrong) pane id.
-        assert_eq!(placement("missing", &layout), (None, "right"));
+        assert_eq!(
+            placement("missing", &layout),
+            Placement::Split(None, "right")
+        );
+    }
+
+    /// Card `20261108-b-35a7f8`, done-when (1): a right column of a
+    /// 40-row and a 4-row pane must split the 40-row one, not the 4-row
+    /// pane a most-recently-created pick would choose — and the computed
+    /// 50/50 ratio a plain split applies keeps both resulting halves at or
+    /// above `MIN_PANE_ROWS` (40.0 / 2.0 == 20.0 >= 12.0).
+    #[test]
+    fn split_placement_splits_the_tallest_pane_in_the_column_not_the_smallest() {
+        let rectangle = |pane: &str, x, y, height| Rectangle {
+            pane: pane.into(),
+            x,
+            y,
+            width: 100.0,
+            height,
+        };
+        let layout = [
+            rectangle("caller", 0.0, 0.0, 44.0),
+            rectangle("short", 100.0, 0.0, 4.0),
+            rectangle("tall", 100.0, 4.0, 40.0),
+        ];
+        assert_eq!(
+            placement("caller", &layout),
+            Placement::Split(Some("tall".into()), "down")
+        );
+        let tallest = layout.iter().find(|r| r.pane == "tall").unwrap();
+        assert!(
+            tallest.height / 2.0 >= MIN_PANE_ROWS,
+            "the computed ratio must keep both halves usable: {}",
+            tallest.height
+        );
+    }
+
+    /// Card `20261108-b-35a7f8`, done-when (2): when every pane in the
+    /// target column is too short to halve without a side dropping below
+    /// `MIN_PANE_ROWS` (here both are 10 rows; 10.0 < 2.0 * 12.0), no split
+    /// is safe, so placement gives up on this tab's column and asks for a
+    /// new tab instead.
+    #[test]
+    fn split_placement_opens_a_new_tab_when_no_pane_can_be_split_within_the_minimum() {
+        let rectangle = |pane: &str, x, y, height| Rectangle {
+            pane: pane.into(),
+            x,
+            y,
+            width: 100.0,
+            height,
+        };
+        let layout = [
+            rectangle("caller", 0.0, 0.0, 20.0),
+            rectangle("a", 100.0, 0.0, 10.0),
+            rectangle("b", 100.0, 10.0, 10.0),
+        ];
+        assert_eq!(placement("caller", &layout), Placement::NewTab);
     }
 
     /// Card `20261102-b-01b66f`: `rectangles()` must read each pane's
@@ -4126,8 +4278,88 @@ mod tests {
         assert_eq!(layout.len(), 2);
         assert_eq!(
             placement("caller", &layout),
-            (Some("right".into()), "down"),
+            Placement::Split(Some("right".into()), "down"),
             "a right-hand column already exists and must be reused, not grown rightward again"
+        );
+    }
+
+    // --- open_overflow_tab (card 20261108-b-35a7f8) -------------------------
+
+    /// A minimal in-process [`Herdr`] for [`open_overflow_tab`] alone:
+    /// handles exactly `pane get` and `tab create`, panicking on anything
+    /// else, so a call this function was not supposed to make fails loudly
+    /// instead of silently falling through to some unrelated default.
+    struct OverflowFake {
+        workspace: Option<&'static str>,
+        root_pane: Option<&'static str>,
+    }
+    impl Herdr for OverflowFake {
+        fn call(
+            &mut self,
+            command: &HerdrCommand,
+            _timeout: Duration,
+        ) -> Result<CommandResult, RunnerError> {
+            let ok = |payload: Option<Value>| CommandResult {
+                argv: command.argv.clone(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                payload,
+                protocol_error: None,
+            };
+            match (command.argv[1].as_str(), command.argv[2].as_str()) {
+                ("pane", "get") => {
+                    let pane = match self.workspace {
+                        Some(workspace) => json!({"workspace_id": workspace}),
+                        None => json!({}),
+                    };
+                    Ok(ok(Some(json!({"result": {"pane": pane}}))))
+                }
+                ("tab", "create") => {
+                    let result = match self.root_pane {
+                        Some(pane) => json!({"root_pane": {"pane_id": pane}}),
+                        None => json!({}),
+                    };
+                    Ok(ok(Some(json!({"result": result}))))
+                }
+                _ => panic!("unexpected herdr call in OverflowFake: {:?}", command.argv),
+            }
+        }
+    }
+
+    #[test]
+    fn open_overflow_tab_returns_the_new_tabs_root_pane() {
+        let mut fake = OverflowFake {
+            workspace: Some("w1"),
+            root_pane: Some("w1:p9"),
+        };
+        let pane = open_overflow_tab(&mut fake, "w1:p1", Path::new("/tmp/project"), "label", &[])
+            .expect("workspace and root pane are both present");
+        assert_eq!(pane, "w1:p9");
+    }
+
+    #[test]
+    fn open_overflow_tab_fails_when_the_current_pane_has_no_workspace_id() {
+        let mut fake = OverflowFake {
+            workspace: None,
+            root_pane: Some("w1:p9"),
+        };
+        let error = open_overflow_tab(&mut fake, "w1:p1", Path::new("/tmp/project"), "label", &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace_id"), "{error}");
+    }
+
+    #[test]
+    fn open_overflow_tab_fails_when_the_new_tab_has_no_root_pane() {
+        let mut fake = OverflowFake {
+            workspace: Some("w1"),
+            root_pane: None,
+        };
+        let error = open_overflow_tab(&mut fake, "w1:p1", Path::new("/tmp/project"), "label", &[])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("pane was not returned"),
+            "{error}"
         );
     }
 

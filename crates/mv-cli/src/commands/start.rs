@@ -38,11 +38,12 @@ use mv_config::roles::Role;
 use mv_engine::fleet_start::{
     find_orchestrator_agent, nexus_agent_name, nexus_legacy_agent_name, FleetState,
 };
-use mv_engine::mv_herdr::argv;
+use mv_engine::mv_herdr::{argv, envelope};
 use mv_engine::nexus_seed::{self, DispatchableRole, SeedContext, SeedRole};
 use mv_engine::runner::{Herdr, ProcessHerdr, Timing};
 use mv_engine::selector;
 use mv_engine::selector::LocalLivenessProbe as _;
+use mv_state::activity::HUB_PROJECT_NAME;
 use sha2::{Digest, Sha256};
 
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
@@ -86,7 +87,11 @@ fn project_lock_path(project_root: &Path) -> PathBuf {
 
 /// `config.dashboard_for` (`config.py:1623-1627`): `--dashboard` is the
 /// operator override; otherwise `[board].dashboard_tab` (bool, or the
-/// default list `["multiverse"]`) decides per project.
+/// empty-by-default project list, decided change 3 `20261108-b-81cb2b`)
+/// decides per project. `launch_project` never calls this for the hub —
+/// its board is the split pane `start` opens directly, never a dashboard
+/// tab — so a `true` here for `"multiverse"` only matters to a caller that
+/// asks this function directly.
 fn dashboard_for(flag: bool, config: &Config, project_name: &str) -> bool {
     if flag {
         return true;
@@ -114,6 +119,26 @@ fn with_extra_lines(mut message: String, lines: Vec<String>) -> String {
         message.push_str(&line);
     }
     message
+}
+
+/// Pure script-render for the dashboard tab watcher's `pane run` command.
+/// Extracted so tests can drive it with a literal invocation directly,
+/// instead of mutating `MULTIVERSE_INVOCATION` — a process-global — to
+/// steer production code through it.
+fn dashboard_tab_script(invocation: &str, config_path: &Path, target: &str) -> String {
+    format!(
+        "{invocation} --config {} board {target} --watch",
+        posix_quote(&config_path.display().to_string())
+    )
+}
+
+/// Pure script-render for the hub's read-only board watcher pane. See
+/// [`dashboard_tab_script`].
+fn home_board_script(invocation: &str, config_path: &Path) -> String {
+    format!(
+        "{invocation} --config {} board --all --watch --read-only",
+        posix_quote(&config_path.display().to_string())
+    )
 }
 
 /// `cli._ensure_dashboard_tab` (`cli.py:5331-5377`): create-if-absent one
@@ -196,10 +221,7 @@ fn ensure_dashboard_tab(
     } else {
         posix_quote(&project.name)
     };
-    let script = format!(
-        "multiverse --config {} board {target} --watch",
-        posix_quote(&config_path.display().to_string())
-    );
+    let script = dashboard_tab_script(&nexus_seed::multiverse_invocation(), config_path, &target);
     match herdr.call(&argv::pane_run(&pane, &script), HERDR_TIMEOUT) {
         Ok(result) if result.ok() => vec!["      dashboard tab running".to_string()],
         Ok(result) => vec![format!(
@@ -208,6 +230,43 @@ fn ensure_dashboard_tab(
         )],
         Err(error) => vec![format!(
             "      dashboard tab created, but watch failed: {error}"
+        )],
+    }
+}
+
+/// Decided change 1c (`20261108-b-81cb2b`): the one time `launch_project`
+/// creates the hub's workspace, split its Nexus pane to the right (no
+/// focus) and run a read-only board watcher in the new pane — the hub's
+/// board, not a dashboard tab. Best-effort, mirroring `ensure_dashboard_tab`:
+/// a split or watch failure is reported as a line in `start`'s own output,
+/// never a reason to fail the hub's own launch.
+fn split_home_board_pane(
+    herdr: &mut impl Herdr,
+    config_path: &Path,
+    path: &Path,
+    pane: &str,
+) -> Vec<String> {
+    let split = match herdr.call(
+        &argv::pane_split(path, &[], Some(pane), false, Some("right"), false),
+        HERDR_TIMEOUT,
+    ) {
+        Ok(result) if result.ok() => result,
+        Ok(result) => return vec![format!("      board pane FAILED — {}", result.message())],
+        Err(error) => return vec![format!("      board pane FAILED — {error}")],
+    };
+    let board_pane = match envelope::pane_id_from(&split) {
+        Ok(pane_id) => pane_id,
+        Err(error) => return vec![format!("      board pane FAILED — {error}")],
+    };
+    let script = home_board_script(&nexus_seed::multiverse_invocation(), config_path);
+    match herdr.call(&argv::pane_run(&board_pane, &script), HERDR_TIMEOUT) {
+        Ok(result) if result.ok() => vec!["      board pane running".to_string()],
+        Ok(result) => vec![format!(
+            "      board pane created, but watch failed: {}",
+            result.message()
+        )],
+        Err(error) => vec![format!(
+            "      board pane created, but watch failed: {error}"
         )],
     }
 }
@@ -223,6 +282,13 @@ fn maybe_dashboard(
     dashboard: bool,
     message: String,
 ) -> String {
+    // Decided change 1c (`20261108-b-81cb2b`): the hub's board is the split
+    // pane `launch_project` opens directly when its workspace is created,
+    // never a dashboard tab — unconditionally, regardless of `--dashboard`
+    // or `[board].dashboard_tab`.
+    if project.name == HUB_PROJECT_NAME {
+        return message;
+    }
     let Some(workspace_id) = workspace_id.filter(|id| !id.is_empty()) else {
         return message;
     };
@@ -659,6 +725,38 @@ fn with_project_seed<T>(
     action(&seed_path, &context)
 }
 
+/// Decided change 1b (`20261108-b-81cb2b`): the hub's own seed context —
+/// every configured project except the hub itself (name and resolved
+/// path), the directives root, and `max_concurrent`. Twin of
+/// [`with_project_seed`], built for [`nexus_seed::HomeSeedContext`] instead
+/// of [`SeedContext`]: the home Nexus owns no repository, so it carries no
+/// handoff, dispatchable roles, or review policy.
+fn with_home_seed<T>(
+    config: &Config,
+    config_path: &Path,
+    path: &Path,
+    action: impl FnOnce(&Path, &nexus_seed::HomeSeedContext<'_>) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let state_dir = state_dir_from_config(config_path);
+    let directives_root = mv_engine::directives::directives_root(&state_dir);
+    let projects: Vec<(String, PathBuf)> = config
+        .projects
+        .iter()
+        .filter(|(name, _)| name.as_str() != HUB_PROJECT_NAME)
+        .filter_map(|(name, project)| {
+            project_path(project).map(|resolved| (name.clone(), resolved.to_path_buf()))
+        })
+        .collect();
+    let context = nexus_seed::HomeSeedContext {
+        home: path,
+        projects: &projects,
+        directives_root: &directives_root,
+        max_concurrent: config.max_concurrent as usize,
+    };
+    let seed_path = path.join(".multiverse").join(nexus_seed::SEED_FILENAME);
+    action(&seed_path, &context)
+}
+
 /// One line naming which card (or file, or neither) [`write_project_seed`]
 /// resolved this project's handoff to — the same resolution the seed
 /// itself carries, surfaced on the console so `start`'s output answers
@@ -727,6 +825,20 @@ fn nexus_launch_script(
     ))
 }
 
+/// Decided change 1a (`20261108-b-81cb2b`): create `<state dir>/home` (or
+/// wherever `[projects.multiverse].path` was pointed) at mode `0700` when
+/// it does not exist yet — the hub is never cloned, so there is no
+/// repository to refuse starting against.
+fn create_hub_home(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_project<H: Herdr>(
     herdr: &mut H,
@@ -741,13 +853,28 @@ fn launch_project<H: Herdr>(
     timing: &Timing,
 ) -> Outcome {
     let name = &project.name;
+    let is_hub = name == HUB_PROJECT_NAME;
     if !path.exists() {
-        return Outcome::Failed {
-            message: format!(
-                "  {name:<20} FAILED — path does not exist: {}",
-                path.display()
-            ),
-        };
+        // Decided change 1a (`20261108-b-81cb2b`): the hub has no
+        // repository to clone, so a missing `<state dir>/home` is created
+        // rather than refused. Every other project keeps the refusal.
+        if is_hub {
+            if let Err(error) = create_hub_home(path) {
+                return Outcome::Failed {
+                    message: format!(
+                        "  {name:<20} FAILED — cannot create home directory {}: {error}",
+                        path.display()
+                    ),
+                };
+            }
+        } else {
+            return Outcome::Failed {
+                message: format!(
+                    "  {name:<20} FAILED — path does not exist: {}",
+                    path.display()
+                ),
+            };
+        }
     }
 
     if fleet.is_open(name, path) {
@@ -776,9 +903,15 @@ fn launch_project<H: Herdr>(
                 ),
             };
         }
-        let was_stale = with_project_seed(config, config_path, project, path, |seed, context| {
-            nexus_seed::seed_is_stale(seed, context)
-        });
+        let was_stale = if is_hub {
+            with_home_seed(config, config_path, path, |seed, context| {
+                nexus_seed::home_seed_is_stale(seed, context)
+            })
+        } else {
+            with_project_seed(config, config_path, project, path, |seed, context| {
+                nexus_seed::seed_is_stale(seed, context)
+            })
+        };
         if matches!(was_stale, Ok(Some(false))) && !orchestrator_dead {
             let found = find_orchestrator_agent(fleet, name, path, seat, short);
             // Python `cli.cmd_start:5586-5589`: `_label_orchestrator_pane`
@@ -826,8 +959,15 @@ fn launch_project<H: Herdr>(
                 ),
             };
         }
-        let (backup, _handoff) = match write_project_seed(config, config_path, project, path) {
-            Ok(result) => result,
+        let backup = if is_hub {
+            with_home_seed(config, config_path, path, |seed, context| {
+                nexus_seed::write_home_seed(seed, context)
+            })
+        } else {
+            write_project_seed(config, config_path, project, path).map(|(backup, _handoff)| backup)
+        };
+        let backup = match backup {
+            Ok(backup) => backup,
             Err(error) => {
                 return Outcome::Failed {
                     message: format!(
@@ -910,7 +1050,11 @@ fn launch_project<H: Herdr>(
                                  clear it, then `multiverse start {name} --reseed`"
                             ),
                             None => {
-                                let pointer = nexus_seed::seed_prompt(name, &seed, true);
+                                let pointer = if is_hub {
+                                    nexus_seed::home_seed_prompt(&seed, true)
+                                } else {
+                                    nexus_seed::seed_prompt(name, &seed, true)
+                                };
                                 match mv_engine::runner::deliver_prompt_to(
                                     herdr,
                                     &agent_name,
@@ -1019,8 +1163,16 @@ fn launch_project<H: Herdr>(
         }
     };
 
-    let (seed, handoff) = match write_project_seed(config, config_path, project, path) {
-        Ok((_, handoff)) => (
+    let seed_write = if is_hub {
+        with_home_seed(config, config_path, path, |seed, context| {
+            nexus_seed::write_home_seed(seed, context)
+        })
+        .map(|_| nexus_seed::Handoff::None)
+    } else {
+        write_project_seed(config, config_path, project, path).map(|(_, handoff)| handoff)
+    };
+    let (seed, handoff) = match seed_write {
+        Ok(handoff) => (
             path.join(".multiverse").join(nexus_seed::SEED_FILENAME),
             handoff,
         ),
@@ -1038,6 +1190,14 @@ fn launch_project<H: Herdr>(
             return Outcome::Failed { message };
         }
     };
+
+    let mut board_fragment = String::new();
+    if is_hub {
+        board_fragment = with_extra_lines(
+            String::new(),
+            split_home_board_pane(herdr, config_path, path, &created.pane),
+        );
+    }
 
     let mut seat_fragment = String::new();
     let mut seeded = false;
@@ -1080,7 +1240,11 @@ fn launch_project<H: Herdr>(
             ),
             Duration::from_secs(30),
         );
-        let pointer = nexus_seed::seed_prompt(name, &seed, false);
+        let pointer = if is_hub {
+            nexus_seed::home_seed_prompt(&seed, false)
+        } else {
+            nexus_seed::seed_prompt(name, &seed, false)
+        };
         let result = mv_engine::fleet_start::launch_script_and_seed(
             herdr,
             &created.pane,
@@ -1108,7 +1272,7 @@ fn launch_project<H: Herdr>(
             Some(&created.workspace_id),
             dashboard,
             format!(
-                "  {name:<20} {}  pane {}  {}{seat_fragment}\n  {name:<20} {}",
+                "  {name:<20} {}  pane {}  {}{seat_fragment}\n  {name:<20} {}{board_fragment}",
                 created.workspace_id,
                 created.pane,
                 path.display(),
@@ -1218,6 +1382,15 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
             names.join(", "),
             configured.join(", ")
         );
+        // Decided change 4 (`20261108-b-81cb2b`): naming the hub when it is
+        // not yet configured gets its own fix line — `short` is the only
+        // required field; `path` defaults to `<state dir>/home`.
+        if unknown.iter().any(|name| name.as_str() == HUB_PROJECT_NAME) {
+            eprintln!(
+                "add [projects.{HUB_PROJECT_NAME}] with a short (e.g. short = \"mv\") to \
+                 config.toml; path is optional."
+            );
+        }
         return Err(Failure::Reported(NEEDS_CONFIG));
     }
 
@@ -1784,7 +1957,12 @@ mod tests {
         .unwrap();
         assert!(dashboard_for(true, &config, "sandbox"));
         assert!(!dashboard_for(false, &config, "sandbox"));
-        assert!(dashboard_for(false, &config, "multiverse"));
+        // Decided change 3 (`20261108-b-81cb2b`): the default
+        // `[board].dashboard_tab` project list is now empty, not
+        // `["multiverse"]` — `launch_project` never calls this for the hub
+        // anyway (its board is the split pane opened directly), but the
+        // function's own default no longer names it either.
+        assert!(!dashboard_for(false, &config, "multiverse"));
 
         let enabled = load_config_str(
             &format!(
@@ -1832,6 +2010,46 @@ mod tests {
         assert_eq!(
             herdr.calls,
             vec!["workspace list".to_string(), "pane list".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ordinary_projects_fresh_create_issues_no_pane_split() {
+        // Decided change 1c (`20261108-b-81cb2b`): only the hub's freshly
+        // created workspace gets a Nexus-adjacent board pane; an ordinary
+        // project's own fresh create must never call `pane split`.
+        let (_dir, sandbox, config, config_path) = sandbox_fixture("sandbox");
+        let project = &config.projects["sandbox"];
+        let mut herdr = Scripted::new(vec![
+            ("workspace list", ok(json!({"result": {"workspaces": []}}))),
+            ("pane list", ok(json!({"result": {"panes": []}}))),
+            (
+                "workspace create",
+                ok(
+                    json!({"result": {"workspace": {"workspace_id": "w1"}, "root_pane": {"pane_id": "w1:p1"}}}),
+                ),
+            ),
+        ]);
+        let outcome = launch_project(
+            &mut herdr,
+            &config,
+            &config_path,
+            project,
+            &sandbox,
+            None,
+            &empty_fleet(),
+            false,
+            false,
+            &Timing::default(),
+        );
+        assert!(matches!(outcome, Outcome::Opened { .. }));
+        assert!(
+            herdr
+                .calls
+                .iter()
+                .all(|call| !call.starts_with("pane split")),
+            "{:?}",
+            herdr.calls
         );
     }
 
@@ -1885,6 +2103,30 @@ mod tests {
         assert_eq!(
             lines,
             vec!["      dashboard tab FAILED — tab create refused".to_string()]
+        );
+    }
+
+    /// Card `board-invocation.md`: both board panes must start with the
+    /// plugin's own invocation (already shell-quoted by `plugin-action.sh`),
+    /// not a bare `multiverse` a plugin user may not have on `PATH`. Drives
+    /// the pure script helpers directly with a literal invocation rather
+    /// than mutating the process-global `MULTIVERSE_INVOCATION` env var,
+    /// which previously raced every other test rendering a script through
+    /// `nexus_seed::multiverse_invocation()` on another thread.
+    #[test]
+    fn board_panes_start_with_the_plugin_invocation_when_set() {
+        let config_path = Path::new("/sandbox/config.toml");
+        let dashboard_script =
+            dashboard_tab_script("'/opt/x/bin/multiverse'", config_path, "--all");
+        assert!(
+            dashboard_script.starts_with("'/opt/x/bin/multiverse' --config"),
+            "{dashboard_script}"
+        );
+
+        let board_script = home_board_script("'/opt/x/bin/multiverse'", config_path);
+        assert!(
+            board_script.starts_with("'/opt/x/bin/multiverse' --config"),
+            "{board_script}"
         );
     }
 

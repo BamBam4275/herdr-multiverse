@@ -1,6 +1,6 @@
 {
   "id": "activity-broadcast-partial-fanout",
-  "description": "`activity broadcast` (hub-only — HUB_PROJECT_NAME is the literal string 'multiverse', not configurable) leaves one message in every project [activity.pairs] permits and reports a partial fan-out rather than refusing outright: a permitted leaf is marked 'sent', a leaf the hub cannot message is marked 'skipped — not permitted by [activity.pairs]', and the totals line counts both. Pure file I/O — no herdr call anywhere on this path.",
+  "description": "`activity broadcast` (hub-only — HUB_PROJECT_NAME is the literal string 'multiverse', not configurable) leaves one message in every project [activity.pairs] permits. Decided change 2 (`20261108-b-81cb2b`): a configured `multiverse` project is now implicitly activity-paired with every other project in both directions, so the `multiverse = [\"project-a\"]` grant below no longer leaves project-b unreachable — both leaves are 'sent' and the fan-out is no longer partial. The scenario id and its original 'partial fan-out' framing predate that change and are kept rather than renamed, so the id stays a historical label, not a description of today's behavior. Pure file I/O — no herdr call anywhere on this path.",
   "projects": {
     "multiverse": {
       "git": true,
@@ -27,13 +27,10 @@
         "exit": 0,
         "stdout_contains": [
           "sent      project-a",
-          "skipped   project-b — not permitted by [activity.pairs]",
-          "1 sent, 1 skipped."
+          "sent      project-b",
+          "2 sent, 0 skipped."
         ]
       }
     }
-  ],
-  "expect_tree": [
-    { "root": "project-b", "unchanged": true }
   ]
 }

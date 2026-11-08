@@ -30,7 +30,7 @@ Rendered by `scripts/docs/render-demo.sh` from a real `multiverse board`,
 
 ## Status
 
-Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.3`.
+Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.4`.
 It is a from-scratch Rust port of a Python reference implementation, built
 so the two can be checked against each other for
 behavioral parity before the Rust binary becomes the only implementation.

@@ -4195,6 +4195,69 @@ mod tests {
         m.subcommand_matches("dispatch").unwrap().clone()
     }
 
+    /// Backlog `20261108-b-bdd00b`: every test that can reach
+    /// `mv_config::load::config_state_dir_from_env` — directly, through
+    /// `RealEngine::resolve`'s `real_breaker`/gauge/seat-state reads, or
+    /// through [`RealDispatchStore::trip_breaker`]'s `limits::Verdict`
+    /// handling — must hold one of these instead of a bare
+    /// `HerdrEnvGuard::unreachable()`. On a dev machine `AGENTS.md`'s own
+    /// dispatched-lane env sets `$MULTIVERSE_STATE_DIR`/
+    /// `$HERDR_PLUGIN_STATE_DIR`, which `config_state_dir_from_env`
+    /// checks before any tempdir default; without this, these tests read
+    /// and wrote the live fleet's `breaker-state.json`/`seat-state.json`
+    /// (card `20261103-b-a5c59f`'s `trip_breaker` test left a real
+    /// `codex:test`/`grok:test` breaker entry behind this way).
+    ///
+    /// Wraps [`HerdrEnvGuard`] — rather than taking `herdr_env::lock()` a
+    /// second time — so a test that also needs `HERDR_BIN_PATH` pointed
+    /// at a nonexistent binary gets that for free, and the one lock
+    /// acquisition still serializes every env-mutating test in this
+    /// binary, state-dir vars included.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        _dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                _dir: dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
     #[test]
     fn request_from_captures_this_lanes_flags() {
         let args = matches(&[
@@ -4824,7 +4887,7 @@ mod tests {
 
     #[test]
     fn resolve_refuses_input_for_a_read_only_role_before_planning() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, mut request) = parity_fixture("scout");
         let input = tempfile::NamedTempFile::new().unwrap();
         request.inputs.push(input.path().display().to_string());
@@ -4839,7 +4902,7 @@ mod tests {
 
     #[test]
     fn resolve_refuses_a_cited_input_nothing_stages() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, mut request) = parity_fixture("builder");
         request.task = "read `.multiverse/input/spec.md` and follow it".into();
         let Err(error) = RealEngine.resolve(&request) else {
@@ -4857,7 +4920,7 @@ mod tests {
 
     #[test]
     fn resolve_allows_a_scope_warning_through_for_a_read_only_role() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, mut request) = parity_fixture("scout");
         request.scope = vec!["src".into()];
         let resolved = RealEngine.resolve(&request).unwrap();
@@ -4942,7 +5005,7 @@ review_scope = "repo"
 
     #[test]
     fn reviewing_reads_only_the_projects_log_and_excludes_all_author_vendors() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, mut request) = parity_fixture("critic");
         let state = Path::new(&request.project_path).join(".multiverse");
         std::fs::create_dir_all(&state).unwrap();
@@ -4979,7 +5042,7 @@ review_scope = "repo"
     /// both `plan` and `dispatch` resolve through the same `resolve`.
     #[test]
     fn an_answered_unclosed_backlog_item_refuses_both_the_dry_run_and_the_real_dispatch() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, request) = parity_fixture("scout");
         let project_root = Path::new(&request.project_path);
         let item = mv_state::backlog::ask(
@@ -5041,7 +5104,7 @@ review_scope = "repo"
 
     #[test]
     fn dry_run_renders_all_plan_sections_and_creates_nothing() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (dir, mut request) = parity_fixture("builder");
         request.scope = vec!["src/**".into(), "README.md".into()];
         request.title = Some("Plan title".into());
@@ -5105,7 +5168,7 @@ review_scope = "repo"
 
     #[test]
     fn live_agent_naming_honors_the_project_short_and_rebudgets_collisions() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, request) = parity_fixture("builder");
         let resolved = RealEngine.resolve(&request).unwrap();
         let store = RealDispatchStore::new(resolved, &request);
@@ -5126,7 +5189,7 @@ review_scope = "repo"
     /// under the project's `.multiverse/evidence/`.
     #[test]
     fn trip_breaker_fences_the_seats_pool_and_writes_evidence_through_the_real_store() {
-        let _herdr = HerdrEnvGuard::unreachable();
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, request) = parity_fixture("builder");
         let resolved = RealEngine.resolve(&request).unwrap();
         let config_dir = resolved.config_dir.clone();
@@ -5214,20 +5277,9 @@ review_scope = "repo"
 
     #[test]
     fn unresolved_dry_run_names_only_the_selected_seats_placeholders() {
-        let _herdr = HerdrEnvGuard::unreachable();
-        // The shared env lock is held by `_herdr`. An ambient state-dir
-        // override could skip `author` and select `other`'s resolved model.
-        struct StateDirEnvGuard(Option<std::ffi::OsString>);
-        impl Drop for StateDirEnvGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
-                    None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
-                }
-            }
-        }
-        let _state_dir = StateDirEnvGuard(std::env::var_os("MULTIVERSE_STATE_DIR"));
-        std::env::remove_var("MULTIVERSE_STATE_DIR");
+        // An ambient state-dir override could skip `author` and select
+        // `other`'s resolved model.
+        let _state_dir = StateDirEnvGuard::new();
         let (_dir, request) = parity_fixture("scout");
         let path = Path::new(request.config_override.as_deref().unwrap());
         let config = std::fs::read_to_string(path)
@@ -5979,6 +6031,7 @@ review_scope = "repo"
     /// parse) for a CLI flag.
     #[test]
     fn dispatch_role_flag_refuses_a_retired_name() {
+        let _state_dir = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -7023,6 +7076,7 @@ review_scope = "repo"
 
     #[test]
     fn into_is_refused_for_a_read_only_role_with_an_otherwise_valid_chain() {
+        let _state_dir = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -7138,6 +7192,7 @@ review_scope = "repo"
 
     #[test]
     fn a_chain_account_without_a_role_model_table_is_needs_config() {
+        let _state_dir = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();

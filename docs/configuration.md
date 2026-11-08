@@ -61,9 +61,12 @@ intended fleet-wide schema:
   plus `nexus` / `council` chains. Seven worker roles dispatch with
   `--role`; Council is its own subcommand; Nexus is seeded by `start`.
 - `[projects.<name>]` with `path` and `[projects.<name>.chains]` — ordered
-  account lists per role. If no chain is configured for a role, loading
-  that dispatch is a configuration error (exit code 3) naming the role
-  and project, not a silent default.
+  account lists per role. `path` is required for every project except the
+  reserved `multiverse` hub project, whose `path` is optional and defaults
+  to `<state dir>/home` when omitted — `multiverse start multiverse` creates
+  that directory if it does not exist yet. If no chain is configured for a
+  role, loading that dispatch is a configuration error (exit code 3) naming
+  the role and project, not a silent default.
 - Optional `[review_policy]` and `[activity.pairs]`.
 
 A `<<PLACEHOLDER: ...>>` marker is carried through, never guessed at, by

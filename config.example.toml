@@ -35,11 +35,14 @@ max_concurrent = 3
 # host_disk_warn_gb = 30
 # host_disk_critical_gb = 15
 
-# Board watch interval and the optional dashboard tab opened by `start --all`.
-# `dashboard_tab` may be true, false, or a list of project names.
+# Board watch interval and the optional dashboard tab opened by
+# `start <project> --dashboard`. `dashboard_tab` may be true, false, or a
+# list of project names; the default is an empty list, so no project opens
+# one unasked. The home hub's own board is a split pane `start` opens
+# directly, not a dashboard tab, so it has no reason to appear in this list.
 # [board]
 # refresh_seconds = 300
-# dashboard_tab = ["multiverse"]
+# dashboard_tab = ["example"]
 
 # Project state is private: Multiverse-created private-state directories are
 # mode 0700, and sensitive state files (including routing.log/index) are mode
@@ -450,6 +453,23 @@ claude = "<<PLACEHOLDER: model id for the fast/cheap tier>>"
 #
 # The minimum viable config needs one project with one chain, naming any one
 # dispatchable role.
+
+# `multiverse` is your home workspace, not an ordinary project: a single
+# install's Start opens one Herdr workspace named `multiverse` with a home
+# Nexus — your cross-project chat, the one place you talk to the fleet about
+# all of your projects, not just one — plus a split board pane.
+#
+# Leave `path` unset, as below: it then defaults to the fleet's own state
+# directory, `<state dir>/home`, and `multiverse start` creates that
+# directory itself. Do NOT point this at your own development checkout of
+# the multiverse repository — the hub needs a plain directory it owns, not
+# a git worktree you are also editing by hand.
+#
+# Every other project is implicitly paired with the hub for activity in both
+# directions, and the hub with every other project — you never write
+# `[activity.pairs]` entries for it yourself.
+[projects.multiverse]
+short = "mv"
 
 [projects.example]
 # Absolute path to the project root, resolved through symlinks, so a project

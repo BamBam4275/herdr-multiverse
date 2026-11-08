@@ -3219,7 +3219,71 @@ mod tests {
         let args = matches(&["tasks", "--reclaimable", "--yes"]);
         list(&root, None, &args, &mut agents, None).unwrap();
         assert_eq!(agents.panes.len(), 1);
-        assert_eq!(agents.probes, 2);
+        // Card 20261108-b-37df85: the name mismatch is now caught while
+        // `reclaimable_panes` builds its candidate list (the pane falls
+        // to `stale`, never `reclaimable`), so there is no longer a
+        // confirmation re-probe to skip a close with — just the one
+        // top-level listing.
+        assert_eq!(agents.probes, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reclaimable_never_closes_a_pane_reused_by_a_different_live_agent() {
+        // Card 20261108-b-37df85 (the mail-reported incident): task T was
+        // dispatched under agent `x-fix-cl` at pane `w1:p1`. Herdr now
+        // reports a different agent, `y-buil-cl`, answering at that same
+        // pane id — a reuse after restart, not T's own session. `--yes`
+        // must never issue a pane-close for it, and the listing must not
+        // offer it as something that would close.
+        let root = temp_dir("reclaim-reused-pane");
+        mv_state::log::ProjectLog::new(&root)
+            .append(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask=20261108-fixer-111111\t\
+                 branch=main\trole=fixer\tagent=x-fix-cl",
+            )
+            .unwrap();
+        mv_state::log::ProjectLog::new(&root)
+            .append(
+                "2026-11-01T00:01:00+00:00\tevent=result\ttask=20261108-fixer-111111\tstatus=done\t\
+                 state=done\trevisions=0\tpane=w1:p1",
+            )
+            .unwrap();
+        let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Idle);
+        agents.panes[0].name = Some("y-buil-cl".into());
+        let args = matches(&["tasks", "--reclaimable", "--yes"]);
+        list(&root, None, &args, &mut agents, None).unwrap();
+        assert_eq!(
+            agents.panes.len(),
+            1,
+            "a pane id reused by a different live agent must never be closed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reclaimable_closes_a_pane_when_the_recorded_agent_still_matches() {
+        let root = temp_dir("reclaim-matching-agent");
+        mv_state::log::ProjectLog::new(&root)
+            .append(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask=20261108-fixer-222222\t\
+                 branch=main\trole=fixer\tagent=x-fix-cl",
+            )
+            .unwrap();
+        mv_state::log::ProjectLog::new(&root)
+            .append(
+                "2026-11-01T00:01:00+00:00\tevent=result\ttask=20261108-fixer-222222\tstatus=done\t\
+                 state=done\trevisions=0\tpane=w1:p1",
+            )
+            .unwrap();
+        let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Idle);
+        agents.panes[0].name = Some("x-fix-cl".into());
+        let args = matches(&["tasks", "--reclaimable", "--yes"]);
+        list(&root, None, &args, &mut agents, None).unwrap();
+        assert!(
+            agents.panes.is_empty(),
+            "a pane still hosting the task's own dispatched agent must still be closed"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
