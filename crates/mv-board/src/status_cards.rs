@@ -1,4 +1,4 @@
-//! The STATUS row: SEATS, OWED REPLIES, MAIL, and ORCHESTRATOR LAST PASS.
+//! The STATUS row: SEATS, OWED REPLIES, MAIL, and NEXUS LAST PASS.
 
 use crate::accounts::{AccountSnapshot, AccountState};
 use crate::layout::{
@@ -201,11 +201,7 @@ fn last_cycle_card_lines(cycles: &[LastCycleEntry], width: usize) -> Vec<String>
             lines.push(format!("{}  {status}  {age}", c.project));
         }
     }
-    let title = if width < 28 {
-        "ORCH LAST PASS"
-    } else {
-        "ORCHESTRATOR LAST PASS"
-    };
+    let title = "NEXUS LAST PASS";
     section_card(title, &lines, width)
 }
 
@@ -369,6 +365,24 @@ mod tests {
                 .any(|l| l.contains("warn") || l.contains('\u{26a0}')),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn last_cycle_card_title_says_nexus_at_wide_and_narrow_widths() {
+        let cycles = vec![LastCycleEntry {
+            project: "proj".into(),
+            mail_at: None,
+            reconcile_at: None,
+            backlog_at: None,
+            overdue: false,
+            parked: false,
+        }];
+        for width in [SECTION_CARD_MIN_WIDTH, 80] {
+            let lines = last_cycle_card_lines(&cycles, width);
+            let rendered = lines.join("\n");
+            assert!(rendered.contains("NEXUS LAST PASS"), "{rendered:?}");
+            assert!(!rendered.to_lowercase().contains("orch"), "{rendered:?}");
+        }
     }
 
     #[test]

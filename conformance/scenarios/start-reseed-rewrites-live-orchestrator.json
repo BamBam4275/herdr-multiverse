@@ -52,7 +52,7 @@
     {
       "root": "sandbox",
       "files": {
-        ".multiverse/orchestrator.md": {
+        ".multiverse/nexus.md": {
           "regex": "\\| Builder \\| worker \\|[\\s\\S]*\\| Critic \\| worker \\|[\\s\\S]*\\| Scout \\| worker \\|[\\s\\S]*- Cross-vendor review required for:"
         },
         "herdr-calls.jsonl": {

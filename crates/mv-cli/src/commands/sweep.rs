@@ -171,12 +171,15 @@ use time::OffsetDateTime;
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
 use crate::exit::Failure;
 
-/// Python's `SWEEP_TICK_PROMPT` (`cli.py:10926-10930`), verbatim — the one
+/// Adapted from Python's `SWEEP_TICK_PROMPT` (`cli.py:10926-10930`) — the one
 /// and only place this text is written, so a cold read of the pane can
 /// never mistake it for Mike's own words (see that constant's own doc
-/// comment for the 2026-10-20 incident this guards against).
+/// comment for the 2026-10-20 incident this guards against). Unlike
+/// Python's frozen reference, this no longer names the seed file directly:
+/// a project's own seed may be at either name depending on when it was
+/// last written (see [`mv_engine::nexus_seed::existing_seed_path`]).
 const SWEEP_TICK_PROMPT: &str = "Hub cycle tick (hub nudge, not Mike): run one pass of your \
-     .multiverse/orchestrator.md Every cycle (mail, reconcile, reclaim, board, backlog). Not a \
+     seed's Every cycle (mail, reconcile, reclaim, board, backlog). Not a \
      recurring job.";
 
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {

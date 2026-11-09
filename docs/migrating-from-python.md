@@ -320,10 +320,10 @@ keys) changes. After migration:
   `result`, `backlog`, `board`, and `worktrees` — all seven `history-*`
   conformance scenarios pass today, including `board --no-reconcile`
   (`history-board-reads-unrecorded-old-role`).
-- Nexus seeds keep the historical on-disk filename
-  (`.multiverse/orchestrator.md`) regardless of the role rename, so an
-  existing project's seed file does not need to be renamed or
-  regenerated for this step.
+- Nexus seeds are unaffected by the role rename itself: a project's seed
+  file is renamed from the legacy `.multiverse/orchestrator.md` to
+  `.multiverse/nexus.md` only the next time its seed is written, not by
+  this migration step.
 
 ## Step 6 — Clear the halt
 
@@ -414,10 +414,10 @@ cutover.
 
 ## How each project finds its handoff
 
-A project's Nexus seed (`.multiverse/orchestrator.md`, the legacy
-filename kept deliberately so existing projects resume in place) points
-at that project's handoff card — the file recording open work and
-decisions a new Nexus session should resume from — at
+A project's Nexus seed (`.multiverse/nexus.md`, or the legacy
+`.multiverse/orchestrator.md` until the project's next seed write
+migrates it) points at that project's handoff card — the file recording
+open work and decisions a new Nexus session should resume from — at
 `.multiverse/handoff.md` inside the project's own repository
 (`crates/mv-engine/src/nexus_seed.rs`). Nothing about this path changes
 with the migration: a project that already has a handoff card keeps

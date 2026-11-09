@@ -150,8 +150,13 @@ existing briefs — still reads. The mapping is:
 | `observer` | Watcher |
 | `council` | Council |
 
-Council was not renamed. Nexus seeds keep the filename
-`.multiverse/orchestrator.md` so existing projects resume in place.
+Council was not renamed. Nexus seeds are written to
+`.multiverse/nexus.md`. A project still carrying the legacy
+`.multiverse/orchestrator.md` keeps reading and writing that file until
+its next seed write, which migrates it onto `nexus.md` — backing up the
+legacy file first if a human had edited it, then removing it, so at most
+one seed file remains. Nothing renames the file out from under a project
+that is never reseeded. Read-only commands accept either name.
 
 The one-shot config migrator that rewrites `[roles.fixer]` (and the rest)
 to the current keys, preserving comments, lives in `mv-config::migrate`

@@ -640,7 +640,7 @@ an author who was wrong about that, not lying.
 ### Critic — adversarial cross-vendor review
 
 **When to dispatch one is config, not a rule of thumb.** Your own seed
-(`.multiverse/orchestrator.md`) carries
+(in `.multiverse/`) carries
 a "## Review policy" section rendered from this project's `[review_policy]` —
 read that, not this paragraph, for the actual list. In outline: a diff
 touching one of the configured risk areas (security, auth, migration,

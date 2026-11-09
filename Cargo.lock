@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "mv-board"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crc32fast",
  "crossterm",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "mv-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "mv-config"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dirs",
  "mv-core",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "mv-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crc32fast",
  "fancy-regex 0.20.0",
@@ -968,11 +968,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "time",
+ "tz-rs",
 ]
 
 [[package]]
 name = "mv-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "mv-config",
  "mv-core",
@@ -989,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "mv-herdr"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "mv-core",
  "serde",
@@ -999,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "mv-state"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crc32fast",
  "mv-config",
@@ -1971,6 +1972,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "tz-rs"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fc6c929ffa10fb34f4a3c7e9a73620a83ef2e85e47f9ec3381b8289e6762f42"
 
 [[package]]
 name = "ucd-trie"

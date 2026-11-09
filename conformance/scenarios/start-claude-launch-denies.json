@@ -74,7 +74,7 @@
           "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {\"state_change_seq\": 5}}}\n" }
         },
         {
-          "match_argv": ["agent", "prompt", "sandbox-nexu-ne", "Read `{{PROJECT:sandbox}}/.multiverse/orchestrator.md` now and follow it. You are the Nexus for sandbox. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route."],
+          "match_argv": ["agent", "prompt", "sandbox-nexu-ne", "Read `{{PROJECT:sandbox}}/.multiverse/nexus.md` now and follow it. You are the Nexus for sandbox. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route."],
           "reply": { "exit": 0, "stdout": "{\"result\": {\"agent\": {}}}\n" }
         },
         {
@@ -97,7 +97,7 @@
     {
       "root": "sandbox",
       "files": {
-        ".multiverse/orchestrator.md": {
+        ".multiverse/nexus.md": {
           "regex": "\\| Builder \\| worker \\|[\\s\\S]*\\| Critic \\| worker \\|[\\s\\S]*\\| Scout \\| worker \\|[\\s\\S]*- Cross-vendor review required for:"
         }
       }

@@ -30,7 +30,7 @@ Rendered by `scripts/docs/render-demo.sh` from a real `multiverse board`,
 
 ## Status
 
-Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.4`.
+Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.5`.
 It is a from-scratch Rust port of a Python reference implementation, built
 so the two can be checked against each other for
 behavioral parity before the Rust binary becomes the only implementation.
@@ -81,7 +81,10 @@ What is on this tree today:
   pane rather than typing into it (`crates/mv-engine/src/runner.rs`'s
   `attention_reason`); a live `dispatch --yes` that lands on one refuses
   with a non-zero exit naming the pane, rather than reporting a
-  successful dispatch.
+  successful dispatch. The first `start` into any folder a Claude seat
+  has never opened — including the home folder — can park on this same
+  dialog; see [`docs/install.md`](docs/install.md#actions-and-their-effects)
+  for the first-run case.
 - A Herdr client, `fake-herdr`, routing log, task/brief rendering,
   embedded prompts/skills, Nexus seeds, config loading and validation,
   comment-preserving config edits, a one-shot role-key config migrator, a

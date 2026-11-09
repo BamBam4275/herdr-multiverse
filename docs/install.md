@@ -115,13 +115,19 @@ workspaces, starts interactive Nexus sessions, and writes project seeds.
 Subsequent dispatches can spend vendor quota and write assigned worktrees.
 The `Multiverse: Start` action itself runs `start multiverse`: it opens only
 the home `multiverse` workspace — a Nexus pane seeded as your cross-project
-chat, split beside a second, read-only pane already running
-`board --all --watch --read-only`. Add a `[projects.multiverse]` section to
+chat, plus an unfocused `board` tab that runs the read-only
+`board --all --read-only` once. Add a `[projects.multiverse]` section to
 `config.toml` to use it; only a `short` (e.g. `short = "mv"`) is required,
 and `path` is optional — it defaults to `<state dir>/home`, created on first
 `start` if it does not exist. Open an individual project's own Nexus with
 `multiverse start <project>` from the CLI, or ask the home Nexus to open it
 for you.
+The first `start` of a model CLI in a folder it has never opened before —
+including the home folder (`<state dir>/home`), the first time
+`start multiverse` creates it — may wait on that CLI's own one-time "do you
+trust this folder?" prompt. Multiverse detects the dialog and leaves it for
+a human rather than typing into it; accept it once in the opened pane
+before that session is usable.
 `import-python` also clears it: it copies a standalone Python install's
 config and fleet state into the directories this plugin reads (see
 [Migrating from Python](migrating-from-python.md)) — real writes, though it

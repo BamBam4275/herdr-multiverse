@@ -623,7 +623,8 @@ fn stale_seed_note(
     project: &Project,
     root: &Path,
 ) -> Option<String> {
-    let seed_path = root.join(".multiverse").join(nexus_seed::SEED_FILENAME);
+    let seed_path =
+        nexus_seed::existing_seed_path(root).unwrap_or_else(|| nexus_seed::seed_path(root));
     let state_dir = mv_config::load::config_state_dir_from_env(config_path);
     let directives_root = mv_engine::directives::directives_root(&state_dir);
     let handoff = nexus_seed::resolve_handoff(root);
@@ -646,7 +647,7 @@ fn stale_seed_note(
     };
     match nexus_seed::seed_is_stale(&seed_path, &context) {
         Ok(Some(true)) => Some(format!(
-            "note: {}'s orchestrator assignment is stale — its dispatch \
+            "note: {}'s Nexus seed is stale — its dispatch \
              table or role prompt has changed since it was written. \
              `multiverse stop {}` then `multiverse start {}` \
              regenerates it; `start` alone will not, because it is \
@@ -656,7 +657,7 @@ fn stale_seed_note(
         )),
         Ok(_) => None,
         Err(error) => Some(format!(
-            "warning: {}: cannot read orchestrator assignment {}: {error}",
+            "warning: {}: cannot read Nexus seed {}: {error}",
             project.name,
             seed_path.display()
         )),

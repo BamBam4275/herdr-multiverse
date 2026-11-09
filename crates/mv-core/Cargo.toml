@@ -21,3 +21,4 @@ fancy-regex = "0.20"
 crc32fast = { workspace = true }
 rustix = { workspace = true }
 tempfile = { workspace = true }
+tz-rs = "0.7.3"

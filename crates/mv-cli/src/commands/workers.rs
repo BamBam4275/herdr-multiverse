@@ -760,7 +760,7 @@ fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
     );
 
     let orchestrator_line = format!(
-        "orchestrators {} (excluded from workers; they do not count against max_concurrent)",
+        "nexus sessions {} (excluded from workers; they do not count against max_concurrent)",
         orchestrator_count.map_or("?".to_string(), |n| n.to_string())
     );
 
@@ -904,7 +904,7 @@ PROJECT          TASK                       ROLE       SEAT             STATUS  
 workers 1/3\n\
 seats: seat-b 0\n\
 projects: sandbox 0 open, ceiling 3\n\
-orchestrators 0 (excluded from workers; they do not count against max_concurrent)";
+nexus sessions 0 (excluded from workers; they do not count against max_concurrent)";
         assert_eq!(output, expected);
     }
 
@@ -924,7 +924,7 @@ PROJECT          TASK                       ROLE       SEAT             STATUS  
 workers 1/3\n\
 seats: seat-b 0\n\
 projects: sandbox 0 open, ceiling 3\n\
-orchestrators 0 (excluded from workers; they do not count against max_concurrent)";
+nexus sessions 0 (excluded from workers; they do not count against max_concurrent)";
         assert_eq!(output, expected);
     }
 
@@ -1172,7 +1172,7 @@ orchestrators 0 (excluded from workers; they do not count against max_concurrent
 workers ?/3\n\
 seats: seat-b ?\n\
 projects: sandbox ? open, ceiling 3\n\
-orchestrators ? (excluded from workers; they do not count against max_concurrent)";
+nexus sessions ? (excluded from workers; they do not count against max_concurrent)";
         assert_eq!(output, expected);
     }
 

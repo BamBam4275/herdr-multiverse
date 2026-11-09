@@ -12,9 +12,58 @@ use mv_state::backlog;
 
 use crate::directives::{self, content_digest, NO_DIRECTIVE_DIGEST};
 
-/// Retain the historical filename so existing projects resume in place.
-pub const SEED_FILENAME: &str = "orchestrator.md";
+/// The current seed filename. A project already carrying
+/// [`LEGACY_SEED_FILENAME`] is migrated onto this one the next time its
+/// seed is written (`write_seed`/`write_home_seed`); nothing renames it
+/// out from under a project that is never reseeded.
+pub const SEED_FILENAME: &str = "nexus.md";
+/// The filename every seed carried before the rename. Still accepted when
+/// reading: a project that has not been reseeded since the rename keeps
+/// this file until its next write.
+pub const LEGACY_SEED_FILENAME: &str = "orchestrator.md";
 const MARKER: &str = "<!-- multiverse:seed-digest ";
+
+/// Where a writer puts a project's (or the home's) seed — always the
+/// current name. The actual migration away from an existing
+/// [`LEGACY_SEED_FILENAME`] sibling happens inside `write_seed`/
+/// `write_home_seed`'s shared writer, so a caller never joins the filename
+/// itself and never has to decide between the two names.
+pub fn seed_path(root: &Path) -> PathBuf {
+    root.join(".multiverse").join(SEED_FILENAME)
+}
+
+/// Where a read-only caller should look: the current name if it exists,
+/// else the legacy name if that alone exists, else `None` — nothing has
+/// ever seeded this project or home yet.
+pub fn existing_seed_path(root: &Path) -> Option<PathBuf> {
+    let current = seed_path(root);
+    if current.is_file() {
+        return Some(current);
+    }
+    let legacy = root.join(".multiverse").join(LEGACY_SEED_FILENAME);
+    legacy.is_file().then_some(legacy)
+}
+
+/// If `path` is the canonical seed path and a legacy sibling exists,
+/// preserve any hand edits to it in a backup (same rule `backup_if_edited`
+/// already applies), then remove it so at most one seed file remains.
+/// Never called for any other path, so a project still reading/writing its
+/// own legacy file (never reseeded) is left alone until it is.
+fn migrate_legacy_sibling(path: &Path) -> io::Result<Option<PathBuf>> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(SEED_FILENAME) {
+        return Ok(None);
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let legacy = parent.join(LEGACY_SEED_FILENAME);
+    if !legacy.is_file() {
+        return Ok(None);
+    }
+    let backup = backup_if_edited(&legacy)?;
+    fs::remove_file(&legacy)?;
+    Ok(backup)
+}
 
 /// Private vocabulary until mv-config's role API lands. Only new write-side
 /// names are exposed; history readers elsewhere still accept retired names.
@@ -449,8 +498,11 @@ pub fn backup_if_edited(path: &Path) -> io::Result<Option<PathBuf>> {
 }
 
 /// Shared by every seed writer: back up a hand-edited file, create the
-/// parent dir at 0700, then write the rendered text at 0600. Return the
-/// backup path so the command layer can report it to the operator.
+/// parent dir at 0700, then write the rendered text at 0600. Also migrates
+/// a legacy sibling onto `path` ([`migrate_legacy_sibling`]), so every
+/// writer gets that behavior for free. Returns whichever backup path (new
+/// file's hand edit, or migrated legacy's) the command layer should report
+/// to the operator; a write that triggers both keeps the new file's.
 fn write_rendered_seed(path: &Path, rendered: &str) -> io::Result<Option<PathBuf>> {
     let backup = backup_if_edited(path)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -476,7 +528,8 @@ fn write_rendered_seed(path: &Path, rendered: &str) -> io::Result<Option<PathBuf
     }
     file.write_all(rendered.as_bytes())?;
     file.sync_all()?;
-    Ok(backup)
+    let legacy_backup = migrate_legacy_sibling(path)?;
+    Ok(backup.or(legacy_backup))
 }
 
 pub fn write_seed(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<PathBuf>> {
@@ -735,6 +788,56 @@ mod tests {
         fs::write(&path, "legacy seed without a marker").unwrap();
         assert_eq!(seed_is_stale(&path, &context).unwrap(), Some(true));
         assert!(backup_if_edited(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn write_seed_writes_the_new_filename_for_a_fresh_project() {
+        let dir = TempDir::new();
+        let context = context(&dir.0);
+        let path = seed_path(&dir.0);
+        assert!(write_seed(&path, &context).unwrap().is_none());
+        assert!(path.is_file());
+        assert!(!dir
+            .0
+            .join(".multiverse")
+            .join(LEGACY_SEED_FILENAME)
+            .is_file());
+    }
+
+    #[test]
+    fn write_seed_migrates_an_existing_legacy_seed_onto_the_new_filename() {
+        let dir = TempDir::new();
+        let context = context(&dir.0);
+        let state_dir = dir.0.join(".multiverse");
+        fs::create_dir_all(&state_dir).unwrap();
+        let legacy = state_dir.join(LEGACY_SEED_FILENAME);
+        fs::write(&legacy, "hand-edited legacy seed, no digest marker\n").unwrap();
+        let path = seed_path(&dir.0);
+        let backup = write_seed(&path, &context)
+            .unwrap()
+            .expect("the legacy file's hand edit is preserved");
+        assert!(path.is_file());
+        assert!(!legacy.is_file());
+        assert_eq!(
+            fs::read_to_string(backup).unwrap(),
+            "hand-edited legacy seed, no digest marker\n"
+        );
+    }
+
+    #[test]
+    fn existing_seed_path_prefers_the_new_name_and_falls_back_to_legacy() {
+        let dir = TempDir::new();
+        assert_eq!(existing_seed_path(&dir.0), None);
+        let state_dir = dir.0.join(".multiverse");
+        fs::create_dir_all(&state_dir).unwrap();
+        let legacy = state_dir.join(LEGACY_SEED_FILENAME);
+        fs::write(&legacy, "legacy\n").unwrap();
+        assert_eq!(existing_seed_path(&dir.0), Some(legacy.clone()));
+        let current = seed_path(&dir.0);
+        fs::write(&current, "current\n").unwrap();
+        assert_eq!(existing_seed_path(&dir.0), Some(current.clone()));
+        fs::remove_file(&legacy).unwrap();
+        assert_eq!(existing_seed_path(&dir.0), Some(current));
     }
 
     #[test]

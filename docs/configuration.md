@@ -35,10 +35,12 @@ Herdr-managed install.
 
 Each project's own task history — briefs, results, status files, the
 routing log, worktrees, backlog, and the Nexus seed
-(`.multiverse/orchestrator.md`, legacy filename) — lives under that
-project's `.multiverse/` directory, not in the plugin's config or state
-directories. That history is read as-is across upgrades; Multiverse does
-not rewrite it except through an explicit, versioned migration (see
+(`.multiverse/nexus.md`; a project still carrying the legacy
+`.multiverse/orchestrator.md` keeps reading and writing that file until
+its next seed write, which migrates it onto `nexus.md`) — lives under
+that project's `.multiverse/` directory, not in the plugin's config or
+state directories. That history is read as-is across upgrades; Multiverse
+does not rewrite it except through an explicit, versioned migration (see
 [Migrations](#migrations) below).
 
 ## `config.toml`

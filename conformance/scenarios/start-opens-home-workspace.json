@@ -1,6 +1,6 @@
 {
   "id": "start-opens-home-workspace",
-  "description": "`start multiverse`, with `[projects.multiverse]` omitting `path`, opens exactly one workspace for the hub (decided changes 1a-1c, `20261108-b-81cb2b`): `workspace create` labeled `multiverse` rooted at `<state dir>/home` (created since it did not exist — a missing hub home is created, never refused, unlike an ordinary project's missing path), the home seed written there, its Nexus pane split to the right with no focus (`pane split`), and a read-only `board --all --watch --read-only` watcher launched in the new pane (`pane run`). No account is configured, so no Nexus launches into the root pane. The strict scripted transcript below is exhaustive: no `tab list`/`tab create` call is scripted, so the hub opening a dashboard tab (it must not, ever) would fail this scenario rather than merely going unchecked. Exit EXIT_OK (0).",
+  "description": "`start multiverse`, with `[projects.multiverse]` omitting `path`, opens exactly one workspace for the hub (decided changes 1a-1c, `20261108-b-81cb2b`, revised by the home-board-tab builder brief): `workspace create` labeled `multiverse` rooted at `<state dir>/home` (created since it did not exist — a missing hub home is created, never refused, unlike an ordinary project's missing path), the home seed written there, and a create-if-absent, unfocused `board` tab (`tab list`, `tab create --label board --no-focus`) running the one-shot `board --all --read-only` (no `--watch`) in its root pane (`pane run`). No account is configured, so no Nexus launches into the root pane. The strict scripted transcript below is exhaustive: no `pane split` call is scripted, so the hub falling back to the old split-pane board (it must not, ever again) would fail this scenario rather than merely going unchecked. Exit EXIT_OK (0).",
   "projects": {
     "project-a": {
       "git": true,
@@ -36,11 +36,15 @@
           "reply": { "exit": 0, "stdout": "{\"result\": {\"workspace\": {\"workspace_id\": \"w1\"}, \"root_pane\": {\"pane_id\": \"w1:p1\"}}}\n" }
         },
         {
-          "match_argv": ["pane", "split", "--pane", "w1:p1", "--direction", "right", "--cwd", "{{RUNTIME_DIR}}/home", "--no-focus"],
-          "reply": { "exit": 0, "stdout": "{\"result\": {\"pane\": {\"pane_id\": \"w1:p2\"}}}\n" }
+          "match_argv": ["tab", "list", "--workspace", "w1"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"tabs\": []}}\n" }
         },
         {
-          "match_argv": ["pane", "run", "w1:p2", "multiverse --config {{STATE_DIR}}/config.toml board --all --watch --read-only"],
+          "match_argv": ["tab", "create", "--workspace", "w1", "--cwd", "{{RUNTIME_DIR}}/home", "--label", "board", "--no-focus"],
+          "reply": { "exit": 0, "stdout": "{\"result\": {\"root_pane\": {\"pane_id\": \"w1:p2\"}}}\n" }
+        },
+        {
+          "match_argv": ["pane", "run", "w1:p2", "multiverse --config {{STATE_DIR}}/config.toml board --all --read-only"],
           "reply": { "exit": 0, "stdout": "" }
         }
       ],
@@ -49,7 +53,7 @@
         "stdout_contains": [
           "w1  pane w1:p1",
           "<RUNTIME_DIR>/home",
-          "board pane running",
+          "board tab running",
           "opened 1 of 1"
         ]
       }

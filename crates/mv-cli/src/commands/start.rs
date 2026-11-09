@@ -38,7 +38,7 @@ use mv_config::roles::Role;
 use mv_engine::fleet_start::{
     find_orchestrator_agent, nexus_agent_name, nexus_legacy_agent_name, FleetState,
 };
-use mv_engine::mv_herdr::{argv, envelope};
+use mv_engine::mv_herdr::argv;
 use mv_engine::nexus_seed::{self, DispatchableRole, SeedContext, SeedRole};
 use mv_engine::runner::{Herdr, ProcessHerdr, Timing};
 use mv_engine::selector;
@@ -89,9 +89,9 @@ fn project_lock_path(project_root: &Path) -> PathBuf {
 /// operator override; otherwise `[board].dashboard_tab` (bool, or the
 /// empty-by-default project list, decided change 3 `20261108-b-81cb2b`)
 /// decides per project. `launch_project` never calls this for the hub —
-/// its board is the split pane `start` opens directly, never a dashboard
-/// tab — so a `true` here for `"multiverse"` only matters to a caller that
-/// asks this function directly.
+/// its board is the one-shot `board` tab `start` opens directly, never a
+/// dashboard tab — so a `true` here for `"multiverse"` only matters to a
+/// caller that asks this function directly.
 fn dashboard_for(flag: bool, config: &Config, project_name: &str) -> bool {
     if flag {
         return true;
@@ -132,26 +132,28 @@ fn dashboard_tab_script(invocation: &str, config_path: &Path, target: &str) -> S
     )
 }
 
-/// Pure script-render for the hub's read-only board watcher pane. See
-/// [`dashboard_tab_script`].
+/// Pure script-render for the hub's one-shot, read-only board — no
+/// `--watch`: it runs once and exits. See [`dashboard_tab_script`].
 fn home_board_script(invocation: &str, config_path: &Path) -> String {
     format!(
-        "{invocation} --config {} board --all --watch --read-only",
+        "{invocation} --config {} board --all --read-only",
         posix_quote(&config_path.display().to_string())
     )
 }
 
-/// `cli._ensure_dashboard_tab` (`cli.py:5331-5377`): create-if-absent one
-/// unfocused `dashboard` tab, then `pane run` the board watcher. The
-/// per-workspace lock covers list/create only, matching Python — the
-/// watcher launch runs after it is released.
-fn ensure_dashboard_tab(
+/// Shared create-if-absent tab logic behind both `ensure_dashboard_tab`
+/// and the hub's `ensure_home_board_tab`: the same per-workspace lock
+/// (covering list/create only, matching Python — the caller's own
+/// `pane run` happens after it is released), `tab_list`, create only if
+/// no tab labeled `label` exists. Returns the new-or-already-open tab's
+/// root pane id for the caller to run a script in, or the message lines
+/// to report instead.
+fn ensure_tab(
     herdr: &mut impl Herdr,
-    config_path: &Path,
-    project: &Project,
     path: &Path,
     workspace_id: &str,
-) -> Vec<String> {
+    label: &str,
+) -> Result<String, Vec<String>> {
     let created = {
         let mut hasher = Sha256::new();
         hasher.update(workspace_id.as_bytes());
@@ -160,25 +162,23 @@ fn ensure_dashboard_tab(
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let lock_path = path
-            .join(".multiverse")
-            .join(format!("dashboard-{key}.lock"));
-        let _lock = match mv_core::lock::acquire_default(&lock_path, "dashboard") {
+        let lock_path = path.join(".multiverse").join(format!("{label}-{key}.lock"));
+        let _lock = match mv_core::lock::acquire_default(&lock_path, label) {
             Ok(guard) => guard,
             Err(error) => {
-                return vec![format!("      dashboard tab unavailable: {error}")];
+                return Err(vec![format!("      {label} tab unavailable: {error}")]);
             }
         };
         let listed = match herdr.call(&argv::tab_list(Some(workspace_id)), HERDR_TIMEOUT) {
             Ok(result) if result.ok() => result,
             Ok(result) => {
-                return vec![format!(
-                    "      dashboard tab unavailable: {}",
+                return Err(vec![format!(
+                    "      {label} tab unavailable: {}",
                     result.message()
-                )];
+                )]);
             }
             Err(error) => {
-                return vec![format!("      dashboard tab unavailable: {error}")];
+                return Err(vec![format!("      {label} tab unavailable: {error}")]);
             }
         };
         let existing = listed
@@ -189,23 +189,24 @@ fn ensure_dashboard_tab(
             .and_then(|tabs| tabs.as_array())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let Some(create) = argv::ensure_dashboard_tab(existing, workspace_id, path, None) else {
-            return vec!["      dashboard tab already open".to_string()];
+        let Some(create) = argv::ensure_dashboard_tab(existing, workspace_id, path, Some(label))
+        else {
+            return Err(vec![format!("      {label} tab already open")]);
         };
         match herdr.call(&create, HERDR_TIMEOUT) {
             Ok(result) => result,
             Err(error) => {
-                return vec![format!("      dashboard tab FAILED — {error}")];
+                return Err(vec![format!("      {label} tab FAILED — {error}")]);
             }
         }
     };
     if !created.ok() {
-        return vec![format!(
-            "      dashboard tab FAILED — {}",
+        return Err(vec![format!(
+            "      {label} tab FAILED — {}",
             created.message()
-        )];
+        )]);
     }
-    let Some(pane) = created
+    created
         .payload
         .as_ref()
         .and_then(|payload| payload.get("result"))
@@ -213,8 +214,25 @@ fn ensure_dashboard_tab(
         .and_then(|pane| pane.get("pane_id"))
         .and_then(|id| id.as_str())
         .map(str::to_owned)
-    else {
-        return vec!["      dashboard tab created, but its pane was not returned".to_string()];
+        .ok_or_else(|| {
+            vec![format!(
+                "      {label} tab created, but its pane was not returned"
+            )]
+        })
+}
+
+/// `cli._ensure_dashboard_tab` (`cli.py:5331-5377`): create-if-absent one
+/// unfocused `dashboard` tab, then `pane run` the board watcher.
+fn ensure_dashboard_tab(
+    herdr: &mut impl Herdr,
+    config_path: &Path,
+    project: &Project,
+    path: &Path,
+    workspace_id: &str,
+) -> Vec<String> {
+    let pane = match ensure_tab(herdr, path, workspace_id, "dashboard") {
+        Ok(pane) => pane,
+        Err(lines) => return lines,
     };
     let target = if project.name == "multiverse" {
         "--all".to_string()
@@ -234,41 +252,62 @@ fn ensure_dashboard_tab(
     }
 }
 
-/// Decided change 1c (`20261108-b-81cb2b`): the one time `launch_project`
-/// creates the hub's workspace, split its Nexus pane to the right (no
-/// focus) and run a read-only board watcher in the new pane — the hub's
-/// board, not a dashboard tab. Best-effort, mirroring `ensure_dashboard_tab`:
-/// a split or watch failure is reported as a line in `start`'s own output,
-/// never a reason to fail the hub's own launch.
-fn split_home_board_pane(
+/// Decided change 1c (`20261108-b-81cb2b`), revised: the hub's board is a
+/// create-if-absent, unfocused `board` tab — not a split pane — running
+/// the one-shot `board --all --read-only` (no `--watch`). Modeled on
+/// `ensure_dashboard_tab` via the shared [`ensure_tab`], but its own tab
+/// label and run; a human closing the tab gets it back on the next
+/// `start multiverse` rather than it staying gone. Best-effort: a create
+/// or run failure is reported as a line in `start`'s own output, never a
+/// reason to fail the hub's own launch.
+fn ensure_home_board_tab(
     herdr: &mut impl Herdr,
     config_path: &Path,
     path: &Path,
-    pane: &str,
+    workspace_id: &str,
 ) -> Vec<String> {
-    let split = match herdr.call(
-        &argv::pane_split(path, &[], Some(pane), false, Some("right"), false),
-        HERDR_TIMEOUT,
-    ) {
-        Ok(result) if result.ok() => result,
-        Ok(result) => return vec![format!("      board pane FAILED — {}", result.message())],
-        Err(error) => return vec![format!("      board pane FAILED — {error}")],
-    };
-    let board_pane = match envelope::pane_id_from(&split) {
-        Ok(pane_id) => pane_id,
-        Err(error) => return vec![format!("      board pane FAILED — {error}")],
+    let pane = match ensure_tab(herdr, path, workspace_id, "board") {
+        Ok(pane) => pane,
+        Err(lines) => return lines,
     };
     let script = home_board_script(&nexus_seed::multiverse_invocation(), config_path);
-    match herdr.call(&argv::pane_run(&board_pane, &script), HERDR_TIMEOUT) {
-        Ok(result) if result.ok() => vec!["      board pane running".to_string()],
+    match herdr.call(&argv::pane_run(&pane, &script), HERDR_TIMEOUT) {
+        Ok(result) if result.ok() => vec!["      board tab running".to_string()],
         Ok(result) => vec![format!(
-            "      board pane created, but watch failed: {}",
+            "      board tab created, but board failed: {}",
             result.message()
         )],
         Err(error) => vec![format!(
-            "      board pane created, but watch failed: {error}"
+            "      board tab created, but board failed: {error}"
         )],
     }
+}
+
+/// The hub's board tab is ensured on every `start multiverse`, not only
+/// when its workspace is freshly created — a user who closed the tab
+/// gets it back on the next start, same as the dashboard tab's own
+/// create-if-absent idempotency. Appends `ensure_home_board_tab`'s lines
+/// to `message` when `project` is the hub and a workspace id is known;
+/// returns `message` unchanged otherwise, including for every other
+/// project, whose board is `maybe_dashboard`'s dashboard-tab handling.
+fn with_home_board(
+    herdr: &mut impl Herdr,
+    config_path: &Path,
+    project: &Project,
+    path: &Path,
+    workspace_id: Option<&str>,
+    message: String,
+) -> String {
+    if project.name != HUB_PROJECT_NAME {
+        return message;
+    }
+    let Some(workspace_id) = workspace_id.filter(|id| !id.is_empty()) else {
+        return message;
+    };
+    with_extra_lines(
+        message,
+        ensure_home_board_tab(herdr, config_path, path, workspace_id),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -282,10 +321,10 @@ fn maybe_dashboard(
     dashboard: bool,
     message: String,
 ) -> String {
-    // Decided change 1c (`20261108-b-81cb2b`): the hub's board is the split
-    // pane `launch_project` opens directly when its workspace is created,
-    // never a dashboard tab — unconditionally, regardless of `--dashboard`
-    // or `[board].dashboard_tab`.
+    // Decided change 1c (`20261108-b-81cb2b`), revised: the hub's board is
+    // the one-shot `board` tab `launch_project` opens directly when its
+    // workspace is created, never a dashboard tab — unconditionally,
+    // regardless of `--dashboard` or `[board].dashboard_tab`.
     if project.name == HUB_PROJECT_NAME {
         return message;
     }
@@ -721,7 +760,7 @@ fn with_project_seed<T>(
         lend_interactive_to_workers: config.lend_interactive_to_workers,
         role_prompt: role_prompt.as_deref(),
     };
-    let seed_path = path.join(".multiverse").join(nexus_seed::SEED_FILENAME);
+    let seed_path = nexus_seed::seed_path(path);
     action(&seed_path, &context)
 }
 
@@ -753,7 +792,7 @@ fn with_home_seed<T>(
         directives_root: &directives_root,
         max_concurrent: config.max_concurrent as usize,
     };
-    let seed_path = path.join(".multiverse").join(nexus_seed::SEED_FILENAME);
+    let seed_path = nexus_seed::seed_path(path);
     action(&seed_path, &context)
 }
 
@@ -890,6 +929,14 @@ fn launch_project<H: Herdr>(
         let orchestrator_dead = seat_account.is_some()
             && find_orchestrator_agent(fleet, name, path, seat, short).is_none();
         if !reseed && !orchestrator_dead {
+            let message = with_home_board(
+                herdr,
+                config_path,
+                project,
+                path,
+                workspace_id.as_deref(),
+                format!("  {name:<20} already open"),
+            );
             return Outcome::Idle {
                 message: maybe_dashboard(
                     herdr,
@@ -899,7 +946,7 @@ fn launch_project<H: Herdr>(
                     path,
                     workspace_id.as_deref(),
                     dashboard,
-                    format!("  {name:<20} already open"),
+                    message,
                 ),
             };
         }
@@ -946,6 +993,14 @@ fn launch_project<H: Herdr>(
                 ),
                 _ => format!("  {name:<20} already current — not re-pointed"),
             };
+            let message = with_home_board(
+                herdr,
+                config_path,
+                project,
+                path,
+                workspace_id.as_deref(),
+                message,
+            );
             return Outcome::Idle {
                 message: maybe_dashboard(
                     herdr,
@@ -983,7 +1038,7 @@ fn launch_project<H: Herdr>(
             ),
             None => String::new(),
         };
-        let seed = path.join(".multiverse").join(nexus_seed::SEED_FILENAME);
+        let seed = nexus_seed::seed_path(path);
         let seed_display = seed.display();
         let found = find_orchestrator_agent(fleet, name, path, seat, short);
         // Python `cli.cmd_start:5643-5646`: `_label_orchestrator_pane` runs
@@ -1079,6 +1134,14 @@ fn launch_project<H: Herdr>(
                 }
             }
         };
+        let message = with_home_board(
+            herdr,
+            config_path,
+            project,
+            path,
+            workspace_id.as_deref(),
+            format!("{backup_note}{reseed_line}"),
+        );
         return Outcome::Idle {
             message: maybe_dashboard(
                 herdr,
@@ -1088,7 +1151,7 @@ fn launch_project<H: Herdr>(
                 path,
                 workspace_id.as_deref(),
                 dashboard,
-                format!("{backup_note}{reseed_line}"),
+                message,
             ),
         };
     }
@@ -1172,10 +1235,7 @@ fn launch_project<H: Herdr>(
         write_project_seed(config, config_path, project, path).map(|(_, handoff)| handoff)
     };
     let (seed, handoff) = match seed_write {
-        Ok(handoff) => (
-            path.join(".multiverse").join(nexus_seed::SEED_FILENAME),
-            handoff,
-        ),
+        Ok(handoff) => (nexus_seed::seed_path(path), handoff),
         Err(error) => {
             let mut message =
                 format!("  {name:<20} FAILED — cannot preserve or write seed: {error}");
@@ -1195,7 +1255,7 @@ fn launch_project<H: Herdr>(
     if is_hub {
         board_fragment = with_extra_lines(
             String::new(),
-            split_home_board_pane(herdr, config_path, path, &created.pane),
+            ensure_home_board_tab(herdr, config_path, path, &created.workspace_id),
         );
     }
 
@@ -1281,6 +1341,58 @@ fn launch_project<H: Herdr>(
         ),
         seeded,
     }
+}
+
+/// Decided change (`20261108-b-d51eab`, Lane A): `run`'s batch summary,
+/// pulled out as a pure function of counts so its wording — split into a
+/// plural-safe project paragraph and a separate home paragraph, neither
+/// naming the seed filename — is unit-testable without driving a Herdr.
+/// `None` when there is nothing to report (no interactive seat and no
+/// pane opened this batch).
+fn batch_summary(
+    seat_configured: bool,
+    opened: usize,
+    project_opened: usize,
+    project_seeded: usize,
+    hub_seeded: usize,
+) -> Option<String> {
+    if !seat_configured {
+        return Some(
+            "No account is marked `interactive = true`, so nothing was started in those panes.\n\
+             Mark the seat you talk to and `start` will bring it up with each project."
+                .to_string(),
+        );
+    }
+    if opened == 0 {
+        return None;
+    }
+    let orch = mv_config::roles::Role::Nexus.display_name();
+    let seeded = project_seeded + hub_seeded;
+    let mut parts = Vec::new();
+    if project_seeded > 0 {
+        parts.push(format!(
+            "{project_seeded} of {project_opened} pane(s) were handed each project's own \
+             **{orch}**: its repository, the roles it may dispatch, and the rule that no \
+             other repository exists. Each project's **{orch}** is the one you talk to for \
+             it; it dispatches its own specialists, and nothing else was started or spent."
+        ));
+    }
+    if hub_seeded > 0 {
+        parts.push(format!(
+            "The home **{orch}** was handed its own seed: it has no repository of its own, \
+             checks on every configured project, and routes work to each project's own \
+             **{orch}**. Nothing else was started and nothing was spent."
+        ));
+    }
+    if seeded < opened {
+        parts.push(format!(
+            "{} pane(s) were opened but never told they are the\n**{orch}** — the reason is \
+             printed under each one above. Until a session reads its seed\nit does not know \
+             this project, and it will not dispatch anything.",
+            opened - seeded
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
@@ -1409,10 +1521,13 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let timing = Timing::default();
     let mut opened = 0usize;
     let mut failed = 0usize;
-    let mut seeded = 0usize;
+    let mut project_opened = 0usize;
+    let mut project_seeded = 0usize;
+    let mut hub_seeded = 0usize;
 
     for name in &wanted {
         let project = &config.projects[name];
+        let is_hub = name == HUB_PROJECT_NAME;
         let Some(path) = project_path(project) else {
             println!("  {name:<20} FAILED — path is not configured");
             failed += 1;
@@ -1436,8 +1551,15 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
             } => {
                 println!("{message}");
                 opened += 1;
-                if was_seeded {
-                    seeded += 1;
+                if is_hub {
+                    if was_seeded {
+                        hub_seeded += 1;
+                    }
+                } else {
+                    project_opened += 1;
+                    if was_seeded {
+                        project_seeded += 1;
+                    }
                 }
             }
             Outcome::Idle { message } => println!("{message}"),
@@ -1449,30 +1571,14 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     }
 
     println!("\nopened {opened} of {}", wanted.len());
-    if seat_account.is_none() {
-        println!(
-            "No account is marked `interactive = true`, so nothing was started in those panes.\n\
-             Mark the seat you talk to and `start` will bring it up with each project."
-        );
-    } else if opened > 0 {
-        let orch = mv_config::roles::Role::Nexus.display_name();
-        if seeded > 0 {
-            println!(
-                "{seeded} of {opened} panes were handed `.multiverse/{}`: their repository, the \
-                 roles\nthey may dispatch, and the rule that no other repository exists. Those \
-                 sessions are\nthis project's **{orch}** — the one you talk to. Each dispatches \
-                 its own specialists;\nnothing else was started and nothing was spent.",
-                nexus_seed::SEED_FILENAME
-            );
-        }
-        if seeded < opened {
-            println!(
-                "\n{} pane(s) were opened but never told they are the\n**{orch}** — the reason \
-                 is printed under each one above. Until a session reads its seed\nit does not \
-                 know this project, and it will not dispatch anything.",
-                opened - seeded
-            );
-        }
+    if let Some(summary) = batch_summary(
+        seat_account.is_some(),
+        opened,
+        project_opened,
+        project_seeded,
+        hub_seeded,
+    ) {
+        println!("{summary}");
     }
 
     if failed > 0 {
@@ -1836,6 +1942,69 @@ mod tests {
     }
 
     #[test]
+    fn batch_summary_project_only_run_names_the_repository_isolation_rule() {
+        let summary = batch_summary(true, 2, 2, 2, 0).unwrap();
+        assert!(
+            summary.contains("each project's own **Nexus**"),
+            "{summary}"
+        );
+        assert!(summary.contains("no other repository exists"), "{summary}");
+        assert!(!summary.contains("home **Nexus**"), "{summary}");
+        assert!(
+            !summary.to_lowercase().contains("orchestrator"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn batch_summary_hub_only_run_uses_home_wording_and_claims_no_repository() {
+        let summary = batch_summary(true, 1, 0, 0, 1).unwrap();
+        assert!(summary.contains("home **Nexus**"), "{summary}");
+        assert!(summary.contains("no repository of its own"), "{summary}");
+        assert!(!summary.contains("no other repository exists"), "{summary}");
+        assert!(
+            !summary.to_lowercase().contains("orchestrator"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn batch_summary_mixed_hub_and_project_batch_prints_both_paragraphs() {
+        let summary = batch_summary(true, 3, 2, 2, 1).unwrap();
+        assert!(
+            summary.contains("each project's own **Nexus**"),
+            "{summary}"
+        );
+        assert!(summary.contains("no other repository exists"), "{summary}");
+        assert!(summary.contains("home **Nexus**"), "{summary}");
+        assert!(summary.contains("no repository of its own"), "{summary}");
+        assert!(
+            !summary.to_lowercase().contains("orchestrator"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn batch_summary_reports_unseeded_panes_regardless_of_hub_or_project() {
+        let summary = batch_summary(true, 2, 2, 1, 0).unwrap();
+        assert!(
+            summary.contains("1 pane(s) were opened but never told"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn batch_summary_without_an_interactive_seat_never_mentions_a_seeded_pane() {
+        let summary = batch_summary(false, 0, 0, 0, 0).unwrap();
+        assert!(summary.contains("No account is marked"), "{summary}");
+    }
+
+    #[test]
+    fn batch_summary_is_none_when_nothing_opened() {
+        assert_eq!(batch_summary(true, 0, 0, 0, 0), None);
+    }
+
+    #[test]
     fn config_load_error_message_appends_the_migrate_fix_only_for_retired_role_keys() {
         let retired = "roles.fixer: \"fixer\" is a retired role key; run the config migrator \
              (`multiverse config migrate`) to rewrite it before loading this file"
@@ -2015,9 +2184,10 @@ mod tests {
 
     #[test]
     fn an_ordinary_projects_fresh_create_issues_no_pane_split() {
-        // Decided change 1c (`20261108-b-81cb2b`): only the hub's freshly
-        // created workspace gets a Nexus-adjacent board pane; an ordinary
-        // project's own fresh create must never call `pane split`.
+        // Decided change 1c (`20261108-b-81cb2b`), revised: only the hub's
+        // freshly created workspace gets a one-shot `board` tab; an
+        // ordinary project's own fresh create must never call `pane split`
+        // (and never opens a `board` tab either).
         let (_dir, sandbox, config, config_path) = sandbox_fixture("sandbox");
         let project = &config.projects["sandbox"];
         let mut herdr = Scripted::new(vec![
@@ -2103,6 +2273,124 @@ mod tests {
         assert_eq!(
             lines,
             vec!["      dashboard tab FAILED — tab create refused".to_string()]
+        );
+    }
+
+    #[test]
+    fn home_board_script_runs_once_without_watch() {
+        let config_path = Path::new("/sandbox/config.toml");
+        let script = home_board_script("multiverse", config_path);
+        assert!(script.contains("board --all --read-only"), "{script}");
+        assert!(!script.contains("--watch"), "{script}");
+    }
+
+    #[test]
+    fn ensure_home_board_tab_reports_already_open_when_the_label_exists() {
+        let (_dir, sandbox, _config, config_path) = sandbox_fixture("sandbox");
+        let mut herdr = Scripted::new(vec![(
+            "tab list",
+            ok(json!({"result": {"tabs": [{"label": "board"}]}})),
+        )]);
+        let lines = ensure_home_board_tab(&mut herdr, &config_path, &sandbox, "w1");
+        assert_eq!(lines, vec!["      board tab already open".to_string()]);
+        assert_eq!(herdr.calls, vec!["tab list --workspace w1".to_string()]);
+        assert!(herdr
+            .calls
+            .iter()
+            .all(|call| !call.starts_with("tab create")));
+    }
+
+    #[test]
+    fn ensure_home_board_tab_runs_the_board_once_after_create() {
+        let (_dir, sandbox, _config, config_path) = sandbox_fixture("sandbox");
+        let mut herdr = Scripted::new(vec![
+            ("tab list", ok(json!({"result": {"tabs": []}}))),
+            (
+                "tab create",
+                ok(json!({"result": {"root_pane": {"pane_id": "w1:p2"}}})),
+            ),
+            ("pane run", ok(json!({"result": {}}))),
+        ]);
+        let lines = ensure_home_board_tab(&mut herdr, &config_path, &sandbox, "w1");
+        assert_eq!(lines, vec!["      board tab running".to_string()]);
+        assert_eq!(herdr.calls.len(), 3);
+        assert!(herdr.calls[0].starts_with("tab list --workspace w1"));
+        assert!(herdr.calls[1].starts_with("tab create --workspace w1"));
+        assert!(
+            herdr.calls[1].contains("--label board"),
+            "{}",
+            herdr.calls[1]
+        );
+        assert!(
+            herdr.calls[2].starts_with("pane run w1:p2 "),
+            "{}",
+            herdr.calls[2]
+        );
+        assert!(herdr.calls[2].contains("board --all --read-only"));
+        assert!(!herdr.calls[2].contains("--watch"));
+    }
+
+    #[test]
+    fn ensure_home_board_tab_reports_failed_when_create_is_refused() {
+        let (_dir, sandbox, _config, config_path) = sandbox_fixture("sandbox");
+        let mut herdr = Scripted::new(vec![
+            ("tab list", ok(json!({"result": {"tabs": []}}))),
+            ("tab create", failed("tab create refused")),
+        ]);
+        let lines = ensure_home_board_tab(&mut herdr, &config_path, &sandbox, "w1");
+        assert_eq!(
+            lines,
+            vec!["      board tab FAILED — tab create refused".to_string()]
+        );
+    }
+
+    fn hub_fixture() -> (tempfile::TempDir, PathBuf, Config, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".multiverse")).unwrap();
+        let toml = format!(
+            "[projects.{HUB_PROJECT_NAME}]\npath = \"{}\"\n",
+            home.display()
+        );
+        let config_path = home.join("config.toml");
+        let config = load_config_str(&toml, &config_path).unwrap();
+        (dir, home, config, config_path)
+    }
+
+    #[test]
+    fn a_second_hub_start_with_an_existing_board_tab_issues_no_tab_create() {
+        // Proof item 3 (home-board-tab-builder.md): the hub's board tab
+        // is ensured on every `start multiverse`, not only when its
+        // workspace is freshly created — this is the hub already open
+        // (e.g. a second `start multiverse`), with `board` already a tab.
+        let (_dir, home, config, config_path) = hub_fixture();
+        let project = &config.projects[HUB_PROJECT_NAME];
+        let fleet = open_fleet(HUB_PROJECT_NAME, &home);
+        let mut herdr = Scripted::new(vec![(
+            "tab list",
+            ok(json!({"result": {"tabs": [{"label": "board"}]}})),
+        )]);
+        let message = outcome_message(launch_project(
+            &mut herdr,
+            &config,
+            &config_path,
+            project,
+            &home,
+            None,
+            &fleet,
+            false,
+            false,
+            &Timing::default(),
+        ));
+        assert!(message.contains("already open"), "{message}");
+        assert!(message.contains("board tab already open"), "{message}");
+        assert!(
+            herdr
+                .calls
+                .iter()
+                .all(|call| !call.starts_with("tab create")),
+            "{:?}",
+            herdr.calls
         );
     }
 
@@ -2261,7 +2549,7 @@ mod tests {
             let project = &config.projects["sandbox"];
             let seat = &config.accounts["nexus-seat"];
             write_project_seed(&config, &config_path, project, &sandbox).unwrap();
-            let seed = sandbox.join(".multiverse/orchestrator.md");
+            let seed = sandbox.join(".multiverse/nexus.md");
             // The digest still matches today's config: preserve human edits
             // rather than rewriting or backing them up on a current reseed.
             let original = format!("{}\nHuman note.\n", std::fs::read_to_string(&seed).unwrap());

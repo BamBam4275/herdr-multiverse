@@ -449,7 +449,7 @@ pub enum DispatchError {
     TooManyLanes { count: usize, max: usize },
 
     #[error(
-        "project {project:?} has already made {used}/{budget} reviewer dispatches in the last 24h"
+        "project {project:?} has already made {used}/{budget} Critic dispatches in the last 24h"
     )]
     ReviewBudgetExceeded {
         project: String,
@@ -960,6 +960,9 @@ mod tests {
                 ..
             }
         ));
+        let message = err.to_string();
+        assert!(message.contains("Critic dispatches"), "{message:?}");
+        assert!(!message.to_lowercase().contains("reviewer"), "{message:?}");
     }
 
     #[test]

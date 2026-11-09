@@ -11,6 +11,8 @@
 //! read, so a Rust writer's own output round-trips through a Python reader
 //! (and vice versa) without either side needing to special-case the other.
 
+use std::sync::OnceLock;
+
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -61,6 +63,49 @@ pub fn parse_flexible(value: &str) -> Result<OffsetDateTime, TimestampParseError
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| TimestampParseError(value.to_string()))
 }
 
+/// `instant`'s local calendar date and clock, as `zone` has it at the UTC
+/// offset in effect at that exact instant — so a card from before a DST
+/// change keeps its own, different offset from one minted after it, the
+/// same as `date -r <epoch>` (or `astimezone(None)`) with `TZ` set to
+/// `zone`. A pure offset lookup once `zone` is parsed: no subprocess, no
+/// further file I/O.
+pub fn local_datetime_in(
+    zone: &tz::TimeZone,
+    instant: OffsetDateTime,
+) -> Option<time::PrimitiveDateTime> {
+    let local_type = zone.find_local_time_type(instant.unix_timestamp()).ok()?;
+    let offset = time::UtcOffset::from_whole_seconds(local_type.ut_offset()).ok()?;
+    let local = instant.to_offset(offset);
+    Some(time::PrimitiveDateTime::new(local.date(), local.time()))
+}
+
+fn resolve_ambient_time_zone() -> Option<tz::TimeZone> {
+    // Mirrors how `date`/`tzset(3)` pick a zone: an explicit `TZ` (POSIX
+    // string, `Region/City`, or empty for UTC) wins; otherwise fall back
+    // to the system default (`/etc/localtime`).
+    match std::env::var("TZ") {
+        Ok(tz) if tz.is_empty() => Some(tz::TimeZone::utc()),
+        Ok(tz) => tz::TimeZone::from_posix_tz(&tz).ok(),
+        Err(_) => tz::TimeZone::local().ok(),
+    }
+}
+
+/// The ambient system timezone, parsed from the IANA tzdata at most once
+/// per process. A board render touching thousands of cards shares this
+/// one parse; only `local_datetime`'s per-instant offset lookup repeats.
+fn ambient_time_zone() -> Option<&'static tz::TimeZone> {
+    static ZONE: OnceLock<Option<tz::TimeZone>> = OnceLock::new();
+    ZONE.get_or_init(resolve_ambient_time_zone).as_ref()
+}
+
+/// `local_datetime_in` against the ambient system timezone (`TZ`, or the
+/// system default). Returns `None` if the zone cannot be resolved, the
+/// same failure mode the old `date`-spawning implementation had when the
+/// child process failed.
+pub fn local_datetime(instant: OffsetDateTime) -> Option<time::PrimitiveDateTime> {
+    local_datetime_in(ambient_time_zone()?, instant)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +152,41 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(parse_flexible("not a timestamp").is_err());
         assert!(parse_flexible("").is_err());
+    }
+
+    #[test]
+    fn local_datetime_in_a_fixed_offset_zone() {
+        let zone = tz::TimeZone::fixed(-5 * 3_600).unwrap();
+        let instant = datetime!(2024-01-15 12:00:00 UTC);
+        assert_eq!(
+            local_datetime_in(&zone, instant),
+            Some(datetime!(2024-01-15 07:00:00))
+        );
+    }
+
+    #[test]
+    fn local_datetime_in_utc_is_the_identity() {
+        let instant = datetime!(2024-01-15 12:00:00 UTC);
+        assert_eq!(
+            local_datetime_in(&tz::TimeZone::utc(), instant),
+            Some(datetime!(2024-01-15 12:00:00))
+        );
+    }
+
+    #[test]
+    fn local_datetime_in_uses_each_instants_own_dst_offset() {
+        // US Eastern as a POSIX rule, not a named zone, so this stays
+        // hermetic: no zoneinfo file on disk is involved.
+        let zone = tz::TimeZone::from_posix_tz("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let winter = datetime!(2024-01-15 12:00:00 UTC); // EST, UTC-5
+        let summer = datetime!(2024-07-15 12:00:00 UTC); // EDT, UTC-4
+        assert_eq!(
+            local_datetime_in(&zone, winter),
+            Some(datetime!(2024-01-15 07:00:00))
+        );
+        assert_eq!(
+            local_datetime_in(&zone, summer),
+            Some(datetime!(2024-07-15 08:00:00))
+        );
     }
 }

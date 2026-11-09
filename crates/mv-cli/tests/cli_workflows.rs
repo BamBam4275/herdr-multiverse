@@ -1083,7 +1083,9 @@ scout = ["primary"]
 }
 
 /// Row #39: `--verbose` names a seed whose digest no longer matches the
-/// current dispatch table / role prompt.
+/// current dispatch table / role prompt. Written at the legacy filename
+/// (not `nexus.md`) to prove `check` still judges a project that has not
+/// been reseeded since the rename, rather than reporting it missing.
 #[test]
 fn check_verbose_reports_a_stale_nexus_seed() {
     let sandbox = Sandbox::new();
@@ -1096,5 +1098,6 @@ fn check_verbose_reports_a_stale_nexus_seed() {
     let output = sandbox.cli(&["check", "--verbose"]);
     let text = stdout(&output);
     assert_code(&output, 0);
-    assert!(text.contains("orchestrator assignment is stale"), "{text}");
+    assert!(text.contains("Nexus seed is stale"), "{text}");
+    assert!(!text.to_lowercase().contains("orchestrator"), "{text}");
 }

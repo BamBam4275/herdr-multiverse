@@ -101,7 +101,7 @@ binding — see each one's own module doc for the complete list.
 | `dispatch` | Scoped task to a worker; execution requires `--yes` | Real: `--dry-run` reports the plan (seat selection, breaker/degrade policy); `--yes` drives the real `mv-engine::runner::dispatch` against `ProcessHerdr`, including `--into` lane adoption, a bounded `lane_setup` timeout, and real breaker trial claims (see `commands::dispatch`'s own module doc for what is not yet ported to full Python parity: agent-name minting's exact byte budget, and a partial task-id collision rebind) |
 | `halt on\|off\|status` | Fleet halt | Real |
 | `scratch open\|read\|close` | Isolated scratch panes | Real |
-| `start` | Start Nexus for selected projects | Real: opens a live Nexus pane through `mv-engine::fleet_start`, and `--reseed` on an already-open project now re-points its live session (dialog/blocked detection, orchestrator-identity-by-name matching, retry-with-probe landing confirmation) (see `commands::start`'s own module doc for what is not yet ported to full Python parity: the project-level concurrency lock, the Claude deny-list launch wrapper, the dashboard tab, the per-role dispatch-availability table, and Python's exact agent-naming scheme) |
+| `start` | Start Nexus for selected projects | Real: opens a live Nexus pane through `mv-engine::fleet_start`, and `--reseed` on an already-open project now re-points its live session (dialog/blocked detection, agent-identity-by-name matching, retry-with-probe landing confirmation) (see `commands::start`'s own module doc for what is not yet ported to full Python parity: the project-level concurrency lock, the Claude deny-list launch wrapper, the dashboard tab, the per-role dispatch-availability table, and Python's exact agent-naming scheme) |
 | `projects` | List configured projects | Real |
 | `stop` | Stop project sessions | Real |
 | `add` | Register an existing project | Real (plain-text append, not yet through `mv-config::edit`) |
@@ -121,7 +121,7 @@ binding — see each one's own module doc for the complete list.
 | `notify` | Queue or flush operator notifications | Real |
 | `inspect` | Inspect project context | Real |
 | `result` | Read a task result | Real |
-| `activity` | `send` / `reply` / `close` / `broadcast` / `nudge` / `inbox` / `update` | Real for all seven: `nudge` types Python's exact `NUDGE_PROMPT` into each permitted recipient's live orchestrator pane and confirms it landed, through the same `FleetState::orchestrator_agent` / `deliver_prompt_to` pair `start --reseed` uses, but does not reproduce Python's fine-grained reached/unconfirmed/unverifiable/unreached split or its composer-text/dialog-menu pane-read checks (`commands::activity`'s own module doc) |
+| `activity` | `send` / `reply` / `close` / `broadcast` / `nudge` / `inbox` / `update` | Real for all seven: `nudge` types Python's exact `NUDGE_PROMPT` into each permitted recipient's live Nexus pane and confirms it landed, through the same `FleetState::orchestrator_agent` / `deliver_prompt_to` pair `start --reseed` uses, but does not reproduce Python's fine-grained reached/unconfirmed/unverifiable/unreached split or its composer-text/dialog-menu pane-read checks (`commands::activity`'s own module doc) |
 | `backlog` | `add` / `list` / `done` / `reopen` / `annotate` / `reprioritize` / `show` / `ask` / `mark-asked` / `answer` | Real |
 | `directives set\|show` | Standing project directives | Real |
 | `workers` | List worker sessions | Real |
@@ -132,7 +132,7 @@ the Nexus); `--as-orchestrator` is rejected outright, not accepted as an
 alias — release policy. The handler honors it: a process carrying a
 dispatched task id (`MULTIVERSE_TASK_ID`) never advances the read cursor
 on a plain read, matching Python's "a specialist must never advance the
-orchestrator's own mail read" rule, unless `--as-nexus` is passed.
+Nexus's own mail read" rule, unless `--as-nexus` is passed.
 `--replay-since SEQ` / `--replay-last N` re-show past mail through
 `mv_state::activity::replay_inbox` without ever touching the cursor; both
 are refused together with each other, with `--peek`, or with `--as-nexus`.
@@ -197,8 +197,12 @@ embedded copy so a live edit does not need a rebuild. `Prompt::body`
 splits on the first `\n---\n`. Skill grants keep the `*` / `!name` / `!*` /
 `[]` algebra; denial wins.
 
-Nexus seeds keep the historical filename `.multiverse/orchestrator.md` so
-existing projects resume in place. The renderer is `mv-engine::nexus_seed`.
+Nexus seeds are written to `.multiverse/nexus.md`. A project still
+carrying the legacy `.multiverse/orchestrator.md` keeps reading and
+writing that file until its next seed write, which migrates it onto
+`nexus.md` (backing up the legacy file first if a human had edited it).
+Read-only commands accept either name. The renderer is
+`mv-engine::nexus_seed`.
 
 ## Packaging and distribution
 

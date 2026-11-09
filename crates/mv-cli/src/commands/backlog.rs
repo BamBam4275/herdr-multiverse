@@ -531,7 +531,7 @@ fn done_for(args: &ArgMatches, caller: Option<String>) -> Result<(), Failure> {
         return Err(Failure::Operation(format!(
             "backlog done was refused: the caller {caller:?} is a dispatched task, and a \
              specialist closing its own card is the wrong actor — report completion to your \
-             orchestrator instead; it verifies by running and closes with evidence."
+             Nexus instead; it verifies by running and closes with evidence."
         )));
     }
     let token = args.get_one::<String>("item").expect("required");
@@ -563,7 +563,7 @@ fn reopen_for(args: &ArgMatches, caller: Option<String>) -> Result<(), Failure> 
     if let Some(caller) = caller {
         return Err(Failure::Operation(format!(
             "backlog reopen was refused: the caller {caller:?} is a dispatched task, and a \
-             specialist reopening a card is the wrong actor — report to your orchestrator \
+             specialist reopening a card is the wrong actor — report to your Nexus \
              instead."
         )));
     }
@@ -893,6 +893,8 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("backlog done was refused"));
         assert!(message.contains("20261102-builder-abc123"));
+        assert!(message.contains("Nexus"));
+        assert!(!message.to_lowercase().contains("orchestrator"));
     }
 
     #[test]
@@ -904,5 +906,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("backlog reopen was refused"));
         assert!(message.contains("20261102-builder-abc123"));
+        assert!(message.contains("Nexus"));
+        assert!(!message.to_lowercase().contains("orchestrator"));
     }
 }

@@ -25,7 +25,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "workers ?/3\nseats: seat-b ?\nprojects: sandbox ? open, ceiling 3\norchestrators ? (excluded from workers; they do not count against max_concurrent)"
+        "stdout": "workers ?/3\nseats: seat-b ?\nprojects: sandbox ? open, ceiling 3\nnexus sessions ? (excluded from workers; they do not count against max_concurrent)"
       }
     }
   ]

@@ -9,6 +9,52 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-09
+
+### Changed
+
+- CLI: `multiverse start multiverse` now opens the hub's board in its own
+  unfocused `board` tab in the `multiverse` workspace, created if absent on
+  every `start` (so closing it gets it back), instead of a split pane beside
+  the Nexus. The board itself runs once — `board --all --read-only`, no
+  `--watch` — instead of a job that keeps refreshing.
+- Nexus seeds: new projects now write `.multiverse/nexus.md` instead of
+  `.multiverse/orchestrator.md`. A project still carrying the legacy file
+  keeps reading and writing it until its next seed write, which migrates it
+  onto `nexus.md` (backing up any hand edits first) and removes the legacy
+  file. Read-only commands accept either name. `start`'s batch summary no
+  longer interpolates the seed filename and now prints a separate project
+  paragraph and home paragraph instead of one that assumed a single
+  repository.
+- Board: `board`'s STATUS card title is now `NEXUS LAST PASS` (was
+  `ORCHESTRATOR LAST PASS` / `ORCH LAST PASS`), and a board card footer or
+  backlog role hint for history recorded under a legacy role name (e.g.
+  `fixer`, `librarian`, `orchestrator`) now shows that role's current key
+  instead of the retired one; the on-disk history itself is unchanged.
+- CLI: the `backlog done`/`backlog reopen` refusal errors for a dispatched
+  caller now say "report ... to your Nexus" instead of "your orchestrator",
+  and `dispatch`'s review-budget-exceeded message now says "Critic
+  dispatches" instead of "reviewer dispatches".
+- CLI: the `workers` summary footer now says "nexus sessions" instead of
+  "orchestrators", and `activity`'s Herdr-unreachable nudge ("orchestrator
+  panes") and its inbox ack-refusal message on a dispatched task id ("not
+  ... orchestrator") now say "Nexus" instead.
+
+### Added
+
+- Docs: note that the first `start` of a model CLI into a folder it has
+  never opened before — including the home folder — may pause on that
+  CLI's own one-time "do you trust this folder?" prompt, which Multiverse
+  detects and leaves for a human to accept rather than typing into.
+
+### Fixed
+
+- Board: rendering no longer spawns a `date` subprocess per card to get
+  its local calendar time; `mv_core::time::local_datetime` now resolves
+  the ambient `TZ` through the `tz-rs` crate once per process and does a
+  pure offset lookup per card, taking a large fleet's `board --all
+  --read-only` from ~166s to ~20s.
+
 ## [0.1.4] - 2026-11-08
 
 ### Changed
@@ -232,6 +278,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.5]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.5
 [0.1.4]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.4
 [0.1.3]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.3
 [0.1.2]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.2

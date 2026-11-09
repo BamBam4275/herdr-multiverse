@@ -278,7 +278,7 @@ fn nudge(args: &ArgMatches) -> Result<(), Failure> {
     let mut herdr = ProcessHerdr;
     let fleet = FleetState::fetch(&mut herdr, true).map_err(|message| {
         Failure::Operation(format!(
-            "could not reach Herdr to find orchestrator panes: {message}"
+            "could not reach Herdr to find Nexus panes: {message}"
         ))
     })?;
     let timing = Timing::default();
@@ -908,12 +908,7 @@ fn inbox_at(
     }
     if acking_requested && !will_acknowledge {
         let id = task_id.expect("not is_orchestrator implies a task id was found");
-        eprintln!(
-            "not acknowledged: this process carries a dispatched task id ({id}), not \
-             {name}'s orchestrator — a specialist must never advance the cursor the \
-             orchestrator's own mail read depends on. Pass --as-nexus if that is wrong, \
-             or --peek to look without it."
-        );
+        eprintln!("{}", task_id_refusal_message(name, &id));
     }
     if will_acknowledge {
         if let Some(seq) = page.through_seq {
@@ -922,6 +917,15 @@ fn inbox_at(
         }
     }
     Ok(())
+}
+
+fn task_id_refusal_message(name: &str, id: &str) -> String {
+    format!(
+        "not acknowledged: this process carries a dispatched task id ({id}), not \
+         {name}'s Nexus — a specialist must never advance the cursor the \
+         Nexus's own mail read depends on. Pass --as-nexus if that is wrong, \
+         or --peek to look without it."
+    )
 }
 
 /// `--replay-since SEQ`: Python's own selection is inclusive of `since_seq`
@@ -1135,6 +1139,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(activity::read_cursor(&state_dir, &log).unwrap(), 0);
+    }
+
+    #[test]
+    fn task_id_refusal_message_uses_nexus_wording_not_orchestrator() {
+        let message = task_id_refusal_message("multiverse", "20261103-fixer-abcdef");
+        assert!(
+            message.to_lowercase().contains("nexus"),
+            "refusal message must name the Nexus: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("orchestrator"),
+            "refusal message must not use legacy orchestrator wording: {message}"
+        );
     }
 
     #[test]

@@ -2003,11 +2003,15 @@ fn display_role(raw: &str) -> String {
     // display_name()`'s capitalized form (found via `conformance/
     // diff_fuzz.py` seed 50034: a dispatch's own board card showed
     // `Scout` where Python showed `scout`). A legacy on-disk key (e.g.
-    // `librarian`) stays as written for the same reason Python's raw
-    // field does — history readers accept old names, and scenario
-    // `history-board-reads-unrecorded-old-role` asserts `librarian`
-    // still appears on the card footer.
-    raw.to_string()
+    // `fixer`) maps to its current lowercase config key (`builder`) so
+    // the board never shows a retired name — history readers still
+    // accept the old key on disk, this only changes what the card
+    // prints. A string that is neither a current nor a legacy key
+    // (`archaeologist`) renders verbatim.
+    match Role::from_any_config_key(raw) {
+        Ok(role) => role.config_key().to_string(),
+        Err(_) => raw.to_string(),
+    }
 }
 
 fn month_abbrev(month: time::Month) -> &'static str {
@@ -2036,28 +2040,11 @@ fn card_corner_from_stamp(when: &str, now: OffsetDateTime) -> (Option<String>, O
 
 /// Resolve the local calendar fields through the system timezone rules,
 /// including `TZ` and the offset at this instant, like `astimezone(None)`.
-/// `date` keeps this safe without adding a timezone dependency or unsafe FFI.
+/// A render touching thousands of cards shares one parse of the IANA
+/// tzdata (`mv_core::time::local_datetime` caches it per process); every
+/// card after that is a pure offset lookup, not a spawned `date`.
 fn card_corner_local_time(instant: OffsetDateTime) -> Option<time::PrimitiveDateTime> {
-    let mut command = std::process::Command::new("date");
-    let timestamp = instant.unix_timestamp();
-    if cfg!(target_os = "linux") {
-        command.args(["-d", &format!("@{timestamp}")]);
-    } else {
-        command.args(["-r", &timestamp.to_string()]);
-    }
-    let output = command
-        .arg("+%Y-%m-%dT%H:%M:%S")
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    time::PrimitiveDateTime::parse(
-        std::str::from_utf8(&output.stdout).ok()?.trim(),
-        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
-    )
-    .ok()
+    mv_core::time::local_datetime(instant)
 }
 
 fn card_corner_from_instant(
@@ -2897,6 +2884,75 @@ mod tests {
         }
     }
 
+    /// Reproduces the card's own repro: a board render used to spawn `date`
+    /// up to twice per card (once for the card's instant, once for `now`),
+    /// so rendering thousands of cards spawned thousands of processes. This
+    /// puts a counting stub ahead of the real `date` on `PATH` and renders
+    /// 500 cards spanning ~4 years of distinct hours; the stub must see at
+    /// most a constant, small number of calls regardless of card count.
+    /// Reverting `card_corner_local_time` to spawn `date` per call fails
+    /// this (it would record ~1000 calls, one or two per card).
+    #[test]
+    fn card_corner_rendering_does_not_spawn_a_process_per_card() {
+        const CHILD: &str = "MV_BOARD_CORNER_SPAWN_TEST_CHILD";
+        let Ok(counter_path) = std::env::var(CHILD) else {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let counter_path = dir.path().join("date-calls");
+            let stub_path = dir.path().join("date");
+            std::fs::write(
+                &stub_path,
+                format!(
+                    "#!/bin/sh\necho called >> \"{}\"\nexec /bin/date \"$@\"\n",
+                    counter_path.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&stub_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_path, perms).unwrap();
+
+            let path = std::env::var("PATH").unwrap_or_default();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::board_data::tests::card_corner_rendering_does_not_spawn_a_process_per_card",
+                    "--test-threads",
+                    "4",
+                ])
+                .env(CHILD, counter_path.to_str().unwrap())
+                .env("PATH", format!("{}:{}", dir.path().display(), path))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let calls = std::fs::read_to_string(&counter_path)
+                .map(|text| text.lines().count())
+                .unwrap_or(0);
+            assert!(
+                calls <= 2,
+                "expected O(1) process spawns for 500 cards, got {calls}"
+            );
+            return;
+        };
+        let counter_path = PathBuf::from(counter_path);
+
+        let start = mv_core::time::parse_flexible("2000-01-01T00:00:00+00:00").unwrap();
+        let now = start + time::Duration::hours(500 * 73 + 24);
+        for i in 0..500i64 {
+            let when = mv_core::time::format_seconds_utc(start + time::Duration::hours(i * 73));
+            card_corner_from_stamp(&when, now);
+        }
+        // Leave the counter file's absence/presence to the parent process
+        // to assert on; this child only needs to exit 0 having rendered.
+        let _ = counter_path;
+    }
+
     #[test]
     fn format_reset_eta_keeps_hours_and_minutes() {
         assert_eq!(format_reset_eta(0), "under 1m");
@@ -3239,7 +3295,10 @@ mod tests {
         let tasks = resolve_tasks(&root, None, now_utc());
         assert_eq!(tasks.len(), 1);
         let task = &tasks[0];
-        assert_eq!(task.role, "librarian");
+        // The recorded `role=librarian` is a legacy on-disk key; the card
+        // footer shows its current config key, `archivist` — see
+        // `display_role_never_title_cases_a_current_config_key`.
+        assert_eq!(task.role, "archivist");
         assert_eq!(task.account, "old-seat");
         assert_eq!(
             task.state_note.as_deref(),
@@ -3367,15 +3426,22 @@ mod tests {
     /// `_backlog_card` print the stored role verbatim, never title-cased —
     /// so a freshly dispatched task whose log already carries the current,
     /// lowercase config key must render exactly that, not `Role::
-    /// display_name()`'s capitalized form.
+    /// display_name()`'s capitalized form. A legacy on-disk key maps to
+    /// its current config key instead of rendering verbatim, so the
+    /// board never shows a retired role name.
     #[test]
     fn display_role_never_title_cases_a_current_config_key() {
         assert_eq!(display_role("scout"), "scout");
         assert_eq!(display_role("builder"), "builder");
-        // Legacy on-disk keys stay as written too — see
+        // Legacy on-disk keys render as their current config key — see
         // `an_unrecorded_terminal_status_with_no_live_agents_gets_the_
         // generic_note` for the end-to-end version of this.
-        assert_eq!(display_role("librarian"), "librarian");
+        assert_eq!(display_role("librarian"), "archivist");
+        assert_eq!(display_role("fixer"), "builder");
+        assert_eq!(display_role("orchestrator"), "nexus");
+        // A string that is neither a current nor a legacy key renders
+        // verbatim.
+        assert_eq!(display_role("archaeologist"), "archaeologist");
     }
 
     #[test]
