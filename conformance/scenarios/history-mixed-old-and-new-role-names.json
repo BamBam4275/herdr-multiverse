@@ -38,7 +38,7 @@
       "expect": {
         "exit": 0,
         "stdout_contains": [
-          "fixer"
+          "builder"
         ]
       }
     }

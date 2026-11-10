@@ -522,6 +522,15 @@ pub fn agent_prompt(name: &str, text: &str, wait: bool, timeout_ms: Option<u64>)
     command(argv, "hand the agent its brief")
 }
 
+/// Send literal key names to a named agent.
+pub fn agent_send_keys(name: &str, keys: &[&str]) -> HerdrCommand {
+    let mut argv = vec![herdr_binary(), "agent".into(), "send-keys".into()];
+    let mut positionals = vec![name];
+    positionals.extend_from_slice(keys);
+    push_positionals(&mut argv, &positionals);
+    command(argv, "press keys in the agent's input box")
+}
+
 /// Give a name to an agent Herdr detected but did not start. `target`
 /// may be a pane id, which is what makes the seat-command launch path
 /// workable: an agent launched by running a command in a pane is
@@ -947,6 +956,31 @@ mod tests {
         let _guard = HerdrBinPathGuard::unset();
         let command = agent_prompt("x", "read the brief and go", false, None);
         assert!(!command.argv.contains(&"--wait".to_string()));
+    }
+
+    #[test]
+    fn agent_send_keys_preserves_targets_and_key_arguments() {
+        let _guard = HerdrBinPathGuard::unset();
+        assert_eq!(
+            agent_send_keys("builder", &["Enter"]).argv,
+            ["herdr", "agent", "send-keys", "builder", "Enter"]
+        );
+        assert_eq!(
+            agent_send_keys("--help", &["Escape", "Enter"]).argv,
+            [
+                "herdr",
+                "agent",
+                "send-keys",
+                "--",
+                "--help",
+                "Escape",
+                "Enter"
+            ]
+        );
+        assert_eq!(
+            agent_send_keys("builder", &["--help"]).argv,
+            ["herdr", "agent", "send-keys", "--", "builder", "--help"]
+        );
     }
 
     // --- reconciliation commands --------------------------------------

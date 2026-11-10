@@ -41,6 +41,9 @@ struct State {
     /// Missing from older state files; empty means the default Ready prompt.
     #[serde(default)]
     pending_text: Vec<String>,
+    /// Prompts pasted without their first Enter, keyed by pane id.
+    #[serde(default)]
+    pending_prompts: BTreeMap<String, String>,
 }
 
 impl Default for State {
@@ -55,6 +58,7 @@ impl Default for State {
             sequence: 5000,
             text: BTreeMap::new(),
             pending_text: Vec::new(),
+            pending_prompts: BTreeMap::new(),
         }
     }
 }
@@ -247,6 +251,7 @@ impl State {
                 )))
             }
             ("agent", "prompt") => self.prompt(tail),
+            ("agent", "send-keys") => self.send_keys(tail),
             ("agent" | "pane", "read") => {
                 let target = arg(tail, 0)?;
                 let opts = options(&tail[1..], &["--source", "--lines"], &[])?;
@@ -545,6 +550,31 @@ impl State {
         let index = self.agent_index(&positionals[0])?;
         let prompt = positionals[1].as_str();
         options(&flag_args, &["--timeout"], &["--wait"])?;
+        if prompt.is_empty() {
+            return Ok(Reply::Json(json!({"error": {
+                "code": "empty_agent_prompt", "message": "agent prompt must not be empty"
+            }})));
+        }
+        self.complete_prompt(index, prompt, "prompt")
+    }
+
+    fn send_keys(&mut self, args: &[String]) -> FakeResult<Reply> {
+        let args = args.strip_prefix(&["--".into()]).unwrap_or(args);
+        let index = self.agent_index(arg(args, 0)?)?;
+        if args.len() < 2 || args[1..].iter().any(|key| key != "Enter") {
+            return Err("fake send-keys requires Enter keys".into());
+        }
+        let pane = self.agents[index]["pane_id"]
+            .as_str()
+            .ok_or("agent has no pane_id")?;
+        if let Some(prompt) = self.pending_prompts.remove(pane) {
+            self.complete_prompt(index, &prompt, "send-keys")
+        } else {
+            Ok(Reply::Text(String::new()))
+        }
+    }
+
+    fn complete_prompt(&mut self, index: usize, prompt: &str, action: &str) -> FakeResult<Reply> {
         // Match FakeHerdr's completion shortcut: only an existing brief named
         // in the prompt authorizes creation of its sibling result and status.
         if let Some(brief) = brief_path(prompt) {
@@ -571,7 +601,7 @@ impl State {
         self.panes[pane_index]["agent_status"] = json!("done");
         Ok(Reply::Json(envelope(
             "agent",
-            "prompt",
+            action,
             json!({"agent": self.agents[index]}),
         )))
     }
@@ -804,6 +834,10 @@ fn main() -> ExitCode {
     let path = env::var_os("MV_FAKE_HERDR_STATE").map(PathBuf::from);
     let calls_path = env::var_os("MV_FAKE_HERDR_CALLS").map(PathBuf::from);
     match run_logged(&args, path.as_deref(), calls_path.as_deref()) {
+        Ok(Reply::Json(value)) if value.get("error").is_some() => {
+            eprintln!("{value}");
+            ExitCode::from(1)
+        }
         Ok(Reply::Json(value)) => {
             println!("{value}");
             ExitCode::SUCCESS
@@ -894,6 +928,57 @@ mod tests {
             );
         }
         assert!(!sandbox.0.join("state.json").exists());
+    }
+
+    #[test]
+    fn empty_prompt_is_refused_and_enter_submits_the_pending_composer() {
+        let sandbox = Sandbox::new();
+        let pane = split(&sandbox);
+        sandbox
+            .call(&[
+                "agent",
+                "start",
+                "--kind",
+                "claude",
+                "--pane",
+                &pane,
+                "--",
+                "--builder",
+            ])
+            .unwrap();
+        let task_dir = sandbox.0.join("pending-task");
+        fs::create_dir(&task_dir).unwrap();
+        let brief = task_dir.join("brief.md");
+        fs::write(&brief, "Task").unwrap();
+        let prompt = format!("Read `{}` and execute it.", brief.display());
+        let state_path = sandbox.0.join("state.json");
+        let mut state: State = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state.pending_prompts.insert(pane.clone(), prompt.clone());
+        state.text.insert(pane.clone(), format!("❯ {prompt}"));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        let error = payload(
+            sandbox
+                .call(&["agent", "prompt", "--", "--builder", ""])
+                .unwrap(),
+        );
+        assert_eq!(error["error"]["code"], "empty_agent_prompt");
+        assert_eq!(error["error"]["message"], "agent prompt must not be empty");
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        assert!(!task_dir.join("status").exists());
+        sandbox
+            .call(&["agent", "send-keys", "--", "--builder", "Enter"])
+            .unwrap();
+        let state: State = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(!state.pending_prompts.contains_key(&pane));
+        assert_eq!(state.text[&pane], "Task completed.\n");
+        let agent = &state.agents[state.agent_index("--builder").unwrap()];
+        assert_eq!(agent["agent_status"], "done");
+        assert_eq!(agent["completion_seq"], agent["state_change_seq"]);
+        assert_eq!(
+            fs::read_to_string(task_dir.join("status")).unwrap(),
+            "done\n"
+        );
     }
 
     #[test]

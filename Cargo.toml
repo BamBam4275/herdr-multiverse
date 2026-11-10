@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -21,12 +21,12 @@ keywords = ["herdr-plugin", "cli", "agent-orchestration", "git-worktree", "multi
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-mv-core = { path = "crates/mv-core", version = "0.1.5" }
-mv-config = { path = "crates/mv-config", version = "0.1.5" }
-mv-herdr = { path = "crates/mv-herdr", version = "0.1.5" }
-mv-state = { path = "crates/mv-state", version = "0.1.5" }
-mv-engine = { path = "crates/mv-engine", version = "0.1.5" }
-mv-board = { path = "crates/mv-board", version = "0.1.5" }
+mv-core = { path = "crates/mv-core", version = "0.1.6" }
+mv-config = { path = "crates/mv-config", version = "0.1.6" }
+mv-herdr = { path = "crates/mv-herdr", version = "0.1.6" }
+mv-state = { path = "crates/mv-state", version = "0.1.6" }
+mv-engine = { path = "crates/mv-engine", version = "0.1.6" }
+mv-board = { path = "crates/mv-board", version = "0.1.6" }
 
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }

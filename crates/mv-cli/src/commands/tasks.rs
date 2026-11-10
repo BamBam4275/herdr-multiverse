@@ -177,6 +177,21 @@ fn gather_task_events(root: &Path) -> (HashMap<String, TaskEvents>, Vec<String>)
     (by_task, order)
 }
 
+/// A raw `routing.log` `role=` value, translated to its current display
+/// name — mirroring `commands::board_data::display_role`'s own translation
+/// of the same on-disk shape for the board's own cards (card
+/// `20261109-b-2a3755`). A legacy on-disk key (`fixer`, `librarian`,
+/// `orchestrator`, …) renders as its current config key; anything else
+/// (an already-current key, or a string that is neither) round-trips
+/// unchanged. `routing.log` itself is never touched — only what this
+/// reader prints.
+fn display_role(raw: &str) -> String {
+    match mv_config::roles::Role::from_any_config_key(raw) {
+        Ok(role) => role.config_key().to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
 /// One rendered row, already resolved to display text.
 struct Row {
     task_id: String,
@@ -853,7 +868,7 @@ fn build_rows(
             needs_look += 1;
         }
         let (role, account) = events
-            .map(|events| (events.role.clone(), events.account.clone()))
+            .map(|events| (display_role(&events.role), events.account.clone()))
             .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
         rows.push(Row {
             task_id: task_id.clone(),
@@ -1103,7 +1118,7 @@ fn reclaimable_and_report(
         println!(
             "  {verb} {} ({}, agent={}, pane={})",
             candidate.task_id,
-            candidate.role,
+            display_role(&candidate.role),
             python_repr(candidate.agent.as_deref().unwrap_or("")),
             python_repr(&candidate.pane)
         );
@@ -1124,7 +1139,7 @@ fn reclaimable_and_report(
             println!(
                 "    {} ({}, agent={}, pane={})",
                 candidate.task_id,
-                candidate.role,
+                display_role(&candidate.role),
                 python_repr(candidate.agent.as_deref().unwrap_or("")),
                 python_repr(&candidate.pane)
             );
@@ -1553,6 +1568,13 @@ mod tests {
         }];
         assert_eq!(classify(Some(&events), None, Some(&live)).0, "running");
         assert_eq!(classify(Some(&events), None, Some(&[])).0, "awaiting");
+    }
+
+    #[test]
+    fn display_role_translates_a_legacy_key_and_passes_unknown_through() {
+        assert_eq!(display_role("fixer"), "builder");
+        assert_eq!(display_role("builder"), "builder");
+        assert_eq!(display_role("archaeologist"), "archaeologist");
     }
 
     #[test]

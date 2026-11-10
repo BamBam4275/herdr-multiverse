@@ -32,7 +32,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "(cwd is inside project 'sandbox' — scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n    <ID>      fixer      old-seat   recorded    done #3\n  * <ID>     oracle     old-seat   unrecorded  done\n      status file says 'done', but pane gone, status done — `--reconcile` leaves it alone until the pane settles.\n  * <ID>   reviewer   old-seat   awaiting    —\n      no status file and no agent recorded for this dispatch: uncertain, not dead. The result, if any, is in its pane.\n\n2 task(s) marked * need a look."
+        "stdout": "(cwd is inside project 'sandbox' — scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n    <ID>      builder    old-seat   recorded    done #3\n  * <ID>     seer       old-seat   unrecorded  done\n      status file says 'done', but pane gone, status done — `--reconcile` leaves it alone until the pane settles.\n  * <ID>   critic     old-seat   awaiting    —\n      no status file and no agent recorded for this dispatch: uncertain, not dead. The result, if any, is in its pane.\n\n2 task(s) marked * need a look."
       }
     }
   ],

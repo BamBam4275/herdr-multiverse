@@ -33,7 +33,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "(cwd is inside project 'sandbox' \u2014 scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n  * <ID>      fixer      old-seat   recorded    failed\n    <ID>      fixer      old-seat   recorded    done #3\n\n1 task(s) marked * need a look."
+        "stdout": "(cwd is inside project 'sandbox' \u2014 scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n  * <ID>      builder    old-seat   recorded    failed\n    <ID>      builder    old-seat   recorded    done #3\n\n1 task(s) marked * need a look."
       }
     },
     {
@@ -55,7 +55,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "(cwd is inside project 'sandbox' \u2014 scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n  * <ID>      fixer      old-seat   recorded    failed #4\n    <ID>      fixer      old-seat   recorded    done #3\n\n1 task(s) marked * need a look."
+        "stdout": "(cwd is inside project 'sandbox' \u2014 scoping to it. Name other projects, or run from outside any project, for the whole fleet.)\n\nsandbox\n  * <ID>      builder    old-seat   recorded    failed #4\n    <ID>      builder    old-seat   recorded    done #3\n\n1 task(s) marked * need a look."
       }
     }
   ]

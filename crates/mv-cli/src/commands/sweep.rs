@@ -513,7 +513,7 @@ fn tick_outcome(
     now: OffsetDateTime,
 ) -> String {
     if config.accounts.values().all(|account| !account.interactive) {
-        return "skipped (no orchestrator)".to_string();
+        return "skipped (no Nexus)".to_string();
     }
     let fleet = match FleetState::fetch(herdr, true) {
         Ok(fleet) => fleet,
@@ -525,7 +525,7 @@ fn tick_outcome(
     let Some((agent_name, live)) =
         mv_engine::fleet_start::find_orchestrator_agent(&fleet, &project.name, path, seat, short)
     else {
-        return "skipped (no orchestrator)".to_string();
+        return "skipped (no Nexus)".to_string();
     };
     if live.is_working() {
         return "skipped (working)".to_string();
@@ -1750,7 +1750,7 @@ fn run_with(
                 skip
             } else if !listed {
                 close_picker_episode(project, &config, !dry_run);
-                "skipped (no orchestrator)".to_string()
+                "skipped (no Nexus)".to_string()
             } else {
                 tick_outcome(project, path, &config, herdr, dry_run, &timing, now)
             };
@@ -2730,7 +2730,7 @@ mod tests {
             &Timing::default(),
             mv_core::time::now_utc(),
         );
-        assert_eq!(outcome, "skipped (no orchestrator)");
+        assert_eq!(outcome, "skipped (no Nexus)");
 
         let _ = std::fs::remove_dir_all(&project_root);
     }
@@ -3525,7 +3525,7 @@ mod tests {
 
         // NullHerdr panics on any call: no interactive seat means this must
         // never ask Herdr anything, same contract as `tick_outcome`'s own
-        // "no orchestrator" case.
+        // "no Nexus" case.
         assert_eq!(
             tick_gauge(project, &project_root, &config, &mut NullHerdr),
             None

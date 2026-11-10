@@ -1265,12 +1265,49 @@ const GHOST_ECHO_RISK_CHARS: usize = COMPOSER_TAIL_CHARS;
 /// "still unsubmitted" either — [`nudge_stuck_composer`] must not press
 /// Enter into a screen it cannot read as a composer, only into one it has
 /// positive evidence is still holding the prompt.
+///
+/// Card `20261109-b-620eeb`: claude's own composer (like grok's, both
+/// drawing the shared `❯` marker — see `composer_marker`) is boxed, not
+/// the bare unbounded line codex's own `›` composer is. A prompt long
+/// enough to wrap — every dispatch brief is, by construction of three
+/// backtick-quoted paths, several of them longer than a realistic box's
+/// own inner width on their own — lands across several of that box's own
+/// rows, each one broken from the last by a real line break *and* a `│`
+/// border character, landing wherever the box's own fixed width falls,
+/// not only at one of the brief's own spaces. A literal `contains` over
+/// that region never matches a wrapped brief at all, so a lane dispatched
+/// to claude could have its prompt accepted as "submitted" while still
+/// sitting, unsubmitted, in its own composer.
+/// [`strip_composer_noise`] drops the border and every wrap-inserted line
+/// break — never replacing either with a space, since a hard wrap lands
+/// wherever the box's own width runs out, including mid-path, not only at
+/// an original space — from both sides before they are compared, so the
+/// match still finds the brief regardless of where the box happened to
+/// break it.
 fn prompt_still_in_composer(text: &str, prompt: &str, kind: &str) -> bool {
     let Some(start) = text.rfind(composer_marker(kind)) else {
         return false;
     };
-    let region = &text[start..];
-    region.contains(prompt) || region.contains(distinctive_tail(prompt))
+    let region = strip_composer_noise(&text[start..]);
+    region.contains(&strip_composer_noise(prompt))
+        || region.contains(&strip_composer_noise(distinctive_tail(prompt)))
+}
+
+/// Drops a composer's own box-drawing border (`│╭╮╰╯─`) and all
+/// whitespace, including every line break a box's own word- or
+/// character-wrap inserts partway through a dispatch prompt (see
+/// [`deliver_prompt`]) — never replacing a dropped break with a space,
+/// since a hard wrap can land mid-path, not only at one of the prompt's
+/// own spaces, and inserting one there would corrupt the very match this
+/// exists to make possible. Dropping real spaces on both sides of a
+/// comparison is harmless: [`prompt_still_in_composer`] applies this to
+/// `prompt`/`distinctive_tail(prompt)` exactly the same way, so whatever
+/// whitespace either side loses, it loses identically. A no-op on codex's
+/// own unbounded, unbordered composer line, which already has neither.
+fn strip_composer_noise(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '╭' | '╮' | '╰' | '╯' | '─'))
+        .collect()
 }
 
 /// Hand `task`'s brief to the agent Herdr just started, and verify it was
@@ -1567,10 +1604,31 @@ fn nudge_stuck_composer(
         }
     }
 
-    herdr.call(
-        &argv::agent_prompt(name, "", false, None),
+    let sent = herdr.call(
+        &argv::agent_send_keys(name, &["Enter"]),
         Duration::from_secs(120),
     )?;
+    // A server error envelope is a refusal even when the process exits zero.
+    let error = serde_json::from_str::<Value>(&sent.stderr)
+        .ok()
+        .filter(|payload| payload.get("error").is_some())
+        .or_else(|| {
+            sent.payload
+                .clone()
+                .filter(|payload| payload.get("error").is_some())
+        });
+    if !sent.ok() || error.is_some() {
+        let message = error
+            .as_ref()
+            .and_then(|payload| payload["error"]["message"].as_str())
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| sent.message());
+        return Err(RunnerError::Refused(format!(
+            "prompt not submitted — Enter retry for agent {name:?} in pane {pane:?} \
+             was refused: {message}; nothing further was sent"
+        )));
+    }
     if confirm_submitted(herdr, name, pane, prompt, kind, baseline_seq, timing)? {
         return Ok(());
     }
@@ -2398,12 +2456,14 @@ mod tests {
         /// the pane still shows the brief verbatim) — card
         /// `20261106-b-19efc6`'s "pasted but never submitted" codex pane.
         stuck_pastes: usize,
-        /// Whether a follow-up empty-text `agent prompt` (the bare-Enter
+        /// Whether a follow-up `agent send-keys Enter` (the bare-Enter
         /// nudge `deliver_prompt` sends when a stuck paste never clears)
         /// actually submits it. `false` simulates an agent whose composer
         /// does not respond to Enter either, so the dispatch must fail
         /// loudly instead of declaring victory.
         enter_submits: bool,
+        /// A process failure or server error envelope from the Enter retry.
+        enter_error: Option<CommandResult>,
         /// One-shot: the next non-empty `agent prompt` lands for real, but
         /// the brief stays visible in scrollback while a *fresh* composer
         /// (unrelated ghost text) opens underneath it — reviewer HOLD
@@ -2471,10 +2531,9 @@ mod tests {
         }
         /// Advance `state_change_seq` from the keystrokes alone, leaving
         /// `agent_status` at `idle` and the pane showing `text` still
-        /// sitting behind the fixture's own codex composer marker (`›`,
-        /// `composer_marker`'s own codex case — this fixture's `kind` is
-        /// always `"codex"`) — a stuck paste that never reached its own
-        /// turn, in a shape `prompt_still_in_composer` can actually read as
+        /// sitting behind the agent's own composer marker — a stuck paste
+        /// that never reached its own turn, in a shape
+        /// `prompt_still_in_composer` can actually read as
         /// a composer.
         fn leave_pasted_and_unsubmitted(&self, name: &str, text: &str) {
             let pane = self.agent_pane(name);
@@ -2488,7 +2547,17 @@ mod tests {
                 let seq = agent["state_change_seq"].as_u64().unwrap_or(0) + 1;
                 agent["state_change_seq"] = json!(seq);
                 agent["agent_status"] = json!("idle");
-                state["text"][&pane] = json!(format!("› {text}"));
+                let kind = agent["agent"].as_str().unwrap_or("codex");
+                let composer = if kind == "codex" {
+                    format!("› {text}")
+                } else {
+                    boxed_composer(text, kind, 60)
+                };
+                state["text"][&pane] = json!(composer);
+                if state.get("pending_prompts").is_none() {
+                    state["pending_prompts"] = json!({});
+                }
+                state["pending_prompts"][&pane] = json!(text);
             });
         }
         /// Leave `name`'s pane showing `brief` only in scrollback — above a
@@ -2539,24 +2608,6 @@ mod tests {
                 state["text"][&pane] = json!(dialog);
             });
         }
-        /// Submit for real: the agent leaves idle, the pane stops showing
-        /// the brief. Mirrors real fake-herdr's own immediate completion.
-        fn complete_prompt(&self, name: &str) {
-            let pane = self.agent_pane(name);
-            self.edit(|state| {
-                let agent = state["agents"]
-                    .as_array_mut()
-                    .unwrap()
-                    .iter_mut()
-                    .find(|a| a["pane_id"] == pane)
-                    .expect("agent must exist");
-                let seq = agent["state_change_seq"].as_u64().unwrap_or(0) + 1;
-                agent["state_change_seq"] = json!(seq);
-                agent["completion_seq"] = json!(seq);
-                agent["agent_status"] = json!("done");
-                state["text"][&pane] = json!("Task completed.\n");
-            });
-        }
     }
     impl Herdr for Fake {
         fn call(
@@ -2579,7 +2630,7 @@ mod tests {
             // (finding 9) reads the pane while the fleet lock Python holds
             // through the whole retry is still held; `get`/`prompt` stay
             // strictly post-unlock, unchanged from before.
-            if matches!(action, "get" | "prompt") {
+            if matches!(action, "get" | "prompt" | "send-keys") {
                 assert_eq!(
                     self.locks.load(Ordering::SeqCst),
                     0,
@@ -2664,11 +2715,25 @@ mod tests {
                     }
                 }
             }
+            if action == "send-keys" {
+                if let Some(mut error) = self.enter_error.take() {
+                    error.argv = command.argv.clone();
+                    return Ok(error);
+                }
+            }
+            if action == "send-keys" && !self.enter_submits {
+                return Ok(CommandResult {
+                    argv: command.argv.clone(),
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    payload: None,
+                    protocol_error: None,
+                });
+            }
             // Submission-verification fixtures (card `20261106-b-19efc6`):
-            // intercept both the original paste and any bare-Enter nudge
-            // `deliver_prompt` sends, rather than delegating to real
-            // fake-herdr, which would complete the brief immediately and
-            // never let the pane sit stuck.
+            // Intercept the original paste so the pane can sit stuck;
+            // fake-herdr's send-keys then submits the pending composer.
             if action == "prompt" {
                 self.prompted = true;
                 // Second Critic HOLD `20261106-reviewer-f7aaf4` fixtures key
@@ -2677,23 +2742,7 @@ mod tests {
                 self.gets_since_prompt = 0;
                 let name = &command.argv[3];
                 let text = &command.argv[4];
-                if text.is_empty() {
-                    if self.enter_submits {
-                        self.complete_prompt(name);
-                    }
-                    // `enter_submits == false`: Herdr accepts the keystroke
-                    // but nothing on the pane changes — the composer does
-                    // not respond to Enter either.
-                    return Ok(CommandResult {
-                        argv: command.argv.clone(),
-                        returncode: 0,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        payload: None,
-                        protocol_error: None,
-                    });
-                }
-                if self.stuck_pastes > 0 {
+                if !text.is_empty() && self.stuck_pastes > 0 {
                     self.stuck_pastes -= 1;
                     self.leave_pasted_and_unsubmitted(name, text);
                     return Ok(CommandResult {
@@ -2893,6 +2942,7 @@ mod tests {
             banner: None,
             stuck_pastes: 0,
             enter_submits: true,
+            enter_error: None,
             leave_scrollback_ghost: false,
             leave_scrollback_ghost_echo: false,
             dialog_after_paste: None,
@@ -3131,6 +3181,7 @@ mod tests {
         assert!(fake.called("agent", "prompt").is_empty());
         assert!(fake.called("pane", "close").is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3140,6 +3191,7 @@ mod tests {
         assert!(dispatch(&mut store, &mut fake, "w52:p1", &timing()).is_err());
         assert!(fake.called("pane", "close").is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3499,6 +3551,7 @@ mod tests {
         assert_eq!(prompts.len(), 1, "no stuck paste, no Enter ever sent");
         assert!(!prompts[0].argv[4].is_empty());
         assert_eq!(store.started, [task.launch.agent_name]);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3509,7 +3562,7 @@ mod tests {
         let prompts = fake.called("agent", "prompt");
         assert_eq!(
             prompts.len(),
-            2,
+            1,
             "the original paste, then exactly one Enter — never a second full retype"
         );
         assert!(
@@ -3518,10 +3571,76 @@ mod tests {
             prompts[0].argv[4]
         );
         assert_eq!(
-            prompts[1].argv[4], "",
+            fake.called("agent", "send-keys")[0].argv[4],
+            "Enter",
             "the nudge must be a bare Enter, not the brief retyped"
         );
         assert_eq!(store.started, [task.launch.agent_name]);
+        assert_eq!(fake.called("agent", "send-keys").len(), 1);
+    }
+
+    #[test]
+    fn a_claude_dropped_enter_is_submitted_via_send_keys() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        store.launch.kind = "claude".into();
+        store.launch.command = Some("CACHE=1 test-wrapper".into());
+        store.launch.native_args = argv::native_args("test-model", "claude", Some("high"));
+        fake.command_route = true;
+        fake.stuck_pastes = 1;
+        let task = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+        assert_eq!(fake.called("agent", "prompt").len(), 1);
+        let keys = fake.called("agent", "send-keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            &keys[0].argv[3..],
+            [task.launch.agent_name.clone(), "Enter".into()]
+        );
+        assert_eq!(store.started, [task.launch.agent_name]);
+        assert!(store.failed_to_start.is_empty());
+    }
+
+    #[test]
+    fn an_enter_error_refuses_without_polling_or_retyping() {
+        for (returncode, stderr_error) in [(0, false), (0, true), (1, false)] {
+            let (_sandbox, mut store, mut fake) = fixture();
+            fake.stuck_pastes = 1;
+            let envelope = json!({"error": {
+                "code": "send_keys_refused", "message": "injected Enter refusal"
+            }});
+            fake.enter_error = Some(CommandResult {
+                argv: Vec::new(),
+                returncode,
+                stdout: String::new(),
+                stderr: if stderr_error {
+                    envelope.to_string()
+                } else {
+                    String::new()
+                },
+                payload: if stderr_error { None } else { Some(envelope) },
+                protocol_error: None,
+            });
+            let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+            assert!(matches!(error, RunnerError::Refused(_)), "{error}");
+            assert!(error.to_string().contains("Enter retry"), "{error}");
+            assert!(
+                error.to_string().contains("injected Enter refusal"),
+                "{error}"
+            );
+            assert_eq!(fake.called("agent", "prompt").len(), 1);
+            assert_eq!(fake.called("agent", "send-keys").len(), 1);
+            let retry = fake
+                .calls
+                .iter()
+                .position(|call| call.argv[2] == "send-keys")
+                .unwrap();
+            // Dispatch may read the pane to classify its failure, but must
+            // never resume confirm_submitted's agent-state polling.
+            assert!(!fake.calls[retry + 1..]
+                .iter()
+                .any(|call| call.argv[1] == "agent" && call.argv[2] == "get"));
+            assert!(store.started.is_empty());
+            assert_eq!(store.failed_to_start.len(), 1);
+        }
     }
 
     #[test]
@@ -3533,12 +3652,14 @@ mod tests {
         let prompts = fake.called("agent", "prompt");
         assert_eq!(
             prompts.len(),
-            2,
+            1,
             "the original paste, then exactly one Enter — no silent idle lane, \
              and no third attempt that would retype the brief into a composer \
              that has already shown it will not submit"
         );
-        assert_eq!(prompts[1].argv[4], "");
+        let keys = fake.called("agent", "send-keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].argv[4], "Enter");
         assert!(
             error.to_string().contains("still shows the prompt"),
             "{error}"
@@ -3570,6 +3691,7 @@ mod tests {
              an Enter — composer-scoped evidence must not"
         );
         assert_eq!(store.started, [task.launch.agent_name]);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3589,6 +3711,7 @@ mod tests {
         );
         assert!(store.started.is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     // --- Second Critic HOLD `20261106-reviewer-f7aaf4`: a composer still
@@ -3615,6 +3738,7 @@ mod tests {
         );
         assert!(store.started.is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3632,6 +3756,7 @@ mod tests {
         );
         assert_eq!(store.started, ["example-builder"]);
         assert!(store.failed_to_start.is_empty());
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3653,6 +3778,7 @@ mod tests {
         );
         assert!(store.started.is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3672,6 +3798,7 @@ mod tests {
         );
         assert!(store.started.is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     // --- `deliver_prompt_to` extension (card `20261106-b-f174b0`): the same
@@ -3735,6 +3862,7 @@ mod tests {
             1,
             "no stuck paste, no Enter ever sent"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3754,11 +3882,13 @@ mod tests {
         let prompts = fake.called("agent", "prompt");
         assert_eq!(
             prompts.len(),
-            2,
+            1,
             "the original nudge, then exactly one Enter — never a second full retype"
         );
         assert_eq!(prompts[0].argv[4], LONG_NUDGE);
-        assert_eq!(prompts[1].argv[4], "");
+        let keys = fake.called("agent", "send-keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].argv[4], "Enter");
     }
 
     #[test]
@@ -3778,7 +3908,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             fake.called("agent", "prompt").len(),
-            2,
+            1,
             "the original nudge, then exactly one Enter — no silent unconfirmed \
              nudge, and no third attempt that would retype it into a composer \
              that has already shown it will not submit"
@@ -3787,6 +3917,7 @@ mod tests {
             error.to_string().contains("still shows the prompt"),
             "{error}"
         );
+        assert_eq!(fake.called("agent", "send-keys").len(), 1);
     }
 
     #[test]
@@ -3813,6 +3944,7 @@ mod tests {
             "the original nudge only — a dialog opening before any landing \
              confirmation must never be answered with a bare Enter"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3836,6 +3968,7 @@ mod tests {
              evidence must not mistake its own fresh ghost text for the \
              nudge still sitting unsubmitted"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3864,6 +3997,7 @@ mod tests {
              happens to repeat it verbatim must never draw a second, \
              phantom Enter"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3888,6 +4022,7 @@ mod tests {
             "a fresh read that failed right before the key must never be \
              treated as licence to press Enter anyway"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3912,6 +4047,7 @@ mod tests {
              agent is already Working — it reached its own turn late, so no \
              Enter is sent"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3940,6 +4076,7 @@ mod tests {
              agent is Blocked on a dialog this text scan did not recognise — \
              never press Enter into that"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3963,6 +4100,7 @@ mod tests {
             "every `agent get` failed outright; this must fail loudly \
              instead of reaching a bare Enter"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     #[test]
@@ -3993,6 +4131,7 @@ mod tests {
              generic trust/approval scan already is, not mistaken for an \
              ordinary stuck composer"
         );
+        assert!(fake.called("agent", "send-keys").is_empty());
     }
 
     const CODEX_MODEL_SWITCH_FOR_NUDGE: &str =
@@ -4693,6 +4832,79 @@ mod tests {
         assert_eq!(fake.prompt_calls, 1);
     }
 
+    // --- `confirm_submitted` (card `20261109-b-620eeb`): a claude dispatch
+    // reported "submitted" with the brief still sitting, unsubmitted, in the
+    // pane's own bordered composer. ---
+
+    /// A minimal in-process [`Herdr`] for [`confirm_submitted`] alone: one
+    /// `agent get` (idle, sequence already past baseline — the keystrokes
+    /// alone moved it, card `20261106-b-19efc6`) and one `pane read`,
+    /// returning `composer_text` verbatim, the same shape `HeartbeatFake`
+    /// uses for [`deliver_heartbeat`].
+    struct ConfirmFake {
+        composer_text: String,
+    }
+    impl Herdr for ConfirmFake {
+        fn call(
+            &mut self,
+            command: &HerdrCommand,
+            _timeout: Duration,
+        ) -> Result<CommandResult, RunnerError> {
+            match (command.argv[1].as_str(), command.argv[2].as_str()) {
+                ("agent", "get") => Ok(CommandResult {
+                    argv: command.argv.clone(),
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    payload: Some(json!({"result": {"agent": {
+                        "name": "demo-builder",
+                        "pane_id": "w1:p1",
+                        "agent_status": "idle",
+                        "state_change_seq": 1,
+                    }}})),
+                    protocol_error: None,
+                }),
+                ("pane", "read") => Ok(CommandResult {
+                    argv: command.argv.clone(),
+                    returncode: 0,
+                    stdout: self.composer_text.clone(),
+                    stderr: String::new(),
+                    payload: None,
+                    protocol_error: None,
+                }),
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn confirm_submitted_refuses_a_claude_brief_still_wrapped_in_its_own_composer() {
+        let prompt = "Read `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/\
+                       brief.md` and execute it. Follow its write scope exactly. Write your \
+                       findings to `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-\
+                       000000/result.md` and then write `done`, `blocked`, or `failed` to \
+                       `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/status`.";
+        let mut fake = ConfirmFake {
+            composer_text: boxed_composer(prompt, "claude", 60),
+        };
+        let landed = confirm_submitted(
+            &mut fake,
+            "demo-builder",
+            "w1:p1",
+            prompt,
+            "claude",
+            0,
+            &timing(),
+        )
+        .expect("a readable idle agent must never error here");
+        assert!(
+            !landed,
+            "the brief is still visibly wrapped across claude's own bordered \
+             composer rows; confirm_submitted must not report it submitted \
+             just because the keystrokes alone moved state_change_seq"
+        );
+    }
+
     #[test]
     fn menu_reason_only_matches_an_open_menu_in_the_pane_tail() {
         let menu = "earlier scrollback\n\n? Pick one\n> option a\n  option b\n\n\
@@ -4766,6 +4978,53 @@ mod tests {
         let tail = distinctive_tail(prompt);
         let wrapped = format!("› …{tail}");
         assert!(prompt_still_in_composer(&wrapped, prompt, "codex"));
+    }
+
+    /// Fixed-width character wrap, oblivious to word boundaries — a
+    /// composer box reflows whatever is typed at its own fixed inner
+    /// width, including straight through the middle of one of the brief's
+    /// three un-spaced, backtick-quoted paths, which routinely run longer
+    /// than `width` on their own. Every row is bordered like grok's own
+    /// boxed composer (`tests/fixtures/rate-limit/grok-weekly-quota-
+    /// remaining.txt`), which claude shares (`composer_marker`); the first
+    /// row opens with `kind`'s own marker.
+    fn boxed_composer(prompt: &str, kind: &str, width: usize) -> String {
+        let marked: Vec<char> = format!("{} {prompt}", composer_marker(kind))
+            .chars()
+            .collect();
+        let border = "─".repeat(width + 2);
+        let mut out = format!("╭{border}╮\n");
+        let mut i = 0;
+        while i < marked.len() {
+            let end = (i + width).min(marked.len());
+            let row: String = marked[i..end].iter().collect();
+            out.push_str(&format!("│ {row:<width$} │\n"));
+            i = end;
+        }
+        out.push_str(&format!("╰{border}╯"));
+        out
+    }
+
+    #[test]
+    fn prompt_still_in_composer_recognises_a_wrapped_bordered_claude_composer() {
+        // Card `20261109-b-620eeb`: dispatch reported success with exactly
+        // this brief shape still sitting, unsubmitted, in the claude pane's
+        // own composer. `width` is deliberately narrower than
+        // `COMPOSER_TAIL_CHARS`, so the wrap cuts through the *middle* of
+        // `distinctive_tail`'s own fallback window too — the fix must not
+        // merely rely on that fallback landing on one unbroken row by luck.
+        let prompt = "Read `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/\
+                       brief.md` and execute it. Follow its write scope exactly. Write your \
+                       findings to `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-\
+                       000000/result.md` and then write `done`, `blocked`, or `failed` to \
+                       `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/status`.";
+        let boxed = boxed_composer(prompt, "claude", 30);
+        assert!(
+            prompt_still_in_composer(&boxed, prompt, "claude"),
+            "the brief is still sitting in claude's own bordered, wrapped \
+             composer; the box's own border characters and the wrap's line \
+             breaks must not defeat the match:\n{boxed}"
+        );
     }
 
     #[test]

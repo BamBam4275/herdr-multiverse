@@ -36,7 +36,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "\nsandbox\n    <ID>      fixer      old-seat   recorded    done #4\n    <ID>      fixer      old-seat   recorded    done #3"
+        "stdout": "\nsandbox\n    <ID>      builder    old-seat   recorded    done #4\n    <ID>      builder    old-seat   recorded    done #3"
       }
     },
     {
@@ -59,7 +59,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "\nsandbox\n    <ID>      fixer      old-seat   recorded    done #5\n    <ID>      fixer      old-seat   recorded    done #3"
+        "stdout": "\nsandbox\n    <ID>      builder    old-seat   recorded    done #5\n    <ID>      builder    old-seat   recorded    done #3"
       }
     }
   ]

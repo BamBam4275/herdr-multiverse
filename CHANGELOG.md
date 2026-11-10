@@ -9,6 +9,24 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-10
+
+### Added
+
+- Tests: guard every user-visible CLI surface against retired role names.
+
+### Fixed
+
+- Dispatch: the one-time Enter retry now uses `herdr agent send-keys
+  <agent> Enter` instead of an empty `agent prompt`, which Herdr refuses.
+  A dropped first Enter (frequent with Claude Code 2.1.321) no longer leaves
+  the brief unsubmitted, and a Herdr error on the retry is now a refusal.
+- Dispatch: recognise a long brief still wrapped across rows of a Claude
+  or Grok composer instead of treating it as submitted.
+- CLI: `sweep` now prints `skipped (no Nexus)` instead of the retired role
+  name, and `tasks`' ROLE column and `tasks --reclaimable` show current role
+  names for history recorded under retired names.
+
 ## [0.1.5] - 2026-11-09
 
 ### Changed
@@ -278,6 +296,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.6]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.6
 [0.1.5]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.5
 [0.1.4]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.4
 [0.1.3]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.3

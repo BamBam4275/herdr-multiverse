@@ -40,7 +40,7 @@
       "expect": {
         "exit": 0,
         "stdout_contains": [
-          "would close <ID> (fixer, agent='', pane='w1:p1')\n  dry run: nothing was closed. Add --yes to close these panes.\n  stale bookkeeping — pane already gone, holds no slot:\n    <ID> (fixer, agent='', pane='w1:p2')\n  open backlog:\n    <ID> P2 fix the thing\n"
+          "would close <ID> (builder, agent='', pane='w1:p1')\n  dry run: nothing was closed. Add --yes to close these panes.\n  stale bookkeeping — pane already gone, holds no slot:\n    <ID> (builder, agent='', pane='w1:p2')\n  open backlog:\n    <ID> P2 fix the thing\n"
         ]
       }
     }

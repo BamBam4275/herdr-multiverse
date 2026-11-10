@@ -45,7 +45,7 @@
       },
       "expect": {
         "exit": 0,
-        "stdout": "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\nsandbox2: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\nsandbox: skipped (no orchestrator)\nsandbox2: skipped (no orchestrator)\n",
+        "stdout": "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\nsandbox2: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\nsandbox: skipped (no Nexus)\nsandbox2: skipped (no Nexus)\n",
         "stderr": ""
       }
     },
@@ -74,7 +74,7 @@
       },
       "expect": {
         "exit": 0,
-        "stdout": "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\nsandbox2: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\nsandbox: skipped (no orchestrator)\nsandbox2: skipped (no orchestrator)\n",
+        "stdout": "sandbox: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\nsandbox2: in progress 0 -> 0, recorded 0, reclaimed 0; warning: process-cwd probe unknown\ndocker: unavailable\nsandbox: skipped (no Nexus)\nsandbox2: skipped (no Nexus)\n",
         "stderr": ""
       }
     }

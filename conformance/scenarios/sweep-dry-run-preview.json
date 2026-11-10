@@ -72,7 +72,7 @@
       ],
       "expect": {
         "exit": 0,
-        "stdout": "sandbox: in progress 1 -> 1, recorded 1, reclaimed 0; warning: process-cwd probe unknown\ndocker: stopped container stopped (unknown age) owner=sandbox/orch\ndocker: local keeps 3 images (deployed + previous is the rule)\ndocker: volume labeled project=sandbox (compose label)\ndocker: volume shared project=sandbox (via mount)\ndocker: volume unowned unattributed\ndocker: images 2GB (50%) reclaimable, build cache 3GB (100%) reclaimable, volumes 4GB total, 1GB reclaimable\nsandbox: skipped (no orchestrator)\n",
+        "stdout": "sandbox: in progress 1 -> 1, recorded 1, reclaimed 0; warning: process-cwd probe unknown\ndocker: stopped container stopped (unknown age) owner=sandbox/orch\ndocker: local keeps 3 images (deployed + previous is the rule)\ndocker: volume labeled project=sandbox (compose label)\ndocker: volume shared project=sandbox (via mount)\ndocker: volume unowned unattributed\ndocker: images 2GB (50%) reclaimable, build cache 3GB (100%) reclaimable, volumes 4GB total, 1GB reclaimable\nsandbox: skipped (no Nexus)\n",
         "stderr": ""
       },
       "env": {
