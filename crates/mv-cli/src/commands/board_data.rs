@@ -89,6 +89,7 @@ use mv_state::paths::is_valid_task_id;
 use mv_state::tasks::{AgentPanes, ReconcileRequest, TaskStatus};
 
 use super::board::{BoardDataSource, BoardScope, BoardView};
+use super::doctor::state_dir_from_config;
 use crate::exit::Failure;
 
 // --- a minimal, read-only JSON reader, duplicated from
@@ -667,6 +668,8 @@ fn projects_in_declaration_order(config: &Config) -> Vec<Project> {
 
 // --- the real data source -------------------------------------------------
 
+/// The real [`super::board::BoardDataSource`] — see the module doc above
+/// for what it wires together and narrows relative to the Python oracle.
 pub(crate) struct LiveSource {
     config: Config,
     state_dir: PathBuf,
@@ -676,6 +679,8 @@ pub(crate) struct LiveSource {
 }
 
 impl LiveSource {
+    /// Resolve config from `args` (or the env/default path) and build a
+    /// `LiveSource` ready to answer `board`'s queries for it.
     pub(crate) fn load(args: &ArgMatches) -> Result<Self, Failure> {
         let path = mv_config::load::resolve_config_path_from_env(
             args.get_one::<String>("config").map(Path::new),
@@ -685,7 +690,7 @@ impl LiveSource {
         })?;
         let config = mv_config::load::load_config(&path)
             .map_err(|error| Failure::Config(error.to_string()))?;
-        let state_dir = mv_config::load::config_state_dir_from_env(&path);
+        let state_dir = state_dir_from_config(&path);
         Ok(Self {
             config,
             state_dir,
@@ -2254,8 +2259,11 @@ fn resolve_tasks_with(
 
     // Per-task log scans used to dominate a warm board; the index above is
     // one pass. `dirty_lane_detail`'s `git status` is still the only
-    // subprocess, and only for a rare unrecorded-done writing-role lane,
-    // so a thread per historical dispatch is not worth the spawn cost.
+    // subprocess, and only for a rare unrecorded-done writing-role lane —
+    // `lane_probe_cache` keeps that to at most one spawn per distinct lane
+    // in this project, so a lane revisited by more than one historical
+    // dispatch (an `--into` chain) is not re-asked.
+    let mut lane_probe_cache: LaneProbeCache = HashMap::new();
     ids.into_iter()
         .filter_map(|task_id| {
             let event = events.get(task_id).expect("indexed from the same map");
@@ -2263,7 +2271,15 @@ fn resolve_tasks_with(
                 .dispatch
                 .and_then(|record| record.fields.get("agent"))
                 .is_some_and(|name| newest_name.get(name.as_str()) == Some(&task_id));
-            let mut task = resolve_one_task(task_id, root, event, agents, now, legacy_owner)?;
+            let mut task = resolve_one_task(
+                task_id,
+                root,
+                event,
+                agents,
+                now,
+                legacy_owner,
+                &mut lane_probe_cache,
+            )?;
             if let Some((config, binary)) = context {
                 probe_task_prompt(&mut task, event, agents, config, binary);
             }
@@ -2282,16 +2298,47 @@ fn is_writing_role(role: &str) -> bool {
     matches!(role, "fixer" | "builder" | "designer" | "artisan")
 }
 
+// Counts actual `git` spawns from `lane_porcelain` — a thread-local so
+// parallel `#[test]` functions (cargo's default) never see each other's
+// probes, since each test runs on its own OS thread. Test-only: this is
+// the "counting fake" a real git runner seam does not exist for here
+// (board-git-batch-builder.md's "existing git runner seam or a counting
+// fake"), proving `resolve_tasks_with`'s per-project `LaneProbeCache`
+// actually elides a repeat spawn rather than merely returning the same
+// string by coincidence.
+#[cfg(test)]
+thread_local! {
+    static LANE_GIT_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_lane_git_probe_count() {
+    LANE_GIT_PROBES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn lane_git_probe_count() -> u32 {
+    LANE_GIT_PROBES.with(std::cell::Cell::get)
+}
+
 /// `git status --porcelain` for a lane's own worktree directory, mirroring
 /// `mv_state::tasks::lane_porcelain` (private to its crate, duplicated for
 /// the same reason as `is_writing_role` above). `None` when the lane
 /// directory is gone or git could not be read — never read as dirty by
-/// omission.
+/// omission. Spawns `git` every time it is called; callers that may ask
+/// about the same lane more than once in a single board build (a lane
+/// revisited by a later `--into` dispatch sharing the same branch) should
+/// go through [`cached_lane_porcelain`] instead so the second ask costs a
+/// map lookup, not a second subprocess — git's own status plumbing has no
+/// way to answer for more than one worktree in a single invocation, so a
+/// repeat ask of the *same* worktree is the only spawn this file can avoid.
 fn lane_porcelain(root: &Path, lane_task_id: &str) -> Option<String> {
     let lane_root = root.join(".multiverse/worktrees").join(lane_task_id);
     if !lane_root.is_dir() {
         return None;
     }
+    #[cfg(test)]
+    LANE_GIT_PROBES.with(|count| count.set(count.get() + 1));
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&lane_root)
@@ -2302,6 +2349,30 @@ fn lane_porcelain(root: &Path, lane_task_id: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// One project's worth of [`lane_porcelain`] results, keyed by
+/// `lane_task_id`, scoped to a single [`resolve_tasks_with`] call — the
+/// unit of batching git's per-worktree status actually allows, since a
+/// `git status` reads one worktree's own index and cannot answer for
+/// several at once. Several historical task ids can name the same lane
+/// (a task dispatched `--into` an existing lane keeps dispatching more
+/// work into that same branch/worktree), and each one reaching the
+/// UNRECORDED-done check below used to re-spawn `git` for a directory
+/// this same pass had already read.
+type LaneProbeCache = HashMap<String, Option<String>>;
+
+fn cached_lane_porcelain(
+    root: &Path,
+    lane_task_id: &str,
+    cache: &mut LaneProbeCache,
+) -> Option<String> {
+    if let Some(hit) = cache.get(lane_task_id) {
+        return hit.clone();
+    }
+    let result = lane_porcelain(root, lane_task_id);
+    cache.insert(lane_task_id.to_string(), result.clone());
+    result
 }
 
 /// What's dirty in a lane, for the "done but lane has uncommitted
@@ -2347,6 +2418,7 @@ fn dirty_lane_detail(
     role: &str,
     branch: Option<&str>,
     task_id: &str,
+    lane_probe_cache: &mut LaneProbeCache,
 ) -> Option<String> {
     if !is_writing_role(role) {
         return None;
@@ -2354,7 +2426,7 @@ fn dirty_lane_detail(
     let lane_task_id = branch
         .and_then(|b| b.strip_prefix("multiverse/"))
         .unwrap_or(task_id);
-    let porcelain = lane_porcelain(root, lane_task_id)?;
+    let porcelain = cached_lane_porcelain(root, lane_task_id, lane_probe_cache)?;
     if porcelain.is_empty() {
         return None;
     }
@@ -2458,6 +2530,7 @@ fn resolve_one_task(
     agents: Option<&[LiveAgent]>,
     now: OffsetDateTime,
     legacy_owner: bool,
+    lane_probe_cache: &mut LaneProbeCache,
 ) -> Option<DispatchedTaskSnapshot> {
     let dispatch = events.dispatch;
     let role = dispatch
@@ -2532,8 +2605,20 @@ fn resolve_one_task(
     if let Some(recorded) = recorded_status.as_deref() {
         match recorded {
             "blocked" => outcome = Some(TaskOutcome::Blocked),
-            "done" | "failed" => return None,
-            _ => {}
+            // "done"/"failed" are the only other tokens a specialist's own
+            // status file can hold (`TaskStatus::parse`), but a human
+            // correction (`tasks --supersede ... --status TEXT`) can record
+            // any free text instead — e.g. `--status superseded`. Every one
+            // of those non-"blocked" recorded values means the same thing
+            // to the board: the task is settled, not still needing a
+            // decision, so it leaves the active columns exactly like a
+            // recorded `done`/`failed` outcome already did. Previously only
+            // the literal `"done"`/`"failed"` strings matched here and
+            // anything else (including `"superseded"`) fell through to the
+            // `_ => {}` arm below, leaving `outcome`/`live_status` both
+            // unset and the task fell back into IN PROGRESS with no
+            // explanation (card 20261108-b-9140f8).
+            _ => return None,
         }
     } else if let Some(status) = status {
         live_status = Some(LiveAgentStatus::Unrecorded);
@@ -2546,7 +2631,8 @@ fn resolve_one_task(
         // fix round (checked first, same order `tasks.py`'s own
         // `if ... elif (detail := _dirty_lane_detail(...)) ...` uses).
         if !still_working && status == TaskStatus::Done {
-            dirty_done_detail = dirty_lane_detail(root, &role, branch.as_deref(), task_id);
+            dirty_done_detail =
+                dirty_lane_detail(root, &role, branch.as_deref(), task_id, lane_probe_cache);
         }
         // `tasks.py`'s `resolve`: `live_agents is not None and task.pane and
         // task.pane not in live_agents.panes` — a herdr listing alone is not
@@ -2721,6 +2807,58 @@ fn resolve_backlog(root: &Path, now: OffsetDateTime) -> Vec<BacklogItemSnapshot>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+
+    /// Card `20261110-b-e592db`: `LiveSource::load` reaches
+    /// `mv_config::load::config_state_dir_from_env` internally, before a
+    /// test can override the loaded `state_dir` field by hand — same
+    /// failure mode `commands::dispatch`'s own `StateDirEnvGuard`
+    /// (`dispatch.rs` line ~4272) exists to close. Wraps [`HerdrEnvGuard`]
+    /// for the one process-wide lock, same shape as that guard, but takes
+    /// the target directory explicitly (like `HerdrEnvGuard::set`) so
+    /// `.load()` resolves `state_dir` to the same path a test would
+    /// otherwise have to overwrite by hand afterward.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn set(path: &Path) -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", path);
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", path);
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
 
     #[test]
     fn json_parser_reads_the_agent_list_fixture_shape() {
@@ -3268,14 +3406,37 @@ mod tests {
         dir
     }
 
-    fn temp_project(tag: &str) -> PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_project(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "mv-cli-board-data-test-{tag}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     #[test]
@@ -3305,8 +3466,6 @@ mod tests {
             Some("unrecorded, needs --reconcile")
         );
         assert!(task.outcome.is_none());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `conformance/diff_fuzz.py` seed 50034: a herdr listing that is merely
@@ -3342,8 +3501,6 @@ mod tests {
             tasks[0].state_note.as_deref(),
             Some("unrecorded, needs --reconcile")
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The pane-confirmed-gone counterpart to the test above: the same
@@ -3376,8 +3533,6 @@ mod tests {
             tasks[0].state_note.as_deref(),
             Some("pane gone, status done")
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `conformance/diff_fuzz.py` seed 50010: a writing role's status file
@@ -3418,8 +3573,6 @@ mod tests {
             Some("unrecorded, needs --reconcile")
         );
         assert!(tasks[0].outcome.is_none());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `conformance/diff_fuzz.py` seed 50034: Python's `_task_card`/
@@ -3461,8 +3614,35 @@ mod tests {
 
         let tasks = resolve_tasks(&root, None, now_utc());
         assert!(tasks.is_empty());
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    /// Card `20261108-b-9140f8`: `tasks <project> --supersede <id> --status
+    /// superseded ...` recorded a blocked task's outcome corrected to the
+    /// free-text status `superseded` (not one of the three tokens a
+    /// specialist's own status file ever holds). `tasks` read that
+    /// correction fine, but the board fell through to its `_ => {}` arm —
+    /// no outcome, no live status — and the task reappeared in IN PROGRESS
+    /// instead of leaving the active columns the way a recorded `done`/
+    /// `failed` outcome already does.
+    #[test]
+    fn a_superseded_outcome_drops_the_task_like_done_or_failed() {
+        let root = temp_project("recorded-superseded");
+        let task_id = "20261102-builder-abcdef";
+        let dir = task_dir(&root, task_id);
+        std::fs::write(dir.join("status"), "blocked").unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={task_id}\trole=builder\taccount=seat-a\n\
+                 2026-11-02T00:05:00+00:00\tevent=result\ttask={task_id}\tstatus=blocked\n\
+                 2026-11-02T00:10:00+00:00\tevent=supersede\ttask={task_id}\tsupersedes=2\t\
+                 supersedes_when=2026-11-02T00:05:00+00:00\tstatus=superseded\tstate=recorded\treason=closed\n"
+            ),
+        )
+        .unwrap();
+
+        let tasks = resolve_tasks(&root, None, now_utc());
+        assert!(tasks.is_empty());
     }
 
     #[test]
@@ -3484,8 +3664,6 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].outcome, Some(TaskOutcome::Blocked));
         assert!(tasks[0].state_note.is_none());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3505,8 +3683,6 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].state_note, None);
         assert_eq!(tasks[0].live_status, Some(LiveAgentStatus::Running));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3529,8 +3705,6 @@ mod tests {
         assert_eq!(items[0].title, "fix the thing");
         assert_eq!(items[0].priority, 1);
         assert_eq!(items[0].status, BacklogStatus::Open);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An unanswered `asked` item (via `backlog::ask` directly — the CLI's
@@ -3565,8 +3739,6 @@ mod tests {
         assert!(backlog_cards.is_empty());
         assert_eq!(blocked[0].role.as_deref(), Some("asked"));
         assert_eq!(blocked[0].title, "which account should we use?");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Card `20261102-b-8fad3e`: the task-id universe comes from
@@ -3586,8 +3758,6 @@ mod tests {
 
         let tasks = resolve_tasks(&root, None, now_utc());
         assert!(tasks.is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The mirror image of the above: a dispatched task discovered purely
@@ -3611,8 +3781,6 @@ mod tests {
         let tasks = resolve_tasks(&root, None, now_utc());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task_id, task_id);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3654,7 +3822,6 @@ mod tests {
         );
         std::fs::write(dir.join("brief.md"), "## Goal\n## Empty\n").unwrap();
         assert_eq!(resolve_tasks(&root, None, now_utc())[0].title, None);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3672,7 +3839,6 @@ mod tests {
         .unwrap();
         let found = resolve_tasks(&root, None, now_utc());
         assert_eq!(found[0].title.as_deref(), Some("Goal 😀 safe"));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3706,7 +3872,6 @@ mod tests {
                 .as_deref(),
             Some("stalled, agent is live but not working")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// `conformance/diff_fuzz.py` seed 50005: a dispatch line from before
@@ -3738,7 +3903,6 @@ mod tests {
             found[0].state_note.as_deref(),
             Some("stalled, agent is live but not working")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The counterpart to the test above: once the dispatch line *does*
@@ -3764,7 +3928,6 @@ mod tests {
         let found = resolve_tasks(&root, Some(&parsed), now_utc());
         assert_eq!(found[0].live_status, Some(LiveAgentStatus::HerdrBlocked));
         assert_eq!(found[0].state_note, None);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3781,10 +3944,9 @@ mod tests {
         let config = mv_config::load::load_config_str(&text, Path::new("config.toml")).unwrap();
         assert_eq!(cwd_project_at(&config, &child).unwrap().name, "inner");
         assert_eq!(cwd_project_at(&config, root.path()).unwrap().name, "outer");
-        let neighbor = root.path().with_extension("neighbor");
-        std::fs::create_dir_all(&neighbor).unwrap();
+        let neighbor = TempDir(root.path().with_extension("neighbor"));
+        std::fs::create_dir_all(&*neighbor).unwrap();
         assert!(cwd_project_at(&config, &neighbor).is_none());
-        std::fs::remove_dir_all(neighbor).unwrap();
     }
 
     fn fake_board_herdr(dir: &Path, body: &str) -> PathBuf {
@@ -3873,7 +4035,6 @@ esac"#,
             panic!("one project")
         };
         assert!(snapshot.project.tasks.is_empty());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Sibling to the test above, pinned by 47d6342: a legacy dispatch line
@@ -3919,7 +4080,6 @@ esac"#,
             "{log}"
         );
         assert!(!root.join("closed").exists());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3938,6 +4098,7 @@ esac"#,
         )
         .unwrap();
         let fake = fake_board_herdr(&root, r#"printf '%s\n' '{"result":{"agents":[]}}'"#);
+        let _state = StateDirEnvGuard::set(&root.join("state"));
         for flag in ["--no-reconcile", "--read-only", "--watch"] {
             let args = crate::args::command()
                 .try_get_matches_from([
@@ -3948,8 +4109,7 @@ esac"#,
                     flag,
                 ])
                 .unwrap();
-            let mut source = LiveSource::load(args.subcommand_matches("board").unwrap()).unwrap();
-            source.state_dir = root.join("state");
+            let source = LiveSource::load(args.subcommand_matches("board").unwrap()).unwrap();
             assert!(!source.reconcile, "{flag}");
             source
                 .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
@@ -3965,15 +4125,13 @@ esac"#,
                 "board",
             ])
             .unwrap();
-        let mut source = LiveSource::load(args.subcommand_matches("board").unwrap()).unwrap();
-        source.state_dir = root.join("state");
+        let source = LiveSource::load(args.subcommand_matches("board").unwrap()).unwrap();
         assert!(source.reconcile);
         let down = fake_board_herdr(&root, "exit 1");
         source
             .snapshot_with(&BoardScope::All, down.to_str().unwrap())
             .unwrap();
         assert_eq!(std::fs::read_to_string(&log).unwrap(), history);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3996,7 +4154,6 @@ esac"#,
         assert_eq!(reconcile, backlog);
         let stamp = mv_core::time::parse_flexible(reconcile.as_deref().unwrap()).unwrap();
         assert!(stamp >= before.replace_nanosecond(0).unwrap() && stamp <= now_utc());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4064,7 +4221,6 @@ esac"#,
             !root.join("state").exists(),
             "prompt inspection must not trip a breaker or write evidence"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4120,7 +4276,6 @@ cat "$(dirname "$0")/pane-text""#,
             .unwrap_or_default()
             .contains("stuck:"));
         assert_eq!(std::fs::read_to_string(log).unwrap(), history);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4153,7 +4308,6 @@ cat "$(dirname "$0")/pane-text""#,
                 .state_note,
             None
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     fn init_git_lane(lane_root: &Path) {
@@ -4211,8 +4365,6 @@ cat "$(dirname "$0")/pane-text""#,
         let (blocked, in_progress) = mv_board::card::split_dispatched(&tasks);
         assert_eq!(blocked.len(), 1);
         assert!(in_progress.is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The same status/role/branch shape, but a clean lane: `_dirty_done`
@@ -4241,8 +4393,6 @@ cat "$(dirname "$0")/pane-text""#,
             tasks[0].state_note.as_deref(),
             Some("unrecorded, needs --reconcile")
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A non-writing role (no lane of its own) never asks git anything,
@@ -4265,8 +4415,88 @@ cat "$(dirname "$0")/pane-text""#,
         let tasks = resolve_tasks(&root, None, now_utc());
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].dirty_done_detail.is_none());
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    /// Card `20261109-b-c0091b`: a project with several lanes whose
+    /// outcome is already recorded (`event=result`) must cost zero live
+    /// `git` spawns for them, even though their worktrees are real and
+    /// dirty — only the one lane still genuinely unsettled (`done`, no
+    /// `event=result` yet) may be probed. `a_recorded_done_outcome_drops_
+    /// the_task_entirely` already proves the *resolution*; this is the
+    /// same shape with a real, dirty lane directory behind each recorded
+    /// task, so a regression that started probing them would be caught
+    /// here, not just inferred from the task disappearing.
+    #[test]
+    fn recorded_done_lanes_cost_no_live_git_probe() {
+        let root = temp_project("recorded-done-no-probe");
+        let mut log = String::new();
+        for n in 0..3 {
+            let task_id = format!("20261102-builder-recorded{n}");
+            let lane_root = root.join(".multiverse/worktrees").join(&task_id);
+            init_git_lane(&lane_root);
+            std::fs::write(lane_root.join("uncommitted.txt"), "oops\n").unwrap();
+            log.push_str(&format!(
+                "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={task_id}\trole=builder\taccount=seat-a\tbranch=multiverse/{task_id}\n\
+                 2026-11-02T00:05:00+00:00\tevent=result\ttask={task_id}\tstatus=done\n"
+            ));
+        }
+        let unsettled_id = "20261102-builder-unsettled";
+        let dir = task_dir(&root, unsettled_id);
+        std::fs::write(dir.join("status"), "done").unwrap();
+        let lane_root = root.join(".multiverse/worktrees").join(unsettled_id);
+        init_git_lane(&lane_root);
+        log.push_str(&format!(
+            "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={unsettled_id}\trole=builder\taccount=seat-a\tbranch=multiverse/{unsettled_id}\n"
+        ));
+        std::fs::write(root.join(".multiverse/routing.log"), log).unwrap();
+
+        reset_lane_git_probe_count();
+        let tasks = resolve_tasks(&root, None, now_utc());
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].task_id, unsettled_id);
+        assert_eq!(
+            lane_git_probe_count(),
+            1,
+            "only the unsettled lane should spawn git"
+        );
+    }
+
+    /// A lane revisited by a later `--into` dispatch (two task ids, one
+    /// branch) used to cost one `git status --porcelain` spawn per task id
+    /// reaching the UNRECORDED-done check, even though both ask about the
+    /// identical worktree directory in the same board build.
+    /// `lane_probe_cache` collapses that to one spawn per project.
+    #[test]
+    fn a_lane_shared_by_two_unrecorded_done_tasks_is_probed_once() {
+        let root = temp_project("shared-lane-one-probe");
+        let lane_id = "20261102-builder-shared";
+        let lane_root = root.join(".multiverse/worktrees").join(lane_id);
+        init_git_lane(&lane_root);
+        let first = lane_id.to_string();
+        let second = "20261103-builder-followup".to_string();
+        for task_id in [&first, &second] {
+            std::fs::write(task_dir(&root, task_id).join("status"), "done").unwrap();
+        }
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={first}\trole=builder\taccount=seat-a\tbranch=multiverse/{lane_id}\n\
+                 2026-11-03T00:00:00+00:00\tevent=dispatch\ttask={second}\trole=builder\taccount=seat-a\tbranch=multiverse/{lane_id}\n"
+            ),
+        )
+        .unwrap();
+
+        reset_lane_git_probe_count();
+        let tasks = resolve_tasks(&root, None, now_utc());
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        for task in &tasks {
+            assert!(task.dirty_done_detail.is_none(), "{task:?}");
+        }
+        assert_eq!(
+            lane_git_probe_count(),
+            1,
+            "both task ids name the same lane; it should be probed once per project"
+        );
     }
 
     fn one_account_config(toml_extra: &str) -> Config {
@@ -4627,7 +4857,5 @@ scout = ["seat"]
             events.get(a).unwrap().outcome.unwrap().fields.get("status"),
             Some(&"blocked".to_string())
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

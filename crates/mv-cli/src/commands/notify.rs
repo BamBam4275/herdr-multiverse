@@ -52,6 +52,23 @@ pub(crate) fn push(
     push_with_token(topic, None, record, priority, tags)
 }
 
+/// What a notify-hook attempt actually did, for a caller that needs to name
+/// the failure precisely (card `20261115-b-51cb75`: `activity send --ask`
+/// must tell the operator the notify hook itself was missing, not just that
+/// nothing happened). [`push_with_token`] keeps its existing bool-only
+/// contract for its own callers (`commands::sweep`) by collapsing this down
+/// to `Sent`/not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushOutcome {
+    /// No topic configured; nothing was attempted.
+    NoTopic,
+    /// The notify hook (`curl`) itself could not be found on `PATH`.
+    HookMissing,
+    /// The hook ran but did not report success (network, auth, ...).
+    Failed,
+    Sent,
+}
+
 /// [`push`], plus an optional `Authorization: Bearer` header
 /// (`notify.py:361-421`'s `_read_token`) and ntfy's own title/body bounds
 /// (`notify.py:403-406`'s own `_bound_notification` call in `ntfy_push`) —
@@ -65,9 +82,25 @@ pub(crate) fn push_with_token(
     priority: &str,
     tags: &[String],
 ) -> bool {
-    let Some(topic) = topic else { return false };
+    push_with_token_detailed(topic, token, record, priority, tags) == PushOutcome::Sent
+}
+
+/// [`push_with_token`], but naming *why* no push happened rather than
+/// collapsing every non-success into the same `false` — a missing notify
+/// hook binary is a different failure than a reachable one that declined
+/// the push, and only the first has a precise name worth surfacing.
+pub(crate) fn push_with_token_detailed(
+    topic: Option<&str>,
+    token: Option<&str>,
+    record: &QueuedNotification,
+    priority: &str,
+    tags: &[String],
+) -> PushOutcome {
+    let Some(topic) = topic else {
+        return PushOutcome::NoTopic;
+    };
     let config = curl_config(&ntfy_url(), topic, token, record, priority, tags);
-    let Ok(mut child) = Command::new("curl")
+    let mut child = match Command::new("curl")
         .args([
             "--fail",
             "--silent",
@@ -81,14 +114,22 @@ pub(crate) fn push_with_token(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return false;
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PushOutcome::HookMissing;
+        }
+        Err(_) => return PushOutcome::Failed,
     };
     let wrote = child
         .stdin
         .take()
         .is_some_and(|mut stdin| stdin.write_all(config.as_bytes()).is_ok());
-    child.wait().is_ok_and(|status| status.success()) && wrote
+    if wrote && child.wait().is_ok_and(|status| status.success()) {
+        PushOutcome::Sent
+    } else {
+        PushOutcome::Failed
+    }
 }
 
 /// The `curl -K -` config text itself, pulled out of [`push_with_token`] so
@@ -254,6 +295,12 @@ fn run_with_state(
     Ok(())
 }
 
+/// The `multiverse notify` entry point: validates the field trio (or
+/// `--flush`) before touching config, then resolves the topic/token and
+/// delegates to [`run_with_state`] with a transport closure that posts
+/// through [`push_with_token`]. Delivery/network/I/O failures are
+/// swallowed to stderr and exit 0, per this module's own doc comment —
+/// only a usage refusal propagates as an `Err`.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     // Usage is decided before config: Python `cmd_notify` never calls
     // `_load(args)`, and a missing trio must exit 2 even when no fleet
@@ -366,6 +413,10 @@ mod tests {
             episode_state: None,
         };
         assert!(!super::push(None, &record, "normal", &[]));
+        assert_eq!(
+            super::push_with_token_detailed(None, None, &record, "normal", &[]),
+            super::PushOutcome::NoTopic
+        );
         assert_eq!(super::curl_quote("a\"\nb\\c\r"), "a\\\"\\nb\\\\c\\r");
     }
 

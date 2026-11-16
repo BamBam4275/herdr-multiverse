@@ -36,6 +36,10 @@ pub fn append_project(
     append_subtable(doc, "projects", name, fields)
 }
 
+/// Shared implementation behind [`append_account`] and [`append_project`]:
+/// create `parent_key`'s table if it does not already exist, refuse to
+/// overwrite `child_key` if it is already present, and otherwise append a
+/// new `[<parent_key>.<child_key>]` table holding `fields` in order.
 fn append_subtable(
     doc: &mut DocumentMut,
     parent_key: &str,
@@ -57,6 +61,10 @@ fn append_subtable(
     }
 
     let mut child = Table::new();
+    // Explicit, not implicit: an implicit table has no header line of its
+    // own in the rendered TOML, but a freshly appended block must print
+    // its own `[parent_key.child_key]` header, the same shape as a
+    // hand-written `[accounts.<name>]` block.
     child.set_implicit(false);
     for (key, value) in fields {
         child.insert(key, Item::Value(Value::from(*value)));

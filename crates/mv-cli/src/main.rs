@@ -1,3 +1,8 @@
+//! The binary entry point. Parses argv against the clap schema
+//! (`args::command`), dispatches to `commands::run`, and is the single place
+//! a `Result<(), exit::Failure>` turns into a process exit code and
+//! stdout/stderr text.
+
 mod args;
 mod commands;
 mod exit;
@@ -186,15 +191,13 @@ mod tests {
         // for an unresolvable project either way, so isolating it here
         // costs nothing and matches the scratch-config pattern `args.rs`'s
         // own coverage test already uses for the same reason.
-        let scratch = std::env::temp_dir().join(format!(
-            "mv-cli-role-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&scratch).unwrap();
+        // `tempfile::tempdir()` removes this on drop, including on panic
+        // (card `20261115-b-3e0fde`: the plain `create_dir_all` this
+        // replaced only cleaned up at the test's own trailing
+        // `remove_dir_all`, so a failure partway through the loops below
+        // left it behind in `TMPDIR`).
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch = scratch.path();
         let config_arg = scratch
             .join("alternate.toml")
             .to_string_lossy()
@@ -273,7 +276,6 @@ mod tests {
                 assert!(out.text.contains("unknown role"));
             }
         }
-        std::fs::remove_dir_all(&scratch).ok();
     }
 
     // Ported from the regression names in spec-cli.md section 7.
@@ -392,16 +394,13 @@ mod tests {
         // which never touches Herdr) must still exit cleanly — never
         // crash — on a Python-era config, and must name the fix rather
         // than leaving the operator to parse `ConfigError`'s raw text.
-        let scratch = std::env::temp_dir().join(format!(
-            "mv-cli-retired-role-key-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&scratch).unwrap();
-        let config_path = scratch.join("config.toml");
+        // `tempfile::tempdir()` removes this on drop, including on panic
+        // (card `20261115-b-3e0fde`: the plain `create_dir_all` this
+        // replaced only cleaned up at the test's own trailing
+        // `remove_dir_all`, so an earlier assertion failure left it behind
+        // in `TMPDIR`).
+        let scratch = tempfile::tempdir().unwrap();
+        let config_path = scratch.path().join("config.toml");
         std::fs::write(
             &config_path,
             "[roles.fixer]\nwrite_scope = \"declared\"\n[roles.fixer.models]\n\
@@ -419,7 +418,6 @@ mod tests {
             "{}",
             out.text
         );
-        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[test]

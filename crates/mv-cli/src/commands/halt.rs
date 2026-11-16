@@ -12,6 +12,8 @@ use mv_state::halt::{
 use super::doctor::{resolve_config_path, state_dir_from_config, utc_timestamp};
 use crate::exit::Failure;
 
+/// Dispatches `halt on|off|status` to `mv_state::halt`'s read/write/clear
+/// helpers and prints the one-line result each subcommand produces.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;

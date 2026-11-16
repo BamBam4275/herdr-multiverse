@@ -119,9 +119,9 @@
 //!   (uncounted) sibling. Runs inside `sweep_project` itself, ahead of
 //!   `expire_awaiting`, so a task it claims is never also lease-expired
 //!   in the same pass — see that function's own doc comment.
-//! - `closed backlog: ...` — [`close_merged_backlog_links`] below mirrors
-//!   `cli._close_merged_backlog_links`: a backlog item linked to a task
-//!   now recorded `done` (and not itself an `auto_supersede` rewrite —
+//! - `closed backlog: ...` — [`mv_state::tasks::close_merged_backlog_links`]
+//!   mirrors `cli._close_merged_backlog_links`: a backlog item linked to a
+//!   task now recorded `done` (and not itself an `auto_supersede` rewrite —
 //!   `SUPERSEDED_MERGED`/`SUPERSEDED_REDISPATCHED` are the task-log's own
 //!   correction, not this task's outcome) whose branch has independently
 //!   landed is closed with that commit as evidence.
@@ -160,10 +160,8 @@ use mv_engine::runner::{
     deliver_heartbeat, dialog_or_menu_reason, Heartbeat, Herdr, ProcessHerdr, RunnerError, Timing,
 };
 use mv_state::activity::HUB_PROJECT_NAME;
-use mv_state::backlog::{done as backlog_done, read_items as read_backlog_items, BacklogError};
 use mv_state::tasks::{
-    is_writing_role, lane_task_id, merged_evidence, AgentPanes, HerdrAgents, SweepTask,
-    SUPERSEDED_MERGED, SUPERSEDED_REDISPATCHED,
+    close_merged_backlog_links, lane_task_id, AgentPanes, HerdrAgents, LiveAgentStatus, SweepTask,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -182,6 +180,8 @@ const SWEEP_TICK_PROMPT: &str = "Hub cycle tick (hub nudge, not Mike): run one p
      seed's Every cycle (mail, reconcile, reclaim, board, backlog). Not a \
      recurring job.";
 
+/// Entry point for `multiverse sweep`, wired to the real Herdr agent/pane
+/// probes, the live host-disk reporter, and a live process-probe mode.
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     run_with(
         args,
@@ -192,14 +192,12 @@ pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     )
 }
 
-/// One host process observed by the read-only cwd probe. Never killed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LaneProcess {
-    pid: u32,
-    cwd: PathBuf,
-    command: String,
-    cpu_percent: String,
-}
+/// One host process observed by the read-only cwd probe. Never killed from
+/// this file — the shared probe now lives in `mv_engine::dockerreport`
+/// (card `20261115-b-9815fe`) so `worktrees --prune --reap` and
+/// `tasks --reclaimable --reap` read the exact same snapshot shape this
+/// report does, instead of each parsing `ps`/`lsof` output on its own.
+use mv_engine::dockerreport::ProcessCwd as LaneProcess;
 
 /// How this sweep pass learns about host processes. Tests inject a snapshot
 /// so the live `ps`/`lsof` probe never runs against the real host.
@@ -210,81 +208,12 @@ enum ProcessProbe {
 }
 
 fn process_label(process: &LaneProcess) -> String {
-    let command: String = process
-        .command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let command: String = command.chars().take(160).collect();
-    format!("pid {} {command}", process.pid)
-}
-
-/// Python's `process_cwd_snapshot`: processes, or `None` (unknown) on
-/// probe failure; never kill anything.
-fn process_cwd_snapshot() -> Option<Vec<LaneProcess>> {
-    probe_process_cwds().ok()
-}
-
-fn probe_process_cwds() -> Result<Vec<LaneProcess>, ()> {
-    let stdout =
-        mv_engine::dockerreport::host_probe("ps", &["-axo", "pid=,pcpu=,comm="]).ok_or(())?;
-    let mut metadata = HashMap::new();
-    for line in stdout.lines() {
-        let mut parts = line.split_whitespace();
-        let Some(pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(cpu) = parts.next() else {
-            continue;
-        };
-        let command = parts.collect::<Vec<_>>().join(" ");
-        if command.is_empty() {
-            continue;
-        }
-        metadata.insert(pid, (command, cpu.to_string()));
-    }
-    let mut cwds: HashMap<u32, PathBuf> = HashMap::new();
-    if cfg!(target_os = "macos") {
-        let stdout =
-            mv_engine::dockerreport::host_probe("lsof", &["-a", "-d", "cwd", "-Fpcn"]).ok_or(())?;
-        let mut pid = None;
-        for line in stdout.lines() {
-            if let Some(rest) = line.strip_prefix('p') {
-                pid = rest.parse().ok();
-            } else if let Some(rest) = line.strip_prefix("n/") {
-                if let Some(pid) = pid {
-                    cwds.insert(pid, PathBuf::from(format!("/{rest}")));
-                }
-            }
-        }
-    } else if cfg!(target_os = "linux") {
-        for pid in metadata.keys().copied() {
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                cwds.insert(pid, cwd);
-            }
-        }
-    } else {
-        return Err(());
-    }
-    let mut rows: Vec<LaneProcess> = cwds
-        .into_iter()
-        .filter_map(|(pid, cwd)| {
-            let (command, cpu_percent) = metadata.get(&pid)?.clone();
-            Some(LaneProcess {
-                pid,
-                cwd,
-                command,
-                cpu_percent,
-            })
-        })
-        .collect();
-    rows.sort_by_key(|p| p.pid);
-    Ok(rows)
+    mv_engine::dockerreport::process_label(process)
 }
 
 fn resolve_process_probe(probe: &ProcessProbe) -> Option<Vec<LaneProcess>> {
     match probe {
-        ProcessProbe::Live => process_cwd_snapshot(),
+        ProcessProbe::Live => mv_engine::dockerreport::process_cwds(),
         #[cfg(test)]
         ProcessProbe::Snapshot(rows) => rows.clone(),
     }
@@ -315,11 +244,18 @@ fn sleep_minutes_from_lines(lines: &[String]) -> i64 {
 }
 
 /// Python's `closed_lane_processes`: only recorded lanes, excluding a lane
-/// with any active occupant.
+/// with any active occupant. Tightened for card `20261115-b-9815fe`: a
+/// recorded task whose own pane is still in this pass's `live` listing is
+/// also excluded — "lane processes still running" now means the pane is
+/// gone and the process remains, not merely that the task record is
+/// recorded. `live` is `None` (a failed listing) wherever this is already
+/// too uncertain to narrow further; every task counts as closed then, the
+/// same as before this tighten.
 fn closed_lane_processes(
     project: &Path,
     tasks: &[SweepTask],
     processes: &[LaneProcess],
+    live: Option<&[LiveAgentStatus]>,
 ) -> Vec<(String, LaneProcess)> {
     let mut closed: HashMap<PathBuf, String> = HashMap::new();
     let mut active: HashSet<PathBuf> = HashSet::new();
@@ -330,7 +266,10 @@ fn closed_lane_processes(
         let Ok(root) = root.canonicalize() else {
             continue;
         };
-        if task.recorded {
+        let pane_still_live = task.pane.as_deref().is_some_and(|pane| {
+            live.is_some_and(|live| live.iter().any(|agent| agent.pane_id == pane))
+        });
+        if task.recorded && !pane_still_live {
             closed.entry(root).or_insert_with(|| task.task_id.clone());
         } else {
             active.insert(root);
@@ -359,11 +298,12 @@ fn lane_process_notes(
     project: &Path,
     tasks: &[SweepTask],
     processes: Option<&[LaneProcess]>,
+    live: Option<&[LiveAgentStatus]>,
 ) -> Vec<String> {
     let Some(processes) = processes else {
         return vec!["warning: process-cwd probe unknown".to_string()];
     };
-    let lingering = closed_lane_processes(project, tasks, processes);
+    let lingering = closed_lane_processes(project, tasks, processes, live);
     if lingering.is_empty() {
         return Vec::new();
     }
@@ -407,13 +347,24 @@ fn record_orchestrator_pass(project_root: &Path, now: OffsetDateTime) {
 
 /// Python's `needs a decision: <id> (done, <detail>, <hours>h)` suffix
 /// (`cli.py:12882-12899`), one line per dirty-done task, sorted by id.
-fn dirty_done_notes(root: &Path, tasks: &[SweepTask], now: OffsetDateTime) -> Vec<String> {
+///
+/// `dirty_details` is [`mv_state::tasks::SweepReport::dirty_details`] — the
+/// detail text `sweep_project_with_live` already computed off its own
+/// pass-wide lane probe cache, reused here instead of calling
+/// `mv_state::tasks::dirty_done_detail` again per task, which used to
+/// re-probe (a second `git status --porcelain`) a lane the pass had
+/// already read once for its own reconcile gate (card `20261115-b-1ba758`).
+fn dirty_done_notes(
+    tasks: &[SweepTask],
+    dirty_details: &BTreeMap<String, String>,
+    now: OffsetDateTime,
+) -> Vec<String> {
     let mut tasks: Vec<&SweepTask> = tasks.iter().collect();
     tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
     tasks
         .into_iter()
         .filter_map(|task| {
-            let detail = mv_state::tasks::dirty_done_detail(root, task)?;
+            let detail = dirty_details.get(&task.task_id)?;
             let hours = task
                 .dispatched_at
                 .map(|at| (now - at).whole_hours().max(0).to_string())
@@ -945,6 +896,9 @@ fn parse_orchestrator_picker(text: &str) -> Option<(String, Vec<String>, String)
         return None;
     }
 
+    // The question line may wrap across one or more prior plain-text
+    // lines (none of them a pointer, numbered option, or bullet) — walk
+    // back to where the wrap starts and rejoin them into `question` below.
     let mut wrap_start = question_index;
     while wrap_start > 0 {
         let prior = menu[wrap_start - 1];
@@ -1149,66 +1103,6 @@ fn reviewer_over_timeout_from_tasks(
     }
 }
 
-/// Close a backlog item whose linked task is now recorded `done` and whose
-/// own branch has independently landed. Mirrors `cli._close_merged_backlog_links`
-/// — returns `(item id, evidence sha, recorded)` for every item closed (or,
-/// under `apply=false`, that would be).
-///
-/// The branch disposition is deliberately checked only for a linked
-/// *writer* task already recorded `done`, so an unrelated recorded-blocked
-/// task — especially one with a live human-facing pane — is never cleared
-/// by this housekeeping pass. [`mv_state::tasks::auto_supersede`] rewrites
-/// a stale BLOCKED/AWAITING record's own status to `done` in place once
-/// its branch lands too — a correction to the task log's own bookkeeping,
-/// not this task's own outcome — so a task whose `outcome_state` is
-/// [`SUPERSEDED_MERGED`]/[`SUPERSEDED_REDISPATCHED`] is excluded here even
-/// though its `status` now reads `done`: that is the one place the
-/// pre-supersede verdict (superseded vs. genuinely done) still survives.
-fn close_merged_backlog_links(
-    root: &Path,
-    tasks: &[SweepTask],
-    apply: bool,
-) -> Vec<(String, String, bool)> {
-    let linked: Vec<_> = read_backlog_items(root, false)
-        .into_iter()
-        .filter(|item| !item.task_id.is_empty() && item.state != "done")
-        .collect();
-    if linked.is_empty() {
-        return Vec::new();
-    }
-    let by_id: HashMap<&str, &SweepTask> = tasks.iter().map(|t| (t.task_id.as_str(), t)).collect();
-
-    let mut closed = Vec::new();
-    for item in &linked {
-        let Some(&task) = by_id.get(item.task_id.as_str()) else {
-            continue;
-        };
-        if task.status != Some(mv_state::tasks::TaskStatus::Done) {
-            continue;
-        }
-        let outcome_state = task.outcome_state.as_deref().unwrap_or("");
-        if outcome_state == SUPERSEDED_MERGED || outcome_state == SUPERSEDED_REDISPATCHED {
-            continue;
-        }
-        if !is_writing_role(&task.role) {
-            continue;
-        }
-        let Some(evidence) = merged_evidence(root, lane_task_id(task)) else {
-            continue;
-        };
-        let mut recorded = false;
-        if apply {
-            match backlog_done(root, &item.item, &evidence, None) {
-                Ok(_) => recorded = true,
-                Err(BacklogError::TerminalItem { .. }) => continue,
-                Err(_) => continue,
-            }
-        }
-        closed.push((item.item.clone(), evidence, recorded));
-    }
-    closed
-}
-
 /// Card `20261103-fixer-2faef1` finding 1: `matched` comes from `mail_index`,
 /// loaded once before this pass's per-project loop (so eight holders do not
 /// re-parse the same eight logs) — but `holder_log` can have moved on since
@@ -1287,6 +1181,41 @@ fn tasks_snapshot_needs_reread(
         || report.reclaimed > 0
         || !report.superseded.is_empty()
         || nudges.resume.iter().any(|r| r.failed)
+}
+
+/// Composer-hold fragments for one project's summary line (card
+/// `20261115-b-bfadda`): the Enter-or-would-Enter outcomes from
+/// [`mv_engine::sweep_nudges::NudgeOutcome::composer`], then the
+/// report-only [`mv_engine::sweep_nudges::NudgeOutcome::unsubmitted_composer`]
+/// strings verbatim. Same visibility as the finish/resume/cap blocks in
+/// [`run_with`]: dry-run and halt preview an unsent hold as "would", a
+/// real send prints "submitted", and a failed send is omitted.
+fn composer_hold_notes(
+    nudges: &mv_engine::sweep_nudges::NudgeOutcome,
+    dry_run: bool,
+    halted: bool,
+) -> Vec<String> {
+    let visible_as = |sent: bool| dry_run || halted || sent;
+    let mut notes = Vec::new();
+    let mut submitted_ids: Vec<&str> = nudges
+        .composer
+        .iter()
+        .filter(|hold| visible_as(hold.sent))
+        .map(|hold| hold.task_id.as_str())
+        .collect();
+    submitted_ids.sort_unstable();
+    if !submitted_ids.is_empty() {
+        let label = if dry_run || halted {
+            "would submit composer"
+        } else {
+            "submitted composer"
+        };
+        notes.push(format!("{label}: {}", submitted_ids.join(", ")));
+    }
+    for note in &nudges.unsubmitted_composer {
+        notes.push(note.clone());
+    }
+    notes
 }
 
 fn run_with(
@@ -1520,6 +1449,7 @@ fn run_with(
             };
             notes.push(format!("{label}: {}", capped_ids.join(", ")));
         }
+        notes.extend(composer_hold_notes(&nudges, dry_run, halted));
 
         if !report.superseded.is_empty() {
             let named: Vec<String> = report
@@ -1577,7 +1507,7 @@ fn run_with(
         {
             notes.push(format!("reviewer over timeout: {named}"));
         }
-        for note in dirty_done_notes(path, &tasks, now) {
+        for note in dirty_done_notes(&tasks, &report.dirty_details, now) {
             notes.push(note);
         }
 
@@ -1628,7 +1558,12 @@ fn run_with(
         if let Some(behind) = mv_state::activity::mail_cursor_behind(path) {
             notes.push(format!("mail cursor behind by {behind}"));
         }
-        for note in lane_process_notes(path, &tasks_snapshot, lane_processes.as_deref()) {
+        for note in lane_process_notes(
+            path,
+            &tasks_snapshot,
+            lane_processes.as_deref(),
+            live.as_deref(),
+        ) {
             notes.push(note);
         }
         println!("{}", project_summary_line(&project.name, &report, &notes));
@@ -1778,11 +1713,94 @@ mod tests {
 
     use super::*;
     use crate::args;
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
     use mv_herdr::argv::HerdrCommand;
     use mv_herdr::envelope::CommandResult;
     use mv_state::tasks::LiveAgent;
     use serde_json::json;
     use std::time::Duration;
+
+    /// Card `20261114-b-f1badb`: every `run_with`/`state_dir_from_config`/
+    /// `push_picker_ntfy` call in this file reaches
+    /// `mv_config::load::config_state_dir_from_env`, which panics
+    /// (`crates/mv-config/src/load.rs:289`) on the `.cargo/config.toml`-forced
+    /// `MULTIVERSE_STATE_DIR` sentinel (card `20261110-b-590e00`) unless
+    /// something has already overridden it — same failure mode
+    /// `commands::dispatch`'s, `commands::council`'s, and
+    /// `commands::review_policy`'s own `StateDirEnvGuard` of the same name
+    /// already close. The three vars live here, lock-free, so a test that
+    /// already holds this file's one process-wide env lock via
+    /// `PmsetBinGuard`/`NtfyUrlGuard`/`CodexBinGuard` can fold them in
+    /// directly instead of locking a second time on the same thread, which
+    /// would deadlock (`std::sync::Mutex` is not reentrant).
+    struct StateDirEnvOverride {
+        _dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvOverride {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _dir: dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvOverride {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
+    /// Standalone use, for a test that holds no other env guard: wraps
+    /// [`HerdrEnvGuard::unreachable`] (this file's one process-wide env
+    /// lock, same as `PmsetBinGuard`/`NtfyUrlGuard`/`CodexBinGuard` below)
+    /// together with [`StateDirEnvOverride`] above. A test that already
+    /// holds the lock via one of those three must use
+    /// `StateDirEnvOverride` directly instead — see their own call sites.
+    ///
+    /// `_state` must stay declared before `_herdr`: struct fields drop in
+    /// declaration order, and the env must be restored while the lock is
+    /// still held, same as `NtfyUrlGuard`'s own `_state`-before-`_lock`
+    /// order below. Declared the other way around, `_herdr`'s lock would
+    /// release before `_state` restores the env, letting another thread's
+    /// guard acquire the lock and read this guard's still-overridden env.
+    struct StateDirEnvGuard {
+        _state: StateDirEnvOverride,
+        _herdr: HerdrEnvGuard,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            Self {
+                _herdr: HerdrEnvGuard::unreachable(),
+                _state: StateDirEnvOverride::new(),
+            }
+        }
+    }
 
     #[test]
     fn sleep_minutes_from_lines_sums_both_line_shapes_and_floors_a_capped_window_critic_h1() {
@@ -2029,12 +2047,12 @@ mod tests {
 
     #[test]
     fn unconfigured_sweep_needs_config() {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-unconfigured-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Card `20261115-b-87937d`: `tempfile::tempdir()` is removed on
+        // drop, including on a panic mid-test, unlike the plain
+        // `std::env::temp_dir().join(...)` this replaced, which only
+        // cleaned up at this test's own trailing `remove_dir_all`.
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let config_arg = dir.join("missing-config.toml");
         let mut agents = FakeAgents { panes: Vec::new() };
         let err = run_with(
@@ -2044,7 +2062,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write_sandbox_config(
@@ -2096,11 +2113,9 @@ mod tests {
 
     #[test]
     fn reports_a_per_project_summary_line_and_reconciles_a_settled_task() {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-reconcile-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _state = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(project_root.join(".multiverse/tasks/20250101-fixer-aaaaaa"))
             .unwrap();
@@ -2132,12 +2147,11 @@ mod tests {
 
         let log = std::fs::read_to_string(project_root.join(".multiverse/routing.log")).unwrap();
         assert!(log.lines().last().unwrap().contains("state=reconciled"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_real_sweep_stamps_orchestrator_pass_byte_identical_to_python() {
+        let _state = StateDirEnvGuard::new();
         let dir = sandbox_project_root();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
@@ -2167,6 +2181,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_sweep_does_not_stamp_orchestrator_pass() {
+        let _state = StateDirEnvGuard::new();
         let dir = sandbox_project_root();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
@@ -2224,7 +2239,14 @@ mod tests {
 
         let tasks = mv_state::tasks::sweep_tasks(&root);
         let now = time::OffsetDateTime::from_unix_timestamp(1_609_459_200).unwrap(); // 2021-01-01
-        let notes = dirty_done_notes(&root, &tasks, now);
+        let dirty_details: BTreeMap<String, String> = tasks
+            .iter()
+            .filter_map(|task| {
+                mv_state::tasks::dirty_done_detail(&root, task)
+                    .map(|detail| (task.task_id.clone(), detail))
+            })
+            .collect();
+        let notes = dirty_done_notes(&tasks, &dirty_details, now);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
             notes[0].starts_with("needs a decision: 20250101-fixer-aaaaaa (done, "),
@@ -2233,6 +2255,75 @@ mod tests {
         );
         assert!(notes[0].contains("uncommitted.txt"), "{}", notes[0]);
         assert!(notes[0].ends_with("h)"), "{}", notes[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Card `20261115-b-563a72`: the test above feeds `dirty_done_notes`
+    /// a `dirty_details` map it built itself, by calling
+    /// `mv_state::tasks::dirty_done_detail` per task directly — never
+    /// `collect_dirty_details`, the function `sweep_project`/`run_with`
+    /// actually call to fill `SweepReport::dirty_details`. Verifying lane
+    /// `20261115-builder-58ea8c` (card `20261115-b-1ba758`) found this gap:
+    /// mutating `collect_dirty_details` to return an empty map broke only
+    /// `mv-state`'s own unit test, while every `mv-cli` `sweep::` test,
+    /// including the one above, kept passing. This one instead drives
+    /// `mv_state::tasks::sweep_project_with_tasks` — the same call
+    /// `commands::sweep::run_with`'s per-project loop makes — so a
+    /// regression in `collect_dirty_details` fails here too.
+    #[test]
+    fn sweep_project_reports_a_done_dirty_unrecorded_lane_through_collect_dirty_details() {
+        let dir = sandbox_project_root();
+        let root = dir.join("sandbox");
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-fixer-aaaaaa")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/tasks/20250101-fixer-aaaaaa/status"),
+            "done",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-fixer-aaaaaa\trole=fixer\taccount=old-seat\tbranch=multiverse/20250101-fixer-aaaaaa\n\
+             2020-01-01T00:05:00+00:00\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+        )
+        .unwrap();
+        let lane = root.join(".multiverse/worktrees/20250101-fixer-aaaaaa");
+        std::fs::create_dir_all(&lane).unwrap();
+        for args in [
+            ["init", "-q", "-b", "main"].as_slice(),
+            ["config", "user.email", "lane@example.invalid"].as_slice(),
+            ["config", "user.name", "Lane Test"].as_slice(),
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&lane)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(lane.join("uncommitted.txt"), "dirty\n").unwrap();
+
+        // Fake herdr reporting no live panes at all: the started pane is
+        // gone, the same "unrecorded" shape the card names.
+        let mut agents = FakeAgents { panes: Vec::new() };
+        let now = time::OffsetDateTime::from_unix_timestamp(1_609_459_200).unwrap(); // 2021-01-01
+        let (report, tasks) = mv_state::tasks::sweep_project_with_tasks(
+            &root,
+            true,
+            60,
+            &HashMap::new(),
+            now,
+            0,
+            &mut agents,
+        );
+        let notes = dirty_done_notes(&tasks, &report.dirty_details, now);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("needs a decision: 20250101-fixer-aaaaaa (done, "),
+            "{}",
+            notes[0]
+        );
+        assert!(notes[0].contains("uncommitted.txt"), "{}", notes[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2264,7 +2355,7 @@ mod tests {
                 cpu_percent: "99.5".into(),
             })
             .collect();
-        let notes = lane_process_notes(&root, &tasks, Some(&rows));
+        let notes = lane_process_notes(&root, &tasks, Some(&rows), None);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
             notes[0].starts_with(&format!(
@@ -2286,7 +2377,7 @@ mod tests {
         let mut mixed = rows.clone();
         mixed.push(sibling);
         assert_eq!(
-            closed_lane_processes(&root, &tasks, &mixed)
+            closed_lane_processes(&root, &tasks, &mixed, None)
                 .iter()
                 .map(|(id, p)| (id.as_str(), p.pid))
                 .collect::<Vec<_>>(),
@@ -2294,8 +2385,54 @@ mod tests {
         );
 
         assert_eq!(
-            lane_process_notes(&root, &tasks, None),
+            lane_process_notes(&root, &tasks, None, None),
             ["warning: process-cwd probe unknown"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recorded_lane_whose_pane_is_still_live_is_not_reported() {
+        // Tighten for card `20261115-b-9815fe`: a recorded-but-still-open
+        // reclaimable task (pane gone from Herdr's own cwd listing, but
+        // still in this pass's agent listing) must not read as "lane
+        // processes still running" — that line should mean the pane is
+        // gone and the process remains, not merely that the task is
+        // recorded done.
+        let dir = sandbox_project_root();
+        let root = dir.join("sandbox");
+        let task_id = "20250101-fixer-cccccc";
+        std::fs::create_dir_all(root.join(".multiverse/tasks").join(task_id)).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask={task_id}\trole=fixer\taccount=old-seat\tbranch=multiverse/{task_id}\n\
+                 2020-01-01T00:05:00+00:00\tevent=started\ttask={task_id}\tpane=w1:p1\n\
+                 2020-01-01T01:00:00+00:00\tevent=result\ttask={task_id}\tstatus=done\tstate=done\trevisions=0\n"
+            ),
+        )
+        .unwrap();
+        let lane = root.join(".multiverse/worktrees").join(task_id);
+        std::fs::create_dir_all(&lane).unwrap();
+        let tasks = mv_state::tasks::sweep_tasks(&root);
+        assert!(tasks.iter().any(|t| t.recorded), "{tasks:?}");
+        let rows = vec![LaneProcess {
+            pid: 4300,
+            cwd: lane.clone(),
+            command: "yes".into(),
+            cpu_percent: "99.5".into(),
+        }];
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: None,
+            status: None,
+        }];
+        assert!(lane_process_notes(&root, &tasks, Some(&rows), Some(&live)).is_empty());
+        // Once the pane is no longer in the live listing, the same
+        // process is reported again.
+        assert_eq!(
+            lane_process_notes(&root, &tasks, Some(&rows), Some(&[])).len(),
+            1
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2324,16 +2461,24 @@ mod tests {
             command: "yes".into(),
             cpu_percent: "99.5".into(),
         }];
-        assert!(lane_process_notes(&root, &tasks, Some(&rows)).is_empty());
+        assert!(lane_process_notes(&root, &tasks, Some(&rows), None).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Guards `MULTIVERSE_PMSET_BIN` behind the crate-wide process-env lock
     /// (`commands::worktrees::herdr_env`) so writers of this var serialize
-    /// with every other remaining env-mutating test in this binary.
+    /// with every other remaining env-mutating test in this binary. Also
+    /// folds in [`StateDirEnvOverride`] (card `20261114-b-f1badb`) rather
+    /// than having its own caller hold a second, independent
+    /// `StateDirEnvGuard`: that would try to lock the same non-reentrant
+    /// mutex twice on one thread and deadlock. `_state` is declared before
+    /// `_lock` so its three vars are restored before the lock is released
+    /// (struct fields drop in declaration order) — otherwise another
+    /// thread could grab the lock and read `MULTIVERSE_STATE_DIR` mid-restore.
     struct PmsetBinGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<String>,
+        _state: StateDirEnvOverride,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl PmsetBinGuard {
@@ -2341,9 +2486,11 @@ mod tests {
             let lock = crate::commands::worktrees::herdr_env::lock();
             let previous = std::env::var("MULTIVERSE_PMSET_BIN").ok();
             std::env::set_var("MULTIVERSE_PMSET_BIN", value);
+            let state = StateDirEnvOverride::new();
             Self {
-                _lock: lock,
                 previous,
+                _state: state,
+                _lock: lock,
             }
         }
     }
@@ -2373,11 +2520,8 @@ mod tests {
 
     #[test]
     fn card_fd9159_hostsleep_report_runs_once_host_wide_against_the_hub_project() {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-hostsleep-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let project_root = dir.join("sandbox");
         let hub_root = dir.join("hub");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -2417,17 +2561,12 @@ mod tests {
             mv_state::hostsleep_store::PMSET_STATE_FILENAME
         )
         .is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn card_fd9159_a_dry_run_never_persists_the_hostsleep_markers() {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-hostsleep-dry-run-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let hub_root = dir.join("hub");
         std::fs::create_dir_all(hub_root.join(".multiverse")).unwrap();
         let config_dir = dir.join("config");
@@ -2458,8 +2597,6 @@ mod tests {
             mv_state::hostsleep_store::PMSET_STATE_FILENAME
         )
         .is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2468,11 +2605,9 @@ mod tests {
         // (`awaiting_lease_minutes`) must actually reach
         // `mv_state::tasks::expire_awaiting`, not just live in `Config`
         // unused.
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-expire-awaiting-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _state = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
         std::fs::write(
@@ -2505,15 +2640,13 @@ mod tests {
             log.lines().last().unwrap().contains("status=failed"),
             "a 1-minute fleet lease must have already expired this long-stranded task"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_tick_under_halt_prints_a_skip_line_per_project() {
-        let dir =
-            std::env::temp_dir().join(format!("mv-cli-sweep-test-halt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _state = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(&project_root).unwrap();
         let config_path = write_sandbox_config(&dir.join("config"), &project_root);
@@ -2537,8 +2670,6 @@ mod tests {
             &mut NullHerdr,
         )
         .unwrap();
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2547,9 +2678,9 @@ mod tests {
         // both reconcile/reclaim the same pass. Holding the lock exactly
         // the way a concurrent sweep would, this run must touch nothing —
         // the stale task below would otherwise be reconciled.
-        let dir =
-            std::env::temp_dir().join(format!("mv-cli-sweep-test-locked-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _state = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(project_root.join(".multiverse/tasks/20250101-fixer-aaaaaa"))
             .unwrap();
@@ -2591,31 +2722,39 @@ mod tests {
             2,
             "a sweep that lost the lock must touch nothing"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- tick_outcome (finding 1, card 20261102-b-4f86db) ------------------
 
-    /// Card `20261103-b-08ec29`: a raw PID-plus-nanos name alone can collide
-    /// when two sweep tests run as threads of the same cargo-test binary and
-    /// land on the same tick, the same bug class fixed in
-    /// `commands::worktrees`'s own `unique_suffix()`
-    /// (card `20261102-b-9235c6`) — so this pairs the nanos with a
-    /// process-wide atomic counter the same way.
-    fn sandbox_project_root() -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-tick-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Card `20261115-b-87937d`: this is the one choke point roughly 50 of
+    /// this file's test temp-dirs share, so making it panic-safe covers all
+    /// of them at once. Wraps `tempfile::TempDir` (already this file's own
+    /// `StateDirEnvOverride` idiom) in an `Arc` so the many call sites below
+    /// that clone the returned root keep compiling unchanged: the directory
+    /// is removed on drop of the last clone, including on a panic mid-test,
+    /// which the plain `PathBuf` this replaced did not — it only cleaned up
+    /// at each test's own trailing `remove_dir_all`. `TempDir`'s own
+    /// randomized suffix also replaces the PID-plus-nanos-plus-counter
+    /// scheme card `20261103-b-08ec29` added for the same collision-proofing
+    /// purpose.
+    #[derive(Clone)]
+    struct SandboxDir(std::sync::Arc<tempfile::TempDir>);
+
+    impl std::ops::Deref for SandboxDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            self.0.path()
+        }
+    }
+
+    impl AsRef<std::path::Path> for SandboxDir {
+        fn as_ref(&self) -> &std::path::Path {
+            self.0.path()
+        }
+    }
+
+    fn sandbox_project_root() -> SandboxDir {
+        SandboxDir(std::sync::Arc::new(tempfile::tempdir().unwrap()))
     }
 
     #[test]
@@ -2658,7 +2797,7 @@ mod tests {
         let project = &config.projects["sandbox"];
 
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "idle",
             pane_text: "Ready >",
             landed_status: "working",
@@ -2688,7 +2827,7 @@ mod tests {
         let project = &config.projects["sandbox"];
 
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "idle",
             pane_text: "Ready >",
             landed_status: "idle",
@@ -2748,7 +2887,7 @@ mod tests {
             ("unknown", "skipped (unknown)"),
         ] {
             let mut fake = TickFake {
-                project_root: project_root.clone(),
+                project_root: project_root.to_path_buf(),
                 agent_status: status,
                 pane_text: "Ready >",
                 landed_status: "idle",
@@ -2779,7 +2918,7 @@ mod tests {
         let project = &config.projects["sandbox"];
 
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "idle",
             pane_text: "Do you trust the files in this folder?",
             landed_status: "idle",
@@ -2847,7 +2986,7 @@ mod tests {
         let start = time::macros::datetime!(2026-10-28 12:00:00 UTC);
         let key = "picker_blocked|sandbox|How should I close the download check?";
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "done",
             pane_text: PICKER_PANE_TEXT,
             landed_status: "idle",
@@ -2939,7 +3078,7 @@ mod tests {
             );
             for dry_run in [true, false] {
                 let mut fake = TickFake {
-                    project_root: project_root.clone(),
+                    project_root: project_root.to_path_buf(),
                     agent_status: "done",
                     pane_text: text,
                     landed_status: "working",
@@ -3002,7 +3141,7 @@ mod tests {
         );
         let before = mv_state::notify_episodes::load(&hub_root).0;
         let mut fake = FailedRead(TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "done",
             pane_text: PICKER_PANE_TEXT,
             landed_status: "idle",
@@ -3040,7 +3179,7 @@ mod tests {
 
         let start = time::macros::datetime!(2026-10-28 12:00:00 UTC);
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "blocked",
             pane_text: PICKER_PANE_TEXT,
             landed_status: "idle",
@@ -3096,7 +3235,7 @@ mod tests {
         let project = &config.projects["sandbox"];
 
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "blocked",
             pane_text: "Waiting on a slow build to finish...",
             landed_status: "idle",
@@ -3142,7 +3281,7 @@ mod tests {
         );
 
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "blocked",
             pane_text: "Nothing picker-shaped here.",
             landed_status: "idle",
@@ -3311,12 +3450,39 @@ mod tests {
         // test in this crate: the push closure never reaches a real
         // network, but `notify::send` still treats the attempt as
         // delivered ("queued"), the same as Python's own unreachable-push
-        // outcome.
+        // outcome. `NtfyUrlGuard` folds in `StateDirEnvOverride` and pins
+        // `MULTIVERSE_NTFY_URL` to a loopback port nothing listens on;
+        // `_topic_file` pins `MULTIVERSE_NTFY_TOPIC_FILE` to a path that
+        // cannot exist. Together they mean a topic leaked onto this
+        // process from outside this test's own config dir still cannot
+        // resolve to a real topic or reach a real network and quietly
+        // skip the outbox this test asserts on.
+        struct TopicFileGuard(Option<std::ffi::OsString>);
+        impl Drop for TopicFileGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("MULTIVERSE_NTFY_TOPIC_FILE", value),
+                    None => std::env::remove_var("MULTIVERSE_NTFY_TOPIC_FILE"),
+                }
+            }
+        }
+        let _ntfy_url = NtfyUrlGuard::set("http://127.0.0.1:1");
+        let _topic_file = TopicFileGuard(std::env::var_os("MULTIVERSE_NTFY_TOPIC_FILE"));
+        std::env::set_var(
+            "MULTIVERSE_NTFY_TOPIC_FILE",
+            "/nonexistent/mv-cli-test-ntfy-topic",
+        );
         let project_root = sandbox_project_root();
         let hub_root = sandbox_project_root();
         let config_path =
             write_sandbox_config_with_hub(&project_root.join("config"), &project_root, &hub_root);
         let config = load_sandbox(&config_path);
+        // Resolved once, up front, and reused below: a second, later
+        // resolution would be the same race this card closes in
+        // `StateDirEnvGuard` one layer up — the write and the read must
+        // agree on one value, not two calls that could in principle land
+        // on different env snapshots.
+        let state_dir = state_dir_from_config(&config.source_path);
 
         assert!(push_picker_ntfy(
             &config,
@@ -3324,7 +3490,6 @@ mod tests {
             "picker_blocked|sandbox|Q?",
             "the body"
         ));
-        let state_dir = state_dir_from_config(&config.source_path);
         let outbox = mv_state::notify::load_outbox(&state_dir.join("notify-outbox.jsonl")).unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].project, "sandbox");
@@ -3347,9 +3512,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&hub_root);
     }
 
+    /// Also folds in [`StateDirEnvOverride`] (card `20261114-b-f1badb`) —
+    /// see [`PmsetBinGuard`]'s own doc for why this cannot instead be a
+    /// second, independent `StateDirEnvGuard` held alongside it, and why
+    /// `_state` must stay declared before `_lock`.
     struct NtfyUrlGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<String>,
+        _state: StateDirEnvOverride,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl NtfyUrlGuard {
@@ -3357,9 +3527,11 @@ mod tests {
             let lock = crate::commands::worktrees::herdr_env::lock();
             let previous = std::env::var("MULTIVERSE_NTFY_URL").ok();
             std::env::set_var("MULTIVERSE_NTFY_URL", value);
+            let state = StateDirEnvOverride::new();
             Self {
-                _lock: lock,
                 previous,
+                _state: state,
+                _lock: lock,
             }
         }
     }
@@ -3502,7 +3674,7 @@ mod tests {
         let project = &config.projects["sandbox"];
 
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "working",
             pane_text: "You've used 91% of your weekly limit · resets Oct 19, 2026, 5:30 PM (IST)",
             landed_status: "working",
@@ -3536,6 +3708,7 @@ mod tests {
 
     #[test]
     fn a_tick_persists_the_interactive_seats_gauge_reading_but_only_without_dry_run() {
+        let _state = StateDirEnvGuard::new();
         let project_root = sandbox_project_root();
         std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
         std::fs::write(project_root.join(".multiverse/routing.log"), "").unwrap();
@@ -3547,7 +3720,7 @@ mod tests {
             panes: vec![("w1:p1".to_string(), "sandbox-nexu-al".to_string())],
         };
         let mut fake = TickFake {
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             agent_status: "idle",
             pane_text: "You've used 91% of your weekly limit · resets Oct 19, 2026, 5:30 PM (IST)",
             landed_status: "idle",
@@ -3880,6 +4053,7 @@ mod tests {
             body: "please rotate the staging creds before 9am".to_string(),
             ask: true,
             reply_to: None,
+            relayed_by: None,
         };
         let matched = vec![mv_state::activity::UnlinkedReply {
             answer: ask.clone(),
@@ -3928,11 +4102,9 @@ mod tests {
 
     #[test]
     fn a_sweep_pass_closes_a_backlog_item_linked_to_a_genuinely_done_landed_task() {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-auto-supersede-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _state = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let project_root = dir.join("sandbox");
         std::fs::create_dir_all(&project_root).unwrap();
         git(&project_root, &["init", "-q", "-b", "main"]);
@@ -4018,17 +4190,13 @@ mod tests {
             reread.state, "done",
             "the linked backlog item must close once its task's branch lands"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_sweep_pass_closes_an_open_ask_a_later_unlinked_reply_already_answered() {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-cli-sweep-test-unlinked-reply-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _state = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let holder_root = dir.join("holder");
         let asker_root = dir.join("asker");
         std::fs::create_dir_all(holder_root.join(".multiverse")).unwrap();
@@ -4085,8 +4253,6 @@ mod tests {
             mv_state::activity::is_closed(&holder_log, 1).unwrap(),
             "a reply that references the ask by `#1` must close it"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- mv_engine::sweep_nudges wiring (card 20261102-b-b4ede0) ------------
@@ -4156,6 +4322,7 @@ mod tests {
 
     #[test]
     fn a_lane_past_its_runtime_cap_gets_capped_through_run_with() {
+        let _state = StateDirEnvGuard::new();
         let project_root = sandbox_project_root();
         std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
         let dispatched = mv_core::time::now_utc() - time::Duration::minutes(90);
@@ -4203,6 +4370,7 @@ mod tests {
 
     #[test]
     fn dry_run_previews_the_runtime_cap_without_sending_or_claiming() {
+        let _state = StateDirEnvGuard::new();
         let project_root = sandbox_project_root();
         std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
         let dispatched = mv_core::time::now_utc() - time::Duration::minutes(90);
@@ -4247,15 +4415,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project_root);
     }
 
+    // --- composer-hold outcome printing (card 20261115-b-bfadda) -----------
+
+    #[test]
+    fn composer_hold_notes_print_a_submitted_and_an_unsubmitted_composer() {
+        let mut nudges = mv_engine::sweep_nudges::NudgeOutcome::default();
+        nudges.composer.push(mv_engine::sweep_nudges::ComposerHold {
+            task_id: "20250101-builder-aaaaaa".to_string(),
+            pane: "w1:p1".to_string(),
+            sent: true,
+        });
+        nudges
+            .unsubmitted_composer
+            .push("unsubmitted composer: 20250101-fixer-bbbbbb".to_string());
+
+        let notes = composer_hold_notes(&nudges, false, false);
+        assert_eq!(
+            notes,
+            [
+                "submitted composer: 20250101-builder-aaaaaa",
+                "unsubmitted composer: 20250101-fixer-bbbbbb",
+            ]
+        );
+        let line =
+            project_summary_line("sandbox", &mv_state::tasks::SweepReport::default(), &notes);
+        assert!(
+            line.contains("submitted composer: 20250101-builder-aaaaaa"),
+            "{line}"
+        );
+        assert!(
+            line.contains("unsubmitted composer: 20250101-fixer-bbbbbb"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn composer_hold_notes_dry_run_and_halt_print_the_would_form() {
+        let mut nudges = mv_engine::sweep_nudges::NudgeOutcome::default();
+        nudges.composer.push(mv_engine::sweep_nudges::ComposerHold {
+            task_id: "20250101-builder-aaaaaa".to_string(),
+            pane: "w1:p1".to_string(),
+            sent: false,
+        });
+
+        assert_eq!(
+            composer_hold_notes(&nudges, true, false),
+            ["would submit composer: 20250101-builder-aaaaaa"]
+        );
+        assert_eq!(
+            composer_hold_notes(&nudges, false, true),
+            ["would submit composer: 20250101-builder-aaaaaa"]
+        );
+        assert!(
+            composer_hold_notes(&nudges, false, false).is_empty(),
+            "an unsent hold is invisible outside dry-run/halt, matching finish/resume/cap"
+        );
+    }
+
     // --- codex-pool recovery probe wiring (leg 3 of this module's own
     // "not ported" list) ------------------------------------------------
 
     /// `cargo test` runs on multiple threads by default, and
     /// `MULTIVERSE_CODEX_BIN` is read from the real process environment —
-    /// same crate-wide lock as [`PmsetBinGuard`] above.
+    /// same crate-wide lock as [`PmsetBinGuard`] above, and the same
+    /// [`StateDirEnvOverride`] folded in for the same reason (card
+    /// `20261114-b-f1badb`).
     struct CodexBinGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<String>,
+        _state: StateDirEnvOverride,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl CodexBinGuard {
@@ -4263,9 +4491,11 @@ mod tests {
             let lock = crate::commands::worktrees::herdr_env::lock();
             let previous = std::env::var("MULTIVERSE_CODEX_BIN").ok();
             std::env::set_var("MULTIVERSE_CODEX_BIN", value);
+            let state = StateDirEnvOverride::new();
             Self {
-                _lock: lock,
                 previous,
+                _state: state,
+                _lock: lock,
             }
         }
     }
@@ -4334,6 +4564,7 @@ mod tests {
     #[test]
     fn the_public_wrapper_honors_the_codex_binary_env_override() {
         let project_root = sandbox_project_root();
+        let _codex_bin = CodexBinGuard::set(&write_fake_codex(&project_root.join("bin")));
         let codex_home = project_root.parent().unwrap().join(format!(
             "{}-codex-home",
             project_root.file_name().unwrap().to_string_lossy()
@@ -4363,7 +4594,6 @@ mod tests {
             },
         );
         mv_state::gauge::save(&state_dir, &gauges).unwrap();
-        let _codex_bin = CodexBinGuard::set(&write_fake_codex(&project_root.join("bin")));
         let config = load_sandbox(&config_path);
         let account = &config.accounts["codex-main"];
 
@@ -4390,6 +4620,7 @@ mod tests {
     #[test]
     fn a_tick_pass_probes_a_drained_codex_pool_once_and_refreshes_its_gauge() {
         let project_root = sandbox_project_root();
+        let _codex_bin = CodexBinGuard::set(&write_fake_codex(&project_root.join("bin")));
         std::fs::create_dir_all(&project_root).unwrap();
         let codex_home = project_root.parent().unwrap().join(format!(
             "{}-codex-home",
@@ -4420,7 +4651,6 @@ mod tests {
             },
         );
         mv_state::gauge::save(&state_dir, &gauges).unwrap();
-        let _codex_bin = CodexBinGuard::set(&write_fake_codex(&project_root.join("bin")));
 
         let mut agents = FakeAgents { panes: Vec::new() };
         run_with(
@@ -4458,6 +4688,7 @@ mod tests {
     #[test]
     fn a_dry_run_never_spends_a_codex_recovery_probe() {
         let project_root = sandbox_project_root();
+        let _codex_bin = CodexBinGuard::set(&write_fake_codex(&project_root.join("bin")));
         std::fs::create_dir_all(&project_root).unwrap();
         let codex_home = project_root.parent().unwrap().join(format!(
             "{}-codex-home",
@@ -4480,7 +4711,6 @@ mod tests {
             },
         );
         mv_state::gauge::save(&state_dir, &gauges).unwrap();
-        let _codex_bin = CodexBinGuard::set(&write_fake_codex(&project_root.join("bin")));
 
         let mut agents = FakeAgents { panes: Vec::new() };
         run_with(
@@ -4507,6 +4737,7 @@ mod tests {
 
     #[test]
     fn host_reporting_runs_every_pass_including_halt_and_never_per_project() {
+        let _state = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let state_dir = state_dir_from_config(&config_path);

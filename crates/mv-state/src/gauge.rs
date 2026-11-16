@@ -52,6 +52,9 @@ where
 /// One pool's most recently observed quota gauge.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GaugeEntry {
+    /// Which vendor this pool's quota belongs to (e.g. `"claude"`,
+    /// `"chatgpt"`), for display and for matching a pool back to its
+    /// vendor-specific probe logic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
     /// Percent of the primary window left (0-100), already range-checked by
@@ -61,26 +64,40 @@ pub struct GaugeEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub percent_left: Option<f64>,
+    /// Human-readable description of the primary window (e.g. a reset
+    /// cadence), as reported by the vendor probe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// When the primary window's quota is expected to reset, as reported
+    /// by the vendor probe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
+    /// When this gauge was last probed — the timestamp a reader uses to
+    /// decide whether the stored percentage is still fresh enough to
+    /// trust.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    /// Length of the primary window in minutes, as reported by the vendor
+    /// probe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_minutes: Option<u32>,
+    /// Percent left in the secondary (longer-period) quota window, if the
+    /// vendor reports one alongside the primary window.
     #[serde(
         rename = "secondary_percent_left",
         skip_serializing_if = "Option::is_none"
     )]
     pub percent_left_secondary: Option<f64>,
+    /// Human-readable description of the secondary window.
     #[serde(rename = "secondary_label", skip_serializing_if = "Option::is_none")]
     pub label_secondary: Option<String>,
+    /// When the secondary window's quota is expected to reset.
     #[serde(
         rename = "secondary_resets_at",
         skip_serializing_if = "Option::is_none"
     )]
     pub resets_at_secondary: Option<String>,
+    /// Length of the secondary window in minutes.
     #[serde(
         rename = "secondary_window_minutes",
         skip_serializing_if = "Option::is_none"
@@ -99,6 +116,7 @@ pub struct GaugeEntry {
 /// Gauge state keyed by pool name.
 pub type GaugeMap = BTreeMap<String, GaugeEntry>;
 
+/// Path to this project's gauge store, inside its config dir.
 pub fn store_path(config_dir: &Path) -> PathBuf {
     config_dir.join("gauge-state.json")
 }

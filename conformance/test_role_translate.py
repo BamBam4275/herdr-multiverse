@@ -8,6 +8,11 @@ from role_translate import translate_config_toml, translate_expect_text, transla
 
 
 class TranslateConfigTomlTests(unittest.TestCase):
+    """`translate_config_toml`'s narrow scope: only `[roles.*]` table
+    headers and `*.chains` entry keys are rewritten; account names and
+    other free text, including a look-alike outside a chains table, are
+    left alone."""
+
     def test_role_table_and_its_subtable_are_renamed(self):
         text = (
             "[roles.explorer]\nwrite_scope = \"none\"\n\n"
@@ -42,6 +47,10 @@ class TranslateConfigTomlTests(unittest.TestCase):
 
 
 class TranslateRoleArgvTests(unittest.TestCase):
+    """`translate_role_argv` rewrites `--role <old>` on every CLI surface
+    it appears on, leaves argv with no `--role` or an already-current
+    value unchanged."""
+
     def test_dispatch_role_value_is_translated(self):
         argv = ["dispatch", "--dry-run", "--role", "fixer", "/proj", "fix it"]
         self.assertEqual(
@@ -73,6 +82,11 @@ class TranslateRoleArgvTests(unittest.TestCase):
 
 
 class TranslateExpectTextTests(unittest.TestCase):
+    """`translate_expect_text`'s fixed anchor positions (card role line,
+    `role=` field, chain-exhausted refusal, fallback-policy sentence,
+    review-policy common nouns) translate, while a history reader's
+    verbatim old-name output is left untouched."""
+
     def test_card_role_line_is_translated(self):
         text = "  role        Explorer\n  column      Execute  (stage, not a role — spec §12)\n"
         self.assertEqual(
@@ -146,10 +160,16 @@ class TranslateExpectTextTests(unittest.TestCase):
 
 
 class TranslateProseRolesTests(unittest.TestCase):
+    """`translate_prose_roles`'s blanket old->new rewrite over live
+    prose: case preservation, box-footer width/centering, hyphenated
+    identifiers left alone, and the narrow static-noun exclusion that
+    still lets a genuine nearby role word convert."""
+
     def test_boxed_role_labels_keep_width_and_centering(self):
         from role_translate import ROLE_RENAME, translate_prose_roles
 
         def footer(role, width, short=""):
+            """A box-footer line with `role` centered in its dash rails."""
             label = f" {role} "
             tail = f" {short} " if short else ""
             rails = width - 2 - len(label) - len(tail)

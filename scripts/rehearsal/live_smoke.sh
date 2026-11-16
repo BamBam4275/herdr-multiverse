@@ -78,6 +78,9 @@ fail=0
 WORK=$(mktemp -d -t mv-live-smoke)
 PANES_TO_CLOSE=""
 
+# Runs on exit (trap below): closes every real Herdr pane this run opened
+# (dispatch_and_check appends to PANES_TO_CLOSE as it confirms each one),
+# then removes or keeps the sandbox per --keep.
 cleanup() {
     for pane in $PANES_TO_CLOSE; do
         note "cleanup: closing pane $pane"

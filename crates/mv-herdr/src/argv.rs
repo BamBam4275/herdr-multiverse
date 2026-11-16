@@ -314,10 +314,9 @@ pub fn pane_list(workspace: Option<&str>) -> HerdrCommand {
 
 /// Read one pane's current label and occupant metadata.
 pub fn pane_get(pane_id: &str) -> HerdrCommand {
-    json_command(
-        vec![herdr_binary(), "pane".into(), "get".into(), pane_id.into()],
-        format!("verify pane {pane_id}"),
-    )
+    let mut argv = vec![herdr_binary(), "pane".into(), "get".into()];
+    push_positionals(&mut argv, &[pane_id]);
+    json_command(argv, format!("verify pane {pane_id}"))
 }
 
 /// Set a pane label used to bind task-owned scratch panes.
@@ -544,10 +543,9 @@ pub fn agent_rename(target: &str, name: &str) -> HerdrCommand {
 
 /// Read one agent's state. The board is a cache; this is the truth.
 pub fn agent_get(name: &str) -> HerdrCommand {
-    json_command(
-        vec![herdr_binary(), "agent".into(), "get".into(), name.into()],
-        "reconcile board state against Herdr",
-    )
+    let mut argv = vec![herdr_binary(), "agent".into(), "get".into()];
+    push_positionals(&mut argv, &[name]);
+    json_command(argv, "reconcile board state against Herdr")
 }
 
 /// List live agents in one call, cheaper than reconciling every row
@@ -568,14 +566,30 @@ pub fn agent_list() -> HerdrCommand {
 /// only as a cheap first block, corroborated by `state_change_seq`
 /// advancing.
 pub fn agent_wait(name: &str, until: &[&str], timeout_ms: Option<u64>) -> HerdrCommand {
-    let mut argv = vec![herdr_binary(), "agent".into(), "wait".into(), name.into()];
-    for state in until {
-        argv.push("--until".into());
-        argv.push((*state).into());
-    }
-    if let Some(timeout_ms) = timeout_ms {
-        argv.push("--timeout".into());
-        argv.push(timeout_ms.to_string());
+    let mut argv = vec![herdr_binary(), "agent".into(), "wait".into()];
+    // Flags before `--` so a dash-leading name cannot be parsed as
+    // `--until`/`--timeout`/`--help` (same guard as `agent_prompt`).
+    if looks_like_flag(name) {
+        for state in until {
+            argv.push("--until".into());
+            argv.push((*state).into());
+        }
+        if let Some(timeout_ms) = timeout_ms {
+            argv.push("--timeout".into());
+            argv.push(timeout_ms.to_string());
+        }
+        argv.push("--".into());
+        argv.push(name.into());
+    } else {
+        argv.push(name.into());
+        for state in until {
+            argv.push("--until".into());
+            argv.push((*state).into());
+        }
+        if let Some(timeout_ms) = timeout_ms {
+            argv.push("--timeout".into());
+            argv.push(timeout_ms.to_string());
+        }
     }
     command(argv, "block until the agent settles (corroboration only)")
 }
@@ -623,17 +637,26 @@ pub fn pane_run(pane_id: &str, script: &str) -> HerdrCommand {
 /// Read ordinary terminal output from one explicitly named pane. Separate
 /// from [`agent_read`]: a scratch pane has no Herdr agent name.
 pub fn pane_read(pane_id: &str, source: Option<&str>, lines: Option<u32>) -> HerdrCommand {
-    let mut argv = vec![
-        herdr_binary(),
-        "pane".into(),
-        "read".into(),
-        pane_id.into(),
-        "--source".into(),
-        source.unwrap_or("recent-unwrapped").into(),
-    ];
-    if let Some(lines) = lines {
-        argv.push("--lines".into());
-        argv.push(lines.to_string());
+    let mut argv = vec![herdr_binary(), "pane".into(), "read".into()];
+    // Flags before `--` so a dash-leading pane id cannot be parsed as
+    // `--source`/`--lines`/`--help` (same guard as `agent_wait`).
+    if looks_like_flag(pane_id) {
+        argv.push("--source".into());
+        argv.push(source.unwrap_or("recent-unwrapped").into());
+        if let Some(lines) = lines {
+            argv.push("--lines".into());
+            argv.push(lines.to_string());
+        }
+        argv.push("--".into());
+        argv.push(pane_id.into());
+    } else {
+        argv.push(pane_id.into());
+        argv.push("--source".into());
+        argv.push(source.unwrap_or("recent-unwrapped").into());
+        if let Some(lines) = lines {
+            argv.push("--lines".into());
+            argv.push(lines.to_string());
+        }
     }
     command(argv, format!("read the scratch pane {pane_id}"))
 }
@@ -857,12 +880,40 @@ mod tests {
     }
 
     #[test]
+    fn pane_read_guards_a_flag_looking_pane_id_with_a_double_dash() {
+        let _guard = HerdrBinPathGuard::unset();
+        assert_eq!(
+            pane_read("--help", None, Some(200)).argv,
+            [
+                "herdr",
+                "pane",
+                "read",
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "200",
+                "--",
+                "--help",
+            ]
+        );
+    }
+
+    #[test]
     fn pane_get_and_rename_target_the_pane_directly() {
         let _guard = HerdrBinPathGuard::unset();
         assert_eq!(pane_get("w1:p2").argv, ["herdr", "pane", "get", "w1:p2"]);
         assert_eq!(
             pane_rename("w1:p2", "scratch-task").argv,
             ["herdr", "pane", "rename", "w1:p2", "scratch-task"]
+        );
+    }
+
+    #[test]
+    fn pane_get_guards_a_flag_looking_pane_id_with_a_double_dash() {
+        let _guard = HerdrBinPathGuard::unset();
+        assert_eq!(
+            pane_get("--help").argv,
+            ["herdr", "pane", "get", "--", "--help"]
         );
     }
 
@@ -995,6 +1046,15 @@ mod tests {
     }
 
     #[test]
+    fn agent_get_guards_a_flag_looking_name_with_a_double_dash() {
+        let _guard = HerdrBinPathGuard::unset();
+        assert_eq!(
+            agent_get("--help").argv,
+            ["herdr", "agent", "get", "--", "--help"]
+        );
+    }
+
+    #[test]
     fn agent_list_exists_as_a_cheaper_reconcile() {
         let _guard = HerdrBinPathGuard::unset();
         assert_eq!(agent_list().argv, ["herdr", "agent", "list"]);
@@ -1027,6 +1087,25 @@ mod tests {
         assert_eq!(
             agent_wait("explorer", &[], None).argv,
             ["herdr", "agent", "wait", "explorer"]
+        );
+    }
+
+    #[test]
+    fn agent_wait_guards_a_flag_looking_name_with_a_double_dash() {
+        let _guard = HerdrBinPathGuard::unset();
+        assert_eq!(
+            agent_wait("--help", &["idle"], Some(1000)).argv,
+            [
+                "herdr",
+                "agent",
+                "wait",
+                "--until",
+                "idle",
+                "--timeout",
+                "1000",
+                "--",
+                "--help"
+            ]
         );
     }
 

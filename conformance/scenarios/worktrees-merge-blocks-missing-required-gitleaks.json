@@ -1,0 +1,47 @@
+{
+  "id": "worktrees-merge-blocks-missing-required-gitleaks",
+  "description": "`worktrees --merge` refuses (needs-config exit code) when [secrets_scan] required = true (the default) and gitleaks cannot be found or run, naming an install hint — never a silent skip (card 20261114-b-069836).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n"
+      },
+      "worktrees": [
+        "20260101-builder-aaaaaa"
+      ]
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[secrets_scan]\ngitleaks = \"/nonexistent/mv-conformance-no-such-gitleaks\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--merge",
+        "20260101-builder-aaaaaa"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stderr_contains": [
+          "was not found or could not be run",
+          "install it",
+          "required = false"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

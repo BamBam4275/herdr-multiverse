@@ -198,6 +198,54 @@ pane is caught by the same generic blocked/dialog detection
 patterns) as a trust dialog, so expect to dismiss it by hand once per
 seat the same way.
 
+### Fleet down / up
+
+`multiverse down [projects...]` and `multiverse up [projects...]` pause and
+resume the whole fleet (or named projects; both default to every configured
+project, including the hub) in one command, rather than stopping each
+project by hand and reseeding it later:
+
+- `down` sets the fleet halt with reason `fleet down: <reason>` (refusing
+  new dispatch the same way `halt on` always does), asks each open
+  project's live Nexus to wrap by delivering a fixed prompt into its pane,
+  waits for `.multiverse/passdown.state` to read `wrapped` behind a
+  non-empty `.multiverse/PASSDOWN.md`, then closes that project's
+  workspace — only once every live agent in it, not only the Nexus, is
+  idle or done. A project with no open Nexus is skipped with a warning,
+  never started just to wrap it.
+- `up` starts every targeted project the same way `start` does (so a
+  pending PASSDOWN resumes through the ordinary seed/`--reseed` path),
+  waits on whichever of those projects were pending or wrapped before the
+  call until each sidecar reads `up`, then clears the fleet halt — only
+  when its reason still carries the exact `fleet down: ` prefix `down`
+  wrote, never a `maintenance` halt or any other operator-set reason.
+
+Both take `--timeout SECONDS` (default `1800`; `0` means wait forever)
+bounding how long they wait on a project's Nexus, and `--dry-run` to
+preview the plan without halting, prompting, or closing anything. Exit
+code `0` means every selected project reached its terminal state; `1`
+means a timeout, an unreachable Nexus, a kept (still-busy) workspace, or a
+rejected `--timeout` value (not a finite, non-negative number of seconds);
+`2` is a command-line parse error (clap's own argument parsing, not this
+command's own validation); `3` is a configuration problem (missing config,
+or an unknown project name).
+
+`.multiverse/passdown.state` is a one-line per-project sidecar, never
+parsed by the CLI beyond its exact text: `pending` (`down` asked this
+Nexus to wrap), `wrapped` (the Nexus wrote `.multiverse/PASSDOWN.md` and
+stopped its stack, or confirmed there is none), and `up` (the Nexus ran
+BRING-UP on the way back). `.multiverse/PASSDOWN.md` itself holds six
+prompt-enforced sections — `## STATE`, `## IN FLIGHT`, `## DECISIONS`,
+`## NEXT UP`, `## BRING-UP`, and `## GOTCHAS` — written and read by the
+Nexus, never by the CLI, which only checks that the file exists and is
+non-empty before accepting `wrapped`.
+
+The CLI never touches docker/compose, never commits or merges, and never
+force-closes a pane; the Nexus does the project-specific work — writing
+`PASSDOWN.md`, stopping its own remote stack with `compose down` (never
+`-v`) after a verified backup on the way down, and running `BRING-UP`'s
+checks on the way back up.
+
 Disable new plugin invocations before removal:
 
 ```sh

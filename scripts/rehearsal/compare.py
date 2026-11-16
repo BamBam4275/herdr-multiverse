@@ -55,6 +55,11 @@ def normalize(text: str, roots: list[tuple[str, str]]) -> str:
 
 @dataclass
 class Entry:
+    """One manifest row: a single command's captured Python-side and
+    Rust-side output, paired for comparison. Unused by this script directly
+    (rows are read as raw dicts in `main`); kept as documentation of the
+    manifest's shape that `read_parity.sh` writes."""
+
     label: str
     argv: str
     py_out: str
@@ -66,6 +71,8 @@ class Entry:
 
 
 def read_text(path: str) -> str:
+    """Return a captured output file's contents, or a placeholder string if
+    the file doesn't exist (the capture was never written)."""
     try:
         with open(path, "r", errors="replace") as f:
             return f.read()
@@ -74,6 +81,11 @@ def read_text(path: str) -> str:
 
 
 def main() -> int:
+    """Read the manifest written by read_parity.sh, normalize and compare
+    each recorded Python/Rust command pair, print a PASS/DIFF line per pair
+    followed by unified diffs for the DIFFs, and return 2 on a usage error
+    or 0 otherwise -- a DIFF is reported in the table, not via a nonzero
+    exit; the caller decides what a DIFF means."""
     if len(sys.argv) != 2:
         print("usage: compare.py <manifest.jsonl>", file=sys.stderr)
         return 2
@@ -84,6 +96,9 @@ def main() -> int:
     import os
 
     def roots_for(prefix: str) -> list[tuple[str, str]]:
+        """Parse one side's newline-separated `literal=placeholder` env var
+        into (literal, placeholder) pairs, longest literal first, for
+        `normalize`."""
         pairs = []
         raw = os.environ.get(prefix, "")
         for chunk in raw.split("\n"):

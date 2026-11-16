@@ -132,6 +132,9 @@ where
     let mut last_fingerprint = Some(fingerprint);
     let mut next_refresh = now() + tick;
     loop {
+        // Never wait more than 1s for an event even when `tick` is much
+        // longer, so q/Esc/Ctrl-C and a resize stay responsive instead of
+        // being stuck behind a long refresh interval.
         let timeout = Duration::from_secs(1).min(next_refresh.saturating_duration_since(now()));
         if let Some(ev) = read_event(timeout)? {
             match classify_event(&ev) {

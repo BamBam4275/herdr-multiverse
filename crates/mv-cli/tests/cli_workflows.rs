@@ -41,6 +41,85 @@ fn dispatch_requires_yes_before_any_side_effect() {
     assert_eq!(sandbox.snapshot(), before);
 }
 
+/// Card `20261115-b-c8bcb5`: dispatch must not hold the project's
+/// `routing.log.lock` across a Herdr call. `mv_engine::runner::start_dispatch`
+/// scopes that lock to `prepare`/`validate`/`write_brief` only — pure
+/// filesystem work — and drops it before the first Herdr round trip pane
+/// placement makes (`pane layout`). A fake Herdr that pauses on exactly that
+/// call, for long enough that no amount of host load could make a single
+/// process spawn run that long, lets a concurrent `activity send` into the
+/// same project (which takes the identical lock file under
+/// `mv_state::activity`'s own "activity" name) prove the lock is already
+/// free: the proof is an ordering observation against the layout call's own
+/// start/end marker files, not a wall-clock bound, so it cannot flake under
+/// load. Before this scoping existed, the send would block until dispatch's
+/// pane layout call — and so the whole lock-holding span — had finished,
+/// meaning `layout_finished` would already exist by the time `send` returned.
+#[test]
+fn dispatch_releases_the_project_lock_before_pane_creation() {
+    let sandbox = Sandbox::new();
+    let sleep_secs = 30;
+    let dispatch =
+        sandbox.dispatch_background_with_slow_pane_layout("Map the repository", sleep_secs);
+
+    // Let prepare/validate/write_brief — the only span that should ever
+    // hold the project lock — finish before racing the slow pane layout
+    // call this test is actually about.
+    let tasks_dir = sandbox.project.join(".multiverse/tasks");
+    let brief_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if tasks_dir
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < brief_deadline,
+            "dispatch never wrote its task directory"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Wait for the pane layout call itself to begin pausing, so the absence
+    // of `layout_finished` checked below reflects "still in progress," not
+    // "hasn't started yet."
+    let layout_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if dispatch.layout_started.exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < layout_deadline,
+            "dispatch never reached the slow pane layout call"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let send = sandbox.cli_in(
+        &sandbox.recipient,
+        &[
+            "activity",
+            "send",
+            "sandbox",
+            "concurrent while dispatch is slow",
+        ],
+    );
+    assert_code(&send, 0);
+    assert!(
+        !dispatch.layout_finished.exists(),
+        "activity send only completed after dispatch's pane layout call finished \
+         pausing ({sleep_secs}s) — dispatch must have still been holding \
+         routing.log.lock across that Herdr call"
+    );
+
+    let output = dispatch
+        .child
+        .wait_with_output()
+        .expect("dispatch must exit");
+    assert_code(&output, 0);
+}
+
 #[test]
 fn retired_role_inputs_exit_three_and_hint_at_current_names() {
     let sandbox = Sandbox::new();
@@ -534,6 +613,66 @@ fn tasks_reads_completed_legacy_role_history_without_rewriting_it() {
     assert_eq!(sandbox.snapshot(), before);
 }
 
+/// Card `20261106-b-2c3d2f` Decision 1: `tasks --close-stranded --yes` must
+/// never record `failed` for a still-live agent that simply has no status
+/// file yet. `pane run` with a bare launch command (no `cd` prefix) is
+/// real Herdr's own auto-classify route (`fake-herdr`'s
+/// `classify_command_route`, card `20261103-b-7febbe`): the pane is live
+/// and `agent list` already reports it `idle`, but it carries no name at
+/// all until a later `agent rename` supplies one — the live-but-unnamed
+/// gap this decision exists to close, distinct from a *confirmed
+/// different* name (card `20261108-b-152b33`, which must still read as
+/// gone).
+#[test]
+fn close_stranded_leaves_a_live_idle_task_with_no_status_file_unrecorded() {
+    let sandbox = Sandbox::new();
+
+    let split = sandbox.herdr(&[
+        "pane",
+        "split",
+        "--pane",
+        "w52:p1",
+        "--direction",
+        "right",
+        "--cwd",
+        sandbox.project.to_str().unwrap(),
+        "--no-focus",
+    ]);
+    let split_reply: serde_json::Value = serde_json::from_slice(&split.stdout).unwrap();
+    let pane_id = split_reply["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sandbox.herdr(&["pane", "run", &pane_id, "claude --model test-model"]);
+
+    let task_id = "20261116-scout-aaaaaa";
+    fs::create_dir_all(sandbox.project.join(".multiverse/tasks").join(task_id)).unwrap();
+    fs::write(
+        sandbox.project.join(".multiverse/routing.log"),
+        format!(
+            "2026-11-16T00:00:00+00:00\tevent=dispatch\ttask={task_id}\t\
+             branch=\trole=scout\taccount=test-seat\tagent=agent-a\n\
+             2026-11-16T00:00:01+00:00\tevent=started\ttask={task_id}\tpane={pane_id}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox.cli(&["tasks", "--close-stranded", "--yes"]);
+    assert_code(&output, 0);
+    let plain = stdout(&output);
+    assert!(
+        plain.contains("refusing to close") && plain.contains(task_id),
+        "a STALLED row must be refused by name, exactly as a RUNNING row is: {plain}"
+    );
+
+    let log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        !log.contains("event=result"),
+        "a still-live agent with no status file must never be recorded as an \
+         outcome: {log}"
+    );
+}
+
 #[test]
 fn result_reads_completed_legacy_role_artifact_without_rewriting_it() {
     let sandbox = Sandbox::new();
@@ -675,6 +814,73 @@ fn activity_send_question_prints_the_ask_hint() {
     assert!(body.contains("--ask"), "{body}");
 }
 
+/// Card `20261115-b-8d103d`: the sender's own inbox sitting on unacked mail
+/// must never block an outgoing `send` — delivery and the existing
+/// `print_unacked_mail_hint` nudge both still happen, and the command still
+/// exits 0, mirroring the question-heuristic case above rather than
+/// introducing a refusal.
+#[test]
+fn activity_send_delivers_despite_the_sender_s_own_unacked_mail() {
+    let sandbox = Sandbox::new();
+    assert_code(
+        &sandbox.cli_in(
+            &sandbox.recipient,
+            &["activity", "send", "sandbox", "heads up"],
+        ),
+        0,
+    );
+    let output = sandbox.cli(&["activity", "send", "recipient", "Ready for review"]);
+    assert_code(&output, 0);
+    let body = stdout(&output);
+    assert!(body.contains("sent to recipient."), "{body}");
+    assert!(body.contains("inbox still has unacked mail"), "{body}");
+    let log = fs::read_to_string(sandbox.recipient.join(".multiverse/routing.log")).unwrap();
+    assert!(log.contains("Ready for review"), "{log}");
+}
+
+/// Card `20261115-b-51cb75`: `send --ask` must still land the post when the
+/// notify hook (`curl`) cannot be found on `PATH` — a warning names what
+/// failed, the post is unaffected, and the command still exits 0.
+#[test]
+fn activity_send_ask_delivers_and_warns_when_the_notify_hook_binary_is_missing() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.root.join("config/ntfy-topic"), "ask-alerts\n").unwrap();
+    let output = sandbox.cli_without_curl(&[
+        "activity",
+        "send",
+        "recipient",
+        "is anyone around to help?",
+        "--ask",
+    ]);
+    assert_code(&output, 0);
+    let body = stdout(&output);
+    assert!(body.contains("sent to recipient."), "{body}");
+    assert!(body.to_lowercase().contains("notify hook"), "{body}");
+    assert!(body.to_lowercase().contains("curl"), "{body}");
+    let log = fs::read_to_string(sandbox.recipient.join(".multiverse/routing.log")).unwrap();
+    assert!(log.contains("is anyone around to help?"), "{log}");
+    assert!(log.contains("ask=1"), "{log}");
+}
+
+/// Companion to the missing-hook case above: with no ntfy topic configured
+/// at all (this sandbox's default), `send --ask` must stay exactly as quiet
+/// as a plain send — no notify attempt, no warning.
+#[test]
+fn activity_send_ask_prints_no_notify_warning_without_a_configured_topic() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.cli(&[
+        "activity",
+        "send",
+        "recipient",
+        "can you take a look?",
+        "--ask",
+    ]);
+    assert_code(&output, 0);
+    let body = stdout(&output);
+    assert!(body.contains("sent to recipient."), "{body}");
+    assert!(!body.to_lowercase().contains("notify"), "{body}");
+}
+
 #[test]
 fn activity_send_auto_routes_through_reply_when_it_answers_one_open_ask() {
     let sandbox = Sandbox::new();
@@ -708,6 +914,44 @@ fn activity_send_auto_routes_through_reply_when_it_answers_one_open_ask() {
     assert!(holder.contains("event=close"), "{holder}");
 }
 
+/// Reproduces card `20261110-b-657008`: a plain `activity send` while the
+/// recipient has more than one open ask on record must refuse — never
+/// silently send nothing while reporting success. It must exit non-zero,
+/// write no `event=message` into the recipient's log, and name
+/// `multiverse activity reply <seq>` so the caller can act on the
+/// refusal without re-deriving the command.
+#[test]
+fn activity_send_refuses_rather_than_guess_among_several_open_asks() {
+    let sandbox = Sandbox::new();
+    for (id, seq_body) in [("ask-1", "an ask from days ago"), ("ask-2", "a newer ask")] {
+        assert_code(
+            &sandbox.cli_in(
+                &sandbox.recipient,
+                &["activity", "send", "sandbox", seq_body, "--ask", "--id", id],
+            ),
+            0,
+        );
+    }
+    let output = sandbox.cli(&["activity", "send", "recipient", "a plain status update"]);
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(code, 0, "must not exit 0 having sent nothing: {output:?}");
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("multiverse activity reply"),
+        "refusal must name `multiverse activity reply <seq>`: {diagnostic}"
+    );
+    assert!(diagnostic.contains("#1"), "{diagnostic}");
+    assert!(diagnostic.contains("#2"), "{diagnostic}");
+    let log_path = sandbox.recipient.join(".multiverse/routing.log");
+    if log_path.exists() {
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !log.contains("event=message"),
+            "a refused send must record no message event: {log}"
+        );
+    }
+}
+
 #[test]
 fn activity_update_refuses_an_unknown_card() {
     let sandbox = Sandbox::new();
@@ -716,6 +960,543 @@ fn activity_update_refuses_an_unknown_card() {
     let diagnostic = stderr(&output);
     assert!(diagnostic.contains("no dispatched card"), "{diagnostic}");
     assert!(!sandbox.project.join(".multiverse/routing.log").exists());
+}
+
+#[test]
+fn activity_reply_resolves_a_bare_seq_against_the_holders_own_log() {
+    let sandbox = Sandbox::new();
+    assert_code(
+        &sandbox.cli_in(
+            &sandbox.recipient,
+            &[
+                "activity",
+                "send",
+                "sandbox",
+                "which seat are you on?",
+                "--ask",
+                "--id",
+                "ask-1",
+            ],
+        ),
+        0,
+    );
+    let output = sandbox.cli(&["activity", "reply", "1", "seat-a"]);
+    assert_code(&output, 0);
+    assert!(stdout(&output).contains("replied to recipient as seq"));
+    let holder = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(holder.contains("event=close"), "{holder}");
+    let asker = fs::read_to_string(sandbox.recipient.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        asker.contains("seat-a") && asker.contains("from=sandbox"),
+        "{asker}"
+    );
+}
+
+/// Adds a `[projects.multiverse]` entry — `mv_state::activity::
+/// HUB_PROJECT_NAME` — to this sandbox's own config, widening
+/// `[activity.pairs]` both ways against `sandbox`, so a test can exercise
+/// an ask the hub itself sent (card `20261115-b-91722d`). Appends rather
+/// than rebuilding the config from scratch, the same pattern
+/// `legacy_name_guard.rs`'s own `enable_interactive_nexus_and_hub` uses —
+/// not shared directly, since that helper lives in a sibling test binary
+/// this crate does not expose as a library. `[activity.pairs]` is already
+/// the last table `Sandbox::new`'s own config defines, so the appended
+/// `multiverse = [...]` line lands inside it rather than redefining it.
+fn enable_hub_project(sandbox: &Sandbox) -> PathBuf {
+    let hub = sandbox.root.join("multiverse");
+    fs::create_dir_all(&hub).unwrap();
+    let config_path = sandbox.root.join("config/config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config = config.replace(
+        "sandbox = [\"recipient\"]",
+        "sandbox = [\"recipient\", \"multiverse\"]",
+    );
+    config.push_str(&format!(
+        "multiverse = [\"sandbox\", \"recipient\"]\n\n[projects.multiverse]\npath = '{hub}'\n",
+        hub = hub.display(),
+    ));
+    fs::write(&config_path, &config).unwrap();
+    fs::copy(
+        &config_path,
+        sandbox.root.join("home/.config/multiverse/config.toml"),
+    )
+    .unwrap();
+    hub
+}
+
+/// Card `20261115-b-91722d`'s exact failing repro: the hub asks a project a
+/// question, and answering it with a bare `SEQ` from the hub's own
+/// directory fails — the hub's own log holds asks addressed *to* it, never
+/// one it sent, so `reply`'s unqualified form has nothing to resolve
+/// against. Before this fix that was a flat "not found"; now it names the
+/// project to requalify against, and the qualified retry succeeds and lands
+/// the answer where the asker (the hub) actually reads it.
+#[test]
+fn activity_reply_resolves_a_hub_sent_ask_via_project_hash_seq() {
+    let sandbox = Sandbox::new();
+    let hub = enable_hub_project(&sandbox);
+    assert_code(
+        &sandbox.cli_in(
+            &hub,
+            &[
+                "activity",
+                "send",
+                "sandbox",
+                "which seat are you on?",
+                "--ask",
+                "--id",
+                "ask-1",
+            ],
+        ),
+        0,
+    );
+
+    let bare = sandbox.cli_in(&hub, &["activity", "reply", "1", "seat-a"]);
+    assert_code(&bare, 3);
+    let diagnostic = stderr(&bare);
+    assert!(
+        diagnostic.contains("sandbox#1"),
+        "refusal must suggest the holder's qualifier: {diagnostic}"
+    );
+    assert!(!hub.join(".multiverse/routing.log").exists());
+
+    let qualified = sandbox.cli_in(&hub, &["activity", "reply", "sandbox#1", "seat-a"]);
+    assert_code(&qualified, 0);
+    assert!(
+        stdout(&qualified).contains("replied to multiverse as seq 1, relayed on behalf of sandbox"),
+        "the hub composed this reply itself, on sandbox's behalf — its own \
+         stdout must say so: {:?}",
+        stdout(&qualified)
+    );
+    let hub_log = fs::read_to_string(hub.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        hub_log.contains("from=sandbox") && hub_log.contains("seat-a"),
+        "the reply must land where the asker (the hub) reads it: {hub_log}"
+    );
+    assert!(
+        hub_log.contains("relayed_by=multiverse"),
+        "the hub, not sandbox, actually wrote this reply's words — the stored \
+         line must say so (card `20261116-b-57998b` finding 2): {hub_log}"
+    );
+    let holder_log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(holder_log.contains("event=close"), "{holder_log}");
+
+    // The relay marker must show up wherever this message is printed, not
+    // just on disk: `inbox`/`show` both read it back through the hub's own
+    // log, which is where the reply actually landed.
+    let shown = sandbox.cli_in(&hub, &["activity", "show", "1"]);
+    assert_code(&shown, 0);
+    assert!(
+        stdout(&shown).contains("relayed by: multiverse"),
+        "{:?}",
+        stdout(&shown)
+    );
+    let inbox = sandbox.cli_in(&hub, &["activity", "inbox", "--peek"]);
+    assert_code(&inbox, 0);
+    assert!(
+        stdout(&inbox).contains("sandbox (relayed by multiverse):"),
+        "{:?}",
+        stdout(&inbox)
+    );
+}
+
+/// Card `20261116-b-40aecf`: naming yourself as an ask's own sender in a
+/// `Holder#SEQ` qualifier is authorization to *act* on that ask, not a
+/// bypass of `[activity.pairs]` deny-by-default messaging — relaying a
+/// reply into the holder's log is itself a send from the caller to that
+/// holder, and the same reverse-direction pair `close_ref` already
+/// re-checks before acting on a remote ask must hold here too.
+///
+/// Deliberately avoids `enable_hub_project`: `mv-config`'s own
+/// `merge_hub_activity_pairs` (card `20261108-b-81cb2b`) grants the hub
+/// project implicit, unrevokable bidirectional `[activity.pairs]` with
+/// every other project, so a hub-as-asker fixture could never exercise
+/// this refusal. `sandbox`/`recipient` carry no such implicit grant, so
+/// revoking one explicit direction between them actually takes effect.
+/// The pair is revoked *after* the ask is sent (so sending it still
+/// exercised the old permission) and *before* the reply — the same
+/// ordering that lets `close_ref`'s own re-check ever matter, since a pair
+/// unchanged since the ask was sent would pass either way.
+#[test]
+fn activity_reply_refuses_a_relay_the_askers_own_pair_does_not_permit() {
+    let sandbox = Sandbox::new();
+    assert_code(
+        &sandbox.cli_in(
+            &sandbox.recipient,
+            &[
+                "activity",
+                "send",
+                "sandbox",
+                "which seat are you on?",
+                "--ask",
+                "--id",
+                "ask-1",
+            ],
+        ),
+        0,
+    );
+
+    // Revoke `recipient -> sandbox` now that the ask is already sent;
+    // `sandbox -> recipient` (the direction `reply`'s own
+    // `may_send_reverse` write needs) stays granted, so only the new
+    // relay re-check is what's missing.
+    let config_path = sandbox.root.join("config/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let config = config.replace("recipient = [\"sandbox\"]", "recipient = []");
+    fs::write(&config_path, &config).unwrap();
+
+    let qualified = sandbox.cli_in(
+        &sandbox.recipient,
+        &["activity", "reply", "sandbox#1", "seat-a"],
+    );
+    let code = qualified.status.code().unwrap_or(-1);
+    assert_ne!(
+        code, 0,
+        "recipient -> sandbox is not permitted; the relay must be refused: {qualified:?}"
+    );
+    let diagnostic = stderr(&qualified);
+    assert!(
+        diagnostic.contains("recipient") && diagnostic.contains("sandbox"),
+        "{diagnostic}"
+    );
+    assert!(
+        !sandbox.recipient.join(".multiverse/routing.log").exists(),
+        "a refused relay must write nothing into the asker's own log"
+    );
+    let holder_log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        !holder_log.contains("event=close"),
+        "the real holder's ask must remain open: {holder_log}"
+    );
+}
+
+/// A project that is neither the ask's holder nor its original sender may
+/// not act on `holder#seq` just by naming it — the same authorization
+/// [`close`]'s own qualifier already enforces.
+#[test]
+fn activity_reply_refuses_project_hash_seq_for_an_uninvolved_caller() {
+    let sandbox = Sandbox::new();
+    let hub = enable_hub_project(&sandbox);
+    assert_code(
+        &sandbox.cli_in(
+            &hub,
+            &[
+                "activity",
+                "send",
+                "sandbox",
+                "which seat are you on?",
+                "--ask",
+                "--id",
+                "ask-1",
+            ],
+        ),
+        0,
+    );
+    let output = sandbox.cli_in(
+        &sandbox.recipient,
+        &["activity", "reply", "sandbox#1", "seat-a"],
+    );
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(
+        code, 0,
+        "an uninvolved project must not reply on another's behalf: {output:?}"
+    );
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("cannot act on sandbox#1"),
+        "{diagnostic}"
+    );
+}
+
+/// Card `20261116-builder-9a50a2`'s exact failing repro, from the other
+/// side of `20261115-b-91722d`'s own fixture: the hub asks `sandbox` a
+/// question, and *`sandbox` itself* — the ask's actual recipient, not the
+/// hub — answers it from its own directory, qualifying with the ask's own
+/// sender (`multiverse#1`) rather than the bare `1` that already worked.
+/// Before this fix, the qualified branch always opened the *named*
+/// project's own log to look for the ask, so `multiverse#1` opened the
+/// hub's log — which never holds an ask addressed to someone else — and
+/// missed with the raw "no ask #1 found in this project's own routing log"
+/// text, never `sandbox`'s own log where the ask actually lives.
+#[test]
+fn activity_reply_resolves_a_recipients_bare_or_sender_qualified_seq() {
+    for raw_seq in ["1", "multiverse#1"] {
+        let sandbox = Sandbox::new();
+        let hub = enable_hub_project(&sandbox);
+        assert_code(
+            &sandbox.cli_in(
+                &hub,
+                &[
+                    "activity",
+                    "send",
+                    "sandbox",
+                    "which seat are you on?",
+                    "--ask",
+                    "--id",
+                    "ask-1",
+                ],
+            ),
+            0,
+        );
+
+        // From `sandbox`'s own directory — its actual recipient, not the hub.
+        let reply = sandbox.cli(&["activity", "reply", raw_seq, "seat-a"]);
+        assert_code(&reply, 0);
+        assert!(
+            stdout(&reply).contains("replied to multiverse as seq"),
+            "{:?}",
+            stdout(&reply)
+        );
+
+        // The answer lands where the asker (the hub) reads it...
+        let hub_log = fs::read_to_string(hub.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            hub_log.contains("from=sandbox") && hub_log.contains("seat-a"),
+            "reply {raw_seq:?}: {hub_log}"
+        );
+        assert!(
+            hub_log.contains("re=1"),
+            "reply {raw_seq:?} must carry re=1: {hub_log}"
+        );
+        // ...and the ask is closed in the holder's (sandbox's) own log.
+        let holder_log =
+            fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+        assert!(holder_log.contains("event=close"), "{holder_log}");
+    }
+}
+
+/// `20261116-builder-9a50a2`'s negative case: a project that is neither the
+/// ask's recipient nor its sender must not be able to claim it just by
+/// naming the sender in the qualifier either — `recipient` was never
+/// addressed by the hub's ask to `sandbox`, so `reply multiverse#1` from
+/// `recipient`'s own directory must refuse and write nothing anywhere: not
+/// into its own log, not into the hub's, and the ask held by `sandbox`
+/// must remain open.
+#[test]
+fn activity_reply_refuses_sender_hash_seq_for_a_project_the_ask_never_reached() {
+    let sandbox = Sandbox::new();
+    let hub = enable_hub_project(&sandbox);
+    assert_code(
+        &sandbox.cli_in(
+            &hub,
+            &[
+                "activity",
+                "send",
+                "sandbox",
+                "which seat are you on?",
+                "--ask",
+                "--id",
+                "ask-1",
+            ],
+        ),
+        0,
+    );
+
+    let output = sandbox.cli_in(
+        &sandbox.recipient,
+        &["activity", "reply", "multiverse#1", "seat-a"],
+    );
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(
+        code, 0,
+        "a project the ask never reached must not be able to answer it: {output:?}"
+    );
+    assert!(
+        !sandbox.recipient.join(".multiverse/routing.log").exists(),
+        "nothing must be written into the uninvolved caller's own log"
+    );
+    assert!(
+        !hub.join(".multiverse/routing.log").exists(),
+        "nothing must be written into the asker's log"
+    );
+    let holder_log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        !holder_log.contains("event=close"),
+        "the real holder's ask must remain open: {holder_log}"
+    );
+}
+
+/// Card `20261115-b-d4cf40`: `activity broadcast --ask` carries the same
+/// per-recipient semantics as `activity send --ask` — each recipient gets
+/// its own `ask=1` message, so each sees its own open ask, either one may
+/// resolve it with an ordinary `reply`, and a recipient nobody has answered
+/// stays open. This must fail if `broadcast`'s handler (or
+/// `mv_state::activity::broadcast`) ever goes back to passing `ask=false`
+/// regardless of the flag: neither inbox would show `ASK #`, and the reply
+/// below would have nothing open to resolve.
+#[test]
+fn activity_broadcast_ask_reaches_every_recipient_as_its_own_open_ask() {
+    let sandbox = Sandbox::new();
+    let hub = enable_hub_project(&sandbox);
+    assert_code(
+        &sandbox.cli_in(
+            &hub,
+            &[
+                "activity",
+                "broadcast",
+                "status check — please confirm",
+                "--ask",
+                "--id",
+                "bcast-ask-1",
+            ],
+        ),
+        0,
+    );
+
+    // Each recipient sees its own ASK, peeked so neither read advances a
+    // cursor the assertions below still depend on.
+    let sandbox_inbox = sandbox.cli(&["activity", "inbox", "--peek"]);
+    assert_code(&sandbox_inbox, 0);
+    assert!(
+        stdout(&sandbox_inbox).contains("ASK #1"),
+        "{:?}",
+        stdout(&sandbox_inbox)
+    );
+    let recipient_inbox = sandbox.cli_in(&sandbox.recipient, &["activity", "inbox", "--peek"]);
+    assert_code(&recipient_inbox, 0);
+    assert!(
+        stdout(&recipient_inbox).contains("ASK #1"),
+        "{:?}",
+        stdout(&recipient_inbox)
+    );
+
+    // `sandbox` answers from its own directory with a bare SEQ.
+    let reply = sandbox.cli(&["activity", "reply", "1", "all clear"]);
+    assert_code(&reply, 0);
+    assert!(
+        stdout(&reply).contains("replied to multiverse as seq"),
+        "{:?}",
+        stdout(&reply)
+    );
+    let hub_log = fs::read_to_string(hub.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        hub_log.contains("from=sandbox")
+            && hub_log.contains("re=1")
+            && hub_log.contains("all clear"),
+        "{hub_log}"
+    );
+    let sandbox_log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        sandbox_log.contains("event=close"),
+        "sandbox's own ask must be closed by its reply: {sandbox_log}"
+    );
+
+    // `recipient` never replied: its ask stays open, both in its own log
+    // and as seen on a fresh peek.
+    let recipient_log =
+        fs::read_to_string(sandbox.recipient.join(".multiverse/routing.log")).unwrap();
+    assert!(
+        !recipient_log.contains("event=close"),
+        "recipient's ask must remain open: {recipient_log}"
+    );
+    let recipient_inbox_again =
+        sandbox.cli_in(&sandbox.recipient, &["activity", "inbox", "--peek"]);
+    assert_code(&recipient_inbox_again, 0);
+    assert!(
+        stdout(&recipient_inbox_again).contains("ASK #1"),
+        "{:?}",
+        stdout(&recipient_inbox_again)
+    );
+}
+
+#[test]
+fn activity_show_prints_one_message_in_full_without_acking() {
+    let sandbox = Sandbox::new();
+    assert_code(
+        &sandbox.cli(&[
+            "activity",
+            "send",
+            "recipient",
+            "Ready for review",
+            "--id",
+            "msg-1",
+        ]),
+        0,
+    );
+    let state_dir = sandbox.recipient.join(".multiverse");
+    let marker_before = fs::read_to_string(state_dir.join("activity.lastseen")).ok();
+
+    let output = sandbox.cli_in(&sandbox.recipient, &["activity", "show", "1"]);
+    assert_code(&output, 0);
+    let body = stdout(&output);
+    assert!(body.contains("Ready for review"), "{body}");
+    assert!(body.contains("sandbox"), "{body}");
+    assert!(
+        !state_dir.join("activity.cursor").exists(),
+        "show must never acknowledge"
+    );
+    assert_eq!(
+        fs::read_to_string(state_dir.join("activity.lastseen")).ok(),
+        marker_before,
+        "show must not touch the recipient's own lastseen marker either"
+    );
+}
+
+/// `show` accepts the same `Project#SEQ` qualifier `close`/`reply` do, with
+/// no `[activity.pairs]` gate — it only ever reads a log already on disk.
+#[test]
+fn activity_show_reads_another_projects_log_via_project_hash_seq() {
+    let sandbox = Sandbox::new();
+    let hub = enable_hub_project(&sandbox);
+    assert_code(
+        &sandbox.cli_in(
+            &hub,
+            &[
+                "activity",
+                "send",
+                "sandbox",
+                "which seat are you on?",
+                "--ask",
+                "--id",
+                "ask-1",
+            ],
+        ),
+        0,
+    );
+    let output = sandbox.cli_in(&sandbox.recipient, &["activity", "show", "sandbox#1"]);
+    assert_code(&output, 0);
+    let body = stdout(&output);
+    assert!(body.contains("which seat are you on?"), "{body}");
+    assert!(body.contains("ask: yes"), "{body}");
+}
+
+#[test]
+fn activity_show_refuses_an_unknown_seq() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.cli(&["activity", "show", "99"]);
+    assert_code(&output, 3);
+    assert!(
+        stderr(&output).contains("no message #99"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Card `20261115-b-2a0f8f`: `--as-nexus --replay-since`/`--replay-last`
+/// used to fail parsing outright ("cannot be used with"); replay is
+/// read-only regardless of `--as-nexus`, so the combination must be
+/// accepted and must still never advance the read cursor.
+#[test]
+fn activity_inbox_replay_accepts_as_nexus_and_still_never_acknowledges() {
+    let sandbox = Sandbox::new();
+    assert_code(
+        &sandbox.cli_in(
+            &sandbox.recipient,
+            &["activity", "send", "sandbox", "hello", "--id", "msg-1"],
+        ),
+        0,
+    );
+    for replay in [
+        ["--replay-since", "1"].as_slice(),
+        ["--replay-last", "1"].as_slice(),
+    ] {
+        let mut args = vec!["activity", "inbox", "--as-nexus"];
+        args.extend_from_slice(replay);
+        let output = sandbox.cli(&args);
+        assert_code(&output, 0);
+        assert!(stdout(&output).contains("hello"), "{}", stdout(&output));
+    }
+    assert!(!sandbox.project.join(".multiverse/activity.cursor").exists());
 }
 
 /// `start sandbox sandbox` — the same project named twice in one

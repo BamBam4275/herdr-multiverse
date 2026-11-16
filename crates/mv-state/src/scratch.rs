@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::worktrees::{guarded_path, private_dir, read_regular, validate_id, WorktreeError};
 
+/// Failure modes for scratch-pane operations: a rejected/guarded path, an
+/// underlying filesystem or JSON error, or an explicit refusal (an identity
+/// or ownership check failed).
 #[derive(Debug, thiserror::Error)]
 pub enum ScratchError {
     #[error(transparent)]
@@ -27,15 +30,26 @@ pub enum ScratchError {
 
 type Result<T> = std::result::Result<T, ScratchError>;
 
+/// The on-disk record binding one task to the Herdr pane running its scratch
+/// session. An empty `pane` marks a reservation that has not yet been
+/// completed with a real pane id (see `ScratchStore::reserve`).
 // Field order is Python's json.dumps(sort_keys=True) order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScratchPane {
+    /// Expected scratch label for this task (`scratch-<task>`), checked
+    /// against the live pane's actual label to confirm it still belongs to
+    /// this record rather than a pane that has since been reused.
     pub name: String,
+    /// The Herdr pane id this record targets; empty while the record is
+    /// only an open reservation.
     pub pane: String,
+    /// The task id this scratch pane belongs to.
     pub task: String,
 }
 
 impl ScratchPane {
+    /// Builds the record for an already-opened pane, deriving the expected
+    /// label from `task` and validating both ids.
     pub fn new(task: &str, pane: &str) -> Result<Self> {
         validate_id(task)?;
         if pane.trim().is_empty() || pane.chars().any(char::is_control) {
@@ -102,11 +116,22 @@ fn ascii_json(value: &str) -> Result<String> {
 /// the record, and the routing-log occupant owns the task.
 #[derive(Debug)]
 pub struct ScratchContext {
+    /// Canonical path to the main project checkout (not the lane worktree).
     pub project_root: PathBuf,
+    /// Canonical path to the dispatched lane's git worktree — the directory
+    /// the scratch pane's shell is actually running in.
     pub lane_root: PathBuf,
+    /// The task id that currently owns this lane, per the routing log.
     pub task: String,
 }
 
+/// Resolves the ambient task context for a scratch-pane operation: given the
+/// calling pane's id and working directory, confirms the pane is running
+/// inside a worktree git has actually registered for a dispatched lane, and
+/// that it is that lane's current (most recently dispatched) occupant,
+/// before returning the project root, lane root, and owning task id.
+/// Scratch records are keyed by task id under `.multiverse/tasks`, so every
+/// other scratch operation depends on this identity being right.
 pub fn resolve_context(pane: Option<&str>, cwd: &Path) -> Result<ScratchContext> {
     let pane = pane
         .map(str::trim)
@@ -120,6 +145,10 @@ pub fn resolve_context(pane: Option<&str>, cwd: &Path) -> Result<ScratchContext>
     let lane = cwd
         .ancestors()
         .find(|candidate| {
+            // Identify the lane worktree root by its known directory shape
+            // (<project>/.multiverse/worktrees/<lane-id>) rather than
+            // assuming cwd itself is the root: a scratch command can run
+            // from any subdirectory of the lane.
             candidate.parent().is_some_and(|parent| {
                 parent.file_name().is_some_and(|name| name == "worktrees")
                     && parent
@@ -148,6 +177,8 @@ pub fn resolve_context(pane: Option<&str>, cwd: &Path) -> Result<ScratchContext>
     let output = String::from_utf8_lossy(&listing.stdout);
     let mut registered_path = None;
     let mut registered = false;
+    // Trust only what git itself reports as a registered worktree+branch
+    // pair; a directory merely shaped like a lane is not enough.
     for field in output.split('\0') {
         if let Some(path) = field.strip_prefix("worktree ") {
             registered_path = Some(PathBuf::from(path));
@@ -162,6 +193,8 @@ pub fn resolve_context(pane: Option<&str>, cwd: &Path) -> Result<ScratchContext>
             "refusing scratch: not a registered dispatched lane".into(),
         ));
     }
+    // A lane can be redispatched to a new task while an old scratch pane
+    // lingers; take the latest dispatch so a superseded task can't claim it.
     let task = crate::tasks::sweep_tasks(project)
         .into_iter()
         .filter(|task| task.pane.as_deref() == Some(pane) && task.branch == branch)
@@ -190,11 +223,16 @@ pub fn resolve_context(pane: Option<&str>, cwd: &Path) -> Result<ScratchContext>
 
 /// Injectable for isolated tests; the production adapter uses only mv-herdr.
 pub trait ScratchPanes {
+    /// Current label Herdr reports for `pane`; used to confirm a record's
+    /// claimed pane still carries this task's scratch label.
     fn label(&mut self, pane: &str) -> Result<String>;
+    /// Visible contents of `pane`, for display to a caller asking for output.
     fn read(&mut self, pane: &str) -> Result<String>;
+    /// Closes `pane` in Herdr. Does not touch the on-disk record.
     fn close(&mut self, pane: &str) -> Result<()>;
 }
 
+/// Production `ScratchPanes`, backed by real Herdr pane commands (get/read/close).
 pub struct HerdrPanes;
 
 impl ScratchPanes for HerdrPanes {
@@ -213,6 +251,8 @@ impl ScratchPanes for HerdrPanes {
             .ok_or_else(|| ScratchError::Refused("pane reply has no label".into()))
     }
     fn read(&mut self, pane: &str) -> Result<String> {
+        // "visible" reads only the pane's current on-screen content, not
+        // its full scrollback.
         let result = run::run(&argv::pane_read(pane, Some("visible"), None), None)
             .map_err(|e| ScratchError::Refused(e.to_string()))?;
         if !result.ok() {
@@ -230,18 +270,25 @@ impl ScratchPanes for HerdrPanes {
     }
 }
 
+/// Filesystem-backed store of scratch-pane records under a project's
+/// `.multiverse/tasks` tree, one record per task.
 #[derive(Debug, Clone)]
 pub struct ScratchStore {
     project: PathBuf,
 }
 
 impl ScratchStore {
+    /// Opens the store rooted at `project`, canonicalizing it and confirming
+    /// the tasks directory is guarded against symlink escapes before any
+    /// record is read or written.
     pub fn new(project: impl AsRef<Path>) -> Result<Self> {
         let project = fs::canonicalize(project)?;
         guarded_path(&project, Path::new(".multiverse/tasks"), true)?;
         Ok(Self { project })
     }
 
+    /// Validated on-disk path for `task`'s scratch record; rejects task ids
+    /// or path components that would escape the guarded tasks directory.
     pub fn record_path(&self, task: &str) -> Result<PathBuf> {
         validate_id(task)?;
         Ok(guarded_path(
@@ -258,6 +305,8 @@ impl ScratchStore {
         record.validate(&record.task)?;
         let path = self.record_path(&record.task)?;
         private_dir(path.parent().expect("record parent"))?;
+        // create_new refuses if a record already exists: creation is
+        // exclusive, never a silent overwrite of another owner's record.
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -265,6 +314,9 @@ impl ScratchStore {
             .open(&path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(record.encode()?.as_bytes())?;
+        // Sync the file, then its parent directory entry, so the new
+        // record is durable on disk rather than surviving only in a page
+        // cache that a crash could lose.
         file.sync_all()?;
         mv_core::atomic::fsync_dir(path.parent().expect("record parent"))?;
         Ok(())
@@ -285,6 +337,10 @@ impl ScratchStore {
         self.record(&ScratchPane::opening(task)?)
     }
 
+    /// Finalizes a reservation once the real pane is known, replacing the
+    /// empty "opening" placeholder with the pane's actual record. Refuses if
+    /// the opening record was removed or changed since `reserve` — e.g. by a
+    /// concurrent close or a second reservation attempt.
     pub fn complete(&self, record: &ScratchPane) -> Result<()> {
         record.validate(&record.task)?;
         if record.pane.is_empty()
@@ -294,6 +350,8 @@ impl ScratchStore {
                 "scratch opening record changed".into(),
             ));
         }
+        // Atomic replace so a concurrent `load` never observes a
+        // half-written record.
         mv_core::atomic::write_atomic(
             &self.record_path(&record.task)?,
             record.encode()?.as_bytes(),
@@ -301,6 +359,8 @@ impl ScratchStore {
         Ok(())
     }
 
+    /// Removes the task's scratch record if one exists. A missing record is
+    /// not an error, so cleanup can run unconditionally.
     pub fn unlink(&self, task: &str) -> Result<()> {
         match fs::remove_file(self.record_path(task)?) {
             Ok(()) => Ok(()),
@@ -309,8 +369,13 @@ impl ScratchStore {
         }
     }
 
+    /// Reads and validates the task's current record, if any. Used both to
+    /// check ownership directly and to resolve the live pane for read/close.
     pub fn load(&self, task: &str) -> Result<Option<ScratchPane>> {
         let path = self.record_path(task)?;
+        // symlink_metadata (not metadata) so a symlinked record is caught
+        // without first following it; `read_regular` below enforces this
+        // more strictly, but existence must not be checked through the link.
         match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -322,6 +387,8 @@ impl ScratchStore {
         Ok(Some(record))
     }
 
+    /// Contents of the task's scratch pane, provided the caller's record
+    /// still matches the live pane's Herdr label.
     pub fn read(&self, task: &str, panes: &mut impl ScratchPanes) -> Result<String> {
         let record = self.owned(task, panes)?;
         panes.read(&record.pane)
@@ -336,6 +403,8 @@ impl ScratchStore {
                 "refusing scratch: pane is still being opened".into(),
             ));
         }
+        // Re-check the live label, not just the on-disk record: Herdr can
+        // reuse a pane id after this task's own pane has closed.
         if panes.label(&record.pane)? != record.name {
             return Err(ScratchError::Refused(
                 "pane no longer has this task's scratch label".into(),
@@ -344,6 +413,9 @@ impl ScratchStore {
         Ok(record)
     }
 
+    /// Closes the task's pane and removes its record, verifying before and
+    /// after the close call that the record is still the one this call
+    /// started with. Returns `false` (a no-op) if there was no record.
     pub fn close(&self, task: &str, panes: &mut impl ScratchPanes) -> Result<bool> {
         if self.load(task)?.is_none() {
             return Ok(false);

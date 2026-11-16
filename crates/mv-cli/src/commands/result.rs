@@ -51,6 +51,10 @@ impl SecureFiles for CheckedFiles {
     }
 }
 
+/// Resolves the configured project containing cwd, classifies the task's
+/// on-disk status with [`classify_status`] (refusing an absent or
+/// unrecognized status rather than guessing), then reads and redacts the
+/// result through [`gateway::read_result`].
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     let task_id = args.get_one::<String>("task_id").expect("required");
     let config = load_config(args)?;
@@ -96,12 +100,40 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mv-cli-result-test-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure
+    /// left it behind in `TMPDIR`). `Deref`s to `Path` so every existing
+    /// call site keeps reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("mv-cli-result-test-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(tag)
     }
 
     const TASK: &str = "20261101-fixer-abcdef";
@@ -118,12 +150,12 @@ mod tests {
         )
         .unwrap();
 
-        let files = CheckedFiles { root: root.clone() };
+        let files = CheckedFiles {
+            root: root.to_path_buf(),
+        };
         let result = gateway::read_result(&files, TASK, &mv_core::redact::redact).unwrap();
         assert!(!result.text.contains("abcdef1234567890"));
         assert_eq!(result.status, gateway::TaskStatus::Done);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -136,10 +168,10 @@ mod tests {
         fs::write(&outside, "secret elsewhere").unwrap();
         std::os::unix::fs::symlink(&outside, task_dir.join("result.md")).unwrap();
 
-        let files = CheckedFiles { root: root.clone() };
+        let files = CheckedFiles {
+            root: root.to_path_buf(),
+        };
         assert!(gateway::read_result(&files, TASK, &mv_core::redact::redact).is_err());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -154,10 +186,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside_task, root.join(".multiverse/tasks").join(TASK))
             .unwrap();
 
-        let files = CheckedFiles { root: root.clone() };
+        let files = CheckedFiles {
+            root: root.to_path_buf(),
+        };
         assert!(gateway::read_result(&files, TASK, &mv_core::redact::redact).is_err());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -167,10 +199,10 @@ mod tests {
         fs::create_dir_all(&task_dir).unwrap();
         fs::write(task_dir.join("status"), "running\n").unwrap();
 
-        let files = CheckedFiles { root: root.clone() };
+        let files = CheckedFiles {
+            root: root.to_path_buf(),
+        };
         assert!(gateway::read_result(&files, TASK, &mv_core::redact::redact).is_err());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

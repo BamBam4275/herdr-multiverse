@@ -62,6 +62,21 @@ ok() { printf 'PASS: %s\n' "$1"; }
 bad() { printf 'FAIL: %s\n' "$1"; fail=1; }
 fail=0
 
+# $1=have $2=want, each "MAJOR.MINOR.PATCH" -- true if have >= want.
+# Pure parameter expansion, no external tools, so this never depends on
+# what else happens to be on PATH.
+version_ge() {
+    have_major=${1%%.*}; have_rest=${1#*.}
+    have_minor=${have_rest%%.*}; have_patch=${have_rest#*.}
+    want_major=${2%%.*}; want_rest=${2#*.}
+    want_minor=${want_rest%%.*}; want_patch=${want_rest#*.}
+    [ "$have_major" -gt "$want_major" ] 2>/dev/null && return 0
+    [ "$have_major" -lt "$want_major" ] 2>/dev/null && return 1
+    [ "$have_minor" -gt "$want_minor" ] 2>/dev/null && return 0
+    [ "$have_minor" -lt "$want_minor" ] 2>/dev/null && return 1
+    [ "$have_patch" -ge "$want_patch" ] 2>/dev/null
+}
+
 note "== exporting tracked tree at HEAD =="
 # POSIX pipelines report only the last command's status. Stage the archive
 # first so successful extraction cannot hide a failed git archive.
@@ -112,14 +127,32 @@ else
 fi
 
 note "== gitleaks dir scan =="
-if command -v docker >/dev/null 2>&1; then
-    if docker run --rm -v "$OUT_DIR:/export:ro" zricethezav/gitleaks:v8.21.2 dir /export -v; then
+# Minimum-version check, not exact: brew (and other package managers) track
+# upstream continuously and will drift ahead of this pin between bumps, so
+# an exact match here reproduces the very failure this pin exists to fix
+# (see 20261115-b-d23447). A minimum still refuses anything older than what
+# .gitleaks.toml has actually been verified against.
+. "$SCRIPT_DIR/gitleaks-version.sh"
+if command -v gitleaks >/dev/null 2>&1; then
+    found_version=$(gitleaks version 2>/dev/null)
+    found_version=${found_version#v}
+    if ! version_ge "$found_version" "$GITLEAKS_VERSION"; then
+        echo "export-fresh: local gitleaks is v${found_version:-unknown}, this export requires >= v$GITLEAKS_VERSION -- install that version or newer (https://github.com/gitleaks/gitleaks/releases) or run with Docker instead." >&2
+        bad "gitleaks dir scan"
+    elif gitleaks dir "$OUT_DIR" --config "$OUT_DIR/.gitleaks.toml" -v; then
+        ok "gitleaks dir scan"
+    else
+        bad "gitleaks dir scan"
+    fi
+elif command -v docker >/dev/null 2>&1; then
+    if docker run --rm -v "$OUT_DIR:/export:ro" "zricethezav/gitleaks:v$GITLEAKS_VERSION" dir /export --config /export/.gitleaks.toml -v; then
         ok "gitleaks dir scan"
     else
         bad "gitleaks dir scan"
     fi
 else
-    note "docker not available, skipping gitleaks scan"
+    echo "export-fresh: gitleaks is not installed and docker is not available -- install gitleaks >= v$GITLEAKS_VERSION (https://github.com/gitleaks/gitleaks/releases) or Docker, then retry." >&2
+    bad "gitleaks dir scan"
 fi
 
 note ""

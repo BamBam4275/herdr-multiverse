@@ -103,6 +103,7 @@ use mv_engine::mv_herdr::{
 use mv_engine::runner::{self, DispatchStore, Herdr as _, PreparedLaunch, RunnerError};
 use mv_engine::selector::{self, LocalLivenessProbe as _, Seat};
 
+use super::doctor::state_dir_from_config;
 use crate::exit::Failure;
 
 /// Python's `AUTH_VARS_TO_CLEAR` (`config.py:297-300`): auth tokens the
@@ -237,6 +238,11 @@ pub struct Plan {
     pub wait_outcome: Option<WaitOutcome>,
 }
 
+/// What a `--wait`-settled dispatch learned about the agent's turn: its
+/// terminal status (or lack of one), any scope violations or requested
+/// revisions, and — for a writer — its lane's handback state. Carried on
+/// [`Plan::wait_outcome`], set only when `--wait` was given and a real
+/// dispatch started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitOutcome {
     pub status: Option<mv_state::tasks::TaskStatus>,
@@ -276,6 +282,8 @@ pub struct LaneHandback {
 
 // `Unimplemented` only ever returns `Refused`; the rest of this surface is
 // real but unreachable until a real `Engine` lands, same as `exit::Failure`.
+/// Every way planning or dispatch can refuse, already classified by which
+/// exit code [`to_failure`] maps it to — see each variant's own doc.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
@@ -998,6 +1006,8 @@ impl engine_dispatch::AccountLookup for ConfigAccounts<'_> {
 }
 
 /// Read only this project's dispatch history; planning never creates an index.
+/// Also the live [`engine_dispatch::ReviewBudget`]: the rolling 24h Critic
+/// count comes from [`engine_dispatch::recent_reviewer_dispatch_count`].
 struct ProjectRouting<'a> {
     project: &'a str,
     root: &'a Path,
@@ -1024,12 +1034,22 @@ impl engine_dispatch::RoutingLookup for ProjectRouting<'_> {
     }
 }
 
-/// No scenario in this lane dispatches the reviewer role; a real 24h
-/// routing-log count is a different lane's wiring.
-struct ZeroReviewBudget;
-impl engine_dispatch::ReviewBudget for ZeroReviewBudget {
-    fn reviewer_dispatch_count(&self, _project: &str, _now: Instant) -> u32 {
-        0
+impl engine_dispatch::ReviewBudget for ProjectRouting<'_> {
+    fn reviewer_dispatch_count(&self, project: &str, _now: Instant) -> u32 {
+        if project != self.project {
+            return 0;
+        }
+        // The trait's `now` is a monotonic Instant (`--wait-for-seat`).
+        // The budget window is wall-clock, the same clock
+        // `multiverse review-policy` stamps used/limit with.
+        match engine_dispatch::recent_reviewer_dispatch_count(self.root, mv_core::time::now_utc()) {
+            Ok(count) => u32::try_from(count).unwrap_or(u32::MAX),
+            // Unreadable logs must not look like an unused budget
+            // (`recent_reviewer_dispatch_count`'s own contract). The trait
+            // cannot surface the error, so fail closed: any finite window
+            // then refuses.
+            Err(_) => u32::MAX,
+        }
     }
 }
 
@@ -1181,21 +1201,55 @@ pub(crate) fn reorder_chain_by_preference(
 /// lane's local-only scope: a task this project dispatched but whose
 /// `routing.log` has no `event=result` yet (`SweepTask::recorded`) is
 /// still occupying a slot, the same "in progress" count `multiverse
-/// sweep` itself reports as `in_progress_before`. No live Herdr call —
-/// unlike Python's `concurrency_or_raise` (which folds this in as a lag
-/// correction over a live `agent list`), this is the sole source here;
-/// see this task's `result.md` for why a live reconciliation was judged
-/// out of this file's scope.
-fn open_task_count(project_root: &Path) -> u32 {
+/// sweep` itself reports as `in_progress_before` — *unless* its own
+/// status file already reads terminal (`SweepTask::file_status`): a lane
+/// that wrote `done`/`blocked`/`failed` has finished even though nobody
+/// has reconciled/recorded it yet, and must not go on holding a
+/// `max_concurrent` slot until a Nexus gets to it (card
+/// `20261110-b-fa4365`: a fleet sat at 15/15 while 7 finished lanes held
+/// slots for 25+ minutes).
+///
+/// This reading stays here rather than moving into `mv_state::tasks`:
+/// "finished but unrecorded does not hold a capacity slot" is a
+/// capacity-specific interpretation of two fields `SweepTask` already
+/// exposes (`recorded`, `file_status`), not an invariant of the type
+/// itself — `sweep`'s own "still open" question differs
+/// (`is_reconcile_candidate` also weighs pane liveness and lane
+/// dirtiness before it will touch a task), so folding this one caller's
+/// rule into the shared type would hand `mv_state` an opinion about
+/// capacity it does not otherwise hold. `commands::council` used to keep
+/// its own copy of this exact function; it now calls this one instead
+/// (same card).
+///
+/// No live Herdr call — unlike Python's `concurrency_or_raise` (which
+/// folds this in as a lag correction over a live `agent list`), this is
+/// the sole source here; see this task's `result.md` for why a live
+/// reconciliation was judged out of this file's scope.
+pub(super) fn open_task_count(project_root: &Path) -> u32 {
     mv_state::tasks::sweep_tasks(project_root)
         .iter()
-        .filter(|task| !task.recorded)
+        .filter(|task| !task.recorded && task.file_status.is_none())
         .count() as u32
 }
 
-/// Fleet-wide open count (every configured project whose `path` resolves),
-/// plus each *other* project's own floor gap (`min_slots` not yet met by
-/// its open count) for `FleetCapacityInputs::other_floor_gaps`.
+/// Whether a `SweepTask::role` (current or retired config key) is Nexus —
+/// shared by [`fleet_open_counts`]/[`live_seat_counts`]/[`grace_open_counts`],
+/// and reused by `commands::council`'s own mirrors of those three, so a
+/// busy Nexus pane is identified one way, not re-derived per caller.
+pub(super) fn is_nexus_role(role: &str) -> bool {
+    Role::from_any_config_key(role).is_ok_and(|role| role == Role::Nexus)
+}
+
+/// Fleet-wide open count of **worker** panes only (every configured project
+/// whose `path` resolves), plus each *other* project's own floor gap
+/// (`min_slots` not yet met by its own, still role-inclusive, open count)
+/// for `FleetCapacityInputs::other_floor_gaps`.
+///
+/// Card `20261115-b-65fe80`: the fleet-wide `max_concurrent` check counts
+/// worker panes only — a busy Nexus pane must never cost a worker dispatch
+/// its last fleet slot. Only the `fleet_open` sum this feeds to
+/// `check_fleet_capacity`'s `max_concurrent` comparison is narrowed; a
+/// project's own floor gap is unchanged (not part of this card's decision).
 fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(String, u32)>) {
     let mut fleet_open = 0u32;
     let mut other_floor_gaps = Vec::new();
@@ -1206,8 +1260,13 @@ fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(Strin
         let Ok(root) = std::fs::canonicalize(raw) else {
             continue;
         };
-        let open = open_task_count(&root);
-        fleet_open += open;
+        let tasks = mv_state::tasks::sweep_tasks(&root);
+        let open_tasks = tasks
+            .iter()
+            .filter(|task| !task.recorded && task.file_status.is_none());
+        let open = open_tasks.clone().count() as u32;
+        let worker_open = open_tasks.filter(|task| !is_nexus_role(&task.role)).count() as u32;
+        fleet_open += worker_open;
         if name != current_project {
             let gap = project.min_slots.saturating_sub(open);
             if gap > 0 {
@@ -1344,6 +1403,12 @@ pub(crate) fn resolve_task_account<'a>(
 /// whose `account=` is no longer a config key (the seat was renamed)
 /// still counts, recovered from the agent name's trailing short — Python's
 /// `account_by_short` (`accounts.py:784-804`).
+/// Card `20261115-b-65fe80`: a busy Nexus pane never holds a seat's
+/// open-agent cap hostage — that cap now counts worker panes only, with
+/// Nexus capacity sized separately by the account's own `nexus_slots`.
+/// Nexus panes are identified off the same dispatch record this function
+/// already reads (`task.role`), not by re-deriving anything from the
+/// agent's own name.
 fn live_seat_counts(
     statuses: &HashMap<String, String>,
     latest: &HashMap<String, mv_state::tasks::SweepTask>,
@@ -1357,6 +1422,9 @@ fn live_seat_counts(
         let Some(task) = latest.get(name) else {
             continue;
         };
+        if is_nexus_role(&task.role) {
+            continue;
+        }
         let Some(account) = resolve_task_account(task, config) else {
             continue;
         };
@@ -1403,6 +1471,9 @@ fn grace_open_counts(
     let mut counts = HashMap::new();
     for task in latest.values() {
         if task.recorded {
+            continue;
+        }
+        if is_nexus_role(&task.role) {
             continue;
         }
         let Some(account) = resolve_task_account(task, config) else {
@@ -1769,6 +1840,11 @@ fn render_card(resolved: &Resolved, request: &Request) -> Result<String, EngineE
         account.config_dir_var,
         account.config_dir.as_raw()
     ));
+    out.push_str(&format!(
+        "  env         MULTIVERSE_CONFIG={}\n  env         MULTIVERSE_STATE_DIR={}\n",
+        resolved.config.source_path.display(),
+        resolved.config_dir.display()
+    ));
     section(
         &mut out,
         "WOULD LOG  (not written — routing.log is untouched on a dry run)",
@@ -1826,7 +1902,13 @@ fn render_card(resolved: &Resolved, request: &Request) -> Result<String, EngineE
     }
     section(&mut out, "WOULD RUN");
     let native = argv::native_args(&store.model, &account.kind, store.effort.as_deref());
-    let env = [(account.config_dir_var.as_str(), account.config_dir.as_raw())];
+    let multiverse_config = resolved.config.source_path.display().to_string();
+    let multiverse_state_dir = resolved.config_dir.display().to_string();
+    let env = [
+        (account.config_dir_var.as_str(), account.config_dir.as_raw()),
+        ("MULTIVERSE_CONFIG", multiverse_config.as_str()),
+        ("MULTIVERSE_STATE_DIR", multiverse_state_dir.as_str()),
+    ];
     let mut commands = vec![argv::pane_split(
         &cwd,
         &env,
@@ -2072,7 +2154,7 @@ impl RealEngine {
             resolve_user_path(&request.project_path, &cwd).map_err(EngineError::Refused)?;
 
         let config = load_config(request.config_override.as_deref())?;
-        let config_dir = load::config_state_dir_from_env(&config.source_path);
+        let config_dir = state_dir_from_config(&config.source_path);
 
         let Some((project_name, project_root)) = resolve_project(&config, &target) else {
             return Err(EngineError::NeedsConfig(no_project_message(
@@ -2151,15 +2233,22 @@ impl RealEngine {
             min_quota_percent: Some(config.review_policy.min_quota_percent as f64),
             budget_per_window: config.review_policy.budget_per_window,
         };
-        let (fleet_open, other_floor_gaps) = fleet_open_counts(&config, &project_name);
-        let capacity = engine_dispatch::FleetCapacityInputs {
-            max_concurrent: config.max_concurrent,
-            fleet_open,
-            project_open: open_task_count(&project_root),
-            project_min_slots: project.min_slots,
-            project_max_slots: project.max_slots,
-            other_floor_gaps,
-            batch_count: 1,
+        // A callback rather than a single snapshot (card 20261110-b-c314f9):
+        // `plan_dispatch`'s own `--wait-for-seat` poll re-counts this on
+        // every attempt, so a slot a Nexus reconciles mid-wait is seen the
+        // next time around rather than only at the moment this dispatch
+        // started waiting.
+        let mut capacity_source = || {
+            let (fleet_open, other_floor_gaps) = fleet_open_counts(&config, &project_name);
+            engine_dispatch::FleetCapacityInputs {
+                max_concurrent: config.max_concurrent,
+                fleet_open,
+                project_open: open_task_count(&project_root),
+                project_min_slots: project.min_slots,
+                project_max_slots: project.max_slots,
+                other_floor_gaps,
+                batch_count: 1,
+            }
         };
         // Card 20261013-b-531383 / `cli.py:3401-3405`: a dry run never
         // waits on a capped seat regardless of `--wait-for-seat`; a real
@@ -2210,10 +2299,11 @@ impl RealEngine {
             &req,
             &routing,
             &ConfigAccounts(&config),
-            &ZeroReviewBudget,
-            &capacity,
+            &routing,
+            &mut capacity_source,
             &halt,
             &breaker,
+            &mut selector::RealSleeper,
             Instant::now(),
         )
         .map_err(|e| to_engine_error(e, &role_display, &project_name))?;
@@ -2622,7 +2712,7 @@ pub(super) struct RealDispatchStore {
     /// or not (`accounts.py:240-253`).
     branch: String,
     /// Set by [`setup_lane`](DispatchStore::setup_lane) on its own
-    /// failure, so [`record_failed_to_start`](DispatchStore::record_failed_to_start)
+    /// failure, so [`record_failed_to_start_reason`](DispatchStore::record_failed_to_start_reason)
     /// can record `state=lane-setup-failed` instead of the generic
     /// `state=failed-to-start` (critic finding 8).
     lane_setup_failed: bool,
@@ -3382,6 +3472,33 @@ fn redispatch_predecessor_ids(task_id: &str, base: &str) -> Vec<String> {
 /// after, not before, the slower dirty/unrescued-output rechecks — so the
 /// window between "confirmed" and "closed" is as narrow as this client can
 /// make it.
+///
+/// Card `20261106-b-9d70c7`: name, pane id, readiness, and a forward
+/// `state_change_seq` all still agree the instant a Herdr restart reissues
+/// this exact deterministic name into a *recycled* pane id — the static
+/// race the card above's window-narrowing cannot see, because it was
+/// never a timing gap. The last two reads before the close add the one
+/// witness that *is* dispatch-unique: the pane's own `label`
+/// ([`mv_state::tasks::AgentPanes::pane_label`], backed by `pane get`),
+/// which `runner::pane_rename` always ends with the dispatching task's
+/// own id, and — when the predecessor has its own worktree — the live
+/// `cwd` [`mv_state::tasks::AgentPanes::confirm_live`] now also carries.
+/// Either mismatch, or either read failing outright, aborts the close
+/// exactly like every other gate here: no outcome recorded, nothing
+/// closed, the new dispatch simply proceeds alongside whatever is
+/// actually in that pane.
+///
+/// What is **not** closed by this: the window between this function's own
+/// last read and the `pane close` call itself (the `20261105-b-bfc75b`
+/// residual race above) is unchanged — a pane-id recycle landing in that
+/// exact gap still races this client. Closing it to zero needs an atomic
+/// close-if-name primitive Herdr itself does not expose today; the
+/// natural shape would be `herdr pane close <pane_id> --if-agent <name>`
+/// (refusing the close, rather than silently succeeding, when `<name>` is
+/// no longer the occupant), requested as a follow-on rather than modeled
+/// here — `fake-herdr` must not grow a `--if-agent` flag real Herdr does
+/// not have, since a test passing against an imagined flag proves nothing
+/// about the real binary.
 fn supersede_collision_predecessor(
     root: &Path,
     task_id: &str,
@@ -3486,13 +3603,24 @@ fn supersede_collision_predecessor(
     check_dirty(&lane_root)?;
     check_unrescued()?;
 
-    // Finding 2: re-verify every gate immediately before the close, under
-    // the project lock that now also guards the write — a stale first
-    // snapshot is never trusted as the authority for a destructive close.
-    let _project_lock = mv_state::log::ProjectLog::new(root)
-        .lock()
-        .map_err(|e| RunnerError::Refused(format!("project lock: {e}")))?;
-
+    // Finding 2: re-verify every gate immediately before the close. This
+    // used to run under an explicit `_project_lock` ("the project lock
+    // that now also guards the write"), but that held `routing.log.lock`
+    // across every Herdr round trip below — `confirm_live`, `pane_label`,
+    // and the close itself — long enough to block a concurrent `activity
+    // send` into the same project for the duration (card
+    // `20261115-b-078277`). No explicit lock is needed here: the two
+    // writes this function can reach, `mv_state::tasks::
+    // append_supersede_if_absent` and `record_stranded_closure`, already
+    // take and release `routing.log.lock` themselves, scoped to just the
+    // append; holding a second, wider lock around them and the Herdr
+    // calls on either side only serialized this function against other
+    // writers for no benefit the self-locking append does not already
+    // give. The re-checks immediately below are what re-validates the
+    // state this close depends on and fails closed if it changed — the
+    // mechanism card `20261105-b-bfc75b` added stays, just no longer
+    // paired with a lock a Herdr call must never be held under.
+    //
     // Card 20261105-b-bfc75b's close-time TOCTOU: dirty and
     // unrescued-output are re-checked first — both can take real wall
     // time (a git subprocess, a filesystem walk) — so the identity/
@@ -3517,6 +3645,30 @@ fn supersede_collision_predecessor(
             // the same pane — not the predecessor we found above.
             return Ok(());
         }
+    }
+
+    // Card 20261106-b-9d70c7: name + pane id, even re-confirmed live,
+    // ready, and with a forward `state_change_seq`, is still not durable
+    // identity across a Herdr restart that reissues this exact
+    // deterministic name into a recycled pane id —
+    // `RealDispatchStore::unfinished_agent_names` is empty in this port,
+    // so uniqueness at mint time is only the live `agent list`
+    // (`runner::unique_agent_name`). The pane's own label
+    // (`runner::pane_rename` always ends it with the dispatching task's
+    // own id) and, when the predecessor has its own worktree, the live
+    // `agent get` cwd are both dispatch-unique in a way the name alone is
+    // not — the last two reads before the close, immediately after the
+    // identity/readiness/seq confirmation above.
+    let Some(label) = agents.pane_label(&live_agent.pane_id) else {
+        return Ok(());
+    };
+    if !mv_state::tasks::label_names_task(Some(label.as_str()), &predecessor.task_id) {
+        return Ok(());
+    }
+    if lane_root.is_dir()
+        && !mv_state::tasks::cwd_confirms_lane(confirmed.cwd.as_deref(), &lane_root)
+    {
+        return Ok(());
     }
 
     let reason = format!(
@@ -3582,6 +3734,41 @@ fn supersede_collision_predecessor(
     Ok(())
 }
 
+/// Stands in for [`mv_state::worktrees::HerdrLaneObserver`] on
+/// [`RealDispatchStore::prepare`]'s own `adopt` call — the one that runs
+/// under `runner::start_dispatch`'s project lock. That call's job is to
+/// re-verify the *local* (filesystem) conditions `Worktrees::adopt`
+/// checks — registered, terminal statuses, process cwd — immediately
+/// before this launch actually claims the lane, failing closed if any of
+/// them changed since `recheck_admission` looked; it is never the one
+/// that talks to Herdr. The live-occupant probe `HerdrLaneObserver::check`
+/// would otherwise run (`agent list`) already ran once, for real, in
+/// [`RealDispatchStore::recheck_admission`] — under the fleet lock alone,
+/// before any project lock exists — and the fleet lock stays held
+/// continuously from there through this call, so nothing else admitted
+/// into this fleet can hand the lane a new live occupant in between.
+/// Asking Herdr again here would reintroduce the exact defect this type
+/// exists to avoid: `routing.log.lock` held across a Herdr round trip
+/// (card `20261115-b-078277`).
+struct AlreadyCheckedLaneObserver;
+
+impl mv_state::worktrees::LaneObserver for AlreadyCheckedLaneObserver {
+    fn check(
+        &mut self,
+        _lane: &mv_state::worktrees::Lane,
+        _force: bool,
+    ) -> std::result::Result<(), mv_state::worktrees::WorktreeError> {
+        Ok(())
+    }
+
+    fn record_prune(
+        &mut self,
+        _lane: &mv_state::worktrees::Lane,
+    ) -> std::result::Result<(), mv_state::worktrees::WorktreeError> {
+        Ok(())
+    }
+}
+
 impl DispatchStore for RealDispatchStore {
     type Guard = StoreGuard;
 
@@ -3621,16 +3808,43 @@ impl DispatchStore for RealDispatchStore {
     /// `cli.py:3502-3525`, which this port's broader reconcile/reclaim pass
     /// below still skips under that flag.
     fn recheck_admission(&mut self) -> Result<(), RunnerError> {
-        if self.into.is_none() {
-            self.task_id = self.collision_rebind(&self.task_id_base)?;
-            if self.task_id != self.task_id_base {
-                let mut agents = mv_state::tasks::HerdrAgents;
-                supersede_collision_predecessor(
-                    &self.project_root,
-                    &self.task_id,
-                    &self.task_id_base,
-                    &mut agents,
-                )?;
+        match &self.into {
+            None => {
+                self.task_id = self.collision_rebind(&self.task_id_base)?;
+                if self.task_id != self.task_id_base {
+                    let mut agents = mv_state::tasks::HerdrAgents;
+                    supersede_collision_predecessor(
+                        &self.project_root,
+                        &self.task_id,
+                        &self.task_id_base,
+                        &mut agents,
+                    )?;
+                }
+            }
+            // `--into`'s own liveness probe. `prepare` (which still has to
+            // run under `runner::start_dispatch`'s project lock, to do the
+            // same filesystem-based rebind/verification every other branch
+            // here does) used to make this exact Herdr call
+            // (`Worktrees::adopt`'s `HerdrLaneObserver::check`, an `agent
+            // list`) itself, which held `routing.log.lock` across it —
+            // card `20261115-b-078277`, the same defect class
+            // `dispatch_releases_the_project_lock_before_pane_creation`
+            // already fixed for the default (non-`--into`) path. Run it
+            // here instead, under the fleet lock alone, before any project
+            // lock exists — the same ordering this function's `None` arm
+            // already relies on for `collision_rebind`/
+            // `supersede_collision_predecessor`. `prepare`'s own later
+            // `adopt` call trusts this result (via
+            // [`AlreadyCheckedLaneObserver`]) rather than asking Herdr a
+            // second time; it still re-verifies every local condition
+            // `Worktrees::adopt` checks and fails closed if one changed.
+            Some(into) => {
+                let worktrees = mv_state::worktrees::Worktrees::new(&self.project_root)
+                    .map_err(|e| RunnerError::Refused(format!("worktree: {e}")))?;
+                let mut observer = mv_state::worktrees::HerdrLaneObserver::new(worktrees.project());
+                worktrees
+                    .adopt(into, &mut observer)
+                    .map_err(|e| RunnerError::Refused(format!("--into {into:?}: {e}")))?;
             }
         }
 
@@ -3716,10 +3930,19 @@ impl DispatchStore for RealDispatchStore {
             // `Worktrees::adopt` is the same check `multiverse worktrees
             // prune` already trusts to judge a lane reusable: registered,
             // not live, no occupant task still unsettled.
+            //
+            // `AlreadyCheckedLaneObserver`, not `HerdrLaneObserver`: this
+            // call runs under the project lock `runner::start_dispatch`
+            // holds through `prepare`, and `HerdrLaneObserver::check` is a
+            // Herdr round trip — `recheck_admission` already made that
+            // exact call, for real, before any project lock existed (card
+            // `20261115-b-078277`). This second `adopt` call still
+            // re-verifies every local condition it checks (registered,
+            // terminal statuses, process cwd) and fails closed if one
+            // changed; it only skips re-asking Herdr.
             let lane = match &self.into {
                 Some(into) => {
-                    let mut observer =
-                        mv_state::worktrees::HerdrLaneObserver::new(worktrees.project());
+                    let mut observer = AlreadyCheckedLaneObserver;
                     worktrees
                         .adopt(into, &mut observer)
                         .map_err(|e| RunnerError::Refused(format!("--into {into:?}: {e}")))?
@@ -3796,10 +4019,28 @@ impl DispatchStore for RealDispatchStore {
                 self.account.name
             ))
         })?;
-        let environment = vec![(
-            self.account.config_dir_var.clone(),
-            config_dir_value.to_string(),
-        )];
+        // Card 20261110-b-f29855: a dispatched pane otherwise inherits only
+        // the seat's own auth-dir var, so its own `multiverse` falls back to
+        // the default `~/.config/multiverse/config.toml`/state dir — a
+        // different fleet than the one that actually planned this dispatch
+        // whenever `--config`/`$MULTIVERSE_CONFIG`/`$MULTIVERSE_STATE_DIR`
+        // pointed elsewhere. Both are already fully resolved, absolute paths
+        // this process itself read (`RealEngine::resolve`'s `load_config`
+        // and `config_state_dir_from_env`), never a default invented here.
+        let environment = vec![
+            (
+                self.account.config_dir_var.clone(),
+                config_dir_value.to_string(),
+            ),
+            (
+                "MULTIVERSE_CONFIG".to_string(),
+                self.config.source_path.display().to_string(),
+            ),
+            (
+                "MULTIVERSE_STATE_DIR".to_string(),
+                self.config_dir.display().to_string(),
+            ),
+        ];
         let command =
             (!self.account.command.trim().is_empty()).then(|| self.account.command.clone());
         let clear_auth = if command.is_some() {
@@ -3975,10 +4216,17 @@ impl DispatchStore for RealDispatchStore {
     /// started, so conflating the two states would read as a start/prompt
     /// miss in the log when the agent in fact came up fine and only the
     /// configured setup command failed.
-    fn record_failed_to_start(
+    ///
+    /// Overrides [`record_failed_to_start_reason`](DispatchStore::record_failed_to_start_reason)
+    /// directly, rather than the plain [`record_failed_to_start`](DispatchStore::record_failed_to_start)
+    /// that default delegates to, so the already-classified `reason` (card
+    /// `20261115-b-dbfd1d`) reaches the real routing.log instead of being
+    /// dropped by that default.
+    fn record_failed_to_start_reason(
         &mut self,
         launch: &PreparedLaunch,
         pane: &str,
+        reason: &str,
     ) -> Result<(), RunnerError> {
         let when = mv_core::time::now_stamp();
         let state = if self.lane_setup_failed {
@@ -3993,6 +4241,7 @@ impl DispatchStore for RealDispatchStore {
         if !pane.is_empty() {
             line.push_str(&format!("\tpane={pane}"));
         }
+        line.push_str(&format!("\treason={reason}"));
         self.append_routing(&line)
     }
 
@@ -4142,6 +4391,8 @@ impl DispatchStore for RealDispatchStore {
     }
 }
 
+/// The `dispatch` subcommand's entry point from `commands::run`'s routing
+/// table: binds [`run`] to the real [`RealEngine`] and stdout.
 pub fn run_default(args: &ArgMatches) -> Result<(), Failure> {
     run(args, &RealEngine, &mut std::io::stdout())
 }
@@ -4675,6 +4926,11 @@ mod tests {
     struct FakeFleetAgents {
         live: Vec<mv_state::tasks::LiveAgentStatus>,
         closed: Vec<String>,
+        /// `pane get`'s own `label`, by pane id — card `20261106-b-
+        /// 9d70c7`'s occupancy gate. A pane with no entry here models a
+        /// fake that was never told to answer this probe, same posture
+        /// as the trait default: `pane_label` returns `None`.
+        labels: HashMap<String, String>,
     }
 
     impl FakeFleetAgents {
@@ -4688,6 +4944,11 @@ mod tests {
                 name: Some(name.to_string()),
                 status: Some(mv_engine::mv_herdr::envelope::AgentState::Idle),
             }
+        }
+
+        fn with_label(mut self, pane_id: &str, label: &str) -> Self {
+            self.labels.insert(pane_id.to_string(), label.to_string());
+            self
         }
     }
 
@@ -4709,6 +4970,10 @@ mod tests {
 
         fn list_checked(&mut self) -> Option<Vec<mv_state::tasks::LiveAgentStatus>> {
             Some(self.live.clone())
+        }
+
+        fn pane_label(&mut self, pane_id: &str) -> Option<String> {
+            self.labels.get(pane_id).cloned()
         }
     }
 
@@ -4767,7 +5032,9 @@ mod tests {
         let mut agents = FakeFleetAgents {
             live: vec![FakeFleetAgents::idle("w2:p1", "mv-fixer-b")],
             closed: Vec::new(),
-        };
+            labels: HashMap::new(),
+        }
+        .with_label("w2:p1", "fixer · 20260101-fixer-bbbbbb");
         reconcile_and_reclaim_fleet(&config, "a", &root_a, &mut agents);
 
         let log_a = std::fs::read_to_string(root_a.join(".multiverse/routing.log")).unwrap();
@@ -4810,6 +5077,7 @@ mod tests {
         let mut agents = FakeFleetAgents {
             live: vec![FakeFleetAgents::idle("w1:p1", "unrelated-agent")],
             closed: Vec::new(),
+            labels: HashMap::new(),
         };
         reclaim_stale_panes(&root, &mut agents);
         assert!(
@@ -4836,7 +5104,9 @@ mod tests {
         let mut agents = FakeFleetAgents {
             live: vec![FakeFleetAgents::idle("w1:p1", "mv-fixer-a")],
             closed: Vec::new(),
-        };
+            labels: HashMap::new(),
+        }
+        .with_label("w1:p1", "fixer · 20260101-fixer-aaaaaa");
         reclaim_stale_panes(&root, &mut agents);
         assert_eq!(agents.closed, vec!["w1:p1".to_string()]);
     }
@@ -4874,6 +5144,7 @@ mod tests {
         let mut agents = FakeFleetAgents {
             live: Vec::new(),
             closed: Vec::new(),
+            labels: HashMap::new(),
         };
         reconcile_and_reclaim_fleet(&config, "a", &root_a, &mut agents);
 
@@ -5035,6 +5306,58 @@ review_scope = "repo"
         assert!(RealEngine.plan(&request).is_err());
     }
 
+    /// Card `20261107-b-5a12e7`: `ZeroReviewBudget` always returned 0, so a
+    /// spent `review_budget_per_window` never refused. Revert-check: this
+    /// fails if the live ReviewBudget is stubbed back to a constant 0.
+    #[test]
+    fn critic_dispatch_is_refused_once_the_review_budget_is_spent() {
+        let _state_dir = StateDirEnvGuard::new();
+        let (_dir, mut request) = parity_fixture("critic");
+        let config_path = Path::new(request.config_override.as_deref().unwrap());
+        let mut toml = std::fs::read_to_string(config_path).unwrap();
+        toml.push_str("review_budget_per_window = 2\n");
+        std::fs::write(config_path, toml).unwrap();
+        request.exclude_vendor = vec!["codex".into()];
+
+        let now = mv_core::time::now_utc();
+        let stamp = |ago: time::Duration| mv_core::time::format_seconds_utc(now - ago);
+        let project = Path::new(&request.project_path);
+        write_routing_log(
+            project,
+            &format!(
+                "{a}\tevent=dispatch\ttask=20261107-critic-aaaaaa\trole=critic\n\
+                 {b}\tevent=dispatch\ttask=20261107-critic-bbbbbb\trole=critic\n",
+                a = stamp(time::Duration::hours(1)),
+                b = stamp(time::Duration::minutes(5)),
+            ),
+        );
+        let error = RealEngine.plan(&request).unwrap_err();
+        match error {
+            EngineError::NeedsConfig(message) => {
+                assert!(
+                    message.contains("2/2") && message.contains("last 24h"),
+                    "{message}"
+                );
+                assert!(message.contains("sandbox"), "{message}");
+            }
+            other => panic!("expected NeedsConfig naming the limit, got {other:?}"),
+        }
+
+        write_routing_log(
+            project,
+            &format!(
+                "{old}\tevent=dispatch\ttask=20261107-critic-oldold\trole=critic\n\
+                 {recent}\tevent=dispatch\ttask=20261107-critic-cccccc\trole=critic\n",
+                old = stamp(time::Duration::hours(25)),
+                recent = stamp(time::Duration::minutes(5)),
+            ),
+        );
+        assert!(
+            RealEngine.plan(&request).is_ok(),
+            "a Critic event older than 24h must not count against the window"
+        );
+    }
+
     /// scout2-gaps.md row #30 / Python `dispatch.py:1677-1684`
     /// (`AnsweredItemsUnclosedError`, armed by `backlog answer`'s own
     /// `by="human"` annotation): a project with an answered-but-unclosed
@@ -5166,6 +5489,75 @@ review_scope = "repo"
         assert_eq!(std::fs::read_to_string(input).unwrap(), "evidence");
     }
 
+    // --- card 20261110-b-f29855: worker panes must get the dispatcher's
+    // resolved config path and state dir, not just the seat's auth-dir var -
+
+    #[test]
+    fn dry_run_card_shows_the_resolved_config_path_and_state_dir() {
+        let state_dir_env = StateDirEnvGuard::new();
+        let (_dir, request) = parity_fixture("scout");
+        let resolved = RealEngine.resolve(&request).unwrap();
+        let report = RealEngine.plan(&request).unwrap().dry_run_report;
+        assert!(
+            report.contains(&format!(
+                "  env         MULTIVERSE_CONFIG={}\n",
+                resolved.config.source_path.display()
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "  env         MULTIVERSE_STATE_DIR={}\n",
+                state_dir_env._dir.path().display()
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "--env CODEX_HOME={} --env MULTIVERSE_CONFIG={} --env MULTIVERSE_STATE_DIR={}",
+                resolved.config.accounts["author"].config_dir.as_raw(),
+                resolved.config.source_path.display(),
+                state_dir_env._dir.path().display(),
+            )),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_carries_the_resolved_config_path_and_state_dir_alongside_the_auth_dir_var() {
+        // The failure this guards: before this fix, a dispatched pane got
+        // only the seat's own auth-dir var (`CODEX_HOME` here), so a
+        // worker's own `multiverse` fell back to the default
+        // `~/.config/multiverse/config.toml`/state dir instead of the
+        // fleet the dispatching process actually resolved (card
+        // `20261110-b-f29855`).
+        let _state_dir = StateDirEnvGuard::new();
+        let (_dir, request) = parity_fixture("scout");
+        let resolved = RealEngine.resolve(&request).unwrap();
+        let config_path = resolved.config.source_path.clone();
+        let state_dir = resolved.config_dir.clone();
+        let auth_dir = resolved.config.accounts["author"]
+            .config_dir
+            .as_raw()
+            .to_string();
+        let mut store = RealDispatchStore::new(resolved, &request);
+        let launch = store.prepare().unwrap();
+        assert_eq!(
+            launch.environment,
+            vec![
+                ("CODEX_HOME".to_string(), auth_dir),
+                (
+                    "MULTIVERSE_CONFIG".to_string(),
+                    config_path.display().to_string()
+                ),
+                (
+                    "MULTIVERSE_STATE_DIR".to_string(),
+                    state_dir.display().to_string()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn live_agent_naming_honors_the_project_short_and_rebudgets_collisions() {
         let _state_dir = StateDirEnvGuard::new();
@@ -5272,6 +5664,50 @@ review_scope = "repo"
                 .unwrap()
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn review_budget_counts_recent_critic_dispatches_from_this_projects_log() {
+        use engine_dispatch::ReviewBudget;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".multiverse")).unwrap();
+        let now = mv_core::time::now_utc();
+        let stamp = |ago: time::Duration| mv_core::time::format_seconds_utc(now - ago);
+        std::fs::write(
+            dir.path().join(".multiverse/routing.log"),
+            format!(
+                "{recent_a}\tevent=dispatch\trole=critic\ttask=t-a\n\
+                 {recent_b}\tevent=dispatch\trole=reviewer\ttask=t-b\n\
+                 {old}\tevent=dispatch\trole=critic\ttask=t-old\n\
+                 {builder}\tevent=dispatch\trole=builder\ttask=t-buil\n",
+                recent_a = stamp(time::Duration::hours(1)),
+                recent_b = stamp(time::Duration::minutes(5)),
+                old = stamp(time::Duration::hours(25)),
+                builder = stamp(time::Duration::minutes(1)),
+            ),
+        )
+        .unwrap();
+        let routing = ProjectRouting {
+            project: "sandbox",
+            root: dir.path(),
+        };
+        assert_eq!(
+            routing.reviewer_dispatch_count("sandbox", Instant::now()),
+            2
+        );
+        assert_eq!(
+            routing.reviewer_dispatch_count("elsewhere", Instant::now()),
+            0
+        );
+        let empty = tempfile::tempdir().unwrap();
+        let missing = ProjectRouting {
+            project: "sandbox",
+            root: empty.path(),
+        };
+        assert_eq!(
+            missing.reviewer_dispatch_count("sandbox", Instant::now()),
+            0
         );
     }
 
@@ -5728,6 +6164,28 @@ review_scope = "repo"
     }
 
     #[test]
+    fn open_task_count_excludes_a_terminal_status_file_nobody_recorded_yet() {
+        // Card 20261110-b-fa4365: a lane whose own status file already
+        // reads `done` has finished even though nothing has reconciled it
+        // into `routing.log` yet (no `event=result` line) — it must not
+        // keep holding a `max_concurrent` slot until a Nexus gets to it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-builder-aaaaaa")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=sandbox\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".multiverse/tasks/20250101-builder-aaaaaa/status"),
+            "done",
+        )
+        .unwrap();
+        assert_eq!(open_task_count(root), 0);
+    }
+
+    #[test]
     fn fleet_open_counts_sums_every_resolvable_project_and_flags_other_floor_gaps() {
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path().join("here");
@@ -5756,6 +6214,58 @@ review_scope = "repo"
             no_gaps.is_empty(),
             "the dispatched project's own floor is never listed as an 'other' gap"
         );
+    }
+
+    /// Card `20261115-b-65fe80`, proof (a): with `max_concurrent = 2`, two
+    /// worker panes plus one busy Nexus pane must refuse a third dispatch
+    /// on the workers alone — swap one worker for the Nexus pane (one
+    /// worker, one Nexus) and the same dispatch is allowed, because the
+    /// fleet cap no longer counts the Nexus pane at all.
+    #[test]
+    fn fleet_open_counts_excludes_a_busy_nexus_pane_from_the_fleet_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("here");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-builder-aaaaaa")).unwrap();
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-nexus-bbbbbb")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n\
+             2020-01-01T00:00:01+00:00\tevent=dispatch\ttask=20250101-nexus-bbbbbb\tproject=here\trole=nexus\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n",
+        )
+        .unwrap();
+        let toml = format!("[projects.here]\npath = \"{}\"\n", root.display());
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+
+        // One worker pane, one busy Nexus pane: allowed under a cap of 2.
+        let (fleet_open, _) = fleet_open_counts(&config, "here");
+        assert_eq!(
+            fleet_open, 1,
+            "the busy Nexus pane must not count toward the fleet cap"
+        );
+        let mut inputs = engine_dispatch::FleetCapacityInputs {
+            max_concurrent: 2,
+            fleet_open,
+            project_open: 0,
+            project_min_slots: 0,
+            project_max_slots: None,
+            other_floor_gaps: Vec::new(),
+            batch_count: 1,
+        };
+        assert!(engine_dispatch::check_fleet_capacity(&inputs).is_ok());
+
+        // Two worker panes, no Nexus pane: refused on the workers alone.
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-builder-cccccc")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n\
+             2020-01-01T00:00:01+00:00\tevent=dispatch\ttask=20250101-builder-cccccc\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n",
+        )
+        .unwrap();
+        let (fleet_open, _) = fleet_open_counts(&config, "here");
+        assert_eq!(fleet_open, 2);
+        inputs.fleet_open = fleet_open;
+        assert!(engine_dispatch::check_fleet_capacity(&inputs).is_err());
     }
 
     /// Card `20261105-fixer-9d070c`: before this task, a seat's open count
@@ -5918,6 +6428,38 @@ review_scope = "repo"
             counts.get("se"),
             None,
             "a name not found in any project's log must not be guessed from its own suffix"
+        );
+    }
+
+    /// Card `20261115-b-65fe80`, proof (b): a seat's open-agent cap counts
+    /// worker panes only — a busy Nexus pane dispatched to this same
+    /// account must not occupy any of its cap, so a cap-1 seat hosting one
+    /// Nexus pane still has room for one worker.
+    #[test]
+    fn live_seat_counts_excludes_a_busy_nexus_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".multiverse/tasks/20250101-nexus-aaaaaa")).unwrap();
+        std::fs::write(
+            project.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\tproject=p\trole=nexus\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tagent=mv-nexus-1-se\tbranch=main\n",
+        )
+        .unwrap();
+        let toml = format!(
+            "[projects.p]\npath = \"{}\"\n[accounts.seat]\nkind = \"codex\"\nshort = \"se\"\ncommand = \"wrap\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{}/codex\"\npool = \"codex:test\"\n",
+            project.display(),
+            dir.path().display(),
+        );
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+        let latest = latest_tasks_by_agent(&config);
+
+        let mut statuses = HashMap::new();
+        statuses.insert("mv-nexus-1-se".to_string(), "working".to_string());
+        let counts = live_seat_counts(&statuses, &latest, &config);
+        assert_eq!(
+            counts.get("se"),
+            None,
+            "a busy Nexus pane must not occupy the seat's worker cap"
         );
     }
 
@@ -6414,13 +6956,63 @@ review_scope = "repo"
         assert!(!log.contains("sometesttoken123"), "{log:?}");
         assert!(log.contains("[redacted]"), "{log:?}");
 
-        // The distinct state `record_failed_to_start` would log.
+        // The distinct state `record_failed_to_start_reason` would log.
         let state = if store.lane_setup_failed {
             "lane-setup-failed"
         } else {
             "failed-to-start"
         };
         assert_eq!(state, "lane-setup-failed");
+    }
+
+    /// Card `20261115-b-dbfd1d`: the reason a `failed-to-start`
+    /// classified — `not-ready-timeout`, `needs-attention`, etc — must
+    /// reach the real routing.log, not just the in-process `RunnerError`,
+    /// or a human grepping for it finds nothing. Field order before
+    /// `reason=` is unchanged from the no-reason line this store already
+    /// wrote (`event=result`...`pane=`); `reason=` is strictly appended.
+    #[test]
+    fn record_failed_to_start_reason_appends_reason_after_the_existing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut store = store_for(
+            &project,
+            config_dir.path(),
+            Role::Builder,
+            "20261102-builder-dddddd",
+        );
+        let launch = PreparedLaunch {
+            project_root: project.clone(),
+            cwd: project.clone(),
+            task_id: "20261102-builder-dddddd".into(),
+            agent_name: "a".into(),
+            role: "builder".into(),
+            kind: "codex".into(),
+            model: "m".into(),
+            seat: "s".into(),
+            brief: String::new(),
+            native_args: Vec::new(),
+            environment: Vec::new(),
+            clear_auth: Vec::new(),
+            command: None,
+        };
+
+        store
+            .record_failed_to_start_reason(&launch, "w1:p1", "not-ready-timeout")
+            .unwrap();
+
+        let log = std::fs::read_to_string(project.join(".multiverse/routing.log")).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(line.ends_with("\treason=not-ready-timeout"), "{line:?}");
+        assert!(
+            line.contains(
+                "\tevent=result\ttask=20261102-builder-dddddd\tstatus=failed\t\
+                 state=failed-to-start\trevisions=0\tpane=w1:p1\treason=not-ready-timeout"
+            ),
+            "{line:?}"
+        );
     }
 
     #[test]
@@ -7277,6 +7869,22 @@ review_scope = "repo"
         /// What `close` reports back — `false` scripts a close that fails
         /// even though the pane was a valid, confirmed target (finding 3).
         close_result: bool,
+        /// `pane get`'s own `label`, reported for every pane — card
+        /// `20261106-b-9d70c7`'s occupancy gate. Absent (the default)
+        /// models a fake that was never told to answer this probe, same
+        /// posture as the trait default: `pane_label` returns `None`, not
+        /// an empty label.
+        label: Option<String>,
+        /// `agent get`'s own `cwd`, reported through `confirm_live` for
+        /// every matching pane/name — the gate's second witness.
+        cwd: Option<std::path::PathBuf>,
+        /// Stands in for a slow Herdr `pane close` round trip (card
+        /// `20261115-b-078277`): when set, `close` flips the flag — so a
+        /// concurrent probe knows the call has actually started, rather
+        /// than racing a guessed delay — then sleeps for the duration
+        /// before returning. `None` (the default) is an immediate close,
+        /// same as before this field existed.
+        close_delay: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, Duration)>,
     }
 
     impl FakeLiveAgents {
@@ -7288,6 +7896,9 @@ review_scope = "repo"
                 list_calls: 0,
                 closed: Vec::new(),
                 close_result: true,
+                label: None,
+                cwd: None,
+                close_delay: None,
             }
         }
 
@@ -7305,6 +7916,25 @@ review_scope = "repo"
             self.close_result = false;
             self
         }
+
+        fn with_label(mut self, label: &str) -> Self {
+            self.label = Some(label.to_string());
+            self
+        }
+
+        fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+            self.cwd = Some(cwd.into());
+            self
+        }
+
+        fn closing_sleeps(
+            mut self,
+            started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            delay: Duration,
+        ) -> Self {
+            self.close_delay = Some((started, delay));
+            self
+        }
     }
 
     impl mv_state::tasks::AgentPanes for FakeLiveAgents {
@@ -7318,11 +7948,40 @@ review_scope = "repo"
         }
 
         fn close(&mut self, pane_id: &str) -> bool {
+            if let Some((started, delay)) = &self.close_delay {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(*delay);
+            }
             self.closed.push(pane_id.to_string());
             if self.close_result {
                 self.agents.retain(|agent| agent.pane_id != pane_id);
             }
             self.close_result
+        }
+
+        fn pane_label(&mut self, _pane_id: &str) -> Option<String> {
+            self.label.clone()
+        }
+
+        /// Overrides the trait default only to carry `cwd` along —
+        /// otherwise the exact same name/pane_id match.
+        fn confirm_live(
+            &mut self,
+            pane_id: &str,
+            name: &str,
+        ) -> Option<mv_state::tasks::LiveConfirmation> {
+            let agents = self.list_checked()?;
+            let agent = agents
+                .into_iter()
+                .find(|agent| agent.pane_id == pane_id && agent.name.as_deref() == Some(name))?;
+            Some(mv_state::tasks::LiveConfirmation {
+                ready: agent
+                    .status
+                    .is_some_and(mv_engine::mv_herdr::envelope::AgentState::is_ready_for_input),
+                state_change_seq: None,
+                cwd: self.cwd.clone(),
+                terminal_id: None,
+            })
         }
 
         fn list_checked(&mut self) -> Option<Vec<mv_state::tasks::LiveAgentStatus>> {
@@ -7362,7 +8021,8 @@ review_scope = "repo"
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_routing_log(root, idle_predecessor_log());
-        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()]);
+        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()])
+            .with_label("builder · 20260101-builder-aaaaaa");
 
         supersede_collision_predecessor(
             root,
@@ -7461,7 +8121,9 @@ review_scope = "repo"
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_routing_log(root, idle_predecessor_log());
-        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()]).closing_fails();
+        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()])
+            .closing_fails()
+            .with_label("builder · 20260101-builder-aaaaaa");
 
         let error = supersede_collision_predecessor(
             root,
@@ -7749,6 +8411,8 @@ review_scope = "repo"
             Some(mv_state::tasks::LiveConfirmation {
                 ready: true,
                 state_change_seq: Some(if self.confirm_calls == 1 { 5 } else { 3 }),
+                cwd: None,
+                terminal_id: None,
             })
         }
     }
@@ -7794,6 +8458,126 @@ review_scope = "repo"
         );
     }
 
+    // --- label/cwd occupancy gate before every pane-id close (card
+    // 20261106-b-9d70c7) ------------------------------------------------
+    //
+    // Everything above already pins name + pane id + readiness + a
+    // forward `state_change_seq`. None of that is durable across a Herdr
+    // restart that reissues this exact deterministic name into a recycled
+    // pane id — the static race, not a timing gap. These pin the two new
+    // witnesses that are.
+
+    /// The static race itself: same pane, same name, not working, seq not
+    /// backwards — every gate above this one agrees — but the pane's own
+    /// label at close time names a *different* task, the shape a Herdr
+    /// restart handing this deterministic name to someone else's pane
+    /// would produce. Revert check: with the label gate removed, this
+    /// predicted-fails case closes exactly like the clean happy path
+    /// above, since every earlier gate already passes it.
+    #[test]
+    fn supersede_collision_predecessor_never_closes_when_the_close_time_label_names_a_different_task(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_routing_log(root, idle_predecessor_log());
+        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()])
+            .with_label("builder · 20260101-builder-zzzzzz");
+
+        supersede_collision_predecessor(
+            root,
+            "20260101-builder-aaaaaa-2",
+            "20260101-builder-aaaaaa",
+            &mut agents,
+        )
+        .unwrap();
+
+        assert!(
+            agents.closed.is_empty(),
+            "a pane label naming a different task must never be closed as this predecessor"
+        );
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            !log.contains("event=supersede"),
+            "no outcome may be recorded for a pane the label disagrees with: {log}"
+        );
+    }
+
+    /// Missing label at close time (the read failed, or Herdr's reply had
+    /// none at all) fails closed exactly like a failed `confirm_live` —
+    /// never read as "can't tell, so assume yes".
+    #[test]
+    fn supersede_collision_predecessor_never_closes_when_the_close_time_label_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_routing_log(root, idle_predecessor_log());
+        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()]);
+
+        supersede_collision_predecessor(
+            root,
+            "20260101-builder-aaaaaa-2",
+            "20260101-builder-aaaaaa",
+            &mut agents,
+        )
+        .unwrap();
+
+        assert!(
+            agents.closed.is_empty(),
+            "a missing label must fail closed, never be treated as a match"
+        );
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(!log.contains("event=supersede"), "{log}");
+    }
+
+    /// The second witness, pinned on its own: a correct label is not
+    /// enough once the predecessor has its own worktree — a copied or
+    /// stale label must not authorize a close when the live `cwd` is
+    /// somewhere else entirely. Revert check: with the cwd gate removed,
+    /// this predicted-fails case closes, since the label alone already
+    /// satisfies the first gate.
+    #[test]
+    fn supersede_collision_predecessor_never_closes_when_the_live_cwd_is_outside_the_predecessors_lane(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "init",
+            ],
+        );
+        write_routing_log(&root, idle_predecessor_log());
+        let worktrees = mv_state::worktrees::Worktrees::new(&root).unwrap();
+        worktrees.create("20260101-builder-aaaaaa", "HEAD").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()])
+            .with_label("builder · 20260101-builder-aaaaaa")
+            .with_cwd(elsewhere.path());
+
+        supersede_collision_predecessor(
+            &root,
+            "20260101-builder-aaaaaa-2",
+            "20260101-builder-aaaaaa",
+            &mut agents,
+        )
+        .unwrap();
+
+        assert!(
+            agents.closed.is_empty(),
+            "a live cwd outside the predecessor's own lane must never be closed, even with a \
+             matching label"
+        );
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(!log.contains("event=supersede"), "{log}");
+    }
+
     /// (c): `recheck_admission`'s early rebind-and-supersede must not leave
     /// the project lock held once it returns — `prepare`'s own later
     /// `lock_project()` call (the identical `ProjectLog::new(path).lock()`)
@@ -7815,24 +8599,6 @@ review_scope = "repo"
             .tempfile()
             .unwrap()
             .into_temp_path();
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1 $2\" in\n  \
-                 \"agent list\") printf '%s' '{{\"result\": {{\"agents\": \
-                 [{{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"a1\"}}]}}}}' ;;\n  \
-                 \"agent get\") printf '%s' '{{\"result\": {{\"agent\": \
-                 {{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"state_change_seq\": 1}}}}}}' ;;\n  \
-                 *) printf '%s' '{{\"result\": {{}}}}' ;;\nesac\n",
-                marker.path().display()
-            ),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        let _guard = HerdrEnvGuard::set(&script);
-
         let repo = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(repo.path()).unwrap();
         git(&project, &["init", "-q", "-b", "main"]);
@@ -7850,7 +8616,7 @@ review_scope = "repo"
             ],
         );
         let worktrees = mv_state::worktrees::Worktrees::new(&project).unwrap();
-        worktrees.create("20261105-builder-aaaaaa", "HEAD").unwrap();
+        let lane = worktrees.create("20261105-builder-aaaaaa", "HEAD").unwrap();
         write_routing_log(
             &project,
             "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20261105-builder-aaaaaa\t\
@@ -7858,6 +8624,28 @@ review_scope = "repo"
              2026-01-01T00:05:00+00:00\tevent=result\ttask=20261105-builder-aaaaaa\t\
              status=done\tstate=done\trevisions=0\tpane=w1:p1\n",
         );
+
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1 $2\" in\n  \
+                 \"agent list\") printf '%s' '{{\"result\": {{\"agents\": \
+                 [{{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"name\": \"a1\"}}]}}}}' ;;\n  \
+                 \"agent get\") printf '%s' '{{\"result\": {{\"agent\": \
+                 {{\"pane_id\": \"w1:p1\", \"agent_status\": \"idle\", \"state_change_seq\": 1, \
+                 \"foreground_cwd\": \"{}\"}}}}}}' ;;\n  \
+                 \"pane get\") printf '%s' '{{\"result\": {{\"pane\": \
+                 {{\"pane_id\": \"w1:p1\", \"label\": \"builder - 20261105-builder-aaaaaa\"}}}}}}' ;;\n  \
+                 *) printf '%s' '{{\"result\": {{}}}}' ;;\nesac\n",
+                marker.path().display(),
+                lane.path.display(),
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let _guard = HerdrEnvGuard::set(&script);
 
         let config_dir = tempfile::tempdir().unwrap();
         let config_toml = format!(
@@ -7915,6 +8703,186 @@ review_scope = "repo"
         assert!(
             calls.lines().any(|line| line == "pane close w1:p1"),
             "{calls:?}"
+        );
+    }
+
+    // --- card 20261115-b-078277: --into/supersede must not hold
+    // routing.log.lock across a Herdr call --------------------------------
+
+    /// `supersede_collision_predecessor`'s own `agents.close` call — the
+    /// Herdr round trip that actually closes the predecessor's pane — used
+    /// to run under an explicit `_project_lock` wrapping the whole
+    /// re-verify-then-close span, so `routing.log.lock` was held for the
+    /// close's entire duration. A concurrent `activity send` takes the
+    /// identical lock file (`mv_state::activity`'s own bounded wait on
+    /// `routing.log.lock`), so that lock being held for as long as the
+    /// close call ran is exactly what would have blocked it.
+    ///
+    /// Spawns `supersede_collision_predecessor` on its own thread against a
+    /// fake Herdr whose `close` sleeps, and proves the lock is free *while
+    /// that sleep is in progress* — not merely after the whole call
+    /// returns, which would miss a lock released partway through and
+    /// re-taken before return. Revert check: re-wrapping the re-verify
+    /// (`check_dirty`/`check_unrescued`/`confirm_live`/`pane_label`) and
+    /// close in an explicit `ProjectLog::new(root).lock()` guard, as before
+    /// this fix, makes the `lock_timeout` probe below time out instead of
+    /// succeeding in well under `sleep_for`.
+    #[test]
+    fn supersede_collision_predecessor_never_holds_the_project_lock_across_the_close_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_routing_log(&root, idle_predecessor_log());
+
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sleep_for = Duration::from_millis(1500);
+        let mut agents = FakeLiveAgents::new(vec![idle_live_agent()])
+            .with_label("builder · 20260101-builder-aaaaaa")
+            .closing_sleeps(started.clone(), sleep_for);
+
+        let thread_root = root.clone();
+        let handle = thread::spawn(move || {
+            supersede_collision_predecessor(
+                &thread_root,
+                "20260101-builder-aaaaaa-2",
+                "20260101-builder-aaaaaa",
+                &mut agents,
+            )
+            .unwrap();
+            agents.closed
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "supersede_collision_predecessor never reached the close call"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let probe_started = Instant::now();
+        let lock = mv_state::log::ProjectLog::new(&root).lock_timeout(Duration::from_millis(500));
+        let probe_elapsed = probe_started.elapsed();
+        assert!(
+            lock.is_ok(),
+            "routing.log.lock must be free while the close call is sleeping, not held across it"
+        );
+        assert!(
+            probe_elapsed < sleep_for,
+            "acquiring the project lock took {probe_elapsed:?} while the close call was \
+             sleeping for {sleep_for:?} — supersede_collision_predecessor must not hold \
+             routing.log.lock across a Herdr call"
+        );
+        drop(lock);
+
+        let closed = handle.join().unwrap();
+        assert_eq!(closed, vec!["w1:p1".to_string()]);
+    }
+
+    /// `prepare`'s own `--into` `adopt` call runs under
+    /// `runner::start_dispatch`'s project lock (held explicitly here, the
+    /// same way that caller does, since this test calls `prepare` directly
+    /// rather than through the full runner). It must never make a Herdr
+    /// round trip while that lock is held: `recheck_admission` already
+    /// makes the one, real `agent list` probe this dispatch needs
+    /// (`HerdrLaneObserver::check`, inside `Worktrees::adopt`), before any
+    /// project lock exists, and `prepare`'s own later `adopt` call
+    /// (`AlreadyCheckedLaneObserver`) must trust that result rather than
+    /// asking again.
+    ///
+    /// A fake Herdr that sleeps on exactly that `agent list` call proves
+    /// it: `prepare` is timed while `routing.log.lock` is held, and must
+    /// return in well under the sleep. Revert check: putting
+    /// `HerdrLaneObserver::new(...)` back in `prepare`'s own `adopt` call,
+    /// as before this fix, makes `prepare` itself sleep for `sleep_secs`
+    /// while holding that lock, failing the elapsed-time assertion below.
+    #[test]
+    fn into_adopt_never_calls_herdr_while_prepares_project_lock_is_held() {
+        let sleep_secs = 2;
+        let script = tempfile::Builder::new()
+            .prefix("mv-cli-slow-herdr-")
+            .suffix(".sh")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        let repo = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(repo.path()).unwrap();
+        git(&project, &["init", "-q", "-b", "main"]);
+        git(
+            &project,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "init",
+            ],
+        );
+
+        let worktrees = mv_state::worktrees::Worktrees::new(&project).unwrap();
+        worktrees.create("20261101-builder-aaaaaa", "HEAD").unwrap();
+
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = agent ] && [ \"$2\" = list ]; then\n  \
+                 sleep {sleep_secs}\nfi\nprintf '%s' '{{\"result\": {{\"agents\": []}}}}'\n",
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let _guard = HerdrEnvGuard::set(&script);
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_toml = format!(
+            "[accounts.seat]\nkind = \"codex\"\nshort = \"se\"\n\
+             config_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{}\"\npool = \"codex:test\"\n\
+             [projects.p]\npath = \"{}\"\n[roles.builder]\nwrite_scope = \"declared\"\n\
+             skills = []\n[roles.builder.models]\ncodex = \"gpt-test\"\n",
+            config_dir.path().join("account").display(),
+            project.display(),
+        );
+        let config_path_dir = tempfile::tempdir().unwrap();
+        let config_path = config_path_dir.path().join("config.toml");
+        std::fs::write(&config_path, config_toml).unwrap();
+        let config = load_config(Some(config_path.to_str().unwrap())).unwrap();
+        let account = config.accounts["seat"].clone();
+        let mut store = RealDispatchStore::for_seat(
+            config,
+            config_dir.path().to_path_buf(),
+            "p".into(),
+            project.clone(),
+            Role::Builder,
+            account,
+            "test-model".into(),
+            "20261102-builder-bbbbbb".into(),
+            "continue the earlier work".into(),
+            "test".into(),
+            false,
+        );
+        store.write_scope = "declared".into();
+        store.no_reconcile = true;
+        store.into = Some("20261101-builder-aaaaaa".into());
+
+        store.recheck_admission().unwrap();
+
+        let _project_lock = mv_state::log::ProjectLog::new(&project).lock().unwrap();
+        let started = Instant::now();
+        let launch = store.prepare().unwrap();
+        let elapsed = started.elapsed();
+        drop(_project_lock);
+
+        assert_eq!(launch.task_id, "20261102-builder-bbbbbb");
+        assert!(
+            elapsed < Duration::from_secs(sleep_secs),
+            "prepare() took {elapsed:?} while routing.log.lock was held and Herdr's `agent \
+             list` sleeps for {sleep_secs}s — prepare's own --into adopt call must not ask \
+             Herdr again while that lock is held"
         );
     }
 }

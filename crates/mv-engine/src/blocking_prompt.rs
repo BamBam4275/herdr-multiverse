@@ -51,6 +51,7 @@ pub enum PromptAudience {
 }
 
 impl PromptAudience {
+    /// The on-disk/wire string for this variant, for serialization and logging.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Operator => "operator",

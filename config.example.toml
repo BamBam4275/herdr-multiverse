@@ -162,6 +162,14 @@ available = true
 # account across the whole config may set this; Multiverse refuses to start
 # if two do.
 # interactive = true
+# How many Nexus panes this seat hosts — one per started project that routes
+# its `nexus` chain here. Nexus panes no longer count against this seat's
+# open-agent cap (`accounts limit`); they count against this instead, so a
+# seat shared between a worker role and Nexus keeps its worker capacity
+# honest. `multiverse accounts` reports both: "workers N/cap, nexus
+# M/nexus_slots". Defaults to 0 — a seat that never hosts Nexus needs no
+# edit here.
+# nexus_slots = 1
 
 [accounts.claude-work]
 kind = "claude"
@@ -645,6 +653,40 @@ scout = ["claude-personal"]
 # mcp = ["**/mcp/**", "**/*mcp*"]
 # deletion = ["**/*delete*", "**/*retire*"]
 # secrets = ["**/*secret*", "**/.env*", "**/*env*"]
+
+
+# ---------------------------------------------------------------------------
+# Secrets scan gate (`multiverse worktrees <path> --merge <task>`)
+# ---------------------------------------------------------------------------
+#
+# Before a lane merges, `--merge` runs gitleaks over the lane's own commits
+# and refuses the merge (exit 1, redacted evidence written to
+# .multiverse/evidence/<task>-secrets.txt) on any finding. One fleet-wide
+# table, same posture as [review_policy] — commented out below with every
+# default spelled out, because those are the defaults you already get with
+# no [secrets_scan] table at all.
+#
+# [secrets_scan]
+# A bare command (resolved against PATH) or an explicit path to gitleaks.
+# gitleaks = "gitleaks"
+#
+# Optional second scanner. When set AND present on PATH/at this path,
+# `--merge` also runs `trufflehog git --only-verified --fail` over the
+# lane's commits after gitleaks passes. Unset by default: a missing
+# trufflehog is never required, only a missing gitleaks is.
+# trufflehog = "trufflehog"
+#
+# NEVER SKIP SILENTLY. true (the default): a missing gitleaks blocks the
+# merge (exit 3, with an install hint) rather than letting an unscanned
+# lane land. false: a missing gitleaks only prints a WARNING line and lets
+# the merge proceed unscanned.
+# required = true
+#
+# Path to a gitleaks config/allowlist, relative to the project being
+# merged — not to this config file. Passed as `--config <path>` only when
+# that file actually exists under the project; otherwise gitleaks runs
+# with no allowlist.
+# allowlist = ".gitleaks.toml"
 
 
 # ---------------------------------------------------------------------------

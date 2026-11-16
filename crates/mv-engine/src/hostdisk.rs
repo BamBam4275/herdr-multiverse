@@ -4,20 +4,26 @@
 //! `multiverse` hub's project history, not fleet runtime state. The separate
 //! notify episode/transport policy remains outside this advisory scan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use mv_config::load::Config;
+use mv_state::worktrees::{find_build_dir, find_main_checkout_build_dir, shared_build_root};
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use crate::dockerreport::{self, HostReport};
 
+/// Where one disk reading falls against `host_disk_warn_gb`/`host_disk_critical_gb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
+    /// At or above the warn floor — nothing to report.
     Ok,
+    /// Below the warn floor but at or above the critical one.
     Warn,
+    /// Below the critical floor — triggers the extra cache/cleanup probes
+    /// and, with `apply`, a hub notice.
     Critical,
 }
 
@@ -31,6 +37,7 @@ impl Level {
     }
 }
 
+/// One `df -Pk` reading for a single mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskUsage {
     pub filesystem: String,
@@ -39,6 +46,8 @@ pub struct DiskUsage {
 }
 
 impl DiskUsage {
+    /// Classifies this reading's free space against the configured warn
+    /// and critical floors (in GB).
     pub fn level(&self, warn_gb: u32, critical_gb: u32) -> Level {
         if self.available_bytes < u64::from(critical_gb) * (1 << 30) {
             Level::Critical
@@ -96,6 +105,9 @@ pub fn parse_df(text: &str) -> Option<DiskUsage> {
     })
 }
 
+/// Result of one disk-floor pass: the lines to print, the worst [`Level`]
+/// seen (`None` if nothing could be read), and whether a hub notice went
+/// out for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiskReport {
     pub lines: Vec<String>,
@@ -119,6 +131,10 @@ pub fn sweep_report(config: &Config, apply: bool, now: OffsetDateTime) -> Vec<St
     )
 }
 
+/// Same as [`sweep_report`], with injectable `HOME`, stale-temp root, and
+/// host probe, so a test can drive the whole sweep-time disk pass (Docker
+/// report plus disk-floor report) without touching the real filesystem or
+/// shelling out.
 pub fn sweep_report_with(
     config: &Config,
     apply: bool,
@@ -132,6 +148,12 @@ pub fn sweep_report_with(
     docker.lines.into_iter().chain(disk.lines).collect()
 }
 
+/// Core disk-floor pass: reads every configured project's mount, picks the
+/// single worst reading, and — only once that reading is [`Level::Critical`]
+/// — probes Docker build-cache, `go-build` cache, worktree `target/`, and
+/// orphaned shared-build-dir sizes so the notice names where the space
+/// went. With `apply`, also sends (or dedupes) the hub notice for a
+/// non-[`Level::Ok`] result.
 #[allow(clippy::too_many_arguments)]
 pub fn report_with(
     config: &Config,
@@ -206,6 +228,13 @@ pub fn report_with(
                 }
             }
         }
+        let worktree_scan_deadline = Instant::now() + WORKTREE_TARGET_SCAN_BUDGET;
+        report
+            .lines
+            .extend(worktree_target_lines(config, worktree_scan_deadline));
+        report
+            .lines
+            .extend(orphaned_build_dir_lines(config, worktree_scan_deadline));
     }
     if apply && report.level.is_some_and(|level| level != Level::Ok) {
         if let Some(hub) = config
@@ -247,6 +276,197 @@ pub fn report_with(
         }
     }
     report
+}
+
+/// Card `20261110-b-2b0ccf`: the Critical branch named Docker and go-build
+/// caches but never `.multiverse/worktrees/*/target` — on 2026-11-08 those
+/// summed to ~23 GB while the notice stayed silent on them. Sizes come from
+/// `std::fs::metadata`, never `du`, so this never shells out and — like
+/// every probe in this module — never reclaims anything. A single shared
+/// deadline bounds the whole scan instead of a depth cap: `target/` nests
+/// deeply (incremental, fingerprint, deps) but a sweep across many lanes is
+/// the only case worth truncating early, and a wall-clock budget truncates
+/// that case directly without guessing a depth that fits every layout.
+const WORKTREE_TARGET_SCAN_BUDGET: Duration = Duration::from_secs(2);
+
+/// One line per project with at least one lane whose `target/` has
+/// content, naming the total, the largest lanes first (top 3), and the
+/// prune command that frees them. A project with no lanes — or none with
+/// a nonempty `target/` — adds no line.
+fn worktree_target_lines(config: &Config, deadline: Instant) -> Vec<String> {
+    let mut projects: Vec<_> = config.projects.values().collect();
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut lines = Vec::new();
+    for project in projects {
+        let Some(root) = project.path.value().filter(|root| !root.is_empty()) else {
+            continue;
+        };
+        let worktrees_dir = Path::new(root).join(".multiverse").join("worktrees");
+        let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+            continue;
+        };
+        let mut lanes: Vec<(String, u64)> = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let size = dir_size(&entry.path().join("target"), deadline);
+            if size > 0 {
+                lanes.push((entry.file_name().to_string_lossy().into_owned(), size));
+            }
+        }
+        if lanes.is_empty() {
+            continue;
+        }
+        let total: u64 = lanes.iter().map(|(_, size)| *size).sum();
+        lanes.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+        let top = lanes
+            .iter()
+            .take(3)
+            .map(|(name, size)| format!("{name} ({})", human_size(*size)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "disk: {} .multiverse/worktrees target {} — {top} — multiverse worktrees {root} --prune",
+            project.name,
+            human_size(total),
+        ));
+    }
+    lines
+}
+
+/// One line per project with cargo build-dir bytes, under its configured
+/// shared-build root, that no longer belong to any build-dir this scan can
+/// still find evidence of for that project's own checkout or any of its
+/// current lanes (card `20261115-b-47f043`) — most often a lane `--prune`
+/// already removed before this cleanup landed, or one whose build-dir this
+/// run simply could not resolve in time. Read-only, like every probe in
+/// this module — `find_build_dir`'s own scan never shells out to `cargo`
+/// or `rustup` either. A project with no configured per-workspace
+/// build-dir namespacing, or nothing orphaned, adds no line. Shares
+/// `worktree_target_lines`'s own scan deadline rather than adding a second
+/// budget on top of it.
+fn orphaned_build_dir_lines(config: &Config, deadline: Instant) -> Vec<String> {
+    let mut projects: Vec<_> = config.projects.values().collect();
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut lines = Vec::new();
+    for project in projects {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(root) = project.path.value().filter(|root| !root.is_empty()) else {
+            continue;
+        };
+        let root = Path::new(root);
+        let Some(shared_root) = shared_build_root(root) else {
+            continue;
+        };
+        let mut live = BTreeSet::new();
+        if let Some(main_dir) = find_main_checkout_build_dir(&shared_root, root) {
+            live.insert(main_dir);
+        }
+        let worktrees_dir = root.join(".multiverse").join("worktrees");
+        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+            for entry in entries.flatten() {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(dir) = find_build_dir(&shared_root, &entry.path()) {
+                    live.insert(dir);
+                }
+            }
+        }
+        let mut total = 0u64;
+        collect_orphan_bytes(&shared_root, &live, deadline, &mut total);
+        if total > 0 {
+            lines.push(format!(
+                "disk: {} cargo shared-build orphaned {} under {}",
+                project.name,
+                human_size(total),
+                shared_root.display()
+            ));
+        }
+    }
+    lines
+}
+
+/// Recurses into `dir` only while it is a real ancestor of some still-live
+/// build-dir; any other directory under the shared root is, by
+/// construction, disjoint from every build-dir this scan could find, so
+/// its whole subtree counts as orphaned in one `dir_size` call rather than
+/// being walked further.
+fn collect_orphan_bytes(dir: &Path, live: &BTreeSet<PathBuf>, deadline: Instant, total: &mut u64) {
+    if Instant::now() >= deadline || live.contains(dir) {
+        return;
+    }
+    if !live.iter().any(|path| path.starts_with(dir)) {
+        *total += dir_size(dir, deadline);
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            collect_orphan_bytes(&entry.path(), live, deadline, total);
+        }
+    }
+}
+
+/// Sums file bytes under `path`, skipping symlinks (both `path` itself and
+/// any entry beneath it) so a lane that symlinks `target/` elsewhere is
+/// never double-counted or followed outside the lane. Stops descending
+/// once `deadline` passes, so a pathologically large `target/` only ever
+/// costs this scan its budget, not an unbounded walk.
+fn dir_size(path: &Path, deadline: Instant) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return 0;
+    }
+    if file_type.is_file() {
+        return meta.len();
+    }
+    if !file_type.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        total += dir_size(&entry.path(), deadline);
+    }
+    total
+}
+
+/// `du -sh`-style human size: base-1024 units, one decimal place once it
+/// rounds up from bytes, matching the `du` output this module already
+/// prints verbatim elsewhere in the Critical branch.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
 }
 
 /// Card `20261019-fixer-29a027`: report-only stale `/private/tmp`/`$TMPDIR`
@@ -1023,6 +1243,208 @@ mod tests {
             ]
         );
         assert!(!dir.path().join("hub/.multiverse").exists());
+    }
+
+    #[test]
+    fn critical_report_names_per_project_worktree_target_piles_largest_lane_first() {
+        // Card `20261110-b-2b0ccf`: the real cost on 2026-11-08 was
+        // `.multiverse/worktrees/*/target`, ~23 GB, named nowhere in the
+        // notice. `demo` gets two lanes of known size; `hub` gets none and
+        // must add no line.
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let worktrees = dir.path().join("demo/.multiverse/worktrees");
+        let lane_a_target = worktrees.join("lane-a/target");
+        let lane_b_target = worktrees.join("lane-b/target");
+        std::fs::create_dir_all(&lane_a_target).unwrap();
+        std::fs::create_dir_all(&lane_b_target).unwrap();
+        std::fs::write(lane_a_target.join("big.bin"), vec![0u8; 300 * 1024]).unwrap();
+        std::fs::write(lane_b_target.join("small.bin"), vec![0u8; 100 * 1024]).unwrap();
+        // A symlinked "lane" must never be walked into.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&lane_a_target, worktrees.join("lane-c")).unwrap();
+
+        let report = report_with(
+            &config,
+            false,
+            OffsetDateTime::UNIX_EPOCH,
+            dir.path(),
+            dir.path(),
+            &HostReport::default(),
+            &mut |program, _| (program == "df").then(|| df(5)),
+        );
+        assert_eq!(report.level, Some(Level::Critical));
+        let line = report
+            .lines
+            .iter()
+            .find(|line| line.contains(".multiverse/worktrees target"))
+            .unwrap_or_else(|| panic!("missing worktree target line in {:?}", report.lines));
+        assert_eq!(
+            line,
+            &format!(
+                "disk: demo .multiverse/worktrees target 400.0K — lane-a (300.0K), lane-b (100.0K) — multiverse worktrees {} --prune",
+                dir.path().join("demo").display()
+            )
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|line| line.starts_with("disk: multiverse .multiverse/worktrees")),
+            "a project with no lanes must add no line: {:?}",
+            report.lines
+        );
+    }
+
+    /// Scopes `CARGO_HOME` to a throwaway directory for a
+    /// `shared_build_root`/`find_build_dir` call this test makes, so
+    /// `{cargo-cache-home}` never resolves into the real, shared
+    /// `~/.cargo`. `std::env::set_var` is process-wide, so concurrent
+    /// tests touching this still need the lock — same shape as
+    /// `mv_state::worktrees`'s own test-only twin.
+    struct CargoHomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl CargoHomeEnvGuard {
+        fn set(value: &Path) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("CARGO_HOME");
+            std::env::set_var("CARGO_HOME", value);
+            Self {
+                previous,
+                _lock: held,
+            }
+        }
+    }
+    impl Drop for CargoHomeEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CARGO_HOME", value),
+                None => std::env::remove_var("CARGO_HOME"),
+            }
+        }
+    }
+
+    /// Clears any inherited `CARGO_BUILD_BUILD_DIR` for the duration of a
+    /// `shared_build_root` call this test makes, restoring it on drop — the
+    /// Nexus and every lane export this variable to their own `$TMPDIR` path
+    /// (with no `{workspace-path-hash}` placeholder), which would otherwise
+    /// shadow `shared_build_root`'s own `.cargo/config.toml` fallback and
+    /// resolve to `None` instead of this test's fixture template (card
+    /// `20261115-b-98b977`, fix round). `LOCK` is this test binary's own
+    /// shared lock for the variable — a lock local to just one caller would
+    /// not serialize against another's, so every caller here must go
+    /// through this same guard.
+    struct BuildDirEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl BuildDirEnvGuard {
+        fn cleared() -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("CARGO_BUILD_BUILD_DIR");
+            std::env::remove_var("CARGO_BUILD_BUILD_DIR");
+            Self {
+                previous,
+                _lock: held,
+            }
+        }
+    }
+    impl Drop for BuildDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CARGO_BUILD_BUILD_DIR", value),
+                None => std::env::remove_var("CARGO_BUILD_BUILD_DIR"),
+            }
+        }
+    }
+
+    fn write_build_dir_template(dir: &Path, template: &str) {
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(
+            dir.join(".cargo/config.toml"),
+            format!("[build]\nbuild-dir = \"{template}\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// A fake cargo dep-info (`.d`) file under `hash_dir`, naming each of
+    /// `workspace_paths` on its own line — the same shape `find_build_dir`'s
+    /// own scan looks for, standing in for a real `cargo build` here since
+    /// this feature never runs cargo at all (card `20261115-b-47f043`,
+    /// second attempt).
+    fn write_build_evidence(hash_dir: &Path, workspace_paths: &[&Path]) {
+        let deps = hash_dir.join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let content: String = workspace_paths
+            .iter()
+            .map(|path| format!("{}/src/lib.rs\n", path.display()))
+            .collect();
+        std::fs::write(deps.join("fixture.d"), content).unwrap();
+    }
+
+    /// `shared_root`'s own real two-level hash-dir shape — a 2-hex-digit
+    /// bucket, then a 14-hex-digit leaf — the same fixture shape
+    /// `mv_state::worktrees`'s own tests use; `find_build_dir` never
+    /// resolves anything shallower (card `20261115-b-47f043`, fix round).
+    fn hash_dir(shared_root: &Path, bucket: &str, leaf: &str) -> PathBuf {
+        shared_root.join(bucket).join(format!("{leaf:0>14}"))
+    }
+
+    /// Card `20261115-b-47f043`: a build-dir hash this scan cannot find
+    /// evidence of for the project's own checkout or any of its current
+    /// lanes must still be named and sized, never silently left out of the
+    /// Critical notice the way `.multiverse/worktrees/*/target` once was —
+    /// found read-only, with no `cargo`/`rustup` subprocess.
+    #[test]
+    fn critical_report_names_orphaned_cargo_build_dir_bytes_under_the_shared_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let demo = dir.path().join("demo");
+        let template = "{cargo-cache-home}/shared-build/{workspace-path-hash}";
+        write_build_dir_template(&demo, template);
+        let lane_a = demo.join(".multiverse/worktrees/lane-a");
+        std::fs::create_dir_all(&lane_a).unwrap();
+
+        let cargo_home = tempfile::tempdir().unwrap();
+        let _cargo_home = CargoHomeEnvGuard::set(cargo_home.path());
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let shared_root = shared_build_root(&demo).expect("shared root resolves");
+        let project_hash_dir = hash_dir(&shared_root, "5a", "1");
+        write_build_evidence(&project_hash_dir, &[&demo]);
+        let lane_hash_dir = hash_dir(&shared_root, "8b", "2");
+        write_build_evidence(&lane_hash_dir, &[&lane_a]);
+        std::fs::write(project_hash_dir.join("marker"), b"keep me").unwrap();
+        std::fs::write(lane_hash_dir.join("marker"), b"keep me").unwrap();
+
+        let orphan = shared_root.join("orphan-leaf");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("stale.bin"), vec![0u8; 4096]).unwrap();
+
+        let lines = orphaned_build_dir_lines(&config, Instant::now() + Duration::from_secs(2));
+        let line = lines
+            .iter()
+            .find(|line| line.contains("cargo shared-build orphaned"))
+            .unwrap_or_else(|| panic!("missing orphaned build-dir line in {lines:?}"));
+        assert_eq!(
+            line,
+            &format!(
+                "disk: demo cargo shared-build orphaned 4.0K under {}",
+                shared_root.display()
+            )
+        );
+        assert!(
+            project_hash_dir.join("marker").exists(),
+            "the main checkout's own build-dir must still exist on disk"
+        );
+        assert!(
+            lane_hash_dir.join("marker").exists(),
+            "a still-existing lane's build-dir must still exist on disk"
+        );
     }
 
     #[test]

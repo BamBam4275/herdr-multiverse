@@ -1,0 +1,51 @@
+{
+  "id": "worktrees-merge-refuses-on-a-gitleaks-finding",
+  "description": "`worktrees --merge` refuses when gitleaks reports a finding: it writes redacted evidence to .multiverse/evidence/<task>-secrets.txt and names that file in its own refusal, merging nothing. `/usr/bin/false` stands in for a gitleaks binary that found something (card 20261114-b-069836 requires a fake scanner on PATH, never the network) — it is a stand-in for the exit code only, not a real content scan; `mv-state`'s own unit tests cover a scanner that actually echoes planted secret text.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n"
+      },
+      "worktrees": [
+        "20260101-builder-aaaaaa"
+      ]
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[secrets_scan]\ngitleaks = \"/usr/bin/false\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--merge",
+        "20260101-builder-aaaaaa"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "secrets scan (gitleaks) found a match in <ID>'s commits",
+          "<ID>-secrets.txt",
+          "merge refused"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        ".multiverse/evidence/20260101-builder-aaaaaa-secrets.txt": {
+          "regex": "^gitleaks findings for <ID> \\(redacted\\):$"
+        }
+      }
+    }
+  ]
+}

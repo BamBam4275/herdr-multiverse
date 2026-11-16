@@ -18,7 +18,14 @@ from run_scenario import run_scenario
 
 
 class ReplayTests(unittest.TestCase):
+    """`run_scenario`/`fake_herdr.py`'s own behavior against a throwaway
+    Python script standing in for the Rust binary: drift detection,
+    transcript exhaustion/mismatch, herdr isolation, capture dependencies,
+    environment isolation, and `run_all.py`'s batch report."""
+
     def setUp(self):
+        """A temp dir, a path for the stand-in "rust" binary, and a
+        minimal one-step scenario each test customizes."""
         self.temp = tempfile.TemporaryDirectory(prefix="conformance-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -32,12 +39,14 @@ class ReplayTests(unittest.TestCase):
         }
 
     def cli(self, source):
+        """Write `source` as the stand-in "rust" binary's Python body."""
         self.binary.write_text(
             f"#!{sys.executable}\n" + source, encoding="utf-8"
         )
         self.binary.chmod(0o700)
 
     def replay(self, scenario=None):
+        """Run `scenario` (or the default one) against the stand-in binary."""
         return run_scenario(
             scenario or self.scenario, impl="rust", python_repo=None,
             rust_bin=str(self.binary),

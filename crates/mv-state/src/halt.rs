@@ -22,9 +22,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// In-memory view of the halt marker, independent of which on-disk shape
+/// (canonical JSON or legacy plain text) it was read from, so every other
+/// function in this module works with a single shape regardless of the
+/// source that produced it.
 pub struct HaltState {
+    /// Whether the fleet is currently halted. When `false`, the other two
+    /// fields are meaningless — no marker was found at all.
     pub halted: bool,
+    /// Why the fleet was halted, when known. Falls back to a fixed
+    /// "halt state is unreadable" placeholder when a marker exists but its
+    /// contents could not be trusted, so callers always have something to
+    /// show instead of failing outright.
     pub reason: Option<String>,
+    /// When the halt began, in RFC 3339. `None` only when neither the
+    /// marker's own timestamp nor the mtime fallback in [`read_halt_state`]
+    /// could supply one.
     pub at: Option<String>,
 }
 
@@ -331,11 +344,19 @@ fn parse_halt_json(text: &str) -> Option<HaltState> {
         .and_then(Json::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        // A parsed object with a missing/blank `reason` field reuses the
+        // same placeholder text the unreadable-marker path below produces,
+        // rather than a separate "no reason given" string — the caller
+        // can't tell the two cases apart, and both already mean "halted,
+        // but why is unclear."
         .unwrap_or("halt state is unreadable")
         .to_owned();
     let at = object
         .get("since")
         .and_then(Json::as_str)
+        // Drop a `since` that isn't valid RFC 3339 rather than propagate a
+        // garbled timestamp — `read_halt_state` falls back to the marker
+        // file's own mtime when this leaves `at` as `None`.
         .filter(|value| {
             time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
                 .is_ok()
@@ -401,6 +422,10 @@ pub fn read_halt_state(state_dir: &Path) -> HaltState {
         Err(_) => unreadable(),
     };
     if state.at.is_none() {
+        // Only reached for a canonical marker whose own `since` was
+        // missing or unparsable — the legacy fallback above returns
+        // earlier and never reaches here. Fall back to the marker file's
+        // own mtime so `format_halt_line` still has a timestamp to show.
         let since = std::fs::metadata(&path)
             .and_then(|metadata| metadata.modified())
             .map(time::OffsetDateTime::from)
@@ -449,6 +474,8 @@ fn remove_if_present(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Render the halt marker as the one-line message `multiverse halt status`
+/// prints — the human-facing counterpart to [`HaltState`]'s own fields.
 pub fn format_halt_line(state: &HaltState) -> String {
     if !state.halted {
         return "fleet is not halted.".to_string();
@@ -464,10 +491,39 @@ pub fn format_halt_line(state: &HaltState) -> String {
 mod tests {
     use super::*;
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mv-halt-test-{label}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure
+    /// left it behind in `TMPDIR`). `Deref`s to `Path` so every existing
+    /// call site keeps reading `&dir`/`dir.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("mv-halt-test-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(label: &str) -> TempDir {
+        TempDir::new(label)
     }
 
     #[test]
@@ -477,7 +533,6 @@ mod tests {
             format_halt_line(&read_halt_state(&dir)),
             "fleet is not halted."
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -496,7 +551,6 @@ mod tests {
             format_halt_line(&read_back),
             "fleet halted since 2026-11-02T12:00:00+00:00: maintenance"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -518,7 +572,6 @@ mod tests {
             format_halt_line(&read_halt_state(&dir)),
             "fleet is not halted."
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -533,7 +586,6 @@ mod tests {
         std::fs::remove_file(halt_state_path(&dir)).unwrap();
         std::fs::create_dir(halt_state_path(&dir)).unwrap();
         assert!(read_halt_state(&dir).halted);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Regression for card 20261102-b-c09e29: the operator halts the
@@ -558,7 +610,6 @@ mod tests {
             format_halt_line(&state),
             "fleet halted since 2026-11-01T23:04:52+00:00: maintenance window"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `write_fleet_halt` (`config.py`) does `json.dumps({"reason": ...,
@@ -585,7 +636,6 @@ mod tests {
             "{\"reason\": \"maintenance\", \"since\": \"2026-11-02T12:00:00+00:00\"}\n"
         );
         assert!(!legacy_halt_state_path(&dir).exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Non-ASCII reason text round-trips: `json.dumps` with
@@ -612,7 +662,6 @@ mod tests {
         );
         let read_back = read_halt_state(&dir);
         assert_eq!(read_back.reason.as_deref(), Some("café \u{1f6d1}"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A state dir touched only by a pre-cutover Rust build — canonical
@@ -629,7 +678,6 @@ mod tests {
         let state = read_halt_state(&dir);
         assert!(state.halted);
         assert_eq!(state.reason.as_deref(), Some("old build"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Canonical `halt` wins over a stale legacy `halt.state` sitting
@@ -654,7 +702,6 @@ mod tests {
         .unwrap();
         let state = read_halt_state(&dir);
         assert_eq!(state.reason.as_deref(), Some("current"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `off` must not leave a stale legacy marker behind to be
@@ -684,6 +731,5 @@ mod tests {
             format_halt_line(&read_halt_state(&dir)),
             "fleet is not halted."
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

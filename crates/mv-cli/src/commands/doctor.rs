@@ -62,8 +62,58 @@ pub(crate) fn resolve_config_path(
 /// (`mv_config::load::config_state_dir_from_env`) — also where this task's
 /// own [`super::halt`] keeps its halt marker, pending `mv-state` landing a
 /// real fleet-state-dir consumer for it.
+///
+/// Card `20261114-b-74029b`: `mv_config::load::config_state_dir_from_env`
+/// only refuses the *exact* `.cargo/config.toml`-forced sentinel, and that
+/// forcing is `cargo`'s own doing — a compiled test binary invoked
+/// directly (`target/debug/deps/mv_cli-<hash>`, skipping `cargo test`)
+/// never has it set, so it falls through to whatever `$MULTIVERSE_STATE_DIR`
+/// is ambient in the process that launched it, live fleet state dir
+/// included. `panic_unless_resolved_under_test_sandbox` below closes
+/// that gap one layer up, in a `#[cfg(test)]` check baked into the test
+/// binary at compile time regardless of how it is later invoked — unlike
+/// `cargo`'s `[env]` forcing, there is no "skip cargo" escape from code
+/// compiled into the binary itself.
 pub(crate) fn state_dir_from_config(config_path: &Path) -> PathBuf {
-    mv_config::load::config_state_dir_from_env(config_path)
+    let state_dir = mv_config::load::config_state_dir_from_env(config_path);
+    #[cfg(test)]
+    panic_unless_resolved_under_test_sandbox(&state_dir);
+    state_dir
+}
+
+/// Panics when `state_dir` is neither under [`std::env::temp_dir`] nor the
+/// `.cargo/config.toml`-forced sentinel
+/// (`mv_config::load::FORBIDDEN_LIVE_STATE_DIR_SENTINEL`) — in particular
+/// the real, home-rooted XDG state/config locations
+/// (`~/.local/state/...`, `~/.config/...`) `config_state_dir_from_env`
+/// falls back to when nothing overrides it. Every test-side
+/// `StateDirEnvGuard` across this crate already points
+/// `$MULTIVERSE_STATE_DIR` at a fresh `tempfile::tempdir()`, which this
+/// accepts; a test that forgot to hold one, or a test binary run outside
+/// `cargo test` with the live fleet's `$MULTIVERSE_STATE_DIR` inherited
+/// from a dispatching pane's shell, does not, and panics here instead of
+/// silently resolving (and in a writer's case, mutating) the real path.
+#[cfg(test)]
+fn panic_unless_resolved_under_test_sandbox(state_dir: &Path) {
+    let sentinel = Path::new(mv_config::load::FORBIDDEN_LIVE_STATE_DIR_SENTINEL);
+    if state_dir.starts_with(sentinel) {
+        return;
+    }
+    let temp_dir = std::env::temp_dir();
+    if state_dir.starts_with(&temp_dir) {
+        return;
+    }
+    panic!(
+        "state_dir_from_config resolved to {} — neither under the test sandbox {} nor the \
+         forced sentinel {}. A test must hold a StateDirEnvGuard (or set \
+         $MULTIVERSE_STATE_DIR to an explicit temp directory) before reaching this call, \
+         rather than letting it fall through to a real, home-rooted fleet state directory \
+         (card 20261114-b-74029b: a test binary run outside `cargo test` skips the \
+         .cargo/config.toml forcing that would otherwise catch this).",
+        state_dir.display(),
+        temp_dir.display(),
+        sentinel.display(),
+    );
 }
 
 /// Resolve the token or path used to invoke Herdr: `$HERDR_BIN_PATH` when
@@ -388,6 +438,65 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+
+    /// Card `20261114-b-74029b`: locks `worktrees::herdr_env`'s
+    /// process-wide mutex (the same lock every other `StateDirEnvGuard`
+    /// in this crate takes) before pointing `$MULTIVERSE_STATE_DIR` at
+    /// `path` directly — standing in for whatever a test, or a dispatched
+    /// pane's inherited shell, already had it set to, without this
+    /// module's own guard family's usual private tempdir.
+    struct SimulatedAmbientStateDirGuard {
+        _herdr: HerdrEnvGuard,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SimulatedAmbientStateDirGuard {
+        fn set(path: &Path) -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let previous = std::env::var_os("MULTIVERSE_STATE_DIR");
+            std::env::set_var("MULTIVERSE_STATE_DIR", path);
+            Self {
+                _herdr: herdr,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SimulatedAmbientStateDirGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "neither under the test sandbox")]
+    fn state_dir_from_config_panics_when_the_ambient_state_dir_looks_real() {
+        // Not under `std::env::temp_dir()`, not the `.cargo/config.toml`
+        // sentinel — the same shape a dispatched pane's inherited *live*
+        // `$MULTIVERSE_STATE_DIR` takes (card `20261114-b-74029b`'s
+        // incident: a real, home-rooted XDG state directory), stood in
+        // for here by a path that is simply never created on disk —
+        // `config_state_dir_from_env` never checks existence, only shape.
+        let live_like = Path::new("/MV_TEST_SIMULATED_LIVE_STATE_DIR_NOT_A_SENTINEL");
+        let _state = SimulatedAmbientStateDirGuard::set(live_like);
+        let _ = state_dir_from_config(Path::new("/irrelevant/config.toml"));
+    }
+
+    #[test]
+    fn state_dir_from_config_still_honors_a_guarded_tempdir_override() {
+        // Every real `StateDirEnvGuard` in this crate points
+        // `$MULTIVERSE_STATE_DIR` at a fresh `tempfile::tempdir()` — the
+        // new check must keep accepting exactly that, not just reject
+        // the unguarded case above.
+        let dir = tempfile::tempdir().unwrap();
+        let _state = SimulatedAmbientStateDirGuard::set(dir.path());
+        let resolved = state_dir_from_config(Path::new("/irrelevant/config.toml"));
+        assert_eq!(resolved, dir.path());
+    }
 
     #[test]
     fn civil_from_days_matches_known_dates() {

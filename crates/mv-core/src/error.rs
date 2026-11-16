@@ -20,6 +20,9 @@ pub struct InvalidIdentifierError {
 }
 
 impl InvalidIdentifierError {
+    /// Build the error from the field name that failed (`kind`) and the
+    /// offending value, mirroring the two positional arguments Python's
+    /// `InvalidIdentifierError(kind, value)` takes.
     pub fn new(kind: impl fmt::Display, value: impl Into<String>) -> Self {
         Self {
             kind: kind.to_string(),

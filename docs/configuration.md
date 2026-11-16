@@ -28,10 +28,23 @@ directories to be absolute, points `MULTIVERSE_CONFIG` at
 missing (exit 3). It does not silently select a standalone global fleet
 config.
 
-`MULTIVERSE_CONFIG` and `MULTIVERSE_STATE_DIR` override these locations for
-local development and the conformance test harness when you invoke
-`bin/multiverse` directly; they are not meant to be set in a normal
-Herdr-managed install.
+`dispatch` and `council` also export both variables into every worker
+or council pane they launch (`RealDispatchStore::prepare`; council
+builds that store with `RealDispatchStore::for_seat`, and the same
+values appear on the `--dry-run` card via `render_card`). The values
+are the dispatching process's already-resolved absolute paths:
+`Config::source_path` from `load_config` /
+`mv_config::load::resolve_config_path_from_env`, and the state
+directory from `mv_config::load::config_state_dir_from_env`. A worker's
+own `multiverse` therefore uses the dispatcher's config and state,
+including when the dispatcher resolved those paths via `--config` or
+the environment.
+
+When you invoke `bin/multiverse` directly (local development and the
+conformance test harness), `MULTIVERSE_CONFIG` and
+`MULTIVERSE_STATE_DIR` override the default locations the same way.
+In a Herdr-managed install the plugin wrapper and dispatch already
+export them.
 
 Each project's own task history — briefs, results, status files, the
 routing log, worktrees, backlog, and the Nexus seed
@@ -52,11 +65,17 @@ intended fleet-wide schema:
   settings.
 - `[accounts.<name>]` — one seat per vendor login (`kind`,
   `config_dir_var`, `config_dir`, `pool`, `available`, optional `short`,
-  `interactive`, `command`, `model`). `command` is required for every
-  `kind = "claude"` account, not only an `interactive` one — a chain that
-  reaches a `claude` seat with no `command` set loads fine but refuses at
-  dispatch time ("no command wrapper configured"). Codex and Grok don't
-  use it.
+  `interactive`, `command`, `model`, `nexus_slots`). `command` is required
+  for every `kind = "claude"` account, not only an `interactive` one — a
+  chain that reaches a `claude` seat with no `command` set loads fine but
+  refuses at dispatch time ("no command wrapper configured"). Codex and
+  Grok don't use it. `nexus_slots` (default `0`) is how many Nexus panes
+  that seat hosts, one per started project whose `nexus` chain routes
+  there; a seat's open-agent cap (set by `multiverse accounts limit`) now
+  counts worker panes only, so a Nexus pane never eats a shared seat's
+  worker capacity, and the fleet-wide `max_concurrent` check excludes
+  Nexus panes entirely. `multiverse accounts` reports both counts on a
+  capped seat: `workers N/cap, nexus M/nexus_slots`.
 - `[roles.<key>]` — write scope, effort, `on_exhausted`, skills, and a
   `[roles.<key>.models]` table keyed by agent kind. The stable keys are
   `scout`, `builder`, `archivist`, `critic`, `seer`, `artisan`, `watcher`,
@@ -69,7 +88,7 @@ intended fleet-wide schema:
   that directory if it does not exist yet. If no chain is configured for a
   role, loading that dispatch is a configuration error (exit code 3) naming
   the role and project, not a silent default.
-- Optional `[review_policy]` and `[activity.pairs]`.
+- Optional `[review_policy]`, `[secrets_scan]`, and `[activity.pairs]`.
 
 A `<<PLACEHOLDER: ...>>` marker is carried through, never guessed at, by
 any tool that loads the file (`mv_config::placeholder::MaybePlaceholder`)
@@ -85,6 +104,35 @@ touch; edits are always appends, never a full-file rewrite.
 plain text rather than going through `mv-config::edit` (the module is
 implemented; this one caller isn't wired to it yet), which has the same
 append-only effect on an unchanged file.
+
+## `[secrets_scan]`: the merge gate
+
+`multiverse worktrees <path> --merge <task>` refuses to merge a lane whose
+commits trip a secrets scan. `[secrets_scan]` configures it (see
+[`config.example.toml`](../config.example.toml) for every key and its
+default, spelled out):
+
+- `gitleaks` (default `"gitleaks"`) — a bare command resolved against
+  `PATH`, or an explicit path.
+- `trufflehog` (optional, unset by default) — run as a second pass, after
+  gitleaks passes, only when set *and* actually found.
+- `required` (default `true`) — a missing `gitleaks` blocks the merge
+  (exit code 3, with an install hint) rather than letting an unscanned
+  lane land silently; `false` only warns and lets the merge proceed.
+- `allowlist` (default `".gitleaks.toml"`) — a path relative to the
+  project being merged (not to `config.toml`), passed to gitleaks as
+  `--config` only when that file exists there.
+
+A finding refuses the merge (exit code 1) and writes the triggering
+tool's output to `.multiverse/evidence/<task>-secrets.txt` in the
+project; nothing is merged. `gitleaks` is run with its own `--redact`
+flag, so its output is already redacted before Multiverse ever sees it.
+TruffleHog has no verified-offline equivalent of `--redact`, so Multiverse
+instead runs it with `--json` and strips the raw-secret fields
+(`Raw`/`RawV2`/`Redacted`) from its own output before writing it, then
+passes the result through `mv-core::redact` (see [Redaction](#redaction)
+below) as a second pass. `multiverse check` reports when `[secrets_scan]`
+is required and `gitleaks` cannot be found.
 
 ## Roster files
 
@@ -110,8 +158,8 @@ which accounts a role's chain draws from, per project.
 | `HERDR_PLUGIN_CONFIG_DIR` | Herdr-provided directory for `config.toml` | `scripts/plugin-action.sh` |
 | `HERDR_PLUGIN_STATE_DIR` | Herdr-provided directory for runtime state | `scripts/plugin-action.sh` |
 | `HERDR_PLUGIN_ROOT` | Root of the installed plugin checkout (binary, scripts) | prompt/template resolution |
-| `MULTIVERSE_CONFIG` | Override the config file path (development/testing) | plugin wrapper; `mv_config::load::resolve_config_path_from_env` |
-| `MULTIVERSE_STATE_DIR` | Override the state directory (development/testing) | plugin wrapper |
+| `MULTIVERSE_CONFIG` | Absolute config-file path. Plugin wrapper sets it from `$HERDR_PLUGIN_CONFIG_DIR/config.toml`; `dispatch`/`council` set it on every worker or council pane to the dispatcher's already-resolved path, so a worker's own `multiverse` uses the dispatcher's config. Direct `bin/multiverse` invocations also use it as a development/testing override. | plugin wrapper; `RealDispatchStore::prepare` / `render_card`; `mv_config::load::resolve_config_path_from_env` |
+| `MULTIVERSE_STATE_DIR` | Absolute fleet state directory. Plugin wrapper sets it from `$HERDR_PLUGIN_STATE_DIR`; `dispatch`/`council` set it on every worker or council pane to the dispatcher's already-resolved state dir, so a worker's own `multiverse` uses the dispatcher's state. Direct `bin/multiverse` invocations also use it as a development/testing override. | plugin wrapper; `RealDispatchStore::prepare` / `render_card`; `mv_config::load::config_state_dir_from_env` |
 | `MULTIVERSE_INVOCATION` | The command a pane uses to re-invoke Multiverse; set by the start action | plugin wrapper, Nexus seed renderer |
 | `MULTIVERSE_READ_ONLY` | Set on every plugin action except `start` | plugin wrapper |
 | `MULTIVERSE_PROMPTS_DIR` | Override embedded `prompts/` | `mv-engine::prompts` |
@@ -127,7 +175,8 @@ Config and state files may contain account identifiers or paths that
 shouldn't appear verbatim in logs, activity records, or bug reports.
 `mv-core::redact` implements that cleaning (PEM blocks, bearer tokens,
 AWS-shaped keys, and credential-named assignments) and is called from
-`backlog`, `activity`, `result`, `inspect`, and brief rendering. When
+`backlog`, `activity`, `result`, `inspect`, brief rendering, and the
+`[secrets_scan]` merge gate's TruffleHog path (above). When
 filing a bug report, still redact anything the
 [bug report template](../.github/ISSUE_TEMPLATE/bug_report.yml) asks you to
 check for — automated redaction is a safety net, not a substitute for

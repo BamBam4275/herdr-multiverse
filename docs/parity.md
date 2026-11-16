@@ -29,7 +29,7 @@ Role names on Rust **write** surfaces (config keys, `--role`, help text) use the
 
 ## Command inventory
 
-Python top-level subcommands: 27. Rust top-level subcommands: 29 (`config` and `import-python` are Rust-only). Counts exclude clap's generated `help` command. Nested leaves match one-for-one except `config migrate`.
+Python top-level subcommands: 27. Rust top-level subcommands: 31 (`config`, `down`, `import-python`, and `up` are Rust-only). Counts exclude clap's generated `help` command. Nested leaves match one-for-one except `config migrate`.
 
 | Command | Python | Rust |
 |---|---|---|
@@ -68,6 +68,7 @@ Python top-level subcommands: 27. Rust top-level subcommands: 29 (`config` and `
 | `directives show` | yes | yes |
 | `dispatch` | yes | yes |
 | `doctor` | yes | yes |
+| `down` | — | yes (Rust-only) |
 | `halt` | yes | yes |
 | `halt off` | yes | yes |
 | `halt on` | yes | yes |
@@ -91,6 +92,7 @@ Python top-level subcommands: 27. Rust top-level subcommands: 29 (`config` and `
 | `stop` | yes | yes |
 | `sweep` | yes | yes |
 | `tasks` | yes | yes |
+| `up` | — | yes (Rust-only) |
 | `workers` | yes | yes |
 | `worktrees` | yes | yes |
 | `config` | — | yes (Rust-only) |
@@ -195,6 +197,7 @@ Rust about: Broadcast a message
 
 | Flag | Python | Rust | Notes |
 |---|---|---|---|
+| `--ask` | — | flag | New in Rust (card `20261115-b-d4cf40`): requests a reply from each recipient, same per-recipient semantics as `activity send --ask`. |
 | `--id` | ID | ID |  |
 
 ### `activity close`
@@ -244,6 +247,14 @@ Rust about: Reply to a message
 | Flag | Python | Rust | Notes |
 |---|---|---|---|
 | `--id` | ID | ID |  |
+
+`reply Holder#SEQ`, run by the ask's own sender rather than its holder, still
+posts the answer as the holder — but the stored line and every printed view
+(`inbox`/`show`/`replay`) now mark it `relayed_by=<sender>`/`(relayed by
+<sender>)`, and the sender's own `[activity.pairs]` permission into the
+holder is re-checked at reply time, the same as `close`'s remote-close check
+(card `20261116-b-57998b` finding 2, `20261116-b-40aecf`). A reply the
+holder posts itself is unaffected and unmarked.
 
 ### `activity send`
 
@@ -552,6 +563,22 @@ Rust about: Check installation prerequisites (exit 0 pass, 1 fail)
 
 No flags besides global `--config` / `--help`.
 
+### `down`
+
+Rust-only. Python has no matching subcommand.
+
+Rust about: Halt dispatch, ask each project's Nexus to wrap, then close its workspace
+
+| Positional | Rust |
+|---|---|
+| `projects...` | optional, variadic (defaults to every configured project, including the hub) |
+
+| Flag | Shape | Help |
+|---|---|---|
+| `--reason` | TEXT, default `operator requested` | Reason recorded on the halt |
+| `--timeout` | SECONDS, default `1800` | Seconds to wait for each project to wrap (`0` means forever) |
+| `--dry-run` | flag | Show the plan without performing the operation |
+
 ### `halt`
 
 Rust about: Control the fleet halt
@@ -765,6 +792,7 @@ Rust about: Inspect or update project tasks
 | `--close-stranded` | flag | flag |  |
 | `--no-reconcile` | flag | flag |  |
 | `--read-only` | flag | flag |  |
+| `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--reclaimable`, end a reclaimed lane's own lingering host process instead of only reporting it; without `--yes` previews "would reap" and signals nothing. |
 | `--reason` | TEXT | TEXT |  |
 | `--reclaimable` | flag | flag |  |
 | `--reconcile` | flag | flag |  |
@@ -775,6 +803,21 @@ Rust about: Inspect or update project tasks
 | `--supersedes` | ORDINAL | ORDINAL |  |
 | `--task` | TASK | TASK_ID |  |
 | `--yes` | flag | flag |  |
+
+### `up`
+
+Rust-only. Python has no matching subcommand.
+
+Rust about: Start project Nexus sessions and clear a halt `down` set
+
+| Positional | Rust |
+|---|---|
+| `projects...` | optional, variadic (defaults to every configured project, including the hub) |
+
+| Flag | Shape | Help |
+|---|---|---|
+| `--timeout` | SECONDS, default `1800` | Seconds to wait for each pending project's bring-up (`0` means forever) |
+| `--dry-run` | flag | Show the plan without performing the operation |
 
 ### `workers`
 
@@ -796,6 +839,7 @@ Rust about: Inspect, prune, rescue, or restore task worktrees
 | `--dry-run` | flag | flag |  |
 | `--force` | flag | flag |  |
 | `--prune` | flag | flag |  |
+| `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--prune`, end a kept lane's own lingering host process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; never with `--force`, and `--dry-run` previews "would reap" and signals nothing. |
 | `--rescue` | flag | flag |  |
 | `--restore` | TASK_ID | TASK_ID |  |
 | `--yes` | flag | flag |  |
@@ -862,9 +906,10 @@ Handlers already reject several of these at runtime; clap is looser than argpars
 - `inspect --reason`, `activity close --reason`, and `activity update --phase` are required on Python and optional on Rust (`activity close` defaults the reason to `closed`; `activity update --phase` defaults to `working`; `inspect --reason` defaults to empty).
 - `backlog mark-asked --recommend` is required `int` on Python; Rust parses a string as a 1-based index in `commands::backlog` and errors if it is missing or non-numeric.
 - Cwd-scoped `backlog` writes (`add` / `done` / `reopen` / `annotate` / `reprioritize` / `show` / `ask` / `mark-asked` / `answer`) take `nargs='+'` on Python so a mistaken project-name token is explained in-handler. Rust takes a single positional.
-- `dispatch --column` is a closed `{Explore, Execute, Review}` choice on Python; Rust takes free text and looks up `column-{name}.md` case-insensitively (`crates/mv-engine/src/prompts.rs`).
+- `dispatch --column` is a closed, case-sensitive `{Explore, Execute, Review}` choice on both sides (`crates/mv-cli/src/args.rs:116`) — not free text as this page previously said; the accepted value is only looked up case-insensitively further downstream, as `column-{name}.md` (`crates/mv-engine/src/prompts.rs`).
+- `worktrees --reap` / `tasks --reap` (card `20261115-b-9815fe`) are new Rust-only functionality, not a Python port: a leftover host process with its cwd still inside a finished lane is now only ever ended when an operator explicitly opts in on `--prune`/`--reclaimable`. `sweep` still only ever reports this class of leak (`crates/mv-cli/src/commands/sweep.rs`'s `lane_process_notes`), the same as Python; the shared process probe/signal primitives live in `mv_engine::dockerreport` (`process_cwds`, `processes_under`, `protected`, `reap`).
 - `dispatch --role` / `backlog add --role` / `backlog ask --role`: Python argparse still lists the retired keys (and treats `orchestrator`/`council` as undispatchable on `dispatch`). Rust write surfaces accept current worker names only; unknown and retired names exit 3.
-- `notify --priority` is a closed `{low, default, high, urgent}` choice on Python; Rust takes a string and treats `urgent` as the bypass, everything else as normal (`commands::notify`).
+- `notify --priority` is a closed, case-sensitive `{low, default, high, urgent}` choice on both sides (`crates/mv-cli/src/args.rs:242`) — not free text as this page previously said; Rust treats `urgent` as the bypass and every other value as normal (`commands::notify`).
 - `config migrate` (`--dry-run`, `--backup`) is Rust-only. It rewrites retired role keys so an unmigrated Python `config.toml` can load.
 - `import-python` (`--from`, `--dry-run`, `--force`) is Rust-only. It copies a Python install's config and fleet state into this install's config/state directories.
 - Root `-V` / `--version` is Rust-only (clap).

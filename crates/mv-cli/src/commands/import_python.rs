@@ -233,6 +233,10 @@ fn run_plan(
     Ok(())
 }
 
+/// Resolves `--from` (or the Python default `$HOME/.config/multiverse`) and
+/// this install's own config/state directories, builds the copy plan with
+/// [`build_plan`], then executes it with [`run_plan`] — writing its report
+/// to `out` so tests can capture it instead of real stdout.
 pub(crate) fn run(args: &ArgMatches, out: &mut dyn Write) -> Result<(), Failure> {
     let dry_run = args.get_flag("dry-run");
     let force = args.get_flag("force");
@@ -271,6 +275,8 @@ pub(crate) fn run(args: &ArgMatches, out: &mut dyn Write) -> Result<(), Failure>
     Ok(())
 }
 
+/// The real entry point wired into `commands::run`'s routing table —
+/// [`run`] against real stdout.
 pub(crate) fn run_default(args: &ArgMatches) -> Result<(), Failure> {
     run(args, &mut std::io::stdout())
 }
@@ -320,11 +326,15 @@ mod tests {
             config_path.to_str().unwrap(),
         ];
         argv.extend_from_slice(extra);
+        let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
         std::env::set_var("MULTIVERSE_STATE_DIR", &layout.state_dir);
         let args = matches(&argv);
         let mut out = Vec::new();
         let result = run(&args, &mut out);
-        std::env::remove_var("MULTIVERSE_STATE_DIR");
+        match previous_state_dir {
+            Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+            None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+        }
         result.map(|()| String::from_utf8(out).unwrap())
     }
 

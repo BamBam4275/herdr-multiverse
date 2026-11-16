@@ -39,6 +39,9 @@ pub enum BoardView {
     Message(Vec<String>),
 }
 
+/// Resolved project scope for a `board` invocation: named projects,
+/// `--all`, `--here`, `--active`, or the default view. See
+/// [`BoardScope::resolve`]'s own doc comment for the precedence among them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoardScope {
     Named(Vec<String>),
@@ -104,6 +107,10 @@ pub struct BoardFrame {
     fingerprint: watch::Fingerprint,
 }
 
+/// The seam a real watch loop implements: drive `render` on a timer and
+/// redraw on change. `LiveWatch` is the only real implementation; tests
+/// call `watch` directly to pin behavior (such as failing fast on the
+/// first resolve) without entering raw terminal mode.
 pub trait BoardWatchLoop {
     fn watch(&self, render: &dyn Fn() -> Result<BoardFrame, Failure>) -> Result<(), Failure>;
 }
@@ -225,6 +232,8 @@ fn render_view(view: &BoardView, options: &RenderOptions, by_project: bool) -> V
     }
 }
 
+/// Entry point for `multiverse board`, wired to the real
+/// `board_data::LiveSource` and `LiveWatch`.
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     // Usage errors (a bad scope-flag combination) must surface before any
     // config load is attempted — the same ordering `commands::validate`
@@ -259,8 +268,8 @@ fn resolve_width() -> usize {
     mv_board::layout::terminal_width().unwrap_or(DEFAULT_WIDTH)
 }
 
-fn resolve_color(args: &ArgMatches) -> bool {
-    mv_board::layout::color_enabled(args.get_flag("no-color"))
+fn resolve_color(args: &ArgMatches, is_tty: bool) -> bool {
+    mv_board::layout::color_enabled(args.get_flag("no-color"), is_tty)
 }
 
 fn resolve_limit(args: &ArgMatches) -> usize {
@@ -331,18 +340,19 @@ fn run_with(
     validate_scope_combination(args)?;
     let scope = BoardScope::resolve(args);
     let render_fn = move || -> Result<BoardFrame, Failure> {
+        let is_tty = {
+            use std::io::IsTerminal;
+            std::io::stdout().is_terminal()
+        };
         let options = RenderOptions {
             width: resolve_width(),
-            height: {
-                use std::io::IsTerminal;
-                auto_height(
-                    args,
-                    std::io::stdout().is_terminal(),
-                    mv_board::layout::terminal_height().unwrap_or(24),
-                )
-            },
+            height: auto_height(
+                args,
+                is_tty,
+                mv_board::layout::terminal_height().unwrap_or(24),
+            ),
             limit: resolve_limit(args),
-            color: resolve_color(args),
+            color: resolve_color(args, is_tty),
             cards_per_row: resolve_cards_per_row(args),
             statuses: resolve_statuses(args),
         };
@@ -662,7 +672,13 @@ mod tests {
 
     #[test]
     fn resolve_color_is_false_when_no_color_flag_is_set() {
-        assert!(!resolve_color(&matches(&["board", "--no-color"])));
+        assert!(!resolve_color(&matches(&["board", "--no-color"]), true));
+    }
+
+    #[test]
+    fn resolve_color_is_false_off_a_tty_even_without_the_flag() {
+        assert!(resolve_color(&matches(&["board"]), true));
+        assert!(!resolve_color(&matches(&["board"]), false));
     }
 
     #[test]

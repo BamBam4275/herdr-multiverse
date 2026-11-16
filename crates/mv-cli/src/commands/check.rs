@@ -19,12 +19,13 @@ use mv_config::load::{Account, Config, FallbackPolicy as ConfigFallbackPolicy, P
 use mv_config::roles::Role;
 use mv_engine::breaker;
 use mv_engine::mv_herdr::argv;
+use mv_engine::mv_herdr::error::HerdrError;
 use mv_engine::nexus_seed::{self, DispatchableRole, SeedContext, SeedRole};
 use mv_engine::runner::{Herdr, ProcessHerdr};
 use mv_engine::selector;
 use mv_state::tasks::sweep_tasks;
 
-use super::doctor::{project_path, resolve_config_path};
+use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
 use super::{is_retired_role_key_error, MIGRATE_FIX_LINE};
 use crate::exit::{Failure, NEEDS_CONFIG};
 
@@ -110,6 +111,24 @@ fn any_capped_seat(config: &Config, state_dir: &Path) -> bool {
         .any(|name| mv_engine::seatstate::get_cap(state_dir, name).is_some())
 }
 
+/// Every configured project's resolved path — [`mv_engine::seatstate::
+/// nexus_agent_names`]'s own fleet scope, matching `commands::dispatch`'s
+/// `is_nexus_role` exclusion (card `20261115-b-234610`): a project still on
+/// a `<<PLACEHOLDER: ...>>` path contributes no routing log.
+fn project_roots(config: &Config) -> Vec<PathBuf> {
+    config
+        .projects
+        .values()
+        .filter_map(|project| project_path(project).map(Path::to_path_buf))
+        .collect()
+}
+
+// Calls Herdr's `agent list` once and reduces its JSON payload to the
+// three shapes callers need: per-project open counts (via
+// `project_open_agents`), per-account-short open counts (via
+// `seatstate::seat_open_counts_from_payload`), and the raw set of pane
+// ids, all from the same live snapshot so the counts stay consistent
+// with each other.
 fn fetch_live_open_counts(config: &Config) -> Result<OpenSnapshot, String> {
     let mut herdr = ProcessHerdr;
     let result = herdr
@@ -133,12 +152,16 @@ fn fetch_live_open_counts(config: &Config) -> Result<OpenSnapshot, String> {
                 .or_else(|| agent["cwd"].as_str()),
         })
         .collect();
+    let nexus_agents = mv_engine::seatstate::nexus_agent_names(&project_roots(config));
     let mut by_short = BTreeMap::new();
     if let Some(payload) = result.payload.as_ref() {
         for account in config.accounts.values() {
-            if let Some(n) = mv_engine::seatstate::open_count_from_payload(payload, &account.short)
-            {
-                by_short.insert(account.short.clone(), n);
+            if let Some(counts) = mv_engine::seatstate::seat_open_counts_from_payload(
+                payload,
+                &account.short,
+                &nexus_agents,
+            ) {
+                by_short.insert(account.short.clone(), counts.workers);
             }
         }
     }
@@ -224,6 +247,25 @@ fn prunable_count(root: &Path) -> Result<usize, String> {
 
 /// Bound the host probe so default `check` cannot hang behind pmset.
 fn idle_sleep_warning() -> Option<String> {
+    idle_sleep_warning_with_timeout(Duration::from_secs(2))
+}
+
+/// `idle_sleep_warning`'s body with an injectable timeout: real `check`
+/// always goes through the 2s budget above; a test can pass a far smaller
+/// one against a slow fake `pmset` to force the timeout branch below on
+/// purpose, deterministically, rather than depending on this host's load
+/// at the moment it runs (card `20261115-b-2754cc`: under load, a real
+/// 2s budget had room to expire anyway, and the prior code treated that
+/// the same as "no warning" — silently, not distinctly).
+///
+/// Every other `run()` error reports the same "unknown" note rather than
+/// vanishing (card `20261115-b-c5917b`): `MissingBinary` is not only "the
+/// binary genuinely doesn't exist" — `spawn_with_busy_retry` raises it for
+/// a plain transient spawn failure too, which a host tight enough on
+/// spawnable processes under load can produce for an otherwise-valid
+/// `pmset`. Collapsing that into silence made the probe's presence in
+/// `check`'s output depend on host contention at the moment it ran.
+fn idle_sleep_warning_with_timeout(timeout: Duration) -> Option<String> {
     if !cfg!(target_os = "macos") && std::env::var_os("MULTIVERSE_PMSET_BIN").is_none() {
         return None;
     }
@@ -237,7 +279,22 @@ fn idle_sleep_warning() -> Option<String> {
         stdin: None,
         expects_json: false,
     };
-    let output = mv_engine::mv_herdr::run::run(&command, Some(Duration::from_secs(2))).ok()?;
+    let output = match mv_engine::mv_herdr::run::run(&command, Some(timeout)) {
+        Ok(output) => output,
+        Err(HerdrError::Timeout { timeout_secs, .. }) => {
+            return Some(format!(
+                "note: this Mac's idle-sleep setting is unknown \u{2014} the pmset \
+                 probe did not return within {timeout_secs}s. Run `pmset -g custom` \
+                 by hand to check it."
+            ));
+        }
+        Err(error) => {
+            return Some(format!(
+                "note: this Mac's idle-sleep setting is unknown \u{2014} the pmset \
+                 probe failed ({error}). Run `pmset -g custom` by hand to check it."
+            ));
+        }
+    };
     if !output.ok() {
         return None;
     }
@@ -383,6 +440,13 @@ fn check_seat(
     }
 }
 
+// Only called when `roster.toml` locally overrides this role's chain:
+// re-reads the raw config TOML for `[projects.<project>.chains.<role>]`
+// so the "shadows global" line can show what that config-level chain
+// actually was, since the already-parsed `Config.chains` the caller
+// otherwise uses only reflects the roster's override, not what it
+// shadowed. Any parse failure or missing key means nothing to show, not
+// an error: this is advisory-only.
 fn shadowed_global_chain(config_path: &Path, project: &str, role: Role) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(config_path).ok()?;
     let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
@@ -427,59 +491,79 @@ fn check_chain_rows(
         roles.sort_by_key(|role| role.config_key());
         for role in roles {
             let chain = &project.chains[&role];
-            let seats: Vec<selector::Seat> = chain
-                .iter()
-                .filter_map(|name| {
-                    config.accounts.get(name).map(|account| {
-                        check_seat(
-                            account,
-                            config,
-                            role,
-                            state_dir,
-                            live_open,
-                            gauges,
-                            local_liveness_probe,
-                        )
-                    })
-                })
-                .collect();
-            let seats = selector::reorder_chain_by_preference(&seats, |name| {
-                mv_engine::seatstate::is_preferred(state_dir, name)
-            });
-            let on_exhausted = config
-                .roles
-                .get(&role)
-                .map(|settings| settings.on_exhausted)
-                .unwrap_or_else(|| default_on_exhausted(role));
-            let reviewer_floor =
-                (role == Role::Critic).then_some(config.review_policy.min_quota_percent as f64);
-            let fleet_floor = (config.dispatch_min_quota_percent > 0)
-                .then_some(config.dispatch_min_quota_percent as f64);
-            let params = selector::SelectParams {
-                role: role.config_key(),
-                project: &project.name,
-                reviewer_role: Role::Critic.config_key(),
-                nexus_role: Role::Nexus.config_key(),
-                exclude_vendors: &[],
-                task_len_chars: 0,
-                floors: selector::QuotaFloors {
-                    reviewer_min_quota_percent: reviewer_floor,
-                    fleet_min_quota_percent: fleet_floor,
-                },
-                policy: to_selector_policy(on_exhausted),
-                task_id: "check",
-                trial_token: None,
-            };
-            let resolved = match selector::select(&seats, &params, &breaker, now) {
-                Ok(selection) => {
-                    if !selection.is_fallback() {
-                        continue;
-                    }
-                    format!("→ {} (chain-fallback)", selection.seat.name)
+            // `start.rs`'s `launch_project` never runs the dispatch
+            // selector for the Nexus pane: `run`'s `seat_account =
+            // config.accounts.values().find(|account| account.interactive)`
+            // opens whichever account is marked `interactive = true`
+            // outright, ignoring the breaker, seat caps, `lent`,
+            // `roles_allowed`, and quota floors `selector::select` enforces
+            // for worker dispatch. Running the Nexus chain through that
+            // same selector reported `ChainExhaustedError` for a chain
+            // `start` would launch without hesitation (card
+            // `20261109-b-58959c`), so Nexus resolves the way `start`
+            // resolves it: by the presence of an interactive account, not
+            // by the worker chain's availability rules.
+            let resolved = if role == Role::Nexus {
+                if config.accounts.values().any(|account| account.interactive) {
+                    continue;
                 }
-                Err(_) => {
-                    unresolved_chain = true;
-                    "→ UNRESOLVED: ChainExhaustedError".to_string()
+                unresolved_chain = true;
+                "→ UNRESOLVED: no account is marked interactive = true".to_string()
+            } else {
+                let seats: Vec<selector::Seat> = chain
+                    .iter()
+                    .filter_map(|name| {
+                        config.accounts.get(name).map(|account| {
+                            check_seat(
+                                account,
+                                config,
+                                role,
+                                state_dir,
+                                live_open,
+                                gauges,
+                                local_liveness_probe,
+                            )
+                        })
+                    })
+                    .collect();
+                let seats = selector::reorder_chain_by_preference(&seats, |name| {
+                    mv_engine::seatstate::is_preferred(state_dir, name)
+                });
+                let on_exhausted = config
+                    .roles
+                    .get(&role)
+                    .map(|settings| settings.on_exhausted)
+                    .unwrap_or_else(|| default_on_exhausted(role));
+                let reviewer_floor =
+                    (role == Role::Critic).then_some(config.review_policy.min_quota_percent as f64);
+                let fleet_floor = (config.dispatch_min_quota_percent > 0)
+                    .then_some(config.dispatch_min_quota_percent as f64);
+                let params = selector::SelectParams {
+                    role: role.config_key(),
+                    project: &project.name,
+                    reviewer_role: Role::Critic.config_key(),
+                    nexus_role: Role::Nexus.config_key(),
+                    exclude_vendors: &[],
+                    task_len_chars: 0,
+                    floors: selector::QuotaFloors {
+                        reviewer_min_quota_percent: reviewer_floor,
+                        fleet_min_quota_percent: fleet_floor,
+                    },
+                    policy: to_selector_policy(on_exhausted),
+                    task_id: "check",
+                    trial_token: None,
+                };
+                match selector::select(&seats, &params, &breaker, now) {
+                    Ok(selection) => {
+                        if !selection.is_fallback() {
+                            continue;
+                        }
+                        format!("→ {} (chain-fallback)", selection.seat.name)
+                    }
+                    Err(_) => {
+                        unresolved_chain = true;
+                        "→ UNRESOLVED: ChainExhaustedError".to_string()
+                    }
                 }
             };
             let local = if mv_config::roster::is_locally_overridden(roster.as_ref(), role) {
@@ -559,6 +643,12 @@ impl selector::BreakerQuery for ClosedBreaker {
     }
 }
 
+// Which account each worker role would seed-select right now, for the
+// nexus seed preview rather than a live dispatch: uses `ClosedBreaker`
+// (always CLOSED, never fences a seat) and `seed_seat` (no live open
+// counts or quota gauges), so the answer reflects config/chain shape
+// alone, not this moment's fleet load — unlike `check_chain_rows`'s
+// `CheckBreaker`, which does read live breaker state.
 fn dispatchable_roles(config: &Config, project: &Project) -> Vec<DispatchableRole> {
     let mut rows = Vec::new();
     let now = Instant::now();
@@ -625,7 +715,7 @@ fn stale_seed_note(
 ) -> Option<String> {
     let seed_path =
         nexus_seed::existing_seed_path(root).unwrap_or_else(|| nexus_seed::seed_path(root));
-    let state_dir = mv_config::load::config_state_dir_from_env(config_path);
+    let state_dir = state_dir_from_config(config_path);
     let directives_root = mv_engine::directives::directives_root(&state_dir);
     let handoff = nexus_seed::resolve_handoff(root);
     let role_prompt = mv_engine::prompts::role_prompt("Nexus")
@@ -921,6 +1011,21 @@ fn tmp_scratch_warning(config: &Config) -> Option<String> {
     )
 }
 
+/// Whether `command` (a `[secrets_scan]` scanner — a bare name or an
+/// explicit path, same as `gitleaks`/`trufflehog` document themselves)
+/// resolves to an existing file: a `PATH` search for a bare name, a plain
+/// existence check for anything containing a `/`. A presence check only —
+/// `multiverse worktrees <path> --merge <task>` is what actually runs it
+/// and refuses on a real spawn failure; this exists only so `check` can
+/// warn before a Builder hits that refusal mid-merge.
+fn scanner_available(command: &str) -> bool {
+    if command.contains('/') {
+        return std::fs::metadata(command).is_ok_and(|info| info.is_file());
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+}
+
 /// Same fix as `start.rs`'s `print_config_load_error` (card
 /// `20261102-b-5c41bb`): this file owns only this call site, so it keeps
 /// its own copy rather than a cross-file shared helper.
@@ -933,6 +1038,12 @@ fn print_config_load_error(message: &str) {
     }
 }
 
+/// Builds and prints the full readiness report (config/state summary,
+/// fenced/draining accounts, placeholders, chain rows, per-project
+/// scratch/seed advisories), then exits `NEEDS_CONFIG` if anything it
+/// found is unresolved, `OK` otherwise — never `ERROR`, per this
+/// module's own doc comment. The report itself is always printed before
+/// the exit code is decided, since `check` reports rather than fails.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -956,7 +1067,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     // Herdr-managed install has no `herdr plugin config-dir`-style lookup
     // for the fleet state directory at all (this task's `result.md`: the
     // cutover runbook's gap item 3).
-    let state_dir = mv_config::load::config_state_dir_from_env(&config_path);
+    let state_dir = state_dir_from_config(&config_path);
 
     let mut blocks: Vec<String> = Vec::new();
     blocks.push(format!(
@@ -1086,6 +1197,16 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     if !placeholders.is_empty() {
         unresolved = true;
         blocks.push(format!("unfilled placeholders ({}):\n  {}\n\nMultiverse will not guess these (spec §0). Dry-runs work; real dispatch is blocked until they are set.", placeholders.len(), placeholders.join("\n  ")));
+    }
+
+    if config.secrets_scan.required && !scanner_available(&config.secrets_scan.gitleaks) {
+        blocks.push(format!(
+            "note: [secrets_scan] requires gitleaks ({}) but it could not be found. \
+             `multiverse worktrees <path> --merge <task>` will refuse with exit code 3 \
+             until it is installed (https://github.com/gitleaks/gitleaks#installing) or \
+             [secrets_scan] required is set to false.",
+            config.secrets_scan.gitleaks
+        ));
     }
 
     let projects: Vec<&Project> = config.projects.values().collect();
@@ -1413,6 +1534,84 @@ mod tests {
         );
     }
 
+    /// Card `20261109-b-58959c`: an interactive-only Nexus seat at its own
+    /// cap is exactly what `start` launches without hesitation (`start.rs`'s
+    /// `seat_account` is picked by `account.interactive` alone, never by
+    /// cap, breaker, `lent`, or `roles_allowed`), so `check` must not route
+    /// it through the worker-dispatch selector and report a false
+    /// `ChainExhaustedError`. This fails on main (`unresolved` is `true`
+    /// there) and passes once Nexus resolves the way `start` resolves it.
+    #[test]
+    fn check_chain_rows_resolves_an_interactive_nexus_seat_despite_being_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let toml = format!(
+            "[accounts.nexus-seat]\n\
+             kind = \"claude\"\n\
+             short = \"pc\"\n\
+             config_dir_var = \"CLAUDE_CONFIG_DIR\"\n\
+             config_dir = \"/tmp\"\n\
+             pool = \"claude:nexus-seat\"\n\
+             command = \"claude-interactive\"\n\
+             interactive = true\n\n\
+             [projects.sandbox]\npath = \"{}\"\n\
+             [projects.sandbox.chains]\n\
+             nexus = [\"nexus-seat\"]\n",
+            sandbox.display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+        mv_engine::seatstate::set_cap(dir.path(), "nexus-seat", Some(1)).unwrap();
+        let mut live = BTreeMap::new();
+        live.insert("pc".to_string(), 1);
+        let gauges = mv_state::gauge::GaugeMap::new();
+        let (rows, unresolved) = check_chain_rows(
+            &config,
+            Path::new("config.toml"),
+            dir.path(),
+            Some(&live),
+            &gauges,
+            &selector::HttpLocalLivenessProbe,
+        );
+        assert!(!unresolved, "{rows:?}");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn check_chain_rows_marks_nexus_unresolved_without_an_interactive_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let toml = format!(
+            "[accounts.primary]\n\
+             kind = \"codex\"\n\
+             short = \"pr\"\n\
+             config_dir_var = \"CODEX_HOME\"\n\
+             config_dir = \"/tmp\"\n\
+             pool = \"codex:primary\"\n\n\
+             [projects.sandbox]\npath = \"{}\"\n\
+             [projects.sandbox.chains]\n\
+             nexus = [\"primary\"]\n",
+            sandbox.display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+        let gauges = mv_state::gauge::GaugeMap::new();
+        let (rows, unresolved) = check_chain_rows(
+            &config,
+            Path::new("config.toml"),
+            dir.path(),
+            None,
+            &gauges,
+            &selector::HttpLocalLivenessProbe,
+        );
+        assert!(unresolved, "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("UNRESOLVED: no account is marked interactive = true")),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn check_chain_rows_stays_quiet_when_a_capped_seat_is_under_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -1681,5 +1880,122 @@ mod tests {
             .expect("threshold 0 fires");
         assert!(message.contains("sandbox copies (1 of them)"), "{message}");
         assert!(message.contains("CHARTER.md"), "{message}");
+    }
+
+    #[test]
+    fn scanner_available_resolves_a_bare_command_against_path() {
+        // Read-only: never mutates the real `PATH`, so this is safe under
+        // parallel test execution. `sh` is the one binary every POSIX host
+        // this suite runs on is guaranteed to have (this crate's own fake
+        // scanners/herdr scripts all shebang `#!/bin/sh`).
+        assert!(scanner_available("sh"));
+        assert!(!scanner_available(
+            "mv-cli-test-definitely-not-a-real-binary-xyz"
+        ));
+    }
+
+    #[test]
+    fn scanner_available_checks_an_explicit_path_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("gitleaks");
+        fs::write(&present, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(scanner_available(present.to_str().unwrap()));
+        let missing = dir.path().join("does-not-exist/gitleaks");
+        assert!(!scanner_available(missing.to_str().unwrap()));
+    }
+
+    /// Serializes this file's own `MULTIVERSE_PMSET_BIN` mutation against
+    /// every other test in the crate that mutates process-wide env vars,
+    /// reusing `worktrees::herdr_env`'s lock rather than a second one —
+    /// two independent locks guarding two different env vars would not
+    /// stop a `HerdrEnvGuard` test and this one from interleaving their
+    /// `std::env` calls on the same thread-shared process state.
+    struct PmsetBinGuard {
+        previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PmsetBinGuard {
+        fn set(path: &Path) -> Self {
+            let held = crate::commands::worktrees::herdr_env::lock();
+            let previous = std::env::var("MULTIVERSE_PMSET_BIN").ok();
+            std::env::set_var("MULTIVERSE_PMSET_BIN", path);
+            Self {
+                previous,
+                _lock: held,
+            }
+        }
+    }
+
+    impl Drop for PmsetBinGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_PMSET_BIN", value),
+                None => std::env::remove_var("MULTIVERSE_PMSET_BIN"),
+            }
+        }
+    }
+
+    /// Card `20261115-b-2754cc`: fails on main, where a timed-out pmset
+    /// probe is swallowed the same as "no warning" (`.ok()?` on the `run`
+    /// result). A 2-second sleep against a 5ms budget forces the timeout
+    /// branch regardless of host scheduling noise — the gap between them
+    /// is large enough that no plausible load on this machine closes it —
+    /// so this does not reproduce the flake by waiting on real load, the
+    /// way the original report did.
+    #[test]
+    fn idle_sleep_warning_reports_unknown_instead_of_dropping_on_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-pmset-slow");
+        fs::write(&script, "#!/bin/sh\nsleep 2\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let _guard = PmsetBinGuard::set(&script);
+
+        let warning = idle_sleep_warning_with_timeout(Duration::from_millis(5))
+            .expect("a timed-out probe must report unknown, not vanish");
+        assert!(warning.contains("unknown"), "{warning}");
+        assert!(!warning.contains("AC-power idle-sleep is"), "{warning}");
+    }
+
+    /// Card `20261115-b-c5917b`: `Timeout` was the only `run()` error
+    /// `idle_sleep_warning_with_timeout` reported distinctly — every other
+    /// variant (e.g. `MissingBinary`, which `spawn_with_busy_retry` also
+    /// raises for a plain transient spawn failure, not just a genuinely
+    /// absent binary) still hit the `Err(_) => None` catch-all and vanished
+    /// the same way a timed-out probe used to. A host tight enough on
+    /// spawnable processes to make `fork`/`posix_spawn` fail transiently
+    /// hits exactly that path, which is what made
+    /// `cli_workflows::check_reports_oversized_logs_docker_context_and_idle_sleep_without_writes`
+    /// flake under load: nothing about that test's own probe sleeps, so
+    /// only a non-`Timeout` spawn error could have dropped its "idle-sleep"
+    /// text. A nonexistent binary path forces `MissingBinary` deterministically,
+    /// without waiting on real host contention.
+    #[test]
+    fn idle_sleep_warning_reports_unknown_instead_of_dropping_on_a_non_timeout_probe_failure() {
+        let missing = Path::new("/no/such/pmset-binary-c5917b");
+        let _guard = PmsetBinGuard::set(missing);
+
+        let warning = idle_sleep_warning_with_timeout(Duration::from_secs(2))
+            .expect("a probe that fails to spawn must report unknown, not vanish");
+        assert!(warning.contains("idle-sleep"), "{warning}");
+        assert!(!warning.contains("AC-power idle-sleep is"), "{warning}");
+    }
+
+    #[test]
+    fn check_notes_a_missing_required_gitleaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let toml = format!(
+            "[secrets_scan]\n\
+             gitleaks = \"{}\"\n\n\
+             [projects.sandbox]\npath = \"{}\"\n",
+            dir.path().join("no-such-gitleaks-binary").display(),
+            sandbox.display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+        assert!(config.secrets_scan.required);
+        assert!(!scanner_available(&config.secrets_scan.gitleaks));
     }
 }

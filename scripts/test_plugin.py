@@ -180,6 +180,16 @@ class PluginTests(unittest.TestCase):
                 self.assertTrue(path.is_file(), f"{relative} is missing")
                 self.assertTrue(os.access(path, os.X_OK), f"{relative} is not executable")
 
+    def test_start_description_matches_the_one_shot_board_tab(self):
+        # The hub's board is a create-if-absent, unfocused `board` tab
+        # running the one-shot `board --all --read-only` (fleet_start.rs's
+        # `ensure_home_board_tab`), not a live pane — card 20261109-b-ac06d2.
+        start = next(
+            entry for entry in self.manifest["actions"] if entry["id"] == "multiverse-start"
+        )
+        self.assertNotIn("live board pane", start["description"])
+        self.assertIn("unfocused `board` tab", start["description"])
+
     def test_manifest_contract_and_license(self):
         workspace = tomllib.loads((REPO / "Cargo.toml").read_text())
         self.assertEqual(self.manifest["version"], workspace["workspace"]["package"]["version"])
@@ -197,8 +207,43 @@ class PluginTests(unittest.TestCase):
 
 
 def load_tests(loader, tests, _pattern):
+    tests_dir = REPO / "scripts/tests"
     # Keep bootstrap lifecycle regressions in the plugin boundary check.
-    tests.addTests(loader.discover(str(REPO / "scripts/tests"), pattern="test_bootstrap.py"))
+    tests.addTests(loader.discover(str(tests_dir), pattern="test_bootstrap.py"))
+    # Keep private-name regressions (git-grep ERE validity) in the plugin boundary check.
+    tests.addTests(loader.discover(str(tests_dir), pattern="test_private_names.py"))
+    # test_release.py imports BootstrapTests into its own module namespace, so
+    # a plain loader.discover(pattern="test_release.py") would also re-collect
+    # and re-run every test_bootstrap.py test added above, under the same
+    # class, for no extra coverage. Load RealReleaseTests directly instead.
+    sys.path.insert(0, str(tests_dir))
+    try:
+        import test_release
+    finally:
+        sys.path.remove(str(tests_dir))
+    # RealReleaseTests' two build-dependent tests only work after `python3
+    # scripts/tests/test_release.py` itself has built real macOS release
+    # archives and recorded them on the class (build_env/built_binaries); run
+    # here, without that setup, they would reach for a real cargo/rustup
+    # toolchain (or crash on the missing attributes). Skip exactly those two
+    # with a clear reason instead of wiring a real build into this fast,
+    # required check — everything else RealReleaseTests inherits uses the
+    # same fake-release fixture as test_bootstrap.py and runs normally here.
+    build_dependent = (
+        "test_missing_release_builds_from_source",
+        "test_each_packaged_target_installs_exact_binary",
+    )
+    reason = (
+        "needs a real macOS cargo/rustup toolchain and network access; "
+        "run scripts/tests/test_release.py directly"
+    )
+    for name in build_dependent:
+        setattr(
+            test_release.RealReleaseTests,
+            name,
+            unittest.skip(reason)(getattr(test_release.RealReleaseTests, name)),
+        )
+    tests.addTests(loader.loadTestsFromTestCase(test_release.RealReleaseTests))
     return tests
 
 

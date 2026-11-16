@@ -26,6 +26,8 @@ _PATH_LINE_RE = re.compile(r'^path = "([^"]*)"(\s*#.*)?$')
 
 
 def load_mapping(path: str) -> dict[str, str]:
+    """Read `old_path=new_path` lines (one pair per line) into a dict,
+    skipping blank lines and any line without an `=`."""
     mapping = {}
     with open(path) as f:
         for line in f:
@@ -38,6 +40,10 @@ def load_mapping(path: str) -> dict[str, str]:
 
 
 def main() -> int:
+    """Rewrite every `path = "..."` line in `input_config` per `--mapping`
+    (or to `--unmapped-dir` when the old path isn't in the mapping), write
+    the result to `output_config`, print a rewritten/unmapped count, and
+    return 0."""
     parser = argparse.ArgumentParser()
     parser.add_argument("input_config")
     parser.add_argument("output_config")

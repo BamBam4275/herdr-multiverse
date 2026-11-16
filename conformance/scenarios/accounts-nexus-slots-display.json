@@ -1,0 +1,48 @@
+{
+  "id": "accounts-nexus-slots-display",
+  "description": "Card 20261115-b-234610: a seat with its own `nexus_slots > 0` shows the capacity-report line `workers N/<cap>, nexus M/<nexus_slots>` rather than one merged open count -- and the worker count excludes a busy Nexus pane dispatched under the same seat, the same exclusion `commands::dispatch`'s `is_nexus_role` already applies. A seat capped at 2, hosting one busy Nexus pane and one busy worker pane, reads `workers 1/2, nexus 1/1` (STATE available, not at cap) -- not the pre-fix `open: 2/2` (STATE at cap: 2/2 open agents), which counted the Nexus pane as a worker. `accounts-open-agent-cap` (nexus_slots unset, no Nexus pane) still pins the old merged `⛁ open: N/cap` text byte for byte.",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\tproject=sandbox\trole=nexus\taccount=nexus-seat\tpool=codex:test\toutcome=chain-primary\treason=\tagent=sandbox-nex-1-ns\tbranch=main\n2020-01-01T00:05:00+00:00\tevent=dispatch\ttask=20250101-builder-bbbbbb\tproject=sandbox\trole=builder\taccount=nexus-seat\tpool=codex:test\toutcome=chain-primary\treason=\tagent=sandbox-buil-1-ns\tbranch=main\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"codex\"\nshort = \"ns\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\nnexus_slots = 1\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "limit", "nexus-seat", "2"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"working\", \"name\": \"sandbox-nex-1-ns\"}, {\"pane_id\": \"w1:p2\", \"agent_status\": \"working\", \"name\": \"sandbox-buil-1-ns\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "⛁ open: workers 1/2, nexus 1/1"
+        ]
+      }
+    }
+  ]
+}

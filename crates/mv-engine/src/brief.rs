@@ -842,7 +842,30 @@ mod tests {
         assert!(!rendered.contains("stage prompt body"));
     }
 
-    fn temp_file(tag: &str) -> PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on the test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// its directory behind in `TMPDIR`). `Deref`s to `Path` so the existing
+    /// call site keeps reading `&path` unchanged.
+    struct TempFile(PathBuf);
+    impl std::ops::Deref for TempFile {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempFile {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    fn temp_file(tag: &str) -> TempFile {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -852,7 +875,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("brief.md")
+        TempFile(dir.join("brief.md"))
     }
 
     #[test]
@@ -862,6 +885,5 @@ mod tests {
         brief.write_to(&path).unwrap();
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, brief.render());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

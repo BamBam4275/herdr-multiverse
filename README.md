@@ -30,7 +30,7 @@ Rendered by `scripts/docs/render-demo.sh` from a real `multiverse board`,
 
 ## Status
 
-Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.6`.
+Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.8`.
 It is a from-scratch Rust port of a Python reference implementation, built
 so the two can be checked against each other for
 behavioral parity before the Rust binary becomes the only implementation.
@@ -40,7 +40,7 @@ What is on this tree today:
 - Seven crates (`mv-core`, `mv-config`, `mv-herdr`, `mv-state`,
   `mv-engine`, `mv-board`, `mv-cli`) and a `multiverse` binary, all with
   real implementations — none of the seven is a module-list stub.
-- Clap parsing for 29 top-level subcommands, exit codes 0/1/2/3, and `--yes`
+- Clap parsing for 31 top-level subcommands, exit codes 0/1/2/3, and `--yes`
   authorization on `dispatch` / `council`.
 - Crate unit/integration tests and verification commands, with current
   passing counts recorded in [`docs/install.md`](docs/install.md#verification-and-troubleshooting).

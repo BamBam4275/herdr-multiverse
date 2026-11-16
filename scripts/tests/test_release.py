@@ -15,10 +15,18 @@ from test_bootstrap import BootstrapTests, REPO
 
 
 class RealReleaseTests(BootstrapTests):
+    """Reruns select BootstrapTests cases against real packaged release
+    archives and a real source build, instead of the fast fixtures the
+    parent class stubs; `main()` below builds `built_binaries` and
+    `release_source` before this suite runs."""
+
     build_env = None
     built_binaries = None
 
     def test_missing_release_builds_from_source(self):
+        """Override: build bin/multiverse from this repo's real source tree
+        with a real cargo invocation, rather than BootstrapTests' stubbed
+        cargo fixture."""
         self.remove_release()
         # Copy only build inputs, never the frozen Python reference or user data.
         for name in ("crates", "fixtures/herdr", "prompts", "templates"):
@@ -39,6 +47,9 @@ class RealReleaseTests(BootstrapTests):
         self.assert_version()
 
     def test_each_packaged_target_installs_exact_binary(self):
+        """For every real packaged archive, spoof `uname` to that target's
+        platform and verify bootstrap selects it and installs its exact
+        bytes."""
         # Verify platform selection and bytes for every archive. Only the native
         # architecture is executed; Intel translation is not required on ARM CI.
         for target, built in self.built_binaries.items():
@@ -65,11 +76,17 @@ class RealReleaseTests(BootstrapTests):
 
 
 def run(command, env, cwd=REPO):
+    """Echo `command` and run it with `check=True`, failing fast on error."""
     print("+ " + " ".join(map(str, command)), flush=True)
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
 def main():
+    """Build real release archives for every available target (both Apple
+    targets, plus Linux targets with a cross compiler on PATH), checksum
+    them the same way release.yml does, then run RealReleaseTests against
+    the result. macOS-only: this is what actually builds the Apple
+    binaries."""
     if platform.system() != "Darwin":
         raise SystemExit("test_release.py requires macOS to build both Apple release targets")
     with tempfile.TemporaryDirectory(prefix="release-test-", dir=REPO / "scripts") as temp:

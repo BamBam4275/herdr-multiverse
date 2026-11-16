@@ -26,17 +26,24 @@ use toml_edit::{DocumentMut, Item, Table};
 /// Everything that can go wrong persisting Codex trust.
 #[derive(Debug, thiserror::Error)]
 pub enum CodexTrustError {
+    /// `config.toml` exists but is not valid TOML.
     #[error("cannot parse {path}: {source}")]
     Parse {
         path: PathBuf,
         source: toml_edit::TomlError,
     },
+    /// The `projects` key (or one project's own entry) exists but is not
+    /// a TOML table.
     #[error("Codex projects table in {0} is not a table")]
     NotATable(PathBuf),
+    /// An existing entry for `path` has a `trust_level` other than
+    /// `"trusted"` — refused rather than silently overridden.
     #[error("Codex project {path:?} is explicitly not trusted")]
     ExplicitlyUntrusted { path: PathBuf },
+    /// Could not acquire the exclusive lock on `config.toml`.
     #[error(transparent)]
     Lock(#[from] mv_core::lock::LockError),
+    /// Any other filesystem failure reading or writing `config.toml`.
     #[error(transparent)]
     Io(#[from] io::Error),
 }

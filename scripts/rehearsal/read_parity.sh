@@ -266,6 +266,8 @@ run_rs() {
 MANIFEST="$WORK/manifest.jsonl"
 : >"$MANIFEST"
 
+# Runs the same argv on both sides via run_py/run_rs, then appends one JSON
+# line per command to $MANIFEST for compare.py to read.
 record() {
     label="$1"
     argv="$2"

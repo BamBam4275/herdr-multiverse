@@ -125,9 +125,17 @@ pub fn claim_runtime_cap(project_root: &Path, task_id: &str, now: OffsetDateTime
 /// `{"sent_at": entry}`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StuckResumeClaim {
+    /// When this claim was made (or, for a legacy bare-string entry, the
+    /// stored timestamp itself), formatted by `mv_core::time`.
     pub sent_at: String,
+    /// The pane the resume nudge was actually sent to, recorded only once
+    /// [`remember_stuck_resume_signal`] confirms the send; `None` for a
+    /// freshly reserved claim or an imported legacy entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+    /// Fingerprint of the exact pane text the nudge was sent for, set
+    /// alongside `pane`; lets a later pass detect "still the same banner"
+    /// versus a different pane now occupying this claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
@@ -323,7 +331,12 @@ pub fn stuck_signal_confirmed(
 /// `stranded-trip-memory.json` entries (`fingerprint` + `tripped_at`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrandedTripEntry {
+    /// Fingerprint of the banner text that was showing when this pane was
+    /// recorded as stranded, used to detect whether it's still the same
+    /// frozen text on a later poll.
     pub fingerprint: String,
+    /// When this trip was recorded, formatted by `mv_core::time`; entries
+    /// older than `STRANDED_TRIP_RETENTION` are pruned on read.
     pub tripped_at: String,
 }
 
@@ -411,7 +424,30 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_project() -> PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&root`/`root.join(...)` unchanged.
+    struct TempProject(PathBuf);
+    impl std::ops::Deref for TempProject {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempProject {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_project() -> TempProject {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
             let dir = std::env::temp_dir().join(format!(
@@ -422,7 +458,7 @@ mod tests {
             match fs::create_dir(&dir) {
                 Ok(()) => {
                     fs::create_dir_all(dir.join(".multiverse")).unwrap();
-                    return dir;
+                    return TempProject(dir);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("temporary project: {error}"),
@@ -441,7 +477,6 @@ mod tests {
         assert!(claim_finish_nudge(&root, "t1", now()));
         assert!(finish_nudge_already_sent(&root, "t1"));
         assert!(!claim_finish_nudge(&root, "t1", now()));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -452,7 +487,6 @@ mod tests {
         assert!(claim_runtime_cap(&root, "t1", now()));
         assert!(finish_nudge_already_sent(&root, "t1"));
         assert!(runtime_cap_already_sent(&root, "t1"));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -466,7 +500,6 @@ mod tests {
         let claim = stuck_resume_claim(&root, "t1").unwrap();
         assert_eq!(claim.pane.as_deref(), Some("w1:p1"));
         assert_eq!(claim.fingerprint, Some(fingerprint("connection lost")));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -477,7 +510,6 @@ mod tests {
         let claim = stuck_resume_claim(&root, "t1").unwrap();
         assert_eq!(claim.sent_at, "2026-01-01T00:00:00+00:00");
         assert_eq!(claim.pane, None);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -492,7 +524,6 @@ mod tests {
             &live,
             moment
         ));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -515,7 +546,6 @@ mod tests {
             &live,
             second
         ));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -547,7 +577,6 @@ mod tests {
             &live,
             second
         ));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -570,7 +599,6 @@ mod tests {
             &live,
             second
         ));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -593,7 +621,6 @@ mod tests {
             &[],
             second
         ));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -617,7 +644,6 @@ mod tests {
             &live,
             second
         ));
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -633,7 +659,6 @@ mod tests {
             Some(fingerprint("out of credits").as_str())
         );
         assert!(raw["w1:p1"]["tripped_at"].as_str().is_some());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -643,6 +668,5 @@ mod tests {
         record_stranded_banner_at_reset(&root, "w1:p1", "out of credits", Some(&live));
         let path = memory_path(&root, STRANDED_TRIP_MEMORY_FILENAME);
         assert!(!path.exists());
-        let _ = fs::remove_dir_all(&root);
     }
 }

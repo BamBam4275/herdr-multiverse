@@ -12,6 +12,9 @@ use crate::layout::{
 const BLOCKED_EMPHASIS_ON: &str = "\u{1b}[1;31m";
 const BLOCKED_EMPHASIS_OFF: &str = "\u{1b}[0m";
 
+// Longest wait first: `None` (unknown wait) always sorts last, and known
+// values compare in reverse (`y.cmp(&x)`) so a bigger wait sorts earlier
+// under the ascending `sort_by` its callers use.
 fn wait_cmp(a: Option<u64>, b: Option<u64>) -> Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
@@ -46,14 +49,20 @@ fn backlog_cmp(a: &Card, b: &Card) -> Ordering {
         .cmp(&b.priority.unwrap_or(u8::MAX))
 }
 
+/// Sorts cards into IN PROGRESS order (longest wait first); see this
+/// module's private `in_progress_cmp` for the rationale.
 pub fn sort_in_progress(cards: &mut [Card]) {
     cards.sort_by(in_progress_cmp);
 }
 
+/// Sorts cards into BLOCKED order (unacknowledged, then priority, then
+/// wait); see this module's private `blocked_cmp` for the rationale.
 pub fn sort_blocked(cards: &mut [Card]) {
     cards.sort_by(blocked_cmp);
 }
 
+/// Sorts cards into BACKLOG order (priority, then creation order); see
+/// this module's private `backlog_cmp` for the rationale.
 pub fn sort_backlog(cards: &mut [Card]) {
     cards.sort_by(backlog_cmp);
 }
@@ -63,10 +72,12 @@ pub fn sort_in_progress_placed(cards: &mut [PlacedCard]) {
     cards.sort_by(|a, b| in_progress_cmp(&a.card, &b.card));
 }
 
+/// [`sort_blocked`], for the merged fleet view's `PlacedCard`s.
 pub fn sort_blocked_placed(cards: &mut [PlacedCard]) {
     cards.sort_by(|a, b| blocked_cmp(&a.card, &b.card));
 }
 
+/// [`sort_backlog`], for the merged fleet view's `PlacedCard`s.
 pub fn sort_backlog_placed(cards: &mut [PlacedCard]) {
     cards.sort_by(|a, b| backlog_cmp(&a.card, &b.card));
 }
@@ -177,6 +188,9 @@ pub enum CardsPerRow {
 }
 
 impl CardsPerRow {
+    /// Parses `--cards-per-row`'s three accepted values; any other input
+    /// (including empty) is rejected so the CLI can report it as invalid
+    /// rather than silently falling back to a default.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "auto" => Some(Self::Auto),
@@ -197,6 +211,8 @@ pub enum BoardColumn {
 }
 
 impl BoardColumn {
+    /// Parses one `--status` key; unrecognized input is rejected so the
+    /// CLI can report it rather than silently dropping a column.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "blocked" => Some(Self::Blocked),
@@ -231,6 +247,7 @@ impl Default for StatusFilter {
 }
 
 impl StatusFilter {
+    /// Every column shown — the default when `--status` is not given.
     pub fn all() -> Self {
         Self {
             blocked: true,
@@ -239,6 +256,10 @@ impl StatusFilter {
         }
     }
 
+    /// Builds a filter from the `--status` keys the CLI collected. An empty
+    /// iterator (the flag was never passed) falls back to [`Self::all`]
+    /// rather than showing no columns, since `--status` is optional and
+    /// omitting it must mean "show everything," not "show nothing."
     pub fn from_keys(keys: impl IntoIterator<Item = BoardColumn>) -> Self {
         let mut filter = Self {
             blocked: false,
@@ -460,6 +481,9 @@ fn render_columns_generic(
             BoardColumn::Backlog => (column.header(), backlog, false),
         }
     };
+    // Too narrow for `n` columns side by side: recurse once per column,
+    // rendering each at the full `total_width` and stacking the results
+    // vertically instead.
     if n > 1 && layout.total_width < n * MIN_COLUMN_WIDTH + n - 1 {
         let mut out = Vec::new();
         for column in selected {
@@ -477,6 +501,9 @@ fn render_columns_generic(
                     .map(|placed| card_height(placed.card, width))
                     .max()
                     .unwrap_or(0);
+                // Even the first row would overflow this column's share of
+                // the height budget: give up on height-based packing and
+                // fall back to the narrow stacked-view card limit instead.
                 if !cards.is_empty() && first_height > height.saturating_sub(2) {
                     child.height = None;
                     child.limit = STACKED_FALLBACK_LIMIT.min(crate::layout::DEFAULT_LIMIT);
@@ -574,6 +601,9 @@ fn pack_for_budget(cards: &[CardRef<'_>], width: usize, lanes: usize, budget: us
     }
 }
 
+// Count only whole rows that fit: a row's height is its tallest card
+// (shorter cards in the same row get padded up to match), so a row is
+// admitted only if adding its full height still stays within `budget`.
 fn pack_n_up(cards: &[CardRef<'_>], width: usize, lanes: usize, budget: usize) -> usize {
     let lanes = lanes.max(1);
     let card_width = n_up_card_width(width, lanes);
@@ -611,10 +641,16 @@ fn auto_column_dimensions(
     let mut widths = 0;
     let mut dimensions = Vec::new();
     for (index, cards) in columns.iter().enumerate() {
+        // Every column after this one needs at least one lane, so this
+        // column may claim at most `lane_budget - assigned - reserved`
+        // lanes; the last column (`reserved == 0`) takes whatever is left.
         let reserved = n - index - 1;
         let lanes = if reserved == 0 {
             lane_budget - assigned
         } else {
+            // Try the fewest lanes (1, then 2) that still fit every one of
+            // this column's cards within the shared row-height budget,
+            // rather than always maximizing lanes.
             let cap = (lane_budget - assigned - reserved).clamp(1, 2);
             (1..=cap)
                 .find(|lanes| {
@@ -670,6 +706,9 @@ pub fn render_columns_merged(
     )
 }
 
+/// [`render_columns_merged`] with explicit [`ColumnLayout`] control, for
+/// the same reason [`render_columns_with`] exists alongside
+/// [`render_columns`].
 pub fn render_columns_merged_with(
     blocked: &[PlacedCard],
     in_progress: &[PlacedCard],
@@ -684,10 +723,6 @@ pub fn render_columns_merged_with(
     )
 }
 
-/// Lay BLOCKED/IN PROGRESS/BACKLOG out side by side when `total_width`
-/// clears three `MIN_COLUMN_WIDTH`-wide columns, else stack them. If even
-/// the stacked form is too narrow to be useful, cards-per-column drops to
-/// `STACKED_FALLBACK_LIMIT` instead of the caller's ordinary `limit`.
 fn card_as_refs(cards: &[Card]) -> Vec<CardRef<'_>> {
     cards
         .iter()
@@ -699,6 +734,10 @@ fn card_as_refs(cards: &[Card]) -> Vec<CardRef<'_>> {
         .collect()
 }
 
+/// Lay BLOCKED/IN PROGRESS/BACKLOG out side by side when `total_width`
+/// clears three `MIN_COLUMN_WIDTH`-wide columns, else stack them. If even
+/// the stacked form is too narrow to be useful, cards-per-column drops to
+/// `STACKED_FALLBACK_LIMIT` instead of the caller's ordinary `limit`.
 pub fn render_columns(
     blocked: &[Card],
     in_progress: &[Card],
@@ -722,6 +761,9 @@ pub fn render_columns(
     )
 }
 
+/// [`render_columns`] with explicit [`ColumnLayout`] control (an optional
+/// height budget and a forced `cards_per_row`), for callers that need more
+/// than the fixed-width, auto-packing defaults.
 pub fn render_columns_with(
     blocked: &[Card],
     in_progress: &[Card],

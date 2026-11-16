@@ -14,13 +14,18 @@ SCRIPT = Path(__file__).with_name("export-fresh.sh")
 
 
 class ExportFixture(unittest.TestCase):
+    """Shared fixture: a synthetic source checkout plus fixture `git`,
+    `cargo`, `python3`, and `gitleaks` stand-ins on PATH, so export/sync
+    behavior can be exercised without a real build, conformance run, or
+    scan."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="mv-export-test-")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
         self.source = self.work / "source checkout's files"
         (self.source / "scripts/release").mkdir(parents=True)
-        for name in ("export-fresh.sh", "sync-public.sh"):
+        for name in ("export-fresh.sh", "sync-public.sh", "gitleaks-version.sh"):
             shutil.copy2(SCRIPT.with_name(name), self.source / "scripts/release" / name)
         (self.source / "README.md").write_text("public source\n")
         (self.source / "Cargo.toml").write_text('[workspace.package]\nversion = "0.2.0"\n')
@@ -58,8 +63,20 @@ class ExportFixture(unittest.TestCase):
                 '[ "${FAIL_CHECK:-}" != "$check" ]\n'
             )
             tool.chmod(0o755)
+        scanner = self.work / "scanner"
+        scanner.mkdir()
+        gitleaks = scanner / "gitleaks"
+        gitleaks.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = version ]; then printf "8.30.1\\n"; exit 0; fi\n'
+            'printf "gitleaks\\n" >> "$CHECK_LOG"\n'
+            '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
+        )
+        gitleaks.chmod(0o755)
+        self.tools_dir = tools
+        self.scanner_dir = scanner
         self.env = {
-            "PATH": str(tools),
+            "PATH": f"{tools}:{scanner}",
             "HOME": str(self.work),
             "TMPDIR": str(self.work),
             "REAL_GIT": shutil.which("git"),
@@ -78,11 +95,15 @@ class ExportFixture(unittest.TestCase):
         self.output = self.work / "public export's files"
 
     def git(self, cwd, *args):
+        """Run the real `git` (not the fixture one on PATH) against `cwd`
+        and return its stripped stdout."""
         return subprocess.check_output(
             [self.env["REAL_GIT"], *args], cwd=cwd, env=self.env, text=True,
         ).strip()
 
     def export(self):
+        """Run export-fresh.sh against the fixture source, writing to
+        self.output."""
         return subprocess.run(
             ["sh", str(self.source / "scripts/release/export-fresh.sh"), str(self.output)],
             env=self.env, text=True, capture_output=True, check=False,
@@ -90,7 +111,12 @@ class ExportFixture(unittest.TestCase):
 
 
 class ExportTests(ExportFixture):
+    """export-fresh.sh against the fixture source checkout."""
+
     def test_success_exports_only_head_with_fresh_history_and_no_remote(self):
+        """Uncommitted, untracked, and gitignored paths never reach the
+        export; the result is a single fresh commit on main with no
+        remote, and the source checkout's own git config is untouched."""
         original_config = (self.source / ".git/config").read_bytes()
         (self.source / "README.md").write_text("uncommitted change\n")
         for name in (".multiverse/private", "evidence/private", "config.toml", "untracked"):
@@ -108,6 +134,9 @@ class ExportTests(ExportFixture):
         self.assertEqual((self.source / ".git/config").read_bytes(), original_config)
 
     def test_archive_failure_after_valid_output_stops_before_commit_or_checks(self):
+        """A `git archive` failure reported only after it already produced
+        readable output still aborts before the new repo is committed or
+        any check runs, and leaves no temp archive behind."""
         self.env["FAIL_ARCHIVE"] = "1"
         result = self.export()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -116,8 +145,68 @@ class ExportTests(ExportFixture):
         self.assertFalse((self.work / "checks.log").exists())
         self.assertEqual(list(self.work.glob("multiverse-export.*")), [])
 
+    def test_wrong_local_gitleaks_version_refused(self):
+        """A local gitleaks older than the pinned minimum fails the export
+        and names both the found and required versions."""
+        gitleaks = self.scanner_dir / "gitleaks"
+        gitleaks.write_text(
+            '#!/bin/sh\nif [ "$1" = version ]; then printf "8.18.1\\n"; exit 0; fi\nexit 1\n'
+        )
+        gitleaks.chmod(0o755)
+        result = self.export()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("8.18.1", result.stderr)
+        self.assertIn("8.30.1", result.stderr)
+        self.assertIn("overall: FAIL", result.stdout)
+
+    def test_newer_local_gitleaks_version_accepted(self):
+        """A local gitleaks newer than the pin is accepted, not just an
+        exact match."""
+        # Minimum-version, not exact-match: a locally-installed gitleaks
+        # newer than the pin (as brew's continuously-updated formula will be
+        # between pin bumps) must still be allowed to run the export.
+        gitleaks = self.scanner_dir / "gitleaks"
+        gitleaks.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = version ]; then printf "9.0.0\\n"; exit 0; fi\n'
+            'printf "gitleaks\\n" >> "$CHECK_LOG"\n'
+            '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
+        )
+        gitleaks.chmod(0o755)
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.work / "checks.log").read_text().splitlines()[-1], "gitleaks")
+
+    def test_uses_docker_when_local_gitleaks_absent(self):
+        """With no local gitleaks binary on PATH but docker available, the
+        export falls back to the containerized scanner."""
+        docker_dir = self.work / "docker-tools"
+        docker_dir.mkdir()
+        docker = docker_dir / "docker"
+        docker.write_text(
+            '#!/bin/sh\nprintf "gitleaks\\n" >> "$CHECK_LOG"\n'
+            '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
+        )
+        docker.chmod(0o755)
+        self.env["PATH"] = f"{self.tools_dir}:{docker_dir}"
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.work / "checks.log").read_text().splitlines()[-1], "gitleaks")
+
+    def test_scanner_missing_export_fails(self):
+        """With neither gitleaks nor docker on PATH, the export fails
+        outright rather than silently skipping the secrets scan."""
+        self.env["PATH"] = str(self.tools_dir)
+        result = self.export()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("install", result.stderr.lower())
+        self.assertIn("overall: FAIL", result.stdout)
+
 
 class SyncTests(ExportFixture):
+    """sync-public.sh against a fixture public clone with an existing
+    v0.1.0 release, cloned from a local bare origin (no network)."""
+
     def setUp(self):
         super().setUp()
         self.origin = self.work / "origin.git"
@@ -131,14 +220,10 @@ class SyncTests(ExportFixture):
         self.git(self.output, "push", "-q", "origin", "main", "v0.1.0")
         self.initial_head = self.git(self.output, "rev-parse", "HEAD")
         self.initial_tag = self.git(self.output, "rev-parse", "v0.1.0")
-        docker = self.work / "tools/docker"
-        docker.write_text(
-            '#!/bin/sh\nprintf "gitleaks\\n" >> "$CHECK_LOG"\n'
-            '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
-        )
-        docker.chmod(0o755)
 
     def sync(self, version="0.2.0", target=None):
+        """Run sync-public.sh against the fixture public clone (or
+        `target`, when the test needs a different directory)."""
         return subprocess.run(
             ["sh", str(self.source / "scripts/release/sync-public.sh"),
              str(self.output if target is None else target), version],
@@ -146,6 +231,8 @@ class SyncTests(ExportFixture):
         )
 
     def assert_unchanged(self):
+        """Assert the public clone's history, tags, and working tree are
+        exactly as `setUp` left them, and no temp export/sync dir survived."""
         self.assertEqual(self.git(self.output, "rev-parse", "HEAD"), self.initial_head)
         self.assertEqual(self.git(self.output, "rev-parse", "v0.1.0"), self.initial_tag)
         self.assertEqual(self.git(self.output, "tag", "--list", "v0.2.0"), "")
@@ -155,6 +242,9 @@ class SyncTests(ExportFixture):
         self.assertEqual(list(self.work.glob("multiverse-export.*")), [])
 
     def test_success_preserves_history_tags_identity_and_only_prints_push(self):
+        """A full sync adds exactly one commit and tag on top of the
+        existing release history, uses the supplied identity, replaces the
+        tracked tree, pushes nothing, and only prints the push command."""
         config = (self.output / ".git/config").read_bytes()
         source_config = (self.source / ".git/config").read_bytes()
         self.env["GIT_AUTHOR_NAME"] = "Release Author"
@@ -196,6 +286,8 @@ class SyncTests(ExportFixture):
         self.assertEqual(list(self.work.glob("multiverse-sync.*")), [])
 
     def test_dirty_clone_refused_before_export(self):
+        """An unstaged, staged, or untracked change in the public clone
+        refuses the sync before the (costly) export ever runs."""
         for kind in ("unstaged", "staged", "untracked"):
             with self.subTest(kind=kind):
                 dirty = self.output / ("untracked" if kind == "untracked" else "README.md")
@@ -213,6 +305,9 @@ class SyncTests(ExportFixture):
                 self.assert_unchanged()
 
     def test_ahead_main_preserved_and_same_size_timestamp_content_replaced(self):
+        """A local commit ahead of origin/main is preserved, and content
+        is still replaced even when the stale file matches the new one's
+        size and mtime (rsync --checksum, not a quick size/time compare)."""
         readme = self.output / "README.md"
         readme.write_text("stale content\n")
         self.assertEqual(readme.stat().st_size, (self.source / "README.md").stat().st_size)
@@ -228,6 +323,8 @@ class SyncTests(ExportFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.initial_head)
 
     def test_branch_and_detached_head_refused(self):
+        """A public clone on a topic branch or in detached-HEAD state is
+        refused; only main is a valid target."""
         for branch in ("topic", "--detach"):
             with self.subTest(branch=branch):
                 if branch == "topic":
@@ -242,6 +339,8 @@ class SyncTests(ExportFixture):
                 self.git(self.output, "checkout", "-q", "main")
 
     def test_status_command_failure_stops_before_export(self):
+        """A failing `git status` in the public clone aborts the sync with
+        its own error before the export runs, leaving the clone untouched."""
         self.env["FAIL_STATUS"] = "1"
         result = self.sync()
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
@@ -250,6 +349,9 @@ class SyncTests(ExportFixture):
         self.assert_unchanged()
 
     def test_behind_and_diverged_main_refused_after_fetch(self):
+        """The sync fetches origin/main fresh before comparing, and
+        refuses both a clone that is behind it and one that has since
+        diverged from it."""
         other = self.work / "other"
         self.git(self.work, "clone", "-q", str(self.origin), str(other))
         (other / "remote-file").write_text("new remote commit\n")
@@ -272,6 +374,9 @@ class SyncTests(ExportFixture):
         self.assertFalse((self.work / "checks.log").exists())
 
     def test_each_export_check_failure_keeps_clone_unchanged(self):
+        """A failure in any one of the export's checks (build, test,
+        conformance, private-names, gitleaks) leaves the public clone
+        exactly as it was."""
         for check in ("cargo build --locked", "cargo test --workspace --locked",
                       "python3 conformance/run_all.py", "private-names", "gitleaks"):
             with self.subTest(check=check):
@@ -282,6 +387,8 @@ class SyncTests(ExportFixture):
                 self.assert_unchanged()
 
     def test_archive_failure_keeps_clone_unchanged(self):
+        """An archive failure inside the inner export-fresh.sh run leaves
+        the public clone exactly as it was."""
         self.env["FAIL_ARCHIVE"] = "1"
         result = self.sync()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -290,6 +397,8 @@ class SyncTests(ExportFixture):
         self.assert_unchanged()
 
     def test_both_manifest_versions_must_match_argument(self):
+        """A mismatch between the requested version and either manifest's
+        own version (Cargo.toml or herdr-plugin.toml) refuses the sync."""
         for name in ("Cargo.toml", "herdr-plugin.toml"):
             with self.subTest(manifest=name):
                 path = self.source / name
@@ -306,6 +415,8 @@ class SyncTests(ExportFixture):
                 self.git(self.source, "commit", "-q", "-m", "restore version")
 
     def test_existing_tag_refused(self):
+        """A public clone that already has the requested release's tag is
+        refused rather than overwriting it."""
         self.git(self.output, "tag", "-a", "v0.2.0", "-m", "already released")
         tag = self.git(self.output, "rev-parse", "v0.2.0")
         result = self.sync()
@@ -316,6 +427,8 @@ class SyncTests(ExportFixture):
         self.assertFalse((self.work / "checks.log").exists())
 
     def test_missing_identity_and_invalid_version_refused(self):
+        """Any missing git identity variable, or a version string that
+        isn't a bare, unprefixed release version, refuses the sync."""
         for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
                      "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
             with self.subTest(identity=name):
@@ -333,6 +446,9 @@ class SyncTests(ExportFixture):
         self.assertFalse((self.work / "checks.log").exists())
 
     def test_source_checkout_and_subdirectory_targets_refused(self):
+        """The public clone target must be separate from the source
+        checkout: the source itself, and a path nested inside either
+        checkout, are both refused."""
         for target in (self.source, self.output / ".git", self.source / "scripts"):
             with self.subTest(target=target):
                 result = self.sync(target=target)

@@ -121,8 +121,11 @@ pub struct Card {
     pub(crate) acknowledged: bool,
 }
 
-/// A `Card` placed into the merged fleet view, carrying the per-project
-/// color tag. `render`'s single-project cards leave these blank.
+/// A `Card` carrying its project's color tag. `render`'s single-project
+/// cards get a color but leave `project_short` blank — the project is
+/// already named in the heading above the columns; the merged fleet view
+/// is the one that needs the label, since its cards come from several
+/// projects at once.
 #[derive(Debug, Clone)]
 pub struct PlacedCard {
     pub card: Card,
@@ -151,6 +154,9 @@ pub fn task_card(snapshot: &DispatchedTaskSnapshot) -> Card {
     if let Some(note) = &snapshot.stale_pane_note {
         notes.push(note.clone());
     }
+    // A dirty-done detail always wins over the acknowledged note: once a
+    // lane is flagged for uncommitted changes, showing just "acknowledged"
+    // would hide that it still needs a human decision.
     if let Some(detail) = &snapshot.dirty_done_detail {
         notes.push(format!(
             "done but lane has uncommitted changes({detail}): commit, or record failed/superseded"
@@ -191,6 +197,8 @@ pub fn backlog_card(item: &BacklogItemSnapshot) -> Card {
         BacklogStatus::Asked => Some("asked".to_string()),
         _ => item.role_hint.clone().filter(|role| !role.is_empty()),
     };
+    // Avoid double-prefixing: some callers already format `due_text` as
+    // `"due ..."` themselves, others pass the bare value.
     let due_text = item.due_text.as_ref().map(|due| {
         if due.starts_with("due ") {
             due.clone()

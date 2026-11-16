@@ -170,49 +170,95 @@ fn classify_envelope(payload: &Option<Value>, command: &HerdrCommand) -> Option<
 }
 
 /// Attempts (including the first) and the delay between them for the
-/// `ExecutableFileBusy` retry below. Linux clears the busy window as soon
-/// as the other thread's `open`-for-write returns, which is microseconds
-/// in practice; a handful of short sleeps absorbs that without making a
-/// genuinely-busy binary (e.g. mid-upgrade) wait long before surfacing
-/// `MissingBinary`.
-const SPAWN_BUSY_RETRIES: u32 = 8;
-const SPAWN_BUSY_DELAY: Duration = Duration::from_millis(15);
+/// retryable spawn errors below. Linux clears the `ExecutableFileBusy`
+/// window as soon as the other thread's `open`-for-write returns, which
+/// is microseconds in practice; a handful of short sleeps absorbs that
+/// without making a genuinely-busy binary (e.g. mid-upgrade) wait long
+/// before surfacing `MissingBinary`. The same bounded retry also covers
+/// the transient resource errors below, which clear on the same kind of
+/// timescale (another process exiting, a GC freeing memory, a fd closing).
+const SPAWN_RETRIES: u32 = 8;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(15);
 
-/// Spawn `command`, retrying a bounded number of times when the OS
-/// reports `ExecutableFileBusy` (Linux ETXTBSY): `binary` is still open
-/// for writing in another process at the instant of `exec`. In this
-/// workspace that other process is almost always a concurrent test
-/// thread's own fake-binary helper — it `fs::write`s a `#!/bin/sh`
-/// script and `fork()`s to exec it, and any *other* thread's `fork()` in
-/// that same window inherits the first thread's still-open write fd,
-/// which keeps the file busy until that child execs or exits, regardless
-/// of which binary the child itself is about to run. Renaming the script
-/// into place after closing it would not help: the race is on the
-/// inherited fd, not on the path, so a second `open` under the final name
-/// can still land inside someone else's write window. A real Herdr
-/// install mid-upgrade hits the identical error for the identical
-/// reason, so retrying here protects both. Any other spawn error returns
-/// immediately.
-fn spawn_with_busy_retry(
-    command: &mut Command,
+/// EMFILE (process-wide fd limit) and ENFILE (system-wide fd table full):
+/// identical on Linux and macOS, the only two targets this workspace
+/// builds for (`AGENTS.md`). `std::io::ErrorKind` has no stable variant
+/// for either (nightly-only `io_error_too_many_open_files`), so these are
+/// matched by raw OS error instead of pulling in a `libc` dependency for
+/// two constants.
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+
+/// Whether `error` reports a transient host-resource shortage rather than
+/// anything about the binary itself: EAGAIN/EWOULDBLOCK (`fork` out of
+/// process slots), ENOMEM (`fork` out of memory), EMFILE/ENFILE (out of
+/// file descriptors, process- or system-wide), or EINTR (the `fork`/`exec`
+/// syscall itself was interrupted by a signal). Card `20261115-b-5d9b72`:
+/// every one of these reaches `Command::spawn()` as a plain `io::Error`
+/// indistinguishable in shape from a missing binary, but none of them says
+/// anything about whether `binary` exists or is executable.
+fn is_transient_spawn_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::OutOfMemory
+    ) || matches!(error.raw_os_error(), Some(EMFILE) | Some(ENFILE))
+        || error.kind() == std::io::ErrorKind::Interrupted
+}
+
+/// Spawn via `spawn`, retrying a bounded number of times on
+/// `ExecutableFileBusy` (Linux ETXTBSY, see below) or a transient
+/// resource shortage ([`is_transient_spawn_error`]), and classifying
+/// whatever error survives the retry budget. `binary` is still open for
+/// writing in another process at the instant of `exec` in the
+/// `ExecutableFileBusy` case: in this workspace that other process is
+/// almost always a concurrent test thread's own fake-binary helper — it
+/// `fs::write`s a `#!/bin/sh` script and `fork()`s to exec it, and any
+/// *other* thread's `fork()` in that same window inherits the first
+/// thread's still-open write fd, which keeps the file busy until that
+/// child execs or exits, regardless of which binary the child itself is
+/// about to run. Renaming the script into place after closing it would
+/// not help: the race is on the inherited fd, not on the path, so a
+/// second `open` under the final name can still land inside someone
+/// else's write window. A real Herdr install mid-upgrade hits the
+/// identical error for the identical reason, so retrying here protects
+/// both.
+///
+/// A busy binary that is still busy once the retries are spent becomes
+/// [`HerdrError::MissingBinary`], same as before this retried transient
+/// errors too: the busy case has always surfaced that way, and nothing
+/// here changes what a genuinely-stuck install reports. A transient
+/// resource error that is still failing once the retries are spent
+/// becomes [`HerdrError::SpawnFailed`] instead — not `MissingBinary`,
+/// because the binary was never the problem. Any other spawn error
+/// (`NotFound`, `PermissionDenied`, ...) returns `MissingBinary`
+/// immediately, with no retry: those are real install/PATH problems, not
+/// ones that clear on their own.
+fn spawn_with_retry(
+    mut spawn: impl FnMut() -> std::io::Result<std::process::Child>,
     binary: &str,
 ) -> Result<std::process::Child, HerdrError> {
-    for attempt in 1..=SPAWN_BUSY_RETRIES {
-        match command.spawn() {
+    for attempt in 1..=SPAWN_RETRIES {
+        let source = match spawn() {
             Ok(child) => return Ok(child),
-            Err(source)
-                if attempt < SPAWN_BUSY_RETRIES
-                    && source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
-            {
-                thread::sleep(SPAWN_BUSY_DELAY);
-            }
-            Err(source) => {
-                return Err(HerdrError::MissingBinary {
-                    binary: binary.to_string(),
-                    source,
-                })
-            }
+            Err(source) => source,
+        };
+        let retryable = source.kind() == std::io::ErrorKind::ExecutableFileBusy
+            || is_transient_spawn_error(&source);
+        if retryable && attempt < SPAWN_RETRIES {
+            thread::sleep(SPAWN_RETRY_DELAY);
+            continue;
         }
+        return Err(if is_transient_spawn_error(&source) {
+            HerdrError::SpawnFailed {
+                binary: binary.to_string(),
+                source,
+            }
+        } else {
+            HerdrError::MissingBinary {
+                binary: binary.to_string(),
+                source,
+            }
+        });
     }
     unreachable!("loop always returns on its last iteration")
 }
@@ -232,7 +278,10 @@ fn spawn_with_busy_retry(
 /// ([`DEFAULT_TIMEOUT_SECONDS`]) unless `timeout` is given; callers may
 /// pass a longer timeout only for a documented slower operation. A
 /// missing or non-executable binary becomes [`HerdrError::MissingBinary`]
-/// rather than a raw OS error, and an elapsed timeout becomes
+/// rather than a raw OS error; a transient host-resource shortage that
+/// outlasts the bounded spawn retry becomes [`HerdrError::SpawnFailed`]
+/// instead, since the binary was never the problem. An elapsed timeout
+/// becomes
 /// [`HerdrError::Timeout`]: a hung `herdr agent prompt` must leave a
 /// typed trace of its own failure, not a silent hang indistinguishable
 /// from a dispatch still in progress. A zero-exit reply that is
@@ -280,7 +329,7 @@ pub fn run(command: &HerdrCommand, timeout: Option<Duration>) -> Result<CommandR
     // signalling this process's group.
     let _ = child_command.process_group(0);
 
-    let mut child = spawn_with_busy_retry(&mut child_command, &binary)?;
+    let mut child = spawn_with_retry(|| child_command.spawn(), &binary)?;
 
     if let Some(input) = command.stdin.clone() {
         if let Some(mut stdin) = child.stdin.take() {
@@ -643,6 +692,106 @@ mod tests {
         assert!(error.to_string().contains("/no/such/binary-xyz"));
     }
 
+    // --- spawn_with_retry, against an injected seam (no real fork
+    // exhaustion: these drive the classification directly, never by
+    // actually starving the OS of process slots, memory, or fds) --------
+
+    /// EAGAIN (`WouldBlock`) twice, then a real spawn succeeds: the
+    /// transient error must retry exactly like the `ExecutableFileBusy`
+    /// case already did, not fail on the first attempt.
+    #[test]
+    fn spawn_with_retry_succeeds_after_transient_eagain_clears() {
+        let mut calls = 0u32;
+        let mut child = spawn_with_retry(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                } else {
+                    Command::new("/bin/echo").arg("ok").spawn()
+                }
+            },
+            "/bin/echo",
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert!(child.wait().unwrap().success());
+    }
+
+    /// EAGAIN on every attempt must exhaust the retry budget and surface
+    /// as the new transient error, never as `MissingBinary` — the bug
+    /// this card fixes was every non-busy spawn error collapsing into
+    /// "missing binary", which sent an operator chasing an install/PATH
+    /// problem that was never there.
+    #[test]
+    fn spawn_with_retry_surfaces_spawn_failed_when_eagain_never_clears() {
+        let mut calls = 0u32;
+        let error = spawn_with_retry(
+            || {
+                calls += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            },
+            "/bin/herdr",
+        )
+        .unwrap_err();
+        assert_eq!(calls, SPAWN_RETRIES);
+        match error {
+            HerdrError::SpawnFailed { binary, .. } => assert_eq!(binary, "/bin/herdr"),
+            other => panic!("expected SpawnFailed, got {other:?}"),
+        }
+    }
+
+    /// Every other transient error this card names classifies the same
+    /// way: retried, then `SpawnFailed` once the budget is spent. EMFILE
+    /// and ENFILE are raw OS errors, not an `ErrorKind` variant (see
+    /// `is_transient_spawn_error`'s doc comment), so these are built with
+    /// `from_raw_os_error` rather than `ErrorKind::from`.
+    #[test]
+    fn spawn_with_retry_classifies_every_named_transient_kind_as_spawn_failed() {
+        let make_errors: [fn() -> std::io::Error; 5] = [
+            || std::io::Error::from(std::io::ErrorKind::WouldBlock),
+            || std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+            || std::io::Error::from(std::io::ErrorKind::Interrupted),
+            || std::io::Error::from_raw_os_error(EMFILE),
+            || std::io::Error::from_raw_os_error(ENFILE),
+        ];
+        for make_error in make_errors {
+            let error = spawn_with_retry(|| Err(make_error()), "/bin/herdr").unwrap_err();
+            assert!(
+                matches!(error, HerdrError::SpawnFailed { .. }),
+                "{:?} should classify as SpawnFailed, got {error:?}",
+                make_error()
+            );
+        }
+    }
+
+    /// `NotFound` is a real missing binary and must stay `MissingBinary`,
+    /// unchanged, with no retry at all — and the same for
+    /// `PermissionDenied`, which this codebase already treats as "missing"
+    /// (see `run_errors_when_the_binary_is_not_executable` below).
+    #[test]
+    fn spawn_with_retry_keeps_not_found_and_permission_denied_as_missing_binary() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let mut calls = 0u32;
+            let error = spawn_with_retry(
+                || {
+                    calls += 1;
+                    Err(std::io::Error::from(kind))
+                },
+                "/no/such/binary-xyz",
+            )
+            .unwrap_err();
+            assert_eq!(calls, 1, "{kind:?} must not be retried");
+            assert!(
+                matches!(error, HerdrError::MissingBinary { .. }),
+                "{kind:?} should classify as MissingBinary, got {error:?}"
+            );
+        }
+    }
+
     /// Reproduces the ETXTBSY window directly — holding the script open
     /// for writing is exactly what makes Linux's `execve` return
     /// `ExecutableFileBusy`, the same condition a racing `fork()` leaves
@@ -651,7 +800,7 @@ mod tests {
     /// on macOS, so this would pass vacuously (never observe the busy
     /// error at all) on the non-Linux hosts this workspace develops on,
     /// which is why CI's `rust:*` Linux container is what actually
-    /// exercises `spawn_with_busy_retry`'s retry arm.
+    /// exercises `spawn_with_retry`'s retry arm.
     #[test]
     #[cfg(target_os = "linux")]
     fn run_retries_past_a_transient_executable_file_busy_and_still_succeeds() {
@@ -753,6 +902,46 @@ mod tests {
         }
     }
 
+    /// Spawns a throwaway `sleep 60 &`-then-`wait` script exactly like the
+    /// one under test, group-leadered the same way `run` spawns its own
+    /// child, and polls (bounded to 10s, no other deadline) for it to
+    /// fork `sleep` and record both pids to `pidfile`. Returns how long
+    /// that took, or `None` if it never happened at all. Always kills and
+    /// reaps the probe and deletes its files before returning, so a
+    /// never-ready probe leaves nothing behind either.
+    fn probe_fork_and_write_latency() -> Option<Duration> {
+        let suffix = unique_suffix();
+        let mut probe_pidfile = std::env::temp_dir();
+        probe_pidfile.push(format!(
+            "mv-herdr-pgid-probe-{}-{suffix}",
+            std::process::id()
+        ));
+        let probe_script = fake_herdr_script(&format!(
+            "sleep 60 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > '{}'\nwait\n",
+            probe_pidfile.display()
+        ));
+        let mut probe = Command::new(&probe_script)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let mut latency = None;
+        for _ in 0..400 {
+            if std::fs::read_to_string(&probe_pidfile).is_ok_and(|s| s.lines().count() >= 2) {
+                latency = Some(start.elapsed());
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        kill_and_reap(&mut probe);
+        std::fs::remove_file(&probe_script).ok();
+        std::fs::remove_file(&probe_pidfile).ok();
+        latency
+    }
+
     #[test]
     fn a_timeout_kills_grandchild_processes_and_leaves_no_zombie() {
         let suffix = unique_suffix();
@@ -763,16 +952,28 @@ mod tests {
             pidfile.display()
         ));
         let command = HerdrCommand::new(vec![script.to_string_lossy().into_owned()]);
-        // 2s, not 500ms: `run` starts its timeout clock only after
-        // `spawn()` returns, but the script still has to be scheduled far
-        // enough to fork `sleep` and write the pidfile before the clock
-        // runs out. On a host busy with other concurrently-running
-        // subprocess-spawning tests, that scheduling alone can eat
-        // hundreds of ms; a 500ms budget made that race, not the kill
-        // logic under test, the thing that failed. 2s keeps this well
-        // under the 60s sleep so a real timeout (not natural exit) is
-        // still what we are observing.
-        let error = run(&command, Some(Duration::from_secs(2))).unwrap_err();
+        // Card `20261116-b-20fd84`: `run` starts its timeout clock the
+        // instant `spawn()` returns, before the OS has necessarily given
+        // the new process a single timeslice — so under enough host load,
+        // scheduling it far enough to fork `sleep` and write the pidfile
+        // can itself lose the race against a *fixed* budget, failing this
+        // test on scheduling noise rather than the kill logic under test
+        // (this is what the 500ms-to-2s bump in an earlier version of
+        // this test was already reaching for, and it still wasn't enough
+        // at load 30+). Rather than guessing at a bigger constant again,
+        // measure — outside this call, with its own 10s bound so a truly
+        // wedged host still fails loudly and distinctly — how long an
+        // identical throwaway script actually takes to reach the same
+        // "forked, pidfile written" point right now, and give `run`'s
+        // own budget enough headroom over that measurement for the fixed
+        // 60s sleep, not scheduling noise, to be what it waits out. Never
+        // less than the 2s this test used before measuring.
+        let probe_latency = probe_fork_and_write_latency().expect(
+            "host could not schedule a throwaway fork-and-write within 10s, outside any timed \
+             call — too loaded to exercise the timeout-kill path at all right now",
+        );
+        let budget = Duration::from_secs(2).max(probe_latency * 4);
+        let error = run(&command, Some(budget)).unwrap_err();
         assert!(matches!(error, HerdrError::Timeout { .. }));
 
         let recorded = std::fs::read_to_string(&pidfile).unwrap_or_default();

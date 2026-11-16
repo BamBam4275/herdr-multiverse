@@ -38,11 +38,14 @@ import sys
 
 
 def _die(code: int, message: str) -> None:
+    """Print `message` tagged with this script's name and exit with `code`."""
     print(f"fake-herdr: {message}", file=sys.stderr)
     raise SystemExit(code)
 
 
 def main() -> int:
+    """Match this call's argv against the next scripted transcript entry,
+    replay its reply, and persist the updated consumption state."""
     transcript_path = os.environ.get("MV_CONFORMANCE_TRANSCRIPT")
     state_path = os.environ.get("MV_CONFORMANCE_STATE")
     if not transcript_path or not state_path:

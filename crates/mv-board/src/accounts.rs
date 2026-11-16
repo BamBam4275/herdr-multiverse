@@ -19,6 +19,8 @@ pub enum AccountState {
 }
 
 impl AccountState {
+    /// The all-caps status word shown next to [`Self::symbol`] on an
+    /// account card's state line (e.g. `"AVAILABLE"`, `"AT CAP"`).
     pub fn label(self) -> &'static str {
         match self {
             AccountState::Available => "AVAILABLE",
@@ -145,6 +147,9 @@ fn account_card_lines(account: &AccountSnapshot, width: usize) -> Vec<String> {
             lines.push(box_text(&seats_text, width));
         }
     }
+    // Detail, quota-window, and token lines are the next things dropped
+    // after the live seats line as the card narrows — only shown once the
+    // card clears the detail-tier minimum width.
     if width >= ACCOUNT_CARD_DETAIL_MIN_WIDTH {
         if let Some(detail) = &account.detail {
             if !detail.is_empty() {
@@ -211,6 +216,9 @@ pub fn render_account_cards(accounts: &[AccountSnapshot], total_width: usize) ->
     let mut out = Vec::new();
     for row in blocks.chunks(cols.max(1)) {
         let height = row.iter().map(|c| c.len()).max().unwrap_or(0);
+        // Pad shorter cards with blank interior lines, inserted just before
+        // the bottom border, so every card sharing this row still closes at
+        // the same height.
         let padded: Vec<_> = row
             .iter()
             .map(|card| {

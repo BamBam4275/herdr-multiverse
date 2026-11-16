@@ -138,6 +138,10 @@ fn render(idle_seconds: Option<f64>, json: bool) -> (String, u8) {
     (text, code)
 }
 
+/// Probes HID idle time, prints [`render`]'s report, and turns the
+/// resulting status into a `Failure::Reported` exit code for anything
+/// other than `active` — the report itself is the output, so no separate
+/// error text is ever printed on top of it.
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (text, code) = render(hid_idle_seconds(), args.get_flag("json"));
     println!("{text}");

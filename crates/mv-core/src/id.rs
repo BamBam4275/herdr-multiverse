@@ -57,10 +57,14 @@ impl TaskId {
         }
     }
 
+    /// Borrow the validated id as plain text, e.g. to format it into a
+    /// routing-log line without allocating.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Consume the `TaskId`, handing back the validated `String` for a
+    /// caller that needs to own it (e.g. to store as a map key).
     pub fn into_string(self) -> String {
         self.0
     }

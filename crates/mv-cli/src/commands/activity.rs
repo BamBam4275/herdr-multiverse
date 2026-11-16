@@ -90,6 +90,55 @@ fn probe_message(from: &str, to: &str, body: &str) -> MessageRecord {
         body: body.to_string(),
         ask: false,
         reply_to: None,
+        relayed_by: None,
+    }
+}
+
+/// What `send` does about the sender's own open asks held against `to`
+/// (card `20261110-b-657008`): the only case `references_ask`'s own
+/// citation covers (`cli.py:13325-13433`, scout2-gaps #13, pinned by
+/// conformance `activity-send-auto-routes-one-open-ask`) is exactly one
+/// open candidate. More than one is this port's own addition, not a line
+/// from Python — guessing which of several still-open asks a plain
+/// message answers risks closing the wrong one, so it refuses instead.
+/// Extracted from `send()` so the three-way decision is testable without
+/// a project tree, the same reason `nudge` keeps [`plan_nudge`] separate.
+#[derive(Debug, PartialEq, Eq)]
+enum SendAskPlan {
+    /// No open ask from `to`: send a plain message.
+    Plain,
+    /// Exactly one open ask, and `references_ask` says this message
+    /// answers it: auto-route through `reply()`.
+    AutoReply(MessageRecord),
+    /// Exactly one open ask, but this message does not look like its
+    /// answer: send plain, with a hint pointing at it.
+    PlainWithHint(MessageRecord),
+    /// More than one open ask from `to`: refuse rather than guess.
+    Ambiguous(Vec<MessageRecord>),
+}
+
+fn plan_send_against_open_asks(
+    candidates: Vec<MessageRecord>,
+    from: &str,
+    to: &str,
+    body: &str,
+) -> SendAskPlan {
+    match candidates.len() {
+        0 => SendAskPlan::Plain,
+        1 => {
+            let candidate = candidates.into_iter().next().expect("len == 1");
+            let probe = probe_message(to, from, body);
+            if activity::references_ask(&candidate, &probe) {
+                SendAskPlan::AutoReply(candidate)
+            } else {
+                SendAskPlan::PlainWithHint(candidate)
+            }
+        }
+        _ => {
+            let mut ordered = candidates;
+            ordered.sort_by_key(|m| m.seq);
+            SendAskPlan::Ambiguous(ordered)
+        }
     }
 }
 
@@ -124,6 +173,9 @@ fn default_message_id(from: &str, to: &str) -> String {
     format!("{from}-{to}-{nanos:x}")
 }
 
+/// Loads config once (so every subcommand below fails the same way on a
+/// broken config, via [`load_activity_config`]'s path-free error text)
+/// and routes to the named subcommand.
 pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
     let (name, args) = matches
         .subcommand()
@@ -133,6 +185,7 @@ pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
         "send" => send(args),
         "reply" => reply(args),
         "close" => close(args),
+        "show" => show(args),
         "broadcast" => broadcast(args),
         "inbox" => inbox(args),
         "update" => update(args),
@@ -463,6 +516,63 @@ fn print_unacked_mail_hint(name: &str, root: &std::path::Path) {
     }
 }
 
+/// What to print, if anything, after a best-effort notify-hook attempt for
+/// a freshly sent ask (card `20261115-b-51cb75`). A missing or failing hook
+/// is advisory only — the ask already landed by the time this is called —
+/// so this never turns into a `Failure`; it only decides the wording.
+fn ask_notify_warning(outcome: super::notify::PushOutcome) -> Option<&'static str> {
+    use super::notify::PushOutcome;
+    match outcome {
+        PushOutcome::HookMissing => Some(
+            "could not notify about this ask: the notify hook (curl) was not found on PATH; \
+             the ask was still sent.",
+        ),
+        PushOutcome::Failed => Some("could not notify about this ask; the ask was still sent."),
+        PushOutcome::NoTopic | PushOutcome::Sent => None,
+    }
+}
+
+/// Best-effort alert for a freshly sent `--ask` (card `20261115-b-51cb75`):
+/// an open ask blocks someone, the same reason `NUDGE_PROMPT` above exists,
+/// so it is worth trying to notify through the same channel the project's
+/// own prompts already point operators at (`multiverse notify`, never curl
+/// directly). Called only after `send_message` has already appended the
+/// message, so nothing here can cost the post itself — a missing hook
+/// binary, an unconfigured topic, or a failed push all just print a warning
+/// and return.
+fn notify_ask_posted(args: &ArgMatches, to: &str, from: &str, body: &str) {
+    let Ok((config_path, _source)) =
+        resolve_config_path(args.get_one::<String>("config").map(String::as_str))
+    else {
+        return;
+    };
+    let topic = super::notify::resolve_topic(&config_path);
+    let token = super::notify::resolve_token(&config_path);
+    let record = mv_state::notify::QueuedNotification {
+        project: to.to_string(),
+        title: format!("ask from {from}"),
+        message: body.to_string(),
+        priority: "default".to_string(),
+        dedup_key: None,
+        queued_at: mv_core::time::now_stamp(),
+        kind: None,
+        subject: None,
+        tags: Vec::new(),
+        episode_key: None,
+        episode_state: None,
+    };
+    let outcome = super::notify::push_with_token_detailed(
+        topic.as_deref(),
+        token.as_deref(),
+        &record,
+        "default",
+        &[],
+    );
+    if let Some(warning) = ask_notify_warning(outcome) {
+        println!("  {warning}");
+    }
+}
+
 fn send(args: &ArgMatches) -> Result<(), Failure> {
     let to = args.get_one::<String>("project").expect("required");
     let body = args.get_one::<String>("message").expect("required");
@@ -509,27 +619,34 @@ fn send(args: &ArgMatches) -> Result<(), Failure> {
                     "no open ask #{requested_seq} from {to} is available to answer."
                 )));
             }
-        } else if candidates.len() == 1 {
-            let candidate = candidates.into_iter().next().expect("len == 1");
-            let probe = probe_message(to, &from, body);
-            if activity::references_ask(&candidate, &probe) {
-                linked_ask = Some(candidate);
-            } else {
-                eprintln!(
-                    "{to} has an open ask (#{seq}) but this message doesn't look like a reply to \
-                     it; sending as a plain message. Use `activity reply {seq}` or `--re {seq}` \
-                     to answer it directly.",
-                    seq = candidate.seq
-                );
+        } else {
+            match plan_send_against_open_asks(candidates, &from, to, body) {
+                SendAskPlan::Plain => {}
+                SendAskPlan::AutoReply(candidate) => {
+                    linked_ask = Some(candidate);
+                }
+                SendAskPlan::PlainWithHint(candidate) => {
+                    eprintln!(
+                        "{to} has an open ask (#{seq}) but this message doesn't look like a \
+                         reply to it; sending as a plain message. Use \
+                         `multiverse activity reply {seq}` or `--re {seq}` to answer it \
+                         directly.",
+                        seq = candidate.seq
+                    );
+                }
+                SendAskPlan::Ambiguous(ordered) => {
+                    let listed = ordered
+                        .iter()
+                        .map(|m| format!("#{}: {}", m.seq, m.body))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(Failure::ItemLookup(format!(
+                        "{to} has multiple open asks from you ({listed}); nothing was sent — \
+                         answer one with `multiverse activity reply <seq>` (or resend with \
+                         `--re <seq>`)."
+                    )));
+                }
             }
-        } else if candidates.len() > 1 {
-            eprintln!("{to} has multiple open asks from you; choose one with --re N:");
-            let mut ordered = candidates;
-            ordered.sort_by_key(|m| m.seq);
-            for message in ordered {
-                eprintln!("  #{}: {}", message.seq, message.body);
-            }
-            return Err(Failure::Reported(1));
         }
     }
 
@@ -556,6 +673,7 @@ fn send(args: &ArgMatches) -> Result<(), Failure> {
             ask_message.seq,
             &id,
             body,
+            None,
             permitted,
             &redact,
         )
@@ -577,7 +695,12 @@ fn send(args: &ArgMatches) -> Result<(), Failure> {
         )
         .map_err(fail)?;
         match outcome {
-            SendOutcome::Sent { .. } => println!("sent to {to}."),
+            SendOutcome::Sent { .. } => {
+                println!("sent to {to}.");
+                if ask {
+                    notify_ask_posted(args, to, &from, body);
+                }
+            }
             SendOutcome::AlreadySent => println!("message {id} was already sent to {to}"),
         }
         if !ask && body.contains('?') {
@@ -591,39 +714,173 @@ fn send(args: &ArgMatches) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `activity reply <SEQ>` / `reply <Project>#<SEQ>` (cards `20261115-b-91722d`,
+/// `20261116-builder-9a50a2`): a bare `SEQ` resolves against the caller's own
+/// log — the ordinary case, where the caller is the ask's own holder (its
+/// recipient). Since the caller's own log is always checked first regardless
+/// of whether a qualifier was given, a holder may *also* qualify with the
+/// ask's own sender's name (`reply <Sender>#<SEQ>`) — natural when a
+/// recipient juggling several open asks wants to name who they're answering,
+/// and harmless because `seq` alone already disambiguates within one log; the
+/// qualifier is just validated against `own_name`/`ask.from_project` rather
+/// than used to pick which log to open. The *other* qualified form names the
+/// project *holding* the ask, the same syntax [`close_ref`] already accepts,
+/// for the case a bare `SEQ` cannot reach: the caller is the ask's original
+/// *sender* (own log never holds an ask it sent, only one it received), who
+/// needs to post an answer on the holder's behalf without first working
+/// inside that project's own pane. [`resolve_open_ask`]'s authorization for
+/// that second form mirrors [`resolve_ask`]'s own qualifier rule exactly.
 fn reply(args: &ArgMatches) -> Result<(), Failure> {
-    let seq = *args.get_one::<u64>("seq").expect("required");
+    let raw = args.get_one::<String>("seq").expect("required");
     let body = args.get_one::<String>("message").expect("required");
     let (own_name, own_root) = current_project(args)?;
-    let own_log = ProjectLog::open(own_name.clone(), &own_root);
-    let ask = activity::find_open_ask(&own_log, seq).map_err(fail)?;
     let config = load_activity_config(args)?;
+    let (qualifier, seq) = activity::parse_ask_ref(raw).map_err(fail)?;
+    let (holder_name, holder_root, ask) =
+        resolve_open_ask(&own_name, &own_root, &config, qualifier.as_deref(), seq)?;
+    let holder_log = ProjectLog::open(holder_name.clone(), &holder_root);
     let asker_root = project_root_by_name(&config, &ask.from_project).map_err(|e| match e {
         Failure::Config(message) => Failure::ItemLookup(message),
         other => other,
     })?;
     let asker_log = ProjectLog::open(ask.from_project.clone(), &asker_root);
-    let may_send_reverse = may_send(&config, &own_name, &ask.from_project);
+    let may_send_reverse = may_send(&config, &holder_name, &ask.from_project);
     let reply_id = args
         .get_one::<String>("id")
         .cloned()
-        .unwrap_or_else(|| default_message_id(&own_name, &ask.from_project));
+        .unwrap_or_else(|| default_message_id(&holder_name, &ask.from_project));
+    // The caller relays this reply on `holder_name`'s behalf exactly when
+    // they are not `holder_name` itself — `resolve_open_ask` has already
+    // confirmed that caller can only then be `ask.from_project`, the
+    // asker, so `own_name` is the relaying asker's own name to record.
+    let relayed_by = (own_name != holder_name).then_some(own_name.as_str());
     let outcome = activity::reply(
-        &own_log,
+        &holder_log,
         &asker_log,
         seq,
         &reply_id,
         body,
+        relayed_by,
         may_send_reverse,
         &redact,
     )
     .map_err(fail)?;
     match outcome {
-        SendOutcome::Sent { seq } => println!("replied to {} as seq {seq}", ask.from_project),
+        SendOutcome::Sent { seq } => {
+            if relayed_by.is_some() {
+                println!(
+                    "replied to {} as seq {seq}, relayed on behalf of {holder_name}",
+                    ask.from_project
+                );
+            } else {
+                println!("replied to {} as seq {seq}", ask.from_project);
+            }
+        }
         SendOutcome::AlreadySent => println!("reply {reply_id} was already sent"),
     }
     print_unacked_mail_hint(&own_name, &own_root);
     Ok(())
+}
+
+/// Resolve `reply`'s target ask. The caller's own log is tried first,
+/// qualifier or not (card `20261116-builder-9a50a2`): an ask the caller
+/// itself holds is fully identified by `seq` alone, so a qualifier given
+/// alongside one is validated — it must name either the caller or the ask's
+/// own sender — rather than used to choose which log to open. This is what
+/// lets the ask's actual recipient use `reply <Sender>#<SEQ>` (naming who
+/// they're answering) and not just the bare form; before this, that
+/// qualified call always opened the *named* project's own log, which can
+/// never hold an ask addressed to someone else, so naming your own asker
+/// always missed with a bare "no ask #N found" ([`ActivityError::
+/// AskNotFound`]'s own text, surfaced unformatted since the qualified
+/// branch historically had no reason to expect this particular miss).
+///
+/// Only once the own-log check misses does qualifier handling fall back to
+/// [`resolve_ask`]'s own model: unqualified, an own-log miss can only ever
+/// mean "not open" — a closed or unknown seq both report through the same
+/// [`ActivityError::AskNotFound`] — so the scan below exists purely to name
+/// which other project to requalify against, the same suggestion
+/// [`unknown_ask`] already renders for `close`. Qualified, the *named*
+/// project's log must hold it, and the caller must either *be* that project
+/// or be the ask's own `from_project` (the sender, answering on the
+/// holder's behalf — the case a bare `SEQ` cannot reach at all, since a
+/// project's own log never holds an ask it sent).
+fn resolve_open_ask(
+    own_name: &str,
+    own_root: &std::path::Path,
+    config: &mv_config::load::Config,
+    qualifier: Option<&str>,
+    seq: u64,
+) -> Result<(String, PathBuf, activity::OpenAsk), Failure> {
+    let own_log = ProjectLog::open(own_name.to_owned(), own_root);
+    match activity::find_open_ask(&own_log, seq) {
+        Ok(ask) => {
+            if let Some(name) = qualifier {
+                if name != own_name && name != ask.from_project {
+                    return Err(Failure::Operation(format!(
+                        "{name:?} names neither {own_name:?} nor #{seq}'s own sender \
+                         ({from:?}); it is held here regardless of the qualifier \
+                         given — retry with `reply {seq}` or `reply {from}#{seq}`.",
+                        from = ask.from_project
+                    )));
+                }
+            }
+            return Ok((own_name.to_string(), own_root.to_path_buf(), ask));
+        }
+        Err(ActivityError::AskNotFound(_)) => {}
+        Err(e) => return Err(fail(e)),
+    }
+
+    match qualifier {
+        None => {
+            let mut suggestions = Vec::new();
+            for (name, project) in &config.projects {
+                if name == own_name {
+                    continue;
+                }
+                let Some(path) = project.path.value() else {
+                    continue;
+                };
+                let log = ProjectLog::open(name.clone(), std::path::Path::new(path));
+                if let Ok(ask) = activity::find_open_ask(&log, seq) {
+                    if ask.from_project == own_name {
+                        suggestions.push(name.clone());
+                    }
+                }
+            }
+            suggestions.sort();
+            Err(unknown_ask(seq, own_name, &suggestions))
+        }
+        Some(holder_name) => {
+            let holder_root = project_root_by_name(config, holder_name).map_err(|e| match e {
+                Failure::Config(message) => Failure::ItemLookup(message),
+                other => other,
+            })?;
+            let holder_log = ProjectLog::open(holder_name.to_string(), &holder_root);
+            let ask = activity::find_open_ask(&holder_log, seq).map_err(fail)?;
+            if holder_name != own_name && ask.from_project != own_name {
+                return Err(Failure::Operation(format!(
+                    "{own_name:?} cannot act on {holder_name}#{seq}: \
+                     that ask is {} -> {holder_name}",
+                    ask.from_project
+                )));
+            }
+            // Card `20261116-b-40aecf`: relaying a reply into another
+            // project's log is itself an activity-messaging send and must
+            // clear its own `[activity.pairs]` pair, the same re-check
+            // `close_ref` applies before it writes into a holder's log —
+            // being this ask's own sender is authorization to *act* on it,
+            // not a bypass of deny-by-default messaging.
+            if holder_name != own_name && !may_send(config, own_name, holder_name) {
+                return Err(Failure::Operation(format!(
+                    "{own_name:?} may not relay a reply into {holder_name:?}'s log: \
+                     activity messaging is deny-by-default and no [activity.pairs] \
+                     entry permits {own_name} -> {holder_name}."
+                )));
+            }
+            Ok((holder_name.to_string(), holder_root, ask))
+        }
+    }
 }
 
 fn close(args: &ArgMatches) -> Result<(), Failure> {
@@ -637,6 +894,12 @@ fn close(args: &ArgMatches) -> Result<(), Failure> {
     close_ref(&own_name, &own_root, &config, raw, &reason)
 }
 
+// Closes the resolved ask in whichever log actually holds it (which may
+// be a remote project's, via the `Project#SEQ` qualifier `resolve_ask`
+// accepts), then best-effort notifies the other side of the ask: the
+// holder when `own_name` retracted a remote ask, otherwise the original
+// asker. A failed notification is reported but never turns `close`
+// itself into an error — the close already succeeded on disk.
 fn close_ref(
     own_name: &str,
     own_root: &std::path::Path,
@@ -716,6 +979,13 @@ fn close_ref(
     Ok(())
 }
 
+// Unqualified `SEQ` only ever means "in my own log" — if it's not there,
+// scan every other configured project's log for an ask with this seq
+// that was sent *to* `own_name`, so a wrong-project mistake gets a
+// `did you mean Project#SEQ?` hint instead of a bare "not found".
+// Qualified `Project#SEQ` resolves against that project's log directly,
+// but is only honored when `own_name` is either the named holder or the
+// ask's original sender (never an unrelated third project's business).
 fn resolve_ask(
     own_name: &str,
     own_root: &std::path::Path,
@@ -768,6 +1038,71 @@ fn resolve_ask(
     }
 }
 
+/// `activity show <SEQ>` / `show <Project>#<SEQ>` (card `20261115-b-9ebad2`):
+/// print one message in full, unwrapped, read-only — no cursor/marker
+/// write, no close, the read-only sibling of `reply`/`close`'s own
+/// `Project#SEQ` qualifier. A bare `SEQ` reads the caller's own log, like
+/// `reply`'s unqualified form; the qualifier names any configured project
+/// directly, with no `[activity.pairs]` gate — this only ever reads a log
+/// already on disk, the same unrestricted scan [`resolve_ask`]'s own
+/// suggestion fallback already performs across every configured project.
+fn show(args: &ArgMatches) -> Result<(), Failure> {
+    let raw = args.get_one::<String>("seq").expect("required");
+    let (own_name, own_root) = current_project(args)?;
+    let config = load_activity_config(args)?;
+    let (qualifier, seq) = activity::parse_ask_ref(raw).map_err(fail)?;
+    let (project_name, project_root) = match qualifier {
+        None => (own_name, own_root),
+        Some(name) => {
+            let root = project_root_by_name(&config, &name).map_err(|e| match e {
+                Failure::Config(message) => Failure::ItemLookup(message),
+                other => other,
+            })?;
+            (name, root)
+        }
+    };
+    let log = ProjectLog::open(project_name.clone(), &project_root);
+    let message = activity::find_message(&log, seq)
+        .map_err(fail)?
+        .ok_or_else(|| unknown_message(seq, &project_name))?;
+    println!("{}", format_full_message(&message));
+    Ok(())
+}
+
+fn unknown_message(seq: u64, project: &str) -> Failure {
+    Failure::ItemLookup(format!("no message #{seq} found in {project}'s log"))
+}
+
+/// One message, unwrapped: every field on its own line, body last and
+/// never truncated — unlike [`format_inbox_line`]'s single compact line,
+/// `show` exists specifically so a long ask is readable in full rather
+/// than grepped out of the raw log by hand.
+fn format_full_message(message: &mv_state::activity::MessageRecord) -> String {
+    let mut lines = vec![format!(
+        "#{} {} -> {} at {}",
+        message.seq,
+        mv_board::layout::sanitize_title(&message.from_project),
+        mv_board::layout::sanitize_title(&message.to_project),
+        mv_board::layout::sanitize_title(&message.when),
+    )];
+    if message.ask {
+        lines.push("ask: yes".to_string());
+    }
+    if let Some(re) = message.reply_to {
+        lines.push(format!("reply to: #{re}"));
+    }
+    if let Some(by) = &message.relayed_by {
+        lines.push(format!(
+            "relayed by: {}",
+            mv_board::layout::sanitize_title(by)
+        ));
+    }
+    lines.push(mv_board::layout::sanitize_title(&redact_text(
+        &message.body,
+    )));
+    lines.join("\n")
+}
+
 fn broadcast(args: &ArgMatches) -> Result<(), Failure> {
     let body = args.get_one::<String>("message").expect("required");
     let (from, _root) = current_project(args)?;
@@ -776,6 +1111,7 @@ fn broadcast(args: &ArgMatches) -> Result<(), Failure> {
         .get_one::<String>("id")
         .cloned()
         .unwrap_or_else(|| default_message_id(&from, "broadcast"));
+    let ask = args.get_flag("ask");
     let mut recipients = Vec::new();
     for (project_name, project) in &config.projects {
         if project_name == &from {
@@ -789,7 +1125,8 @@ fn broadcast(args: &ArgMatches) -> Result<(), Failure> {
             may_send(&config, &from, project_name),
         ));
     }
-    let report = activity::broadcast(&from, body, &recipients, &msg_id, &redact).map_err(fail)?;
+    let report =
+        activity::broadcast(&from, body, ask, &recipients, &msg_id, &redact).map_err(fail)?;
     let sent_count = report.sent().count();
     let skipped_count = report.skipped().count();
     for name in report.sent() {
@@ -820,11 +1157,15 @@ fn inbox(args: &ArgMatches) -> Result<(), Failure> {
     let limit = args.get_one::<u32>("limit").copied().unwrap_or(20) as usize;
     let replay_since = args.get_one::<u64>("replay-since").copied();
     let replay_last = args.get_one::<u32>("replay-last").copied();
-    // `--peek`/`--as-nexus` are declared `conflicts_with` every replay flag
-    // in `args.rs`, so reaching here with a replay flag set means neither
-    // is present — matching Python's own refusal (`cli.py:13896-13918`)
-    // that a replay never acknowledges, so neither flag has anything to
-    // authorize or prevent, just enforced a step earlier, at the parser.
+    // `--peek` is declared `conflicts_with` every replay flag in `args.rs`,
+    // so reaching here with a replay flag set means it is absent — matching
+    // Python's own refusal (`cli.py:13896-13918`) that a replay never
+    // acknowledges, so `--peek` has nothing to authorize or prevent, just
+    // enforced a step earlier, at the parser. `--as-nexus` is read below
+    // without that same conflict (card `20261115-b-2a0f8f`): it still has
+    // nothing to do here either, since neither replay branch ever reads it,
+    // but unlike `--peek` it is not a parse-time error to pass alongside
+    // a replay flag — just as inert.
     if let Some(since) = replay_since {
         return replay_at(&name, &root, since);
     }
@@ -883,6 +1224,10 @@ fn inbox_at(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let is_orchestrator = task_id.is_none();
+    // Only the project's own Nexus (no dispatched task id) or an explicit
+    // `--as-nexus` override may advance the read marker; a dispatched
+    // specialist calling without it always gets a non-destructive peek,
+    // regardless of `--peek` (see `carries_dispatched_task_id`'s doc).
     let will_acknowledge = acking_requested && (is_orchestrator || as_nexus);
     let page = activity::read_inbox(&state_dir, &log, limit, !will_acknowledge).map_err(fail)?;
     if page.messages.is_empty() {
@@ -916,6 +1261,7 @@ fn inbox_at(
                 .map_err(fail)?;
         }
     }
+    print_open_ask_aging_footer(name, &log)?;
     Ok(())
 }
 
@@ -940,6 +1286,7 @@ fn replay_at(name: &str, root: &std::path::Path, since: u64) -> Result<(), Failu
     let messages =
         activity::replay_inbox(&log, since.saturating_sub(1), usize::MAX).map_err(fail)?;
     print_replay(name, &messages);
+    print_open_ask_aging_footer(name, &log)?;
     Ok(())
 }
 
@@ -954,6 +1301,7 @@ fn replay_last_at(name: &str, root: &std::path::Path, last: usize) -> Result<(),
     let keep = messages.len().saturating_sub(last);
     messages.drain(..keep);
     print_replay(name, &messages);
+    print_open_ask_aging_footer(name, &log)?;
     Ok(())
 }
 
@@ -975,11 +1323,81 @@ fn format_inbox_line(message: &mv_state::activity::MessageRecord) -> String {
         String::new()
     };
     let body = mv_board::layout::sanitize_title(&redact_text(&message.body));
+    let from = mv_board::layout::sanitize_title(&message.from_project);
+    let who = match &message.relayed_by {
+        Some(by) => format!(
+            "{from} (relayed by {})",
+            mv_board::layout::sanitize_title(by)
+        ),
+        None => from,
+    };
     format!(
-        "[{}] {}: {tag}{body}",
+        "[{}] {who}: {tag}{body}",
         mv_board::layout::sanitize_title(&message.when),
-        mv_board::layout::sanitize_title(&message.from_project),
     )
+}
+
+/// Card `20261110-b-5a407b`: an aging signal for open asks, printed as a
+/// footer after `inbox`'s listing (and after a replay's) so a still-open
+/// ask does not sit invisible in the log between inbox reads. One line per
+/// still-open ask this project holds, oldest first, worded in the same
+/// `<holder> owes <sender>` direction as the board's OWED REPLIES card
+/// (`mv-board/src/status_cards.rs`'s `owed_reply_card_lines`), condensed to
+/// `<recipient> owes <sender> #<seq> <age>` to fit inline rather than in a
+/// boxed card. Nothing is printed when `open` is empty.
+fn open_ask_aging_lines(
+    open: &[MessageRecord],
+    this_project: &str,
+    now: time::OffsetDateTime,
+) -> Vec<String> {
+    let mut open: Vec<&MessageRecord> = open.iter().collect();
+    open.sort_by_key(|ask| ask.seq);
+    open.into_iter()
+        .map(|ask| {
+            format!(
+                "{} owes {} #{} {}",
+                mv_board::layout::sanitize_title(this_project),
+                mv_board::layout::sanitize_title(&ask.from_project),
+                ask.seq,
+                ask_age(&ask.when, now),
+            )
+        })
+        .collect()
+}
+
+/// Same `Ns`/`Nm`/`Nh` unit selection as `board_data::compact_elapsed`
+/// (`crates/mv-cli/src/commands/board_data.rs`), duplicated here rather
+/// than shared because that helper is private to its own module and this
+/// file's write scope does not reach across to it. `"?"` for a timestamp
+/// that fails to parse or is somehow in the future, matching
+/// `board_data::elapsed_compact`'s own `None` case.
+fn ask_age(when: &str, now: time::OffsetDateTime) -> String {
+    let Ok(at) = mv_core::time::parse_flexible(when) else {
+        return "?".to_string();
+    };
+    if at > now {
+        return "?".to_string();
+    }
+    let seconds = (now - at).whole_seconds().max(0) as u64;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3_600)
+    }
+}
+
+/// Looks up `log`'s still-open asks and prints [`open_ask_aging_lines`] for
+/// them — the shared tail `inbox_at`/`replay_at`/`replay_last_at` all call,
+/// so `--peek` and the replay flags show the same footer as an ordinary
+/// read.
+fn print_open_ask_aging_footer(name: &str, log: &ProjectLog) -> Result<(), Failure> {
+    let open = activity::open_asks(log).map_err(fail)?;
+    for line in open_ask_aging_lines(&open, name, mv_core::time::now_utc()) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn update(args: &ArgMatches) -> Result<(), Failure> {
@@ -1039,12 +1457,107 @@ fn update_suppressed_line(task: &str) -> String {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mv-cli-activity-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced left every one of these behind in
+    /// `TMPDIR`). `Deref`s to `Path` so every existing call site keeps
+    /// reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("mv-cli-activity-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(tag)
+    }
+
+    fn open_ask(seq: u64, from: &str, body: &str) -> MessageRecord {
+        MessageRecord {
+            seq,
+            when: String::new(),
+            id: String::new(),
+            from_project: from.to_string(),
+            to_project: "me".to_string(),
+            body: body.to_string(),
+            ask: true,
+            reply_to: None,
+            relayed_by: None,
+        }
+    }
+
+    #[test]
+    fn plan_send_against_open_asks_sends_plain_with_no_candidates() {
+        assert_eq!(
+            plan_send_against_open_asks(vec![], "me", "them", "just an update"),
+            SendAskPlan::Plain
+        );
+    }
+
+    #[test]
+    fn plan_send_against_open_asks_auto_replies_to_the_one_matching_candidate() {
+        let ask = open_ask(1, "them", "please rotate the staging creds before 9am");
+        assert_eq!(
+            plan_send_against_open_asks(
+                vec![ask.clone()],
+                "me",
+                "them",
+                "rotated the staging creds before 9am"
+            ),
+            SendAskPlan::AutoReply(ask)
+        );
+    }
+
+    #[test]
+    fn plan_send_against_open_asks_sends_plain_with_a_hint_when_the_one_candidate_is_unrelated() {
+        let ask = open_ask(1, "them", "please rotate the staging creds before 9am");
+        assert_eq!(
+            plan_send_against_open_asks(
+                vec![ask.clone()],
+                "me",
+                "them",
+                "unrelated status update about something else entirely"
+            ),
+            SendAskPlan::PlainWithHint(ask)
+        );
+    }
+
+    /// The reproduction for card `20261110-b-657008`: a stale open ask
+    /// (seq 1) sitting alongside a newer one (seq 2) must never make
+    /// `send` guess — it must refuse, name both, and never fall through
+    /// to [`SendAskPlan::Plain`] or [`SendAskPlan::AutoReply`], either of
+    /// which a caller could mistake for "sent" having recorded nothing.
+    #[test]
+    fn plan_send_against_open_asks_refuses_to_guess_among_several_candidates() {
+        let stale = open_ask(1, "them", "an ask from days ago");
+        let fresh = open_ask(2, "them", "a different, newer ask");
+        let plan = plan_send_against_open_asks(
+            vec![fresh.clone(), stale.clone()],
+            "me",
+            "them",
+            "a plain status update",
+        );
+        assert_eq!(plan, SendAskPlan::Ambiguous(vec![stale, fresh]));
     }
 
     #[test]
@@ -1069,6 +1582,20 @@ mod tests {
             update_suppressed_line(task),
             "update for task-1 suppressed by cooldown"
         );
+    }
+
+    /// Card `20261115-b-51cb75`: a missing or failing notify hook must
+    /// never read as "nothing happened" — the warning names which one it
+    /// was — and a sent/unconfigured push must print nothing at all.
+    #[test]
+    fn ask_notify_warning_names_the_hook_only_when_something_went_wrong() {
+        use crate::commands::notify::PushOutcome;
+        let missing = ask_notify_warning(PushOutcome::HookMissing).unwrap();
+        assert!(missing.contains("notify hook"), "{missing}");
+        assert!(missing.contains("curl"), "{missing}");
+        assert!(ask_notify_warning(PushOutcome::Failed).is_some());
+        assert_eq!(ask_notify_warning(PushOutcome::NoTopic), None);
+        assert_eq!(ask_notify_warning(PushOutcome::Sent), None);
     }
 
     #[test]
@@ -1368,12 +1895,65 @@ mod tests {
             body: "hello\u{1b}]52;c;EVIL\u{07}world".into(),
             ask: false,
             reply_to: None,
+            relayed_by: None,
         };
         let line = format_inbox_line(&message);
         assert!(!line.contains('\u{1b}'));
         assert!(!line.contains('\u{07}'));
         assert!(!line.contains("]52;"));
         assert!(line.contains("helloworld"));
+    }
+
+    #[test]
+    fn format_full_message_lists_every_field_unwrapped() {
+        let ask = mv_state::activity::MessageRecord {
+            seq: 7,
+            when: "12:00".into(),
+            id: "m1".into(),
+            from_project: "alpha".into(),
+            to_project: "beta".into(),
+            body: "which seat?".into(),
+            ask: true,
+            reply_to: None,
+            relayed_by: None,
+        };
+        let shown = format_full_message(&ask);
+        assert!(shown.contains("#7 alpha -> beta at 12:00"), "{shown}");
+        assert!(shown.contains("ask: yes"), "{shown}");
+        assert!(shown.contains("which seat?"), "{shown}");
+
+        let reply = mv_state::activity::MessageRecord {
+            seq: 8,
+            when: "12:01".into(),
+            id: "m2".into(),
+            from_project: "beta".into(),
+            to_project: "alpha".into(),
+            body: "seat-a".into(),
+            ask: false,
+            reply_to: Some(7),
+            relayed_by: None,
+        };
+        let shown = format_full_message(&reply);
+        assert!(shown.contains("reply to: #7"), "{shown}");
+        assert!(!shown.contains("ask: yes"), "{shown}");
+    }
+
+    #[test]
+    fn format_full_message_marks_a_relayed_reply_without_hiding_from_project() {
+        let reply = mv_state::activity::MessageRecord {
+            seq: 9,
+            when: "12:02".into(),
+            id: "m3".into(),
+            from_project: "holder".into(),
+            to_project: "asker".into(),
+            body: "yes".into(),
+            ask: false,
+            reply_to: Some(7),
+            relayed_by: Some("asker".into()),
+        };
+        let shown = format_full_message(&reply);
+        assert!(shown.contains("#9 holder -> asker"), "{shown}");
+        assert!(shown.contains("relayed by: asker"), "{shown}");
     }
 
     #[test]
@@ -1387,6 +1967,7 @@ mod tests {
             body: "which seat?".into(),
             ask: true,
             reply_to: None,
+            relayed_by: None,
         };
         assert!(format_inbox_line(&ask).contains("ASK #7 which seat?"));
         let reply = mv_state::activity::MessageRecord {
@@ -1398,7 +1979,157 @@ mod tests {
             body: "seat-a".into(),
             ask: false,
             reply_to: Some(7),
+            relayed_by: None,
         };
         assert!(format_inbox_line(&reply).contains("re #7 seat-a"));
+    }
+
+    #[test]
+    fn format_inbox_line_marks_a_relayed_reply() {
+        let reply = mv_state::activity::MessageRecord {
+            seq: 9,
+            when: "12:02".into(),
+            id: "m3".into(),
+            from_project: "holder".into(),
+            to_project: "asker".into(),
+            body: "seat-a".into(),
+            ask: false,
+            reply_to: Some(7),
+            relayed_by: Some("asker".into()),
+        };
+        let line = format_inbox_line(&reply);
+        assert!(
+            line.contains("holder (relayed by asker): re #7 seat-a"),
+            "{line}"
+        );
+    }
+
+    /// Card `20261110-b-5a407b`'s own reproduction: an open ask, created
+    /// (per the real stamped `when` `send_message` writes) 3h before the
+    /// clock the footer is asked to render against, must show up as
+    /// `<holder> owes <sender> #<seq> 3h` — the same direction wording and
+    /// age format the board's OWED REPLIES card uses, condensed to one
+    /// line. Once the ask is closed, the same lookup produces no line at
+    /// all, not a stale one.
+    #[test]
+    fn open_ask_aging_lines_ages_an_open_ask_and_drops_it_once_closed() {
+        let root = temp_dir("aging-basic");
+        let log = ProjectLog::open("me".to_owned(), &root);
+        activity::send_message(
+            &log,
+            "ask-1",
+            "A",
+            "me",
+            "please help",
+            true,
+            None,
+            true,
+            &redact,
+        )
+        .unwrap();
+        let open = activity::open_asks(&log).unwrap();
+        assert_eq!(open.len(), 1);
+        let created_at = mv_core::time::parse_flexible(&open[0].when).unwrap();
+        let now = created_at + time::Duration::hours(3);
+
+        assert_eq!(
+            open_ask_aging_lines(&open, "me", now),
+            vec!["me owes A #1 3h".to_string()]
+        );
+
+        activity::close_ask(&log, 1, "answered", &redact).unwrap();
+        let open_after_close = activity::open_asks(&log).unwrap();
+        assert!(open_after_close.is_empty());
+        assert!(open_ask_aging_lines(&open_after_close, "me", now).is_empty());
+    }
+
+    /// Byte-identical-to-today's-output requirement: with no open asks, the
+    /// footer contributes nothing — not even a header or an empty line.
+    #[test]
+    fn open_ask_aging_lines_prints_nothing_when_there_are_no_open_asks() {
+        let now = mv_core::time::now_utc();
+        assert!(open_ask_aging_lines(&[], "me", now).is_empty());
+    }
+
+    /// Several open asks print oldest first, in file/seq order, regardless
+    /// of which sender holds the newer one.
+    #[test]
+    fn open_ask_aging_lines_orders_oldest_first() {
+        let root = temp_dir("aging-order");
+        let log = ProjectLog::open("me".to_owned(), &root);
+        activity::send_message(
+            &log,
+            "ask-1",
+            "A",
+            "me",
+            "first ask",
+            true,
+            None,
+            true,
+            &redact,
+        )
+        .unwrap();
+        activity::send_message(
+            &log,
+            "ask-2",
+            "B",
+            "me",
+            "second ask",
+            true,
+            None,
+            true,
+            &redact,
+        )
+        .unwrap();
+        let open = activity::open_asks(&log).unwrap();
+        assert_eq!(open.len(), 2);
+        let now = mv_core::time::parse_flexible(&open[1].when).unwrap() + time::Duration::hours(1);
+
+        let lines = open_ask_aging_lines(&open, "me", now);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("me owes A #1 "));
+        assert!(lines[1].starts_with("me owes B #2 "));
+    }
+
+    /// `ask_age` matches `board_data::compact_elapsed`'s own unit
+    /// selection (`s`/`m`/`h`) and falls back to `"?"` for a timestamp that
+    /// does not parse or sits in the future — the same `None` case
+    /// `board_data::elapsed_compact` has.
+    #[test]
+    fn ask_age_picks_the_right_unit_and_falls_back_on_bad_input() {
+        let now = mv_core::time::parse_flexible("2026-01-01T00:10:00+00:00").unwrap();
+        assert_eq!(ask_age("2026-01-01T00:09:55+00:00", now), "5s");
+        assert_eq!(ask_age("2026-01-01T00:08:00+00:00", now), "2m");
+        assert_eq!(ask_age("2025-12-31T22:10:00+00:00", now), "2h");
+        assert_eq!(ask_age("not a timestamp", now), "?");
+        assert_eq!(ask_age("2026-01-01T00:20:00+00:00", now), "?");
+    }
+
+    /// Wiring smoke test: `inbox_at` must not error, and must still print
+    /// the aging footer line, when the inbox read itself has nothing new
+    /// — the brief's "also when it reports 'nothing new'" case.
+    #[test]
+    fn inbox_at_runs_clean_with_an_open_ask_and_nothing_new_to_read() {
+        let root = temp_dir("aging-inbox-wiring");
+        let log = ProjectLog::open("me".to_owned(), &root);
+        activity::send_message(
+            &log,
+            "ask-1",
+            "A",
+            "me",
+            "please help",
+            true,
+            None,
+            true,
+            &redact,
+        )
+        .unwrap();
+        let state_dir = root.join(".multiverse");
+        let high_water = log.high_water_seq().unwrap();
+        activity::acknowledge(&state_dir, &log, high_water, 1).unwrap();
+
+        inbox_at("me", &root, 20, true, false, None).unwrap();
+        replay_at("me", &root, 1).unwrap();
+        replay_last_at("me", &root, 10).unwrap();
     }
 }

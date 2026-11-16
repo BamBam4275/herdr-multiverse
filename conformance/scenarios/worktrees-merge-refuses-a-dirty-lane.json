@@ -1,0 +1,49 @@
+{
+  "id": "worktrees-merge-refuses-a-dirty-lane",
+  "description": "`worktrees --merge` refuses a lane with uncommitted changes before any secrets scan runs (card 20261114-b-069836): no scanner is configured at all, so a clean refusal here proves the uncommitted-changes gate runs first and the merge touches nothing.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n"
+      },
+      "worktrees": {
+        "20260101-builder-aaaaaa": {
+          "files": {
+            "change.txt": "uncommitted work\n"
+          }
+        }
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--merge",
+        "20260101-builder-aaaaaa"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr_contains": [
+          "uncommitted changes"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "unchanged": true
+    }
+  ]
+}

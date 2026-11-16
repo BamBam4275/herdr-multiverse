@@ -33,6 +33,10 @@ pub const MAX_BODY_BYTES: usize = 32_768;
 /// atomic up to a small, filesystem-dependent size).
 pub const MAX_EVENT_LINE_BYTES: usize = 512;
 
+/// Every way a mail operation in this module can fail, one variant per
+/// distinct validation or corruption case — so a caller can match on the
+/// specific failure (e.g. an unpermitted pairing vs. a corrupt envelope)
+/// instead of a single opaque error.
 #[derive(Debug, Error)]
 pub enum MailError {
     #[error(
@@ -58,6 +62,9 @@ pub enum MailError {
 
     #[error("mail event line would be {actual} bytes, over the {MAX_EVENT_LINE_BYTES}-byte limit")]
     EventLineTooLarge { actual: usize },
+
+    #[error("mail event field {key:?} contains a CR or LF, which would forge a second event line")]
+    UnsafeEventField { key: String },
 
     #[error("{0:?} is not a valid mail event name")]
     UnknownEvent(String),
@@ -151,6 +158,8 @@ pub enum MailStatus {
 }
 
 impl MailStatus {
+    /// The exact lowercase word this status is written as in the `status`
+    /// file — the same word [`read_status`] parses back.
     pub fn as_str(self) -> &'static str {
         match self {
             MailStatus::Done => "done",
@@ -170,6 +179,8 @@ pub enum MailEvent {
 }
 
 impl MailEvent {
+    /// The exact hyphenated name this event is written as in the `events`
+    /// line — the same name [`parse_event`] accepts back.
     pub fn as_str(self) -> &'static str {
         match self {
             MailEvent::DeliveryAttempted => "delivery-attempted",
@@ -233,7 +244,12 @@ pub fn message_id(day: &str, from: &str, to: &str, kind: &str, body: &str) -> St
 /// `mail.py`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendResult {
+    /// The message's content-hashed id — identical whether this call just
+    /// created it or found a matching send already on disk.
     pub id: String,
+    /// `true` if this call wrote the message directory for the first time;
+    /// `false` if an identical message already existed (the idempotent
+    /// resend path).
     pub created: bool,
 }
 
@@ -274,6 +290,10 @@ fn toml_unescape(quoted: &str) -> Option<String> {
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
+            // Only the two escapes `toml_escape` ever produces are
+            // recognised; anything else means the file wasn't written by
+            // this module's own writer, so it's treated as unparsable
+            // rather than guessed at.
             match chars.next()? {
                 '\\' => out.push('\\'),
                 '"' => out.push('"'),
@@ -306,6 +326,10 @@ fn parse_envelope_toml(text: &str) -> Option<ParsedEnvelope> {
         if line.is_empty() {
             continue;
         }
+        // Unlike `parse_event_line` (which tolerates a torn line in an
+        // append-only log), any malformed line here fails the whole parse:
+        // `envelope.toml` is written once, atomically, so a bad line means
+        // real corruption, not a write caught mid-flight.
         let (key, raw_value) = line.split_once('=')?;
         fields.insert(key.trim().to_string(), toml_unescape(raw_value.trim())?);
     }
@@ -327,12 +351,25 @@ fn parse_envelope_toml(text: &str) -> Option<ParsedEnvelope> {
 /// tolerates one being present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
+    /// This message's own id, matching the name of its directory under
+    /// `mail_root`.
     pub id: String,
+    /// The sending project's identifier.
     pub from: String,
+    /// The receiving project's identifier.
     pub to: String,
+    /// Either `"question"` or `"notice"` — the only two kinds
+    /// `validate_kind` allows a message to be sent as.
     pub kind: String,
+    /// When [`create_message`] wrote this envelope, as an ASCII
+    /// JSON-ish timestamp (see `crate::activity::support`'s helpers).
     pub created: String,
+    /// The hex-encoded SHA-256 of the (already redacted) `body.md` this
+    /// envelope accompanies, used to detect a tampered or mismatched body.
     pub body_sha256: String,
+    /// Reserved for a future expiry on this message; always `None` today
+    /// since nothing in this module writes it yet, but a reader must not
+    /// choke on one being present.
     pub deadline: Option<String>,
 }
 
@@ -392,8 +429,15 @@ pub fn list_message_ids(mail_root: &Path) -> Vec<String> {
 /// message's `events` file, as [`read_events`] returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailEventRecord {
+    /// This event's timestamp, as written at the start of its `events`
+    /// line.
     pub when: String,
+    /// The event's name — one of [`MailEvent::as_str`]'s three values,
+    /// but kept as a plain `String` here since a line from an old or
+    /// future writer may use a name this build doesn't recognise.
     pub name: String,
+    /// Any extra `key=value` pairs attached to this event line (e.g. which
+    /// pane delivery was attempted on), in the order they appeared.
     pub fields: Vec<(String, String)>,
 }
 
@@ -582,6 +626,8 @@ pub fn create_message(
     let tmp_dir = mail_root.join(format!(".tmp-{id}"));
     let _ = fs::remove_dir_all(&tmp_dir);
 
+    // Owner-only (0o700) while the message is still being assembled, so
+    // another local user can never read a not-yet-committed envelope/body.
     #[cfg(unix)]
     support::ensure_dir_mode(&tmp_dir, 0o700)?;
     #[cfg(not(unix))]
@@ -596,6 +642,10 @@ pub fn create_message(
     support::atomic_write(&tmp_dir.join("body.md"), redacted_body.as_bytes(), 0o600)?;
 
     fs::rename(&tmp_dir, &dir)?;
+    // Best-effort: fsync the parent directory so the rename that commits
+    // this message is itself durable, not just the file contents already
+    // synced by `atomic_write`. A failure here is ignored rather than
+    // surfaced, since the message is already correctly committed either way.
     if let Ok(dir_file) = fs::File::open(mail_root) {
         let _ = dir_file.sync_all();
     }
@@ -614,6 +664,11 @@ pub fn append_event(
     let when = support::now_stamp();
     let mut line = format!("{when}\tevent={}", event.as_str());
     for (key, value) in fields {
+        if value.contains(['\r', '\n']) {
+            return Err(MailError::UnsafeEventField {
+                key: (*key).to_string(),
+            });
+        }
         line.push('\t');
         line.push_str(key);
         line.push('=');
@@ -625,6 +680,17 @@ pub fn append_event(
     }
 
     let path = mail_dir.join("events");
+    let existed = path.exists();
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -632,7 +698,10 @@ pub fn append_event(
     file.write_all(line.as_bytes())?;
     file.sync_all()?;
     #[cfg(unix)]
-    {
+    if existed {
+        // `.mode(0o600)` above already closes the create-then-chmod race
+        // for a file this `open` creates; this chmod only tightens one
+        // that already existed with a wider mode.
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
@@ -681,6 +750,41 @@ mod tests {
 
     fn no_redact(s: &str) -> String {
         s.to_string()
+    }
+
+    /// Env var a re-exec'd child checks: when set, it skips straight to
+    /// the umask-0 assertion instead of spawning another child. Unsafe
+    /// code is `forbid`den workspace-wide (`Cargo.toml` `[workspace.lints.rust]`),
+    /// so there is no in-process `libc::umask` call available here; `sh`'s
+    /// `umask` builtin sets it on the shell process, which `exec` then
+    /// hands straight to this same test binary, umask and all, the same
+    /// cross-process-child pattern `mv_core::lock`'s
+    /// `a_second_process_times_out_while_another_process_holds_it` test
+    /// uses for a different process-wide property (a held `flock`).
+    #[cfg(unix)]
+    const UMASK_CHILD_MARKER_VAR: &str = "MV_STATE_MAIL_TEST_UMASK_CHILD";
+
+    /// `true` if this call is running inside the umask-0 re-exec'd child
+    /// (so the caller should run its real body now, under the umask it
+    /// asked for) — `false` in the original process, which has already
+    /// spawned that child, asserted it passed, and so must *not* also run
+    /// the body itself under its own, uncontrolled umask.
+    #[cfg(unix)]
+    fn is_umask_000_child(test_name: &str) -> bool {
+        if std::env::var_os(UMASK_CHILD_MARKER_VAR).is_some() {
+            return true;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 000 && exec "$0" --exact "$1" --nocapture"#)
+            .arg(&exe)
+            .arg(test_name)
+            .env(UMASK_CHILD_MARKER_VAR, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "umask-0 child run of {test_name} failed");
+        false
     }
 
     #[test]
@@ -1119,6 +1223,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn append_event_creates_the_events_file_at_mode_0600_under_umask_000() {
+        if !is_umask_000_child(
+            "mail::tests::append_event_creates_the_events_file_at_mode_0600_under_umask_000",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let result = create_message(
+            dir.path(),
+            "20261102",
+            "a",
+            "b",
+            "question",
+            "hi",
+            true,
+            &no_redact,
+        )
+        .unwrap();
+        let msg_dir = dir.path().join(&result.id);
+        let events_path = msg_dir.join("events");
+        assert!(!events_path.exists());
+
+        append_event(&msg_dir, MailEvent::DeliveryAttempted, &[("pane", "p1")]).unwrap();
+
+        let mode = fs::metadata(&events_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the events file must be 0600 from the `open` that creates it, not from a later chmod"
+        );
+    }
+
+    #[test]
     fn append_event_rejects_an_oversized_line() {
         let dir = tempdir().unwrap();
         let result = create_message(
@@ -1137,6 +1275,33 @@ mod tests {
         let err =
             append_event(&msg_dir, MailEvent::Delivered, &[("note", &huge_value)]).unwrap_err();
         assert!(matches!(err, MailError::EventLineTooLarge { .. }));
+    }
+
+    #[test]
+    fn append_event_rejects_a_newline_in_a_value_with_nothing_written() {
+        let dir = tempdir().unwrap();
+        let result = create_message(
+            dir.path(),
+            "20261102",
+            "a",
+            "b",
+            "question",
+            "hi",
+            true,
+            &no_redact,
+        )
+        .unwrap();
+        let msg_dir = dir.path().join(&result.id);
+        let events_path = msg_dir.join("events");
+        assert!(!events_path.exists());
+        let err = append_event(
+            &msg_dir,
+            MailEvent::Delivered,
+            &[("note", "a\nevent=forged")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, MailError::UnsafeEventField { .. }));
+        assert!(!events_path.exists(), "a rejected field must write nothing");
     }
 
     #[test]

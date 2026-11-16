@@ -36,9 +36,10 @@ use mv_config::load::{
 };
 use mv_config::roles::Role;
 use mv_engine::fleet_start::{
-    find_orchestrator_agent, nexus_agent_name, nexus_legacy_agent_name, FleetState,
+    find_orchestrator_agent, nexus_agent_name, nexus_legacy_agent_name, FleetState, LiveAgent,
 };
 use mv_engine::mv_herdr::argv;
+use mv_engine::mv_herdr::envelope::AgentState;
 use mv_engine::nexus_seed::{self, DispatchableRole, SeedContext, SeedRole};
 use mv_engine::runner::{Herdr, ProcessHerdr, Timing};
 use mv_engine::selector;
@@ -155,6 +156,8 @@ fn ensure_tab(
     label: &str,
 ) -> Result<String, Vec<String>> {
     let created = {
+        // Hash the workspace id into a fixed-length, filesystem-safe key so
+        // the lock file name never has to carry the id's own raw characters.
         let mut hasher = Sha256::new();
         hasher.update(workspace_id.as_bytes());
         let key: String = hasher
@@ -878,6 +881,109 @@ fn create_hub_home(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether a pane sidebar title carries this Nexus agent name: either the
+/// name alone, or the `{name} · …` form [`orchestrator_pane_label`] writes
+/// before the seat is launched.
+fn pane_label_carries_nexus(label: &str, agent_name: &str) -> bool {
+    !agent_name.is_empty()
+        && (label == agent_name || label.starts_with(&format!("{agent_name} · ")))
+}
+
+/// The live Nexus pane to re-point after a seed rewrite: the named roster
+/// entry first, then a pane in this project's workspace whose title already
+/// carries the Nexus agent name.
+///
+/// A first seed blocked on a folder-trust dialog never reaches
+/// `agent rename`, so [`find_orchestrator_agent`] misses the session even
+/// though `pane rename` already labelled the root pane (card
+/// `20261108-b-e3ca35`). The fallback names that occupant so later
+/// `agent read`/`agent prompt` can address it; a nameless agent cannot be
+/// prompted. Does not replace the `orchestrator_dead` check, which still
+/// uses the roster alone so a labelled-but-unnamed pane still refreshes a
+/// current seed that was never delivered.
+///
+/// `pub(crate)`: `commands::lifecycle`'s `deliver_wrap_prompt` shares this
+/// same two-step lookup (card `20261116-b-457efa`) so `down` finds a Nexus
+/// whose first seed never reached `agent rename` either, instead of
+/// reporting its pane as not found.
+pub(crate) fn find_reseed_target<H: Herdr>(
+    herdr: &mut H,
+    fleet: &FleetState,
+    project_name: &str,
+    project_root: &Path,
+    seat: &str,
+    short: &str,
+) -> Option<(String, LiveAgent)> {
+    if let Some(found) = find_orchestrator_agent(fleet, project_name, project_root, seat, short) {
+        return Some(found);
+    }
+    find_labelled_nexus_pane(herdr, fleet, project_name, project_root, seat, short)
+}
+
+fn find_labelled_nexus_pane<H: Herdr>(
+    herdr: &mut H,
+    fleet: &FleetState,
+    project_name: &str,
+    project_root: &Path,
+    seat: &str,
+    short: &str,
+) -> Option<(String, LiveAgent)> {
+    let current = nexus_agent_name(project_name, seat, short).ok()?;
+    let legacy = nexus_legacy_agent_name(project_name, seat, short).ok();
+    let workspace_id = fleet.workspace_id(project_name, project_root)?;
+    let listed = match herdr.call(&argv::pane_list(Some(&workspace_id)), HERDR_TIMEOUT) {
+        Ok(result) if result.ok() => result,
+        _ => return None,
+    };
+    let panes = listed
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("result"))
+        .and_then(|result| result.get("panes"))
+        .and_then(|panes| panes.as_array())?;
+    let pane = panes.iter().find(|pane| {
+        pane.get("workspace_id").and_then(|value| value.as_str()) == Some(workspace_id.as_str())
+            && pane
+                .get("label")
+                .and_then(|value| value.as_str())
+                .is_some_and(|label| {
+                    pane_label_carries_nexus(label, &current)
+                        || legacy
+                            .as_deref()
+                            .is_some_and(|legacy| pane_label_carries_nexus(label, legacy))
+                })
+    })?;
+    let pane_id = pane
+        .get("pane_id")
+        .and_then(|value| value.as_str())?
+        .to_owned();
+    let label = pane.get("label").and_then(|value| value.as_str())?;
+    let agent_name = if pane_label_carries_nexus(label, &current) {
+        current
+    } else {
+        legacy.filter(|legacy| pane_label_carries_nexus(label, legacy))?
+    };
+    // Best-effort: a nameless occupant cannot be prompted or polled.
+    let _ = herdr.call(&argv::agent_rename(&pane_id, &agent_name), HERDR_TIMEOUT);
+    let state = pane
+        .get("agent_status")
+        .and_then(|value| value.as_str())
+        .and_then(|status| status.parse().ok())
+        .unwrap_or(AgentState::Idle);
+    let state_change_seq = pane
+        .get("state_change_seq")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    Some((
+        agent_name,
+        LiveAgent {
+            pane_id,
+            state,
+            state_change_seq,
+        },
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_project<H: Herdr>(
     herdr: &mut H,
@@ -1040,7 +1146,7 @@ fn launch_project<H: Herdr>(
         };
         let seed = nexus_seed::seed_path(path);
         let seed_display = seed.display();
-        let found = find_orchestrator_agent(fleet, name, path, seat, short);
+        let found = find_reseed_target(herdr, fleet, name, path, seat, short);
         // Python `cli.cmd_start:5643-5646`: `_label_orchestrator_pane` runs
         // as soon as the pane is found, before the blocked/dialog/send
         // checks below — a reseed re-labels the pane even when the
@@ -1395,6 +1501,11 @@ fn batch_summary(
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+/// `multiverse start [projects...] [--all] [--reseed] [--dashboard]`: open
+/// each requested project's workspace (or every configured one) and, when
+/// an interactive seat exists, seed its Nexus pane. With no projects named
+/// and no `--all`, prints each configured project's open/not-open status
+/// instead of starting anything.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -1633,12 +1744,67 @@ mod tests {
     use mv_engine::runner::RunnerError;
     use serde_json::json;
 
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+
+    /// Card `20261114-b-74029b`: `with_project_seed`/`with_home_seed`
+    /// (this file's own `write_project_seed` and `launch_project`'s
+    /// reseed/stale-orchestrator branches) reach `state_dir_from_config`
+    /// at this file's lines ~743/~779, the same failure mode
+    /// `commands::sweep`/`commands::dispatch`/`commands::council`/
+    /// `commands::review_policy`/`commands::seat`/`commands::tasks` each
+    /// close with a guard of this same name — this module had none.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        _dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                _dir: dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
     #[test]
     fn a_project_under_the_temp_root_is_temporary() {
-        let dir = std::env::temp_dir().join(format!("mv-start-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(projects_are_temporary(std::iter::once(dir.as_path())));
-        std::fs::remove_dir(&dir).ok();
+        // `tempfile::tempdir()` removes this on drop, including on panic
+        // (card `20261115-b-c8065f`: the plain `create_dir_all` this
+        // replaced only cleaned up past the assertion below).
+        let dir = tempfile::tempdir().unwrap();
+        assert!(projects_are_temporary(std::iter::once(dir.path())));
     }
 
     #[test]
@@ -2146,6 +2312,7 @@ mod tests {
 
     #[test]
     fn a_re_list_under_the_project_lock_reports_a_concurrent_start() {
+        let _state = StateDirEnvGuard::new();
         let (_dir, sandbox, config, config_path) = sandbox_fixture("sandbox");
         let project = &config.projects["sandbox"];
         let cwd = sandbox.to_string_lossy().into_owned();
@@ -2188,6 +2355,7 @@ mod tests {
         // freshly created workspace gets a one-shot `board` tab; an
         // ordinary project's own fresh create must never call `pane split`
         // (and never opens a `board` tab either).
+        let _state = StateDirEnvGuard::new();
         let (_dir, sandbox, config, config_path) = sandbox_fixture("sandbox");
         let project = &config.projects["sandbox"];
         let mut herdr = Scripted::new(vec![
@@ -2363,6 +2531,7 @@ mod tests {
         // is ensured on every `start multiverse`, not only when its
         // workspace is freshly created — this is the hub already open
         // (e.g. a second `start multiverse`), with `board` already a tab.
+        let _state = StateDirEnvGuard::new();
         let (_dir, home, config, config_path) = hub_fixture();
         let project = &config.projects[HUB_PROJECT_NAME];
         let fleet = open_fleet(HUB_PROJECT_NAME, &home);
@@ -2425,6 +2594,7 @@ mod tests {
         // from `fleet`, the pre-lock snapshot `run()` took before the lock
         // was acquired and before a concurrent `start` could have landed
         // the very agent this guard exists to catch.
+        let _state = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let sandbox = dir.path().join("sandbox");
         let claude_home = dir.path().join("claude-home");
@@ -2494,6 +2664,7 @@ mod tests {
 
     #[test]
     fn already_open_without_dashboard_does_not_call_herdr() {
+        let _state = StateDirEnvGuard::new();
         let (_dir, sandbox, config, config_path) = sandbox_fixture("sandbox");
         let project = &config.projects["sandbox"];
         let fleet = open_fleet("sandbox", &sandbox);
@@ -2517,6 +2688,7 @@ mod tests {
 
     #[test]
     fn already_open_with_dashboard_appends_the_tab_status() {
+        let _state = StateDirEnvGuard::new();
         let (_dir, sandbox, config, config_path) = sandbox_fixture("sandbox");
         let project = &config.projects["sandbox"];
         let fleet = open_fleet("sandbox", &sandbox);
@@ -2542,6 +2714,7 @@ mod tests {
 
     #[test]
     fn current_reseed_preserves_the_seed_and_does_not_repoint() {
+        let _state = StateDirEnvGuard::new();
         for status in ["idle", "blocked"] {
             let (dir, config) = chained_fixture(true);
             let sandbox = dir.path().join("sandbox");
@@ -2623,6 +2796,7 @@ mod tests {
         // `already open` shortcut unconditionally and never rewrote the
         // seed or attempted a re-point, even though no live Nexus agent
         // could be found for this project.
+        let _state = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let sandbox = dir.path().join("sandbox");
         let claude_home = dir.path().join("claude-home");
@@ -2649,9 +2823,16 @@ mod tests {
         // Even a current file must not hide a missing Nexus session.
         write_project_seed(&config, &config_path, project, &sandbox).unwrap();
         // `open_fleet` fetches no agents, matching a workspace whose Nexus
-        // pane is no longer in the roster.
+        // pane is no longer in the roster. The reseed-target fallback then
+        // lists panes; this listing has no Nexus label, so the root pane
+        // is still missing.
         let fleet = open_fleet("sandbox", &sandbox);
-        let mut herdr = Scripted::new(vec![]);
+        let mut herdr = Scripted::new(vec![(
+            "pane list",
+            ok(
+                json!({"result": {"panes": [{"workspace_id": "w1", "pane_id": "w1:p1", "foreground_cwd": sandbox}]}}),
+            ),
+        )]);
         let message = outcome_message(launch_project(
             &mut herdr,
             &config,
@@ -2718,6 +2899,7 @@ mod tests {
     /// stale (or missing) seed has already been rewritten.
     #[test]
     fn stale_reseed_reports_a_blocked_pane_without_reading_or_sending() {
+        let _state = StateDirEnvGuard::new();
         let (dir, config) = chained_fixture(true);
         let sandbox = dir.path().join("sandbox");
         let config_path = sandbox.join("config.toml");
@@ -2753,6 +2935,7 @@ mod tests {
     /// is even checked — is reported as unreadable, not typed into.
     #[test]
     fn stale_reseed_reports_an_unreadable_pane_before_sending() {
+        let _state = StateDirEnvGuard::new();
         let (dir, config) = chained_fixture(true);
         let sandbox = dir.path().join("sandbox");
         let config_path = sandbox.join("config.toml");
@@ -2793,6 +2976,7 @@ mod tests {
     /// pane even though both precede any send.
     #[test]
     fn stale_reseed_reports_a_parked_dialog_before_sending() {
+        let _state = StateDirEnvGuard::new();
         let (dir, config) = chained_fixture(true);
         let sandbox = dir.path().join("sandbox");
         let config_path = sandbox.join("config.toml");
@@ -2830,6 +3014,7 @@ mod tests {
     /// of the two probe-stage messages above.
     #[test]
     fn stale_reseed_reports_rpc_failure_distinct_from_unreadable_or_dialog() {
+        let _state = StateDirEnvGuard::new();
         let (dir, config) = chained_fixture(true);
         let sandbox = dir.path().join("sandbox");
         let config_path = sandbox.join("config.toml");
@@ -2890,6 +3075,7 @@ mod tests {
     /// probe read.
     #[test]
     fn stale_reseed_reports_success_when_the_prompt_lands() {
+        let _state = StateDirEnvGuard::new();
         let (dir, config) = chained_fixture(true);
         let sandbox = dir.path().join("sandbox");
         let config_path = sandbox.join("config.toml");
@@ -2932,6 +3118,147 @@ mod tests {
         assert!(
             message.contains("reseeded and re-pointed (sandbox-nexu-ne)"),
             "{message}"
+        );
+    }
+
+    /// Card `20261108-b-e3ca35`: a first seed blocked on a folder-trust
+    /// dialog never `agent rename`s, so the roster has no Nexus identity.
+    /// The root pane is still live and already labelled with that name.
+    /// `--reseed` must find it and send the seed prompt once.
+    fn labelled_nexus_pane_fleet(sandbox: &Path, pane: &str) -> FleetState {
+        let mut listings = Scripted::new(vec![
+            (
+                "workspace list",
+                ok(json!({"result": {"workspaces": [{"label": "sandbox", "workspace_id": "w1"}]}})),
+            ),
+            (
+                "pane list",
+                ok(
+                    json!({"result": {"panes": [{"workspace_id": "w1", "pane_id": pane, "foreground_cwd": sandbox}]}}),
+                ),
+            ),
+            ("agent list", ok(json!({"result": {"agents": []}}))),
+        ]);
+        FleetState::fetch(&mut listings, true).unwrap()
+    }
+
+    fn labelled_nexus_pane_list(sandbox: &Path, pane: &str, label: &str) -> CommandResult {
+        ok(json!({"result": {"panes": [{
+            "workspace_id": "w1",
+            "pane_id": pane,
+            "foreground_cwd": sandbox,
+            "label": label,
+        }]}}))
+    }
+
+    #[test]
+    fn reseed_repoints_a_live_pane_labelled_as_the_nexus_with_no_named_agent() {
+        let _state = StateDirEnvGuard::new();
+        let (dir, config) = chained_fixture(true);
+        let sandbox = dir.path().join("sandbox");
+        let config_path = sandbox.join("config.toml");
+        let project = &config.projects["sandbox"];
+        let seat = &config.accounts["nexus-seat"];
+        let fleet = labelled_nexus_pane_fleet(&sandbox, "w1:p1");
+        let label = "sandbox-nexu-ne · claude-interactive ·  · nexus-seat · nexus sandbox";
+        let mut herdr = Scripted::new(vec![
+            (
+                "pane list",
+                labelled_nexus_pane_list(&sandbox, "w1:p1", label),
+            ),
+            ("agent rename", readable("")),
+            ("pane rename", ok(json!({"result": {}}))),
+            ("agent read", readable("ready")),
+            ("pane read", readable("ready")),
+            ("agent prompt", ok(json!({"result": {}}))),
+            (
+                "agent get",
+                ok(json!({"result": {"agent": {
+                    "name": "sandbox-nexu-ne",
+                    "pane_id": "w1:p1",
+                    "agent_status": "idle",
+                    "state_change_seq": 1
+                }}})),
+            ),
+            ("pane read", readable("ready")),
+        ]);
+        let timing = Timing {
+            readiness: Duration::ZERO,
+            prompt: Duration::ZERO,
+            poll: Duration::ZERO,
+        };
+        let message = outcome_message(launch_project(
+            &mut herdr,
+            &config,
+            &config_path,
+            project,
+            &sandbox,
+            Some(seat),
+            &fleet,
+            true,
+            false,
+            &timing,
+        ));
+        assert!(
+            message.contains("reseeded and re-pointed (sandbox-nexu-ne)"),
+            "{message}"
+        );
+        assert_eq!(
+            herdr
+                .calls
+                .iter()
+                .filter(|call| call.starts_with("agent prompt"))
+                .count(),
+            1,
+            "{:?}",
+            herdr.calls
+        );
+    }
+
+    #[test]
+    fn reseed_refuses_a_labelled_nexus_pane_parked_on_a_trust_dialog_without_sending() {
+        let _state = StateDirEnvGuard::new();
+        let (dir, config) = chained_fixture(true);
+        let sandbox = dir.path().join("sandbox");
+        let config_path = sandbox.join("config.toml");
+        let project = &config.projects["sandbox"];
+        let seat = &config.accounts["nexus-seat"];
+        let fleet = labelled_nexus_pane_fleet(&sandbox, "w1:p1");
+        let label = "sandbox-nexu-ne · claude-interactive ·  · nexus-seat · nexus sandbox";
+        let mut herdr = Scripted::new(vec![
+            (
+                "pane list",
+                labelled_nexus_pane_list(&sandbox, "w1:p1", label),
+            ),
+            ("agent rename", readable("")),
+            ("pane rename", ok(json!({"result": {}}))),
+            ("agent read", readable("Do you trust this folder?")),
+        ]);
+        let message = outcome_message(launch_project(
+            &mut herdr,
+            &config,
+            &config_path,
+            project,
+            &sandbox,
+            Some(seat),
+            &fleet,
+            true,
+            false,
+            &Timing::default(),
+        ));
+        assert!(
+            message.contains("RESEEDED")
+                && message.contains("sandbox-nexu-ne is parked on a dialog (trust dialog)")
+                && message.contains("clear it, then `multiverse start sandbox --reseed`"),
+            "{message}"
+        );
+        assert!(
+            herdr
+                .calls
+                .iter()
+                .all(|call| !call.starts_with("agent prompt")),
+            "{:?}",
+            herdr.calls
         );
     }
 }

@@ -86,6 +86,7 @@ class PathMap:
     entries: list[tuple[str, str]] = field(default_factory=list)
 
     def add(self, path: str, token: str) -> None:
+        """Register `path` (and its realpath, if different) for `token`."""
         resolved = os.path.realpath(path)
         for concrete in {path, resolved}:
             concrete = concrete.rstrip("/")
@@ -93,10 +94,14 @@ class PathMap:
                 self.entries.append((concrete, token))
 
     def ordered(self) -> list[tuple[str, str]]:
+        """Entries longest-path-first, so a substring parent never shadows
+        a longer path registered after it."""
         return sorted(self.entries, key=lambda pair: len(pair[0]), reverse=True)
 
 
 def _card_clock(match: re.Match[str]) -> str:
+    """Fold one board card's `HH:MM · elapsed` clock, rebalancing its
+    leading rail (if any) to keep the card's rendered width."""
     replacement = "<TIME> · <ELAPSED>"
     rail = match.group(1)
     if rail:

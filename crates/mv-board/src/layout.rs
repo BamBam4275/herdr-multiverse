@@ -19,9 +19,16 @@ pub const DEFAULT_LIMIT: usize = 10;
 /// Limit used when even the stacked fallback is starved for width.
 pub const STACKED_FALLBACK_LIMIT: usize = 2;
 
-/// Shared floor for the ACCOUNTS cards.
+/// Shared floor for the ACCOUNTS cards: below this, `card_row_dims` folds
+/// to fewer columns rather than rendering a card too narrow to read.
 pub const ACCOUNT_CARD_MIN_WIDTH: usize = 22;
+/// Width an account card needs before it also shows its live `seats
+/// open/cap free N` line — higher than [`ACCOUNT_CARD_DETAIL_MIN_WIDTH`]
+/// so the live seat count is the first extra line a narrowing card drops.
 pub const ACCOUNT_CARD_LIVE_MIN_WIDTH: usize = 24;
+/// Width an account card needs before it also shows its detail text,
+/// quota windows, and 24h token line — these stay down to a narrower
+/// card than the live seats line above, and still vanish below this floor.
 pub const ACCOUNT_CARD_DETAIL_MIN_WIDTH: usize = 22;
 
 /// Shared floor for the SEATS/OWED REPLIES/MAIL/LAST CYCLE cards.
@@ -72,18 +79,35 @@ pub fn terminal_height() -> Option<usize> {
         })
 }
 
-/// True when the board should emit SGR color. `--no-color` wins; a
-/// non-empty `NO_COLOR` env var (<https://no-color.org/>) also disables
-/// color, regardless of its value.
-pub fn color_enabled(cli_no_color: bool) -> bool {
-    color_enabled_from(cli_no_color, std::env::var("NO_COLOR").ok().as_deref())
+/// True when the board should emit SGR color. `--no-color` wins; so does
+/// a non-empty `NO_COLOR` env var (<https://no-color.org/>), regardless
+/// of its value; so does `TERM=dumb`; and so does stdout not being a real
+/// terminal (a pipe, a redirect, a log capture) — the caller passes that
+/// last check in as `is_tty` since only it can ask the question of its
+/// own stdout. Any one of these keeps the board at its plain, uncolored
+/// rendering, byte for byte.
+pub fn color_enabled(cli_no_color: bool, is_tty: bool) -> bool {
+    color_enabled_from(
+        cli_no_color,
+        is_tty,
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    )
 }
 
-fn color_enabled_from(cli_no_color: bool, no_color: Option<&str>) -> bool {
-    if cli_no_color {
+fn color_enabled_from(
+    cli_no_color: bool,
+    is_tty: bool,
+    no_color: Option<&str>,
+    term: Option<&str>,
+) -> bool {
+    if cli_no_color || !is_tty {
         return false;
     }
-    !matches!(no_color, Some(value) if !value.is_empty())
+    if matches!(no_color, Some(value) if !value.is_empty()) {
+        return false;
+    }
+    !matches!(term, Some("dumb"))
 }
 
 /// How many of `n` equal-width cards fit on one row of `width` cells, and
@@ -477,6 +501,9 @@ pub fn box_top_with_corner(title: &str, corner: &str, width: usize) -> Option<St
         return None;
     }
     let dashes = inner - left_w - right_w;
+    // The check above guarantees `dashes >= 2`: one goes right after the
+    // corner (`lead`, always exactly one), leaving at least one (`mid`)
+    // between the two labels.
     let lead = 1;
     let mid = dashes - lead;
     Some(format!(
@@ -551,6 +578,10 @@ pub fn card_bottom(width: usize, short: Option<&str>, role: &str) -> String {
     if cell_width(&short_label) + 2 > inner {
         short_label.clear();
     }
+    // `region` is everything except the right-corner short label; the role
+    // (if it still fits) is centered within that region, with `lead`
+    // floored to at least one dash so the border never starts `└` straight
+    // into a label.
     let region = inner.saturating_sub(cell_width(&short_label));
     let lead = if role_label.is_empty() {
         region
@@ -885,9 +916,21 @@ mod tests {
 
     #[test]
     fn color_enabled_honors_no_color_flag_and_env() {
-        assert!(color_enabled_from(false, None));
-        assert!(!color_enabled_from(true, None));
-        assert!(!color_enabled_from(false, Some("1")));
-        assert!(color_enabled_from(false, Some("")));
+        assert!(color_enabled_from(false, true, None, None));
+        assert!(!color_enabled_from(true, true, None, None));
+        assert!(!color_enabled_from(false, true, Some("1"), None));
+        assert!(color_enabled_from(false, true, Some(""), None));
+    }
+
+    #[test]
+    fn color_enabled_is_off_for_term_dumb_or_a_non_tty() {
+        assert!(!color_enabled_from(false, true, None, Some("dumb")));
+        assert!(color_enabled_from(
+            false,
+            true,
+            None,
+            Some("xterm-256color")
+        ));
+        assert!(!color_enabled_from(false, false, None, None));
     }
 }

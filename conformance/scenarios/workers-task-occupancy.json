@@ -33,12 +33,26 @@
             "exit": 0,
             "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp/lane\", \"name\": \"sandbox-expl-sb\", \"pane_id\": \"w1:p1\"}]}}\n"
           }
+        },
+        {
+          "match_argv": [
+            "pane",
+            "read",
+            "w1:p1",
+            "--lines",
+            "200"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "agent output\n"
+          }
         }
       ],
       "expect": {
         "exit": 0,
         "stdout_contains": [
-          "sandbox          <ID>",
+          "sandbox <ID>",
+          "working done",
           "seats: seat-b 0",
           "sandbox 1 open, ceiling 3"
         ]

@@ -1,6 +1,17 @@
 # Release bootstrap checks
 
-Run `python3 scripts/test_plugin.py` for the fast plugin and bootstrap tests.
+Run `python3 scripts/test_plugin.py` for the fast plugin, bootstrap, and
+private-names tests: `test_bootstrap.py` and `test_private_names.py` are
+both loaded by that script's `load_tests`, alongside the plugin boundary
+tests in `scripts/test_plugin.py` itself. `load_tests` also loads
+`RealReleaseTests` from `test_release.py` there, skipping its two
+build-dependent tests (`test_missing_release_builds_from_source`,
+`test_each_packaged_target_installs_exact_binary`) with a clear reason —
+they need a real macOS cargo/rustup toolchain and network access that only
+running `test_release.py` directly (below) sets up. Everything else
+`RealReleaseTests` inherits from `BootstrapTests` runs against the same
+fake-release fixture, so it is covered by the fast, required check too.
+
 The bootstrap tests use local `file://` assets, a fixed tool allowlist without
 cargo, and temporary plugin roots containing spaces and apostrophes. They
 cover verified installation, repeat installation, bad/missing checksums,
@@ -8,6 +19,10 @@ source fallback, recovery instructions when neither release nor cargo is
 available, and stub-`gh` provenance cases on the default GitHub URL (too
 old, unauthenticated, offline, missing attestation, mismatch, success).
 Cargo is a fixture in this fast check.
+
+`test_private_names.py` covers `check-private-names.sh`'s `git grep` ERE
+validation, including that an invalid ERE exits 2 with a message rather
+than silently passing.
 
 On macOS, run the real release path from the repository root:
 

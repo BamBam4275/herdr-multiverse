@@ -86,6 +86,11 @@ fn seats_card_lines(
             continue;
         }
         let symbol = account.state.symbol();
+        // HalfOpen always shows its "HALF-OPEN" label (with any extra
+        // detail appended), since the bare detail text alone wouldn't say
+        // what state the account is in. Every other non-Available state
+        // shows only its own detail text, which already carries that
+        // context (e.g. a cooldown or cap reason).
         let detail = if account.state == AccountState::HalfOpen {
             match &account.detail {
                 Some(detail) if !detail.is_empty() => {
@@ -111,6 +116,9 @@ fn seats_card_lines(
 
 fn owed_reply_card_lines(replies: &[OwedReply], width: usize) -> Vec<String> {
     let inner = width.saturating_sub(4);
+    // Below the width a full sentence needs, fold every reply down to one
+    // "<project>: N owed" line per project instead of one line per reply,
+    // so a narrow card stays readable rather than showing mangled fragments.
     let lines: Vec<String> = if inner < 28 {
         let mut counts: Vec<(String, u32)> = Vec::new();
         for reply in replies {
@@ -133,6 +141,10 @@ fn owed_reply_card_lines(replies: &[OwedReply], width: usize) -> Vec<String> {
                 let tail = format!("#{} ({})", r.seq, r.wait_text);
                 let full = format!("{head} a reply to {tail}");
                 let condensed = format!("{head} {tail}");
+                // Prefer the full sentence; drop "a reply to" first since
+                // the "#<seq> (<age>)" tail is the identifying part worth
+                // keeping, and only truncate with an ellipsis as the last
+                // resort once even that doesn't fit.
                 if cell_width(&full) <= inner {
                     full
                 } else if cell_width(&condensed) <= inner {
@@ -228,6 +240,10 @@ pub fn render_status_cards(
         last_cycle_card_lines(last_cycle, per_card),
     ];
     let mut out = Vec::new();
+    // Group the four cards into rows of `cols` cards each, stretch every
+    // card in a row to that row's tallest card so their bottom borders
+    // line up, then join the row's cards side by side with one space
+    // between (an n-up row), one printed line at a time.
     for row in blocks.chunks(cols.max(1)) {
         let height = row.iter().map(|c| c.len()).max().unwrap_or(0);
         let padded: Vec<Vec<String>> = row

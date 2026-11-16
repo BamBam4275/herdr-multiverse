@@ -50,10 +50,13 @@ fn resolve_pmset_binary(raw: Option<String>) -> String {
     }
 }
 
+/// Why [`run_pmset_log`]/[`run_pmset_log_with`] failed to read the log.
 #[derive(Debug, thiserror::Error)]
 pub enum PmsetError {
+    /// The subprocess call itself failed (binary missing, spawn error, …).
     #[error("pmset probe failed: {0}")]
     Probe(#[from] mv_herdr::error::HerdrError),
+    /// `pmset` ran but exited non-zero.
     #[error("pmset -g log exited with status {0}")]
     Exit(i32),
 }
@@ -82,9 +85,14 @@ pub fn run_pmset_log_with(binary: &str) -> Result<String, PmsetError> {
     Ok(output.stdout)
 }
 
+/// Intervals shorter than this are dropped as noise rather than reported.
 pub const MIN_INTERVAL_MINUTES: i64 = 5;
+/// Cap on how many trailing `pmset -g log` lines are ever parsed.
 pub const MAX_LOG_LINES: usize = 20_000;
+/// Minimum gap since the last sweep watermark before `pmset` is probed again.
 pub const SWEEP_GAP_MINUTES: i64 = 15;
+/// Minimum gap since `pmset` was last actually invoked before it is probed
+/// again, independent of the sweep-watermark gap.
 pub const PMSET_STALE_MINUTES: i64 = 30;
 
 /// One `Sleep` → `Wake` interval. `lower_bound` is `true` when the opening
@@ -641,14 +649,41 @@ mod tests {
         assert_eq!(earliest_timestamp("garbage"), None);
     }
 
-    fn temp_project(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-engine-hostsleep-report-test-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced left every one of these behind in
+    /// `TMPDIR`). `Deref`s to `Path` so every existing call site keeps
+    /// reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mv-engine-hostsleep-report-test-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_project(tag: &str) -> TempDir {
+        TempDir::new(tag)
     }
 
     #[test]

@@ -137,6 +137,12 @@ fn show_directive(directive: &directives::Directive, now: SystemTime) -> String 
     text
 }
 
+/// The `multiverse directives set|show` entry point: resolves config and
+/// the project(s) named (or every project under the current one, via
+/// [`select_projects`]), then delegates to [`run_set`]/[`run_show`]. `set`
+/// additionally refuses outright unless both stdin and stdout are a real
+/// terminal, since a standing directive is meant to be typed by a human,
+/// not piped in from a script.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     // An operator's own terminal is required before loading config or writing.
     if args.subcommand_name() == Some("set")

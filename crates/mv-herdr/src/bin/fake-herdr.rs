@@ -616,6 +616,9 @@ fn object(value: Value) -> Map<String, Value> {
     value.as_object().expect("literal object").clone()
 }
 
+// Build the `{"id": "cli:<group>:<action>", "result": {"type": "<group>_<action>", ...fields}}`
+// shape every real Herdr reply uses, so each command handler only has to
+// supply its own result fields rather than re-deriving `id`/`type` itself.
 fn envelope(group: &str, action: &str, fields: Value) -> Value {
     let mut result = object(fields);
     result.insert("type".into(), json!(format!("{group}_{action}")));
@@ -777,6 +780,9 @@ fn brief_path(prompt: &str) -> Option<PathBuf> {
 }
 
 fn run(args: &[String], state_path: Option<&Path>) -> FakeResult<Reply> {
+    // `list`/`get`/`read` actions and the whole `plugin` group never mutate
+    // state, so they may run without MV_FAKE_HERDR_STATE set at all — only
+    // a write needs a disposable state file to persist into.
     let readonly = args == ["--version"]
         || args
             .get(1)
@@ -1542,6 +1548,33 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(created["result"]["workspace"]["label"], "--help");
+    }
+
+    /// Card `20261116-b-34a189`: `pane rename`'s label must round-trip
+    /// through `pane get` in the same shape real Herdr uses (a `label`
+    /// field on the `pane` record), since `mv_state::tasks::
+    /// reclaimable_panes`'s occupancy witness (`AgentPanes::pane_label` ->
+    /// `label_names_task`) reads `pane get`'s `label` directly and has no
+    /// other way to confirm a live occupant is still the task that labelled
+    /// it.
+    #[test]
+    fn pane_rename_label_round_trips_through_pane_get() {
+        let sandbox = Sandbox::new();
+        let pane = split(&sandbox);
+        let before = payload(sandbox.call(&["pane", "get", &pane]).unwrap());
+        assert_eq!(before["result"]["pane"]["pane_id"], pane);
+        assert_ne!(
+            before["result"]["pane"]["label"],
+            "builder 20250101-builder-aaaaaa"
+        );
+        sandbox
+            .call(&["pane", "rename", &pane, "builder 20250101-builder-aaaaaa"])
+            .unwrap();
+        let after = payload(sandbox.call(&["pane", "get", &pane]).unwrap());
+        assert_eq!(
+            after["result"]["pane"]["label"],
+            "builder 20250101-builder-aaaaaa"
+        );
     }
 
     #[test]

@@ -24,14 +24,21 @@ use crate::codex_trust;
 use crate::codex_worktree_permissions;
 use crate::limits;
 
+/// Errors produced while preparing, starting, or driving a dispatch.
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
+    /// A dispatch was refused outright, with a human-readable reason (e.g.
+    /// a failed admission check or an exhausted agent-name budget).
     #[error("{0}")]
     Refused(String),
+    /// A lower-level Herdr protocol/transport call failed.
     #[error("{0}")]
     Herdr(#[from] mv_herdr::error::HerdrError),
+    /// A filesystem or process I/O call failed.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    /// The pane is up but showing something (a dialog, a menu) a human must
+    /// resolve before the runner can continue.
     #[error("agent {agent} in pane {pane} needs attention: {reason}")]
     NeedsAttention {
         agent: String,
@@ -73,8 +80,12 @@ pub struct PreparedLaunch {
 /// inputs, and prepare Codex trust/permissions before returning. Policy and
 /// Git lifecycle stay in their owning modules rather than being guessed here.
 pub trait DispatchStore {
+    /// Lock guard type returned by [`lock_fleet`](Self::lock_fleet) and
+    /// [`lock_project`](Self::lock_project); dropping it releases the lock.
     type Guard;
+    /// Acquire the fleet-wide lock, held until the returned guard drops.
     fn lock_fleet(&mut self) -> Result<Self::Guard, RunnerError>;
+    /// Acquire the per-project lock, held until the returned guard drops.
     fn lock_project(&mut self) -> Result<Self::Guard, RunnerError>;
     /// Re-verify concurrency, project floors/ceilings, and the selected
     /// seat's own cap against *current* fleet state — a fresh chain walk,
@@ -89,7 +100,13 @@ pub trait DispatchStore {
     fn recheck_admission(&mut self) -> Result<(), RunnerError> {
         Ok(())
     }
+    /// Bind and prepare a launch for a planned dispatch, with both locks
+    /// held — see the trait-level doc above for everything this must do
+    /// before returning.
     fn prepare(&mut self) -> Result<PreparedLaunch, RunnerError>;
+    /// Names of agents with no terminal outcome recorded yet, used as the
+    /// starting "taken" set for [`unique_agent_name`](Self::unique_agent_name)
+    /// so a freshly minted name can't collide with one still running.
     fn unfinished_agent_names(&mut self) -> Result<HashSet<String>, RunnerError>;
     /// Recompute collision names from the original project/role/seat when
     /// available, including the shorter project budget for each instance.
@@ -160,6 +177,24 @@ pub trait DispatchStore {
         let _ = (launch, pane);
         Ok(())
     }
+    /// Tag a `failed-to-start` record with a short, sanitized reason — a
+    /// human reading routing.log can then filter on
+    /// `reason=not-ready-timeout` directly rather than re-deriving it from
+    /// the diagnostic text ("agent ... did not become readable and ready",
+    /// [`wait_ready`]) that is otherwise only ever printed to the CLI and
+    /// lost the moment that process exits. The default delegates to
+    /// [`record_failed_to_start`](Self::record_failed_to_start) and drops
+    /// `reason`, so a store that has not been updated to log it keeps
+    /// compiling and behaving exactly as before this method existed.
+    fn record_failed_to_start_reason(
+        &mut self,
+        launch: &PreparedLaunch,
+        pane: &str,
+        reason: &str,
+    ) -> Result<(), RunnerError> {
+        let _ = reason;
+        self.record_failed_to_start(launch, pane)
+    }
     /// Trip the pool backing `launch`'s seat, given a settled/failed pane's
     /// own vendor-exhaustion [`limits::Verdict`] and the pane text it was
     /// read from. Python's one production call site for an automatic trip
@@ -221,7 +256,10 @@ pub trait DispatchStore {
     }
 }
 
+/// Seam between this module and the Herdr CLI, so tests can swap in a fake
+/// without spawning a real `herdr` process.
 pub trait Herdr {
+    /// Run one Herdr command and return its parsed result.
     fn call(
         &mut self,
         command: &HerdrCommand,
@@ -229,6 +267,8 @@ pub trait Herdr {
     ) -> Result<CommandResult, RunnerError>;
 }
 
+/// Production [`Herdr`] impl: shells out to the real `herdr` binary via
+/// [`mv_herdr::run::run`].
 pub struct ProcessHerdr;
 
 impl Herdr for ProcessHerdr {
@@ -241,6 +281,8 @@ impl Herdr for ProcessHerdr {
     }
 }
 
+/// Poll cadence and budgets for the readiness/prompt-confirmation waits
+/// below; production uses [`Default::default`], tests shrink it.
 #[derive(Debug, Clone)]
 pub struct Timing {
     pub readiness: Duration,
@@ -258,6 +300,8 @@ impl Default for Timing {
     }
 }
 
+/// A started, prompted dispatch, returned once the pane exists and the
+/// prompt has been sent — everything a caller needs to watch it run.
 #[derive(Debug)]
 pub struct Dispatched {
     pub launch: PreparedLaunch,
@@ -394,6 +438,7 @@ fn write_brief(launch: &PreparedLaunch) -> Result<PathBuf, RunnerError> {
 #[path = "naming.rs"]
 pub mod naming;
 
+/// Pick `base`, or the first `base-2`, `base-3`, ... not already in `taken`.
 pub fn unique_agent_name(base: &str, taken: &HashSet<String>) -> Result<String, RunnerError> {
     if !taken.contains(base) {
         return Ok(base.into());
@@ -450,6 +495,9 @@ fn is_shell_identifier(name: &str) -> bool {
         && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
+/// Human-readable pane title: the running program (the first word of
+/// `launch.command` that isn't an env assignment, falling back to `kind`),
+/// alongside the agent/model/seat/role/task identifiers.
 pub fn pane_label(launch: &PreparedLaunch) -> String {
     let program = launch
         .command
@@ -1048,6 +1096,11 @@ fn read_for_classification(herdr: &mut impl Herdr, pane: &str) -> Option<String>
     (!result.stdout.trim().is_empty()).then_some(result.stdout)
 }
 
+/// Wait until `agent` in `pane` is both detected by Herdr and ready for
+/// input, or until `timing.readiness` runs out. Returns the state-change
+/// sequence Herdr reported at that point, for callers to use as a baseline.
+/// Fails fast on a dialog/menu ([`RunnerError::NeedsAttention`]) rather than
+/// waiting it out.
 pub fn wait_ready(
     herdr: &mut impl Herdr,
     agent: &str,
@@ -1190,6 +1243,11 @@ pub struct TurnGate {
 }
 
 impl TurnGate {
+    /// Feed one poll's `(state, seq)` sample in; returns whether the turn
+    /// should now be considered complete. A `Blocked` sample only passes on
+    /// its *second* consecutive observation at the same `seq` (it must hold
+    /// still); any other state passes once `seq` has moved past `baseline`
+    /// and is ready for input.
     pub fn observe(&mut self, baseline: u64, state: AgentState, seq: u64) -> bool {
         if state == AgentState::Blocked {
             let settled = self.blocked_seq == Some(seq);
@@ -1209,7 +1267,7 @@ impl TurnGate {
 /// lone `❯` sits inside the input box. Any other/unrecognised `kind`
 /// falls back to the same `❯`, the majority shape — `PreparedLaunch::kind`
 /// only ever carries one of the three above in practice.
-fn composer_marker(kind: &str) -> &'static str {
+pub(crate) fn composer_marker(kind: &str) -> &'static str {
     match kind {
         "codex" => "›",
         _ => "❯",
@@ -1284,7 +1342,7 @@ const GHOST_ECHO_RISK_CHARS: usize = COMPOSER_TAIL_CHARS;
 /// an original space — from both sides before they are compared, so the
 /// match still finds the brief regardless of where the box happened to
 /// break it.
-fn prompt_still_in_composer(text: &str, prompt: &str, kind: &str) -> bool {
+pub(crate) fn prompt_still_in_composer(text: &str, prompt: &str, kind: &str) -> bool {
     let Some(start) = text.rfind(composer_marker(kind)) else {
         return false;
     };
@@ -1647,7 +1705,11 @@ fn nudge_stuck_composer(
 /// never be repeated, so there is nothing left to retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heartbeat {
+    /// The agent picked up the heartbeat (seen `Working`, or its
+    /// state-change sequence moved past the baseline into a terminal state).
     Landed,
+    /// The wait ran out before landing was confirmed; the send itself still
+    /// happened and is not retried. Carries the last observed agent state.
     Unconfirmed { last_status: String },
 }
 
@@ -1724,7 +1786,11 @@ pub fn deliver_heartbeat(
 /// caller's lock before the prompt — the defect critic-grok3 row 4 names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FleetLock {
+    /// Ordinary single-dispatch path: take the fleet lock, recheck
+    /// admission, start, then drop the lock before the prompt.
     Acquire,
+    /// The caller already holds the fleet lock and has already run the
+    /// batch-level cap/capacity checks; do not acquire or drop it here.
     AlreadyHeld,
 }
 
@@ -2012,6 +2078,108 @@ pub fn prompt_dispatch(
     finalize_dispatch_attempt(store, herdr, owned_pane, owned_agent, dispatched, attempt)
 }
 
+/// Short, sanitized tag for routing.log's own `reason=` field — cheap
+/// enough to recompute from the error already in hand rather than
+/// threading a second value through every failure path that can reach
+/// [`finalize_dispatch_attempt`]. Deliberately coarse: a filter a human can
+/// grep routing.log for, not a copy of the free-text CLI message.
+fn failed_to_start_reason(error: &RunnerError) -> &'static str {
+    match error {
+        RunnerError::NeedsAttention { .. } => "needs-attention",
+        RunnerError::Refused(message) if message.contains("did not become readable and ready") => {
+            "not-ready-timeout"
+        }
+        RunnerError::Refused(message) if message.contains("pane is unreadable") => {
+            "unreadable-pane"
+        }
+        _ => "start-error",
+    }
+}
+
+/// Save what Herdr can still say about a pane that never became ready, so
+/// the next occurrence of the same timeout is diagnosable without having
+/// caught it live: the last `agent list` entry naming this agent/pane, and
+/// a visible plus a recent-scrollback pane read. Best effort, like the
+/// other cleanup in [`finalize_dispatch_attempt`] — a failed capture must
+/// not replace the dispatch error that triggered it, so failures only ever
+/// reach `store.warn`.
+fn capture_not_ready_evidence(
+    store: &mut impl DispatchStore,
+    herdr: &mut impl Herdr,
+    launch: &PreparedLaunch,
+    pane: &str,
+) {
+    let mut report = String::new();
+    match checked(herdr, argv::agent_list(), COMMAND_TIMEOUT) {
+        Ok(result) => {
+            let entry = result
+                .payload
+                .as_ref()
+                .and_then(|p| p["result"]["agents"].as_array())
+                .and_then(|agents| {
+                    agents.iter().find(|a| {
+                        a["name"].as_str() == Some(&launch.agent_name)
+                            && a["pane_id"].as_str() == Some(pane)
+                    })
+                });
+            report.push_str("agent list entry:\n");
+            report.push_str(&match entry {
+                Some(value) => {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                }
+                None => "<no matching agent list entry>".to_string(),
+            });
+            report.push('\n');
+        }
+        Err(error) => {
+            report.push_str(&format!("agent list entry: <unavailable: {error}>\n"));
+        }
+    }
+    for source in ["visible", "recent"] {
+        report.push_str(&format!("\npane read ({source}):\n"));
+        match checked(
+            herdr,
+            argv::pane_read(pane, Some(source), None),
+            COMMAND_TIMEOUT,
+        ) {
+            Ok(result) => report.push_str(&result.stdout),
+            Err(error) => report.push_str(&format!("<unavailable: {error}>")),
+        }
+        report.push('\n');
+    }
+    let state = launch.project_root.join(".multiverse");
+    let directory = state.join("evidence");
+    for path in [&state, &directory] {
+        match DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        store.warn(&format!("{} is not a real directory", path.display()));
+                        return;
+                    }
+                    Err(error) => {
+                        store.warn(&format!("could not stat {}: {error}", path.display()));
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                store.warn(&format!("could not create {}: {error}", path.display()));
+                return;
+            }
+        }
+    }
+    let path = directory.join(format!("{}-failed-to-start.txt", launch.task_id));
+    let report = mv_core::redact::redact_text(&report);
+    if let Err(error) = mv_core::atomic::write_atomic(&path, report.as_bytes()) {
+        store.warn(&format!(
+            "could not write failed-to-start evidence: {error}"
+        ));
+    }
+}
+
 fn finalize_dispatch_attempt<T>(
     store: &mut impl DispatchStore,
     herdr: &mut impl Herdr,
@@ -2037,6 +2205,7 @@ fn finalize_dispatch_attempt<T>(
         other => other,
     };
     if let Err(error) = &attempt {
+        let reason = failed_to_start_reason(error);
         // Classify the newly-created pane for vendor exhaustion on every
         // failure shape — Python's `_maybe_trip_breaker` runs from the same
         // `except Exception` branch regardless of which check inside the
@@ -2077,13 +2246,24 @@ fn finalize_dispatch_attempt<T>(
                 }
             }
         }
+        // A not-ready timeout is the one failure shape with nothing else
+        // left behind to diagnose it: the pane is about to be torn down
+        // (or kept, but the CLI invocation that will next read it may be
+        // long gone), and `wait_ready`'s own diagnostic text is only ever
+        // printed to that CLI's stdout, never logged. Capture what Herdr
+        // can still say about it now, before that's lost too.
+        if reason == "not-ready-timeout" {
+            if let (Some(launch), Some(pane)) = (&dispatched, &owned_pane) {
+                capture_not_ready_evidence(store, herdr, launch, pane);
+            }
+        }
         // A start or prompt that never lands must not leave the task
         // AWAITING forever against `tasks.resolve`, nor hold its fleet-cap
         // slot open — recorded even for a needs-attention pane, since
         // Python records `failed-to-start` the same way for one (finding 4).
         if let Some(launch) = &dispatched {
             let pane = owned_pane.as_deref().unwrap_or("");
-            if let Err(cleanup) = store.record_failed_to_start(launch, pane) {
+            if let Err(cleanup) = store.record_failed_to_start_reason(launch, pane, reason) {
                 store.warn(&format!(
                     "could not record failed-to-start for task {:?}: {cleanup}",
                     launch.task_id
@@ -2242,7 +2422,10 @@ mod tests {
         shell_retry: Duration,
         dispatched: Vec<String>,
         started: Vec<String>,
-        failed_to_start: Vec<(String, String)>,
+        /// `(agent_name, pane, reason)` for every
+        /// [`DispatchStore::record_failed_to_start_reason`] call this store
+        /// received.
+        failed_to_start: Vec<(String, String, String)>,
         failed_to_start_fails: bool,
         /// `(agent_name, verdict.rule, verdict.interactive)` for every
         /// [`DispatchStore::trip_breaker`] call this store received.
@@ -2307,13 +2490,17 @@ mod tests {
             }
             Ok(())
         }
-        fn record_failed_to_start(
+        fn record_failed_to_start_reason(
             &mut self,
             launch: &PreparedLaunch,
             pane: &str,
+            reason: &str,
         ) -> Result<(), RunnerError> {
-            self.failed_to_start
-                .push((launch.agent_name.clone(), pane.to_owned()));
+            self.failed_to_start.push((
+                launch.agent_name.clone(),
+                pane.to_owned(),
+                reason.to_owned(),
+            ));
             if self.failed_to_start_fails {
                 return Err(RunnerError::Refused("routing unavailable".into()));
             }
@@ -2429,6 +2616,11 @@ mod tests {
         prompted: bool,
         stalled_prompts: usize,
         start_not_ready: bool,
+        /// Freeze the newly-started agent at `agent_status: "working"`
+        /// instead of the backend's default `"idle"`, so it is detected and
+        /// readable but never reports ready — exercising [`wait_ready`]'s
+        /// own timeout rather than [`wait_detected`]'s or a startup error.
+        never_ready: bool,
         /// How many leading `agent start` calls fail with a generic,
         /// uncoded "shell not ready" error before succeeding (finding 9).
         start_failures: usize,
@@ -2839,11 +3031,13 @@ mod tests {
                 let trust = self.trust;
                 let unreadable = self.unreadable;
                 let banner = self.banner;
+                let never_ready = self.never_ready;
                 self.edit(|state| {
-                    let pane = state["agents"].as_array().unwrap().last().unwrap()["pane_id"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned();
+                    let agent = state["agents"].as_array_mut().unwrap().last_mut().unwrap();
+                    let pane = agent["pane_id"].as_str().unwrap().to_owned();
+                    if never_ready {
+                        agent["agent_status"] = json!("working");
+                    }
                     state["text"][pane] = json!(if trust {
                         "Do you trust the files in this folder?"
                     } else if unreadable {
@@ -2934,6 +3128,7 @@ mod tests {
             prompted: false,
             stalled_prompts: 0,
             start_not_ready: false,
+            never_ready: false,
             start_failures: 0,
             command_route: false,
             claude_detect_delay: 0,
@@ -3181,6 +3376,13 @@ mod tests {
         assert!(fake.called("agent", "prompt").is_empty());
         assert!(fake.called("pane", "close").is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+        // An unreadable screen never lets `wait_ready`'s own readiness
+        // check succeed (its `screen.is_ok_and(...)` term), so this still
+        // surfaces as the generic readiness timeout rather than the
+        // dedicated `unreadable-pane` tag — that one belongs to
+        // `refuse_if_parked_on_dialog`'s own later read, after readiness
+        // has already been satisfied.
+        assert_eq!(store.failed_to_start[0].2, "not-ready-timeout");
         assert!(fake.called("agent", "send-keys").is_empty());
     }
 
@@ -3506,6 +3708,139 @@ mod tests {
         assert!(fake.called("agent", "start").len() >= 2);
         assert!(fake.called("pane", "close").is_empty());
         assert_eq!(store.failed_to_start.len(), 1);
+    }
+
+    // --- Card `20261114-b-1a0c6b`: two blank codex `failed-to-start`
+    // results both turned out to be `wait_ready`'s own timeout, but
+    // routing.log's `event=result state=failed-to-start` line named only a
+    // pane; the diagnostic text ("did not become readable and ready") was
+    // printed to the CLI that ran the dispatch and lost the moment it
+    // exited. `failed_to_start_reason` tags the record with a short reason
+    // instead, and a not-ready timeout specifically also leaves behind an
+    // evidence file so the next occurrence is diagnosable. ---
+
+    #[test]
+    fn not_ready_timeout_tags_the_reason_and_captures_evidence() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        fake.never_ready = true;
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not become readable and ready"));
+        assert_eq!(store.failed_to_start.len(), 1);
+        assert_eq!(store.failed_to_start[0].0, "example-builder");
+        assert_eq!(store.failed_to_start[0].2, "not-ready-timeout");
+        let evidence = fs::read_to_string(
+            store
+                .launch
+                .project_root
+                .join(".multiverse/evidence")
+                .join(format!("{}-failed-to-start.txt", store.launch.task_id)),
+        )
+        .expect("not-ready timeout must leave an evidence file behind");
+        assert!(evidence.contains("agent list entry"));
+        assert!(evidence.contains("\"agent_status\": \"working\""));
+        assert!(evidence.contains("pane read (visible):"));
+        assert!(evidence.contains("pane read (recent):"));
+        assert!(evidence.contains("Ready >"));
+    }
+
+    // --- Security review part 2, finding 1 (card `20261116-b-57998b`): a
+    // pre-planted symlink at the evidence path, or at its parent directory,
+    // must not let a not-ready-timeout capture write through it to
+    // somewhere outside the project, and the evidence file itself must be
+    // `0600`. ---
+
+    #[test]
+    fn not_ready_timeout_evidence_does_not_follow_a_planted_symlink() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        let outside = Sandbox::new();
+        let sentinel = outside.0.join("sentinel.txt");
+        fs::write(&sentinel, "untouched").unwrap();
+
+        let state = store.launch.project_root.join(".multiverse");
+        fs::create_dir(&state).unwrap();
+        let directory = state.join("evidence");
+        fs::create_dir(&directory).unwrap();
+        let evidence_path = directory.join(format!("{}-failed-to-start.txt", store.launch.task_id));
+        std::os::unix::fs::symlink(&sentinel, &evidence_path).unwrap();
+
+        fake.never_ready = true;
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not become readable and ready"));
+
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "untouched",
+            "a planted symlink's target must not be written through"
+        );
+        assert!(
+            !fs::symlink_metadata(&evidence_path).unwrap().is_symlink(),
+            "the evidence write must replace the symlink, not follow it"
+        );
+        let mode = fs::symlink_metadata(&evidence_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "evidence file must be 0600");
+        let evidence = fs::read_to_string(&evidence_path).unwrap();
+        assert!(evidence.contains("agent list entry"));
+    }
+
+    #[test]
+    fn not_ready_timeout_refuses_a_symlinked_evidence_directory() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        let outside = Sandbox::new();
+
+        let state = store.launch.project_root.join(".multiverse");
+        fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&outside.0, state.join("evidence")).unwrap();
+
+        fake.never_ready = true;
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not become readable and ready"));
+
+        assert!(
+            fs::read_dir(&outside.0).unwrap().next().is_none(),
+            "nothing may be written through a symlinked evidence directory"
+        );
+        assert!(store
+            .warnings
+            .iter()
+            .any(|w| w.contains("not a real directory")));
+    }
+
+    #[test]
+    fn needs_attention_and_start_error_get_their_own_reason_tags() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        fake.trust = true;
+        assert!(matches!(
+            dispatch(&mut store, &mut fake, "w52:p1", &timing()),
+            Err(RunnerError::NeedsAttention { .. })
+        ));
+        assert_eq!(store.failed_to_start.len(), 1);
+        assert_eq!(store.failed_to_start[0].2, "needs-attention");
+        assert!(
+            !store
+                .launch
+                .project_root
+                .join(".multiverse/evidence")
+                .exists(),
+            "evidence capture is specific to a not-ready timeout"
+        );
+
+        let (_sandbox, mut store, mut fake) = fixture();
+        fake.start_failures = usize::MAX;
+        store.shell_retry = Duration::from_millis(5);
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(error.to_string().contains("not an available shell"));
+        assert_eq!(store.failed_to_start.len(), 1);
+        assert_eq!(store.failed_to_start[0].2, "start-error");
     }
 
     #[test]

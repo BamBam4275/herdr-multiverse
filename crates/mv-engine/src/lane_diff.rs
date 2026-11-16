@@ -22,6 +22,7 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Why [`lane_diff`]/[`fix_round_commits`] could not resolve a lane.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LaneDiffError {
     /// `task_id` names no branch this repo can diff, and no merged-lane

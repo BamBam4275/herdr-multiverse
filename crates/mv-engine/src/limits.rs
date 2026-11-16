@@ -311,6 +311,7 @@ pub fn record_probe(entry: &mut mv_state::gauge::GaugeEntry, now_stamp: impl Int
     entry.last_probe_at = Some(now_stamp.into());
 }
 
+/// Read back the recovery-probe timestamp stamped by [`record_probe`], if any.
 pub fn last_probe_at(entry: &mv_state::gauge::GaugeEntry) -> Option<&str> {
     entry.last_probe_at.as_deref()
 }

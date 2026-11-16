@@ -93,6 +93,8 @@ pub struct LoggedDispatch {
 /// per task). A reviewed task is always looked up in *its own* project's
 /// log, never another project's.
 pub trait RoutingLookup {
+    /// `project`'s own routing-log entry for `task_id`, or `None` if it
+    /// was never dispatched there.
     fn dispatch_for_task(&self, project: &str, task_id: &str) -> Option<LoggedDispatch>;
 }
 
@@ -192,6 +194,8 @@ pub struct ReviewPolicy {
 /// see [`recent_reviewer_dispatch_count`] below — though `mv-cli`'s own
 /// dispatch command does not wire it into this trait yet).
 pub trait ReviewBudget {
+    /// How many Critic dispatches `project` has made in the rolling 24h
+    /// window ending at `now`.
     fn reviewer_dispatch_count(&self, project: &str, now: Instant) -> u32;
 }
 
@@ -261,6 +265,7 @@ fn fleet_halt_line(reason: &str, since: Option<&str>) -> String {
 /// failure (corrupt/unreadable store), not "no halt recorded" — that case
 /// is `Ok(None)`.
 pub trait HaltQuery {
+    /// Read the current fleet halt record, if any.
     fn read(&self) -> Result<Option<FleetHalt>, String>;
 }
 
@@ -317,8 +322,12 @@ pub fn check_halt_before_pane_creation(
 pub struct FleetCapacityInputs {
     /// `config.max_concurrent`.
     pub max_concurrent: u32,
-    /// Effective fleet-wide running count (live agents plus
-    /// Herdr-lag grace), *before* this batch.
+    /// Effective fleet-wide running count of **worker** panes only (live
+    /// agents plus Herdr-lag grace), *before* this batch. Card
+    /// `20261115-b-65fe80`: a busy Nexus pane is excluded entirely, so it
+    /// never costs a worker dispatch its last fleet slot — the caller
+    /// filling in this struct (`mv-cli`'s `fleet_open_counts`) is where
+    /// that exclusion happens, not this comparison.
     pub fleet_open: u32,
     /// This project's own open count, *before* this batch.
     pub project_open: u32,
@@ -419,6 +428,8 @@ pub struct DispatchRequest<'a> {
 /// over this enum).
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DispatchError {
+    /// `raw` (from `--exclude-vendor`) resolves to no configured vendor,
+    /// account, or account kind.
     #[error(
         "{raw:?} is not a known vendor, account, or account kind. \
          Vendors: {vendors:?}. Accounts: {accounts:?}. Kinds: {kinds:?}."
@@ -430,24 +441,35 @@ pub enum DispatchError {
         kinds: Vec<String>,
     },
 
+    /// `--reviewing` named a task id with no dispatch recorded in the
+    /// given project's routing log.
     #[error("task {task_id:?} was never dispatched in project {project:?}'s routing log")]
     UnknownReviewedTask { task_id: String, project: String },
 
+    /// The reviewed task's routing-log entry has no recorded account to
+    /// resolve a vendor from.
     #[error("task {task_id:?}'s routing-log entry has no recorded account")]
     ReviewedTaskMissingAccount { task_id: String },
 
+    /// The reviewed task's recorded account is no longer configured.
     #[error("task {task_id:?}'s recorded account {account:?} is no longer in config")]
     ReviewedTaskAccountGone { task_id: String, account: String },
 
+    /// Critic dispatch was given neither `--reviewing` nor
+    /// `--exclude-vendor`, so there is no author vendor to exclude.
     #[error(
         "\nCritic dispatch needs --reviewing <task-id> or --exclude-vendor <vendor> — neither was given, so there is no author vendor to exclude and this dispatch would be free to land on the author's own vendor.\n\
          Name the lane under review with --reviewing, or exclude a vendor directly with --exclude-vendor.\n"
     )]
     ReviewerVendorUnknown,
 
+    /// `--reviewing` named more lanes than `review_policy.batch_max_lanes`
+    /// allows in one batch.
     #[error("--reviewing named {count} lanes, over the configured batch_max_lanes of {max}")]
     TooManyLanes { count: usize, max: usize },
 
+    /// The project already used its rolling 24h Critic-dispatch budget
+    /// (`review_policy.budget_per_window`).
     #[error(
         "project {project:?} has already made {used}/{budget} Critic dispatches in the last 24h"
     )]
@@ -457,21 +479,28 @@ pub enum DispatchError {
         budget: u32,
     },
 
+    /// The fleet is halted and `--force` was not given.
     #[error("dispatch refused: {}; use --force to override.", fleet_halt_line(.reason, .since.as_deref()))]
     FleetHaltActive {
         reason: String,
         since: Option<String>,
     },
 
+    /// The fleet halt store could not be read, so dispatch refuses rather
+    /// than guessing whether a halt is active.
     #[error("dispatch refused: could not verify fleet halt ({detail})")]
     FleetHaltUnreadable { detail: String },
 
+    /// Starting this batch would exceed `max_concurrent`.
     #[error("{running} agent(s) already running and max_concurrent is {cap}; nothing was started")]
     FleetCapExceeded { running: u32, cap: u32 },
 
+    /// Starting this batch would exceed the project's own slot ceiling.
     #[error("project already has {open} agent(s) running and its ceiling is {ceiling}; nothing was started")]
     ProjectCeilingExceeded { open: u32, ceiling: u32 },
 
+    /// Starting this batch would borrow fleet capacity that another
+    /// project still needs to reach its own configured floor.
     #[error(
         "starting another agent here would leave only {free_after} free fleet slot(s) \
          (max_concurrent is {max_concurrent}), but other projects still need \
@@ -484,30 +513,102 @@ pub enum DispatchError {
         limiting: Vec<(String, u32)>,
     },
 
+    /// No seat in the chain was available or willing; wraps the
+    /// selector's own exhaustion error.
     #[error(transparent)]
     ChainExhausted(#[from] ChainExhaustedError),
 
+    /// `--wait-for-seat` failed while waiting on a seat; wraps the
+    /// selector's own wait error.
     #[error(transparent)]
     Wait(#[from] WaitError),
+}
+
+/// Polls `capacity` — a fresh re-count on every call, never a frozen
+/// snapshot — at the same cadence [`selector::select_or_wait`] already
+/// uses for a capped seat, until [`check_fleet_capacity`] passes or
+/// `timeout` elapses. Card `20261110-b-c314f9`: [`plan_dispatch`] used to
+/// run `check_fleet_capacity` exactly once, against the snapshot taken
+/// before this dispatch asked to wait at all, so `--wait-for-seat`
+/// refused a full fleet immediately instead of waiting for a slot the
+/// same way it already waits for a capped seat. On timeout this returns
+/// the same [`DispatchError`] a synchronous `check_fleet_capacity` call
+/// would have raised — same refusal text, same exit code.
+fn wait_for_fleet_capacity(
+    capacity: &mut dyn FnMut() -> FleetCapacityInputs,
+    timeout: Option<f64>,
+    poll_interval: f64,
+    sleeper: &mut dyn selector::Sleeper,
+    on_wait: &mut dyn FnMut(&str),
+) -> Result<(), DispatchError> {
+    let mut waited = 0.0_f64;
+    loop {
+        match check_fleet_capacity(&capacity()) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if let Some(timeout) = timeout {
+                    if waited >= timeout {
+                        return Err(err);
+                    }
+                }
+                on_wait(&format!("waiting for fleet capacity: {err}"));
+                let this_sleep = match timeout {
+                    None => poll_interval,
+                    Some(timeout) => poll_interval.min(timeout - waited),
+                }
+                .max(0.0);
+                sleeper.sleep(std::time::Duration::from_secs_f64(this_sleep));
+                waited += this_sleep;
+            }
+        }
+    }
 }
 
 /// `DispatchPlanner.plan` (`dispatch.py:1073-1305`), narrowed to this
 /// crate's decision scope: halt, fleet/project capacity, reviewer
 /// preconditions, exclude-vendor resolution, then seat selection. Checks
 /// run in Python's own order — refuse before spending anything.
+///
+/// `capacity` is a callback rather than a frozen [`FleetCapacityInputs`]
+/// so a `--wait-for-seat` dispatch can re-count it on every poll (card
+/// `20261110-b-c314f9`) — a caller that is not waiting still only ever
+/// calls it once.
+///
+/// `sleeper` is the same injectable seam [`selector::select_or_wait`]
+/// already takes — a real caller passes `&mut selector::RealSleeper`, a
+/// test passes a fake that records calls instead of blocking (card
+/// `20261110-b-839ec1`: without this seam, the `wait_for_capacity &&
+/// !dry_run` branch could only be exercised with a real sleep, so no
+/// plan_dispatch-level test ever covered it).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_dispatch(
     req: &DispatchRequest,
     routing: &dyn RoutingLookup,
     accounts: &dyn AccountLookup,
     budget: &dyn ReviewBudget,
-    capacity: &FleetCapacityInputs,
+    capacity: &mut dyn FnMut() -> FleetCapacityInputs,
     halt: &dyn HaltQuery,
     breaker: &dyn BreakerQuery,
+    sleeper: &mut dyn selector::Sleeper,
     now: Instant,
 ) -> Result<Selection, DispatchError> {
     check_halt(halt, req.force, req.dry_run)?;
-    check_fleet_capacity(capacity)?;
+
+    // A dry run never waits on fleet capacity, matching the seat-level
+    // exemption below (`dispatch.py`'s `plan`: `False` is passed for
+    // dry-run) — it plans and renders only, so it always takes the
+    // no-wait path regardless of `--wait-for-seat`.
+    if req.wait_for_capacity && !req.dry_run {
+        wait_for_fleet_capacity(
+            capacity,
+            req.capacity_timeout,
+            selector::DEFAULT_POLL_INTERVAL_SECS,
+            sleeper,
+            &mut |_msg: &str| {},
+        )?;
+    } else {
+        check_fleet_capacity(&capacity())?;
+    }
     check_reviewer_preconditions(
         req.role,
         req.reviewer_role,
@@ -556,7 +657,7 @@ pub fn plan_dispatch(
         let opts = selector::WaitOptions {
             timeout: req.capacity_timeout,
             poll_interval: selector::DEFAULT_POLL_INTERVAL_SECS,
-            sleeper: &mut selector::RealSleeper,
+            sleeper,
             on_wait: &mut |_msg: &str| {},
         };
         Ok(selector::select_or_wait(
@@ -1223,9 +1324,10 @@ mod tests {
             &routing,
             &accounts,
             &budget,
-            &capacity(),
+            &mut || capacity(),
             &halt,
             &AlwaysOpenBreaker,
+            &mut selector::RealSleeper,
             Instant::now(),
         )
         .unwrap_err();
@@ -1264,9 +1366,10 @@ mod tests {
             &routing,
             &accounts,
             &budget,
-            &capacity(),
+            &mut || capacity(),
             &halt,
             &AlwaysOpenBreaker,
+            &mut selector::RealSleeper,
             Instant::now(),
         )
         .unwrap();
@@ -1311,12 +1414,222 @@ mod tests {
             &routing,
             &accounts,
             &budget,
-            &capacity(),
+            &mut || capacity(),
             &halt,
             &AlwaysOpenBreaker,
+            &mut selector::RealSleeper,
             Instant::now(),
         )
         .unwrap_err();
         assert!(matches!(err, DispatchError::ChainExhausted(_)));
+    }
+
+    // --- wait_for_fleet_capacity / card 20261110-b-c314f9 ---
+
+    struct FakeSleeper {
+        calls: Vec<std::time::Duration>,
+    }
+
+    impl selector::Sleeper for FakeSleeper {
+        fn sleep(&mut self, duration: std::time::Duration) {
+            self.calls.push(duration);
+        }
+    }
+
+    fn full_capacity() -> FleetCapacityInputs {
+        FleetCapacityInputs {
+            max_concurrent: 1,
+            fleet_open: 1,
+            project_open: 0,
+            project_min_slots: 0,
+            project_max_slots: None,
+            other_floor_gaps: vec![],
+            batch_count: 1,
+        }
+    }
+
+    #[test]
+    fn wait_for_fleet_capacity_polls_until_a_slot_frees_then_succeeds() {
+        // The fleet is full for the first N (here, 2) re-counts, then a
+        // finished-but-unrecorded lane frees up — the same shape
+        // `open_task_count`'s own fix (card 20261110-b-fa4365) now lets a
+        // reconcile/sweep eventually produce.
+        let polls = std::cell::Cell::new(0u32);
+        let mut capacity = || {
+            let n = polls.get();
+            polls.set(n + 1);
+            let mut inputs = full_capacity();
+            if n >= 2 {
+                inputs.fleet_open = 0;
+            }
+            inputs
+        };
+        let mut sleeper = FakeSleeper { calls: vec![] };
+        let mut messages = Vec::new();
+        let mut on_wait = |msg: &str| messages.push(msg.to_string());
+
+        wait_for_fleet_capacity(&mut capacity, Some(100.0), 1.0, &mut sleeper, &mut on_wait)
+            .expect("capacity frees on the third re-count");
+
+        assert_eq!(polls.get(), 3);
+        assert_eq!(sleeper.calls.len(), 2);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].contains("already running"));
+    }
+
+    #[test]
+    fn wait_for_fleet_capacity_times_out_with_the_original_refusal_when_never_freed() {
+        let mut capacity = full_capacity;
+        let mut sleeper = FakeSleeper { calls: vec![] };
+        let mut on_wait = |_: &str| {};
+
+        let err =
+            wait_for_fleet_capacity(&mut capacity, Some(5.0), 2.0, &mut sleeper, &mut on_wait)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DispatchError::FleetCapExceeded { running: 1, cap: 1 }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "1 agent(s) already running and max_concurrent is 1; nothing was started"
+        );
+    }
+
+    // --- plan_dispatch's own wait_for_capacity wiring / card 20261110-b-839ec1 ---
+    //
+    // `wait_for_fleet_capacity` above is tested directly, but until now
+    // nothing exercised `plan_dispatch`'s own `if req.wait_for_capacity &&
+    // !req.dry_run` branch end to end — flipping that condition to `if
+    // false && ...` left every dispatch:: test green. These three cover the
+    // branch the way `plan_dispatch` itself takes it: through the public
+    // entry point, with a fake sleeper standing in for `RealSleeper`.
+
+    fn base_wait_req<'a>(
+        chain: &'a [Seat],
+        wait_for_capacity: bool,
+        dry_run: bool,
+    ) -> DispatchRequest<'a> {
+        DispatchRequest {
+            role: "builder",
+            reviewer_role: "critic",
+            nexus_role: "nexus",
+            project: "example",
+            task_id: "20261102-builder-abcdef",
+            task_len_chars: 10,
+            reviewing: &[],
+            explicit_exclude_vendor: &[],
+            chain,
+            policy: FallbackPolicy::Degrade,
+            review_policy: ReviewPolicy::default(),
+            fleet_min_quota_percent: None,
+            wait_for_capacity,
+            capacity_timeout: Some(100.0),
+            force: false,
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn plan_dispatch_waits_for_fleet_capacity_then_selects_a_seat_after_one_fake_sleep() {
+        let chain = [plain_seat("a")];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        let req = base_wait_req(&chain, true, false);
+
+        let polls = std::cell::Cell::new(0u32);
+        let mut capacity = || {
+            let n = polls.get();
+            polls.set(n + 1);
+            let mut inputs = full_capacity();
+            if n >= 1 {
+                inputs.fleet_open = 0; // free on the second call
+            }
+            inputs
+        };
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let selection = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut capacity,
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .expect("capacity frees on the second re-count");
+
+        assert_eq!(selection.seat.name, "a");
+        assert_eq!(polls.get(), 2);
+        assert_eq!(sleeper.calls.len(), 1);
+    }
+
+    #[test]
+    fn plan_dispatch_dry_run_refuses_a_full_fleet_at_once_without_sleeping() {
+        let chain = [plain_seat("a")];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        // wait_for_capacity is requested, but dry_run must still force the
+        // no-wait path (matches the seat-level exemption covered by
+        // `plan_dispatch_dry_run_never_waits_on_a_capped_seat` above).
+        let req = base_wait_req(&chain, true, true);
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let err = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut full_capacity,
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DispatchError::FleetCapExceeded { .. }));
+        assert!(sleeper.calls.is_empty());
+    }
+
+    #[test]
+    fn plan_dispatch_without_wait_for_capacity_refuses_a_full_fleet_at_once() {
+        let chain = [plain_seat("a")];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        let req = base_wait_req(&chain, false, false);
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let err = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut full_capacity,
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DispatchError::FleetCapExceeded { .. }));
+        assert!(sleeper.calls.is_empty());
     }
 }

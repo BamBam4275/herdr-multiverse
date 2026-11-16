@@ -42,6 +42,8 @@ _FAKE_HERDR_BIN: str | None = None
 
 
 def _fake_herdr_binary() -> str:
+    """Build (once per process) and return the path to the real, stateful
+    `fake-herdr` binary used by `"herdr_seed"` scenarios."""
     global _FAKE_HERDR_BIN
     if _FAKE_HERDR_BIN is None:
         _FAKE_HERDR_BIN = build_fake_herdr_binary()
@@ -50,6 +52,8 @@ def _fake_herdr_binary() -> str:
 
 @dataclass
 class StepResult:
+    """One scenario step's outcome, for `run_all.py`'s report table."""
+
     index: int
     argv: list[str]
     status: str
@@ -57,6 +61,8 @@ class StepResult:
 
 @dataclass
 class ScenarioResult:
+    """The outcome of replaying one whole scenario against one implementation."""
+
     ok: bool
     failures: list[str] = field(default_factory=list)
     sandbox_root: Path | None = None
@@ -64,6 +70,8 @@ class ScenarioResult:
 
 
 def _substitute_captures(text: str, captures: dict[str, str]) -> str:
+    """Replace every `{{capture:name}}` token in `text` with the value an
+    earlier step captured under that name."""
     def repl(match: re.Match) -> str:
         name = match.group(1)
         if name not in captures:
@@ -74,6 +82,9 @@ def _substitute_captures(text: str, captures: dict[str, str]) -> str:
 
 
 def _render(value, sandbox: Sandbox, captures: dict[str, str]):
+    """Recursively resolve `{{...}}` sandbox-path tokens and
+    `{{capture:...}}` references through a scenario-authored str/list/dict
+    value, leaving any other type untouched."""
     if isinstance(value, str):
         return sandbox.resolve(_substitute_captures(value, captures))
     if isinstance(value, list):
@@ -114,6 +125,8 @@ def _stateful_herdr_target(sandbox: Sandbox, binary: str) -> Path:
 
 
 def _base_env(sandbox: Sandbox, fake_herdr: Path) -> dict[str, str]:
+    """The isolated environment every step runs under, pointed entirely at
+    this sandbox: no real fleet config/state dir, no real Herdr."""
     return {
         "PATH": f"{sandbox.root / 'bin'}:{_BASE_PATH}",
         "HOME": str(sandbox.home),
@@ -287,6 +300,8 @@ def run_scenario(
     rust_bin: str | None,
     keep_sandbox: bool = False,
 ) -> ScenarioResult:
+    """Build a fresh sandbox from `scenario`, replay its steps against
+    `impl`, check its `expect_tree` assertions, and return the result."""
     sandbox = make_sandbox()
     failures: list[str] = []
     captures: dict[str, str] = {}
@@ -435,6 +450,7 @@ def run_scenario(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse CLI args, replay the named scenario file, and print its result."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scenario", type=Path)
     parser.add_argument("--impl", choices=["python", "rust"], default="rust")

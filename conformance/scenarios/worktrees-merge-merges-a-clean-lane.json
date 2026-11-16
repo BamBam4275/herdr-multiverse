@@ -1,0 +1,39 @@
+{
+  "id": "worktrees-merge-merges-a-clean-lane",
+  "description": "`worktrees --merge` merges a clean, done lane once the (fake) scanner passes, printing the merge sha (card 20261114-b-069836). `/usr/bin/true` stands in for a gitleaks that found nothing (never the network, per the card's own test requirement). The fixture lane has no commits of its own beyond the project's initial commit, so this pins the exit code and message shape rather than a new merge commit landing; `mv-state`'s own unit tests cover the `Merge branch '...'` commit this produces for a lane with real work.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".gitignore": ".multiverse/\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/status": "done\n",
+        ".multiverse/tasks/20260101-builder-aaaaaa/result.md": "finished\n"
+      },
+      "worktrees": [
+        "20260101-builder-aaaaaa"
+      ]
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[secrets_scan]\ngitleaks = \"/usr/bin/true\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "worktrees",
+        "{{PROJECT:sandbox}}",
+        "--merge",
+        "20260101-builder-aaaaaa"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "merged multiverse/<ID> at"
+        ]
+      }
+    }
+  ]
+}

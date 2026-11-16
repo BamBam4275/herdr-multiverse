@@ -38,6 +38,17 @@ in the right place.
    `herdr plugin link` skips the `[[build]]` hook, so run `cargo build
    --release` yourself first.
 
+4. Opt in to the repository's git hooks (currently a pre-push secrets scan):
+
+   ```sh
+   sh scripts/hooks/install.sh
+   ```
+
+   This sets `core.hooksPath` to `scripts/hooks` for this checkout only;
+   nothing runs it automatically. The hook requires `gitleaks` on `PATH` (see
+   the `secrets` job in `.github/workflows/ci.yml` for the pinned version)
+   and refuses to push unscanned or flagged commits rather than skip the scan.
+
 ## Required checks
 
 Run these before opening a pull request; CI enforces all of them:

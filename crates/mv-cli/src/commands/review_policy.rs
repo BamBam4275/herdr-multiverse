@@ -46,7 +46,7 @@
 //! this task's result.md.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
 use mv_config::load::{load_config, resolve_config_path_from_env, Config, ReviewPolicy};
@@ -54,9 +54,25 @@ use mv_config::roles::Role;
 use mv_engine::{seatstate, selector};
 use mv_state::gauge::GaugeMap;
 
+use super::doctor::{project_path, state_dir_from_config};
 use crate::commands::accounts::account_state;
 use crate::exit::Failure;
 
+/// Every configured project's resolved path — [`seatstate::
+/// nexus_agent_names`]'s own fleet scope, matching `commands::dispatch`'s
+/// `is_nexus_role` exclusion (card `20261115-b-234610`): a project still on
+/// a `<<PLACEHOLDER: ...>>` path contributes no routing log.
+fn project_roots(config: &Config) -> Vec<PathBuf> {
+    config
+        .projects
+        .values()
+        .filter_map(|project| project_path(project).map(Path::to_path_buf))
+        .collect()
+}
+
+/// Resolves the effective review policy report (or one lane's risk
+/// classification) from config, abstracted so tests can substitute a
+/// fixture instead of `LiveConfig`'s real config/state-dir load.
 pub trait ReviewPolicySource {
     /// `lane` is `--lane TASK_ID`'s value, when given; `config_override` is
     /// `--config PATH`'s value. Only [`Failure::Config`] may be returned —
@@ -82,7 +98,7 @@ impl ReviewPolicySource for LiveConfig {
         if let Some(lane) = lane {
             return format_lane_risk(&config, lane);
         }
-        let state_dir = mv_config::load::config_state_dir_from_env(&path);
+        let state_dir = state_dir_from_config(&path);
         format_report(&config, &state_dir, mv_core::time::now_utc())
     }
 }
@@ -298,16 +314,22 @@ fn reviewer_seat_display(
     state_dir: &Path,
     gauges: &GaugeMap,
     name: &str,
+    nexus_agents: &HashSet<String>,
 ) -> String {
     let Some(account) = config.accounts.get(name) else {
         return format!("{name} (unknown account)");
     };
     // Resolved once and threaded into `account_state`'s own cap check
     // (card `20261105-fixer-9d070c`) rather than calling
-    // `seatstate::live_open_count` a second time below — one `agent list`
-    // round trip per capped seat, not two.
+    // `seatstate::live_seat_open_counts` a second time below — one `agent
+    // list` round trip per capped seat, not two. Card `20261115-b-234610`:
+    // a busy Nexus pane dispatched under this same seat must not occupy
+    // any of its reviewer cap, the same exclusion `commands::dispatch`'s
+    // `is_nexus_role` already applies.
     let cap = seatstate::get_cap(state_dir, name);
-    let live_open_count = cap.and_then(|_| seatstate::live_open_count(&account.short));
+    let live_open_count = cap
+        .and_then(|_| seatstate::live_seat_open_counts(&account.short, nexus_agents))
+        .map(|counts| counts.workers);
     let state = account_state(
         config,
         state_dir,
@@ -337,65 +359,6 @@ fn reviewer_seat_display(
     format!("{name} {state}")
 }
 
-/// `recent_reviewer_dispatch_count`'s own window/role filter
-/// (`mv_engine::dispatch`, out of this task's write scope — see this
-/// file's module doc), corrected for finding 5: a dispatch whose task
-/// later recorded `state=failed-to-start` never actually occupied a
-/// reviewer seat and must not count against the window's budget.
-/// Reimplemented over the same routing log rather than editing
-/// `dispatch.rs`.
-fn recent_reviewer_dispatch_count(
-    root: &Path,
-    now: time::OffsetDateTime,
-) -> std::io::Result<usize> {
-    let path = mv_state::log::ProjectLog::new(root);
-    let text = match std::fs::read_to_string(path.path()) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let since = now - time::Duration::hours(24);
-    let mut failed_to_start: HashSet<String> = HashSet::new();
-    let mut dispatches: Vec<(String, String, time::OffsetDateTime)> = Vec::new();
-    for record in text
-        .lines()
-        .filter_map(|line| mv_state::log::parse(line).ok())
-    {
-        let Some(task) = record.fields.get("task").cloned() else {
-            continue;
-        };
-        match record.event() {
-            "dispatch" => {
-                // A redispatch reusing this task id starts over: the
-                // previous round's failed-to-start verdict is not this
-                // round's.
-                failed_to_start.remove(&task);
-                if let (Some(role), Ok(when)) = (
-                    record.fields.get("role").cloned(),
-                    mv_core::time::parse_flexible(&record.when),
-                ) {
-                    dispatches.push((task, role, when));
-                }
-            }
-            "result"
-                if record.fields.get("state").map(String::as_str) == Some("failed-to-start") =>
-            {
-                failed_to_start.insert(task);
-            }
-            _ => {}
-        }
-    }
-    Ok(dispatches
-        .into_iter()
-        .filter(|(task, role, when)| {
-            matches!(role.as_str(), "reviewer" | "critic")
-                && *when >= since
-                && *when <= now
-                && !failed_to_start.contains(task)
-        })
-        .count())
-}
-
 fn format_report(
     config: &Config,
     state_dir: &Path,
@@ -408,6 +371,7 @@ fn format_report(
         format_policy(&config.review_policy)
     );
     let gauges = mv_state::gauge::load(state_dir);
+    let nexus_agents = seatstate::nexus_agent_names(&project_roots(config));
     let mut projects: Vec<&mv_config::load::Project> = config.projects.values().collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     let mut configured = false;
@@ -420,7 +384,7 @@ fn format_report(
             configured = true;
             let seats: Vec<String> = chain
                 .iter()
-                .map(|name| reviewer_seat_display(config, state_dir, &gauges, name))
+                .map(|name| reviewer_seat_display(config, state_dir, &gauges, name, &nexus_agents))
                 .collect();
             text.push_str(&format!("  {}: {}\n", project.name, seats.join(", ")));
         }
@@ -432,20 +396,25 @@ fn format_report(
     }
     text.push_str(&format!("\n{critic_noun} dispatch budget:\n"));
     // Python `cmd_review_policy`: budget 0 is one fleet-wide line, not a
-    // per-project used/unlimited row.
+    // per-project used/unlimited row. The used count is
+    // `mv_engine::dispatch::recent_reviewer_dispatch_count` — the same
+    // function `commands::dispatch`'s ReviewBudget impl calls, so the
+    // used/limit line cannot disagree with what `dispatch` enforces.
     if config.review_policy.budget_per_window == 0 {
         text.push_str("  unlimited (review_budget_per_window = 0)\n");
     } else {
         let budget = config.review_policy.budget_per_window;
         for project in &projects {
             let used = match project.path.value() {
-                Some(root) => recent_reviewer_dispatch_count(Path::new(root), now)
-                    .map_err(|error| {
-                        Failure::Config(format!(
-                            "cannot read {critic_noun} dispatch history: {error}"
-                        ))
-                    })?
-                    .to_string(),
+                Some(root) => {
+                    mv_engine::dispatch::recent_reviewer_dispatch_count(Path::new(root), now)
+                        .map_err(|error| {
+                            Failure::Config(format!(
+                                "cannot read {critic_noun} dispatch history: {error}"
+                            ))
+                        })?
+                        .to_string()
+                }
                 None => "unknown".into(),
             };
             text.push_str(&format!(
@@ -457,6 +426,8 @@ fn format_report(
     Ok(text.trim_end().to_owned())
 }
 
+/// Prints the effective review policy (or, with `--lane`, one lane's risk
+/// classification) using the real config/state-dir source.
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     run_with(args, &LiveConfig)
 }
@@ -477,6 +448,59 @@ mod tests {
     use crate::args;
     use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
     use std::cell::RefCell;
+
+    /// Card `20261110-b-e592db`: `LiveConfig::resolve` reaches
+    /// `mv_config::load::config_state_dir_from_env` (this file, line ~85)
+    /// whenever no `--lane` is given, with nothing overriding
+    /// `MULTIVERSE_STATE_DIR` — same failure mode `commands::dispatch`'s
+    /// own `StateDirEnvGuard` (`dispatch.rs` line ~4272) and
+    /// `commands::council`'s (`council.rs` line ~1099) exist to close.
+    /// Wraps [`HerdrEnvGuard`] for the one process-wide lock, same shape
+    /// as those guards.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        _dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                _dir: dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
 
     struct Fixed(&'static str);
     impl ReviewPolicySource for Fixed {
@@ -629,6 +653,7 @@ mod tests {
 
     #[test]
     fn a_real_config_file_is_loaded_and_its_defaults_are_shown() {
+        let _state = StateDirEnvGuard::new();
         let file = TempFile::write("defaults", "");
         let m = matches(&["--config", file.0.to_str().unwrap(), "review-policy"]);
         let text = {
@@ -928,14 +953,26 @@ pool = "claude:default"
         let gauges = GaugeMap::new();
 
         assert_eq!(
-            reviewer_seat_display(&config, state_dir.path(), &gauges, "review-seat"),
+            reviewer_seat_display(
+                &config,
+                state_dir.path(),
+                &gauges,
+                "review-seat",
+                &HashSet::new()
+            ),
             "review-seat available"
         );
 
         mv_engine::breaker::manual_trip(state_dir.path(), "claude:default", "claude", None, None)
             .unwrap();
         assert_eq!(
-            reviewer_seat_display(&config, state_dir.path(), &gauges, "review-seat"),
+            reviewer_seat_display(
+                &config,
+                state_dir.path(),
+                &gauges,
+                "review-seat",
+                &HashSet::new()
+            ),
             "review-seat fenced"
         );
     }
@@ -955,7 +992,13 @@ pool = "claude:default"
         mv_engine::seatstate::set_cap(state_dir.path(), "review-seat", Some(2)).unwrap();
 
         assert_eq!(
-            reviewer_seat_display(&config, state_dir.path(), &GaugeMap::new(), "review-seat"),
+            reviewer_seat_display(
+                &config,
+                state_dir.path(),
+                &GaugeMap::new(),
+                "review-seat",
+                &HashSet::new()
+            ),
             "review-seat ?/2"
         );
     }
@@ -984,7 +1027,13 @@ review_min_quota_percent = 20
         );
 
         assert_eq!(
-            reviewer_seat_display(&config, state_dir.path(), &gauges, "review-seat"),
+            reviewer_seat_display(
+                &config,
+                state_dir.path(),
+                &gauges,
+                "review-seat",
+                &HashSet::new()
+            ),
             "review-seat below quota floor (5% left < 20%)"
         );
     }
@@ -1003,32 +1052,109 @@ pool = "claude:default"
         mv_engine::seatstate::set_lend(state_dir.path(), "review-seat", false).unwrap();
 
         assert_eq!(
-            reviewer_seat_display(&config, state_dir.path(), &GaugeMap::new(), "review-seat"),
+            reviewer_seat_display(
+                &config,
+                state_dir.path(),
+                &GaugeMap::new(),
+                "review-seat",
+                &HashSet::new()
+            ),
             "review-seat lent off — not in chains right now (`accounts lend` to change it)"
         );
     }
 
+    fn chmod_script(path: &Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Card `20261115-b-234610`, proof: a seat capped at 2, hosting one
+    /// busy Nexus pane and one busy Critic pane, must read `1/2`, never
+    /// `2/2` — the same role exclusion `commands::dispatch`'s
+    /// `is_nexus_role` already applies to a worker seat's cap.
     #[test]
-    fn reviewer_dispatch_count_skips_a_task_that_failed_to_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = mv_core::time::now_utc();
-        let stamp = |minutes_ago: i64| {
-            mv_core::time::format_seconds_utc(now - time::Duration::minutes(minutes_ago))
-        };
-        std::fs::create_dir_all(dir.path().join(".multiverse")).unwrap();
+    fn reviewer_seat_display_excludes_a_busy_nexus_pane_from_its_cap() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".multiverse")).unwrap();
         std::fs::write(
-            dir.path().join(".multiverse/routing.log"),
-            format!(
-                "{a_dispatch}\tevent=dispatch\ttask=20260101-reviewer-aaaaaa\trole=reviewer\n\
-                 {a_result}\tevent=result\ttask=20260101-reviewer-aaaaaa\tstatus=failed\tstate=failed-to-start\n\
-                 {b_dispatch}\tevent=dispatch\ttask=20260101-reviewer-bbbbbb\trole=reviewer\n",
-                a_dispatch = stamp(10),
-                a_result = stamp(9),
-                b_dispatch = stamp(5),
-            ),
+            project.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\t\
+             role=nexus\tagent=mv-nexus-1-rs\tbranch=main\n",
         )
         .unwrap();
 
-        assert_eq!(recent_reviewer_dispatch_count(dir.path(), now).unwrap(), 1);
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let script = tempfile::Builder::new()
+            .prefix("mv-cli-fake-herdr-")
+            .suffix(".sh")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s' '{{\"result\": {{\"agents\": \
+                 [{{\"pane_id\": \"w1:p1\", \"agent_status\": \"working\", \"name\": \"mv-nexus-1-rs\"}}, \
+                 {{\"pane_id\": \"w1:p2\", \"agent_status\": \"working\", \"name\": \"mv-critic-1-rs\"}}]}}}}'\n",
+                marker.path().display()
+            ),
+        )
+        .unwrap();
+        chmod_script(&script);
+        let _guard = HerdrEnvGuard::set(&script);
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let content = format!(
+            "[accounts.review-seat]\n\
+             kind = \"claude\"\n\
+             config_dir_var = \"CLAUDE_CONFIG_DIR\"\n\
+             config_dir = \"<<PLACEHOLDER: path>>\"\n\
+             pool = \"claude:default\"\n\
+             short = \"rs\"\n\n\
+             [projects.sandbox]\npath = {:?}\n",
+            project.path().to_str().unwrap()
+        );
+        let config = mv_config::load::load_config_str(&content, Path::new("config.toml")).unwrap();
+        mv_engine::seatstate::set_cap(state_dir.path(), "review-seat", Some(2)).unwrap();
+        let nexus_agents = seatstate::nexus_agent_names(&project_roots(&config));
+
+        assert_eq!(
+            reviewer_seat_display(
+                &config,
+                state_dir.path(),
+                &GaugeMap::new(),
+                "review-seat",
+                &nexus_agents
+            ),
+            "review-seat 1/2"
+        );
+    }
+
+    #[test]
+    fn format_report_budget_used_matches_the_engine_24h_count() {
+        let root = tempfile::tempdir().unwrap();
+        let now = mv_core::time::now_utc();
+        let stamp = |ago: time::Duration| mv_core::time::format_seconds_utc(now - ago);
+        std::fs::create_dir_all(root.path().join(".multiverse")).unwrap();
+        std::fs::write(
+            root.path().join(".multiverse/routing.log"),
+            format!(
+                "{a}\tevent=dispatch\ttask=20260101-critic-aaaaaa\trole=critic\n\
+                 {b}\tevent=dispatch\ttask=20260101-critic-bbbbbb\trole=critic\n\
+                 {old}\tevent=dispatch\ttask=20260101-critic-oldold\trole=critic\n",
+                a = stamp(time::Duration::minutes(10)),
+                b = stamp(time::Duration::minutes(5)),
+                old = stamp(time::Duration::hours(25)),
+            ),
+        )
+        .unwrap();
+        let content = format!(
+            "[projects.sandbox]\npath = {:?}\n[review_policy]\nreview_budget_per_window = 7\n",
+            root.path().to_str().unwrap()
+        );
+        let config = mv_config::load::load_config_str(&content, Path::new("config.toml")).unwrap();
+        let report = format_report(&config, root.path(), now).unwrap();
+        assert!(report.contains("sandbox: 2/7 in the last 24h"), "{report}");
     }
 }

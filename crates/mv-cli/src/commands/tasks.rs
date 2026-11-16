@@ -53,10 +53,10 @@ use mv_state::tasks::{
 };
 use time::OffsetDateTime;
 
-use crate::exit::Failure;
+use crate::exit::{Failure, UNKNOWN};
 
 use super::current_project_root;
-use super::doctor::project_path;
+use super::doctor::{project_path, state_dir_from_config};
 
 const DASH: &str = "\u{2014}";
 const ID_WIDTH: usize = 26;
@@ -387,6 +387,27 @@ pub(super) fn python_repr(value: &str) -> String {
     out
 }
 
+/// Mirrors `mv_state::tasks`'s own injection guard at the flag boundary, so
+/// a bad `--supersede`/`--status`/`--state`/`--acknowledge` value is
+/// refused with a usage exit code before `supersede`/`acknowledge` ever
+/// reaches the state layer — never relying on that layer's own refusal
+/// alone to be the only thing standing between a bad flag and a corrupted
+/// routing-log line (card `20261116-b-5f49bd`).
+fn invalid_log_field(flag: &str, value: &str) -> Option<String> {
+    if value.contains(['\t', '\r', '\n', '=']) {
+        return Some(format!(
+            "{flag}: must not contain a tab, carriage return, line feed, or '=' — any of those \
+             could smuggle an extra field into the tab-separated routing-log line (got {value:?})"
+        ));
+    }
+    if value.starts_with(' ') || value.ends_with(' ') {
+        return Some(format!(
+            "{flag}: must not have a leading or trailing space (got {value:?})"
+        ));
+    }
+    None
+}
+
 fn read_only_mode(args: &ArgMatches) -> bool {
     args.get_flag("read-only") || std::env::var("MULTIVERSE_READ_ONLY").as_deref() == Ok("1")
 }
@@ -416,6 +437,17 @@ fn supersede(args: &ArgMatches) -> Result<(), Failure> {
         .unwrap_or_default();
     let revisions = *args.get_one::<i64>("revisions").unwrap_or(&0);
     let yes = args.get_flag("yes");
+
+    for (flag, value) in [
+        ("--supersede", task.as_str()),
+        ("--status", status.as_str()),
+        ("--state", state.as_str()),
+    ] {
+        if let Some(message) = invalid_log_field(flag, value) {
+            eprintln!("tasks: {message}");
+            return Err(Failure::Reported(UNKNOWN));
+        }
+    }
 
     if reason.is_empty() {
         return Err(Failure::Operation(format!(
@@ -511,6 +543,11 @@ fn acknowledge(args: &ArgMatches) -> Result<(), Failure> {
     };
     let yes = args.get_flag("yes");
 
+    if let Some(message) = invalid_log_field("--acknowledge", &task) {
+        eprintln!("tasks: {message}");
+        return Err(Failure::Reported(UNKNOWN));
+    }
+
     let root = resolve_single_project(args, "--acknowledge", "marks one record in")?;
     let targets = mv_state::tasks::outcome_targets(&root, &task);
     let acknowledges_ord = u64::try_from(acknowledges)
@@ -550,6 +587,9 @@ fn acknowledge(args: &ArgMatches) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The command's public entry point: delegates to [`run_with`], the real
+/// body, wired to the real [`HerdrAgents`] pane source. See `run_with`'s
+/// own doc comment for why the split exists.
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     run_with(args, &mut HerdrAgents)
 }
@@ -935,6 +975,18 @@ impl<A: AgentPanes> AgentPanes for ObservedAgents<'_, A> {
     fn read_visible(&mut self, pane: &str) -> Option<String> {
         self.agents.read_visible(pane)
     }
+
+    fn confirm_live(
+        &mut self,
+        pane_id: &str,
+        name: &str,
+    ) -> Option<mv_state::tasks::LiveConfirmation> {
+        self.agents.confirm_live(pane_id, name)
+    }
+
+    fn pane_label(&mut self, pane_id: &str) -> Option<String> {
+        self.agents.pane_label(pane_id)
+    }
 }
 
 fn list(
@@ -1031,10 +1083,16 @@ fn list(
 
 /// `--close-stranded`'s own write leg, run after the listing above —
 /// mirrors `cmd_tasks`'s own order: a task with a live agent is named as
-/// refused before anything closes (it is `RUNNING`, not stranded — a task
-/// with a recoverable status file is `unrecorded`, `--reconcile`'s own,
-/// untouched here), then every determination [`mv_state::tasks::close_stranded`]
-/// computed is printed with its evidence, dry-run or not.
+/// refused before anything closes (it is `RUNNING` or `STALLED`, not
+/// stranded — a task with a recoverable status file is `unrecorded`,
+/// `--reconcile`'s own, untouched here), then every determination
+/// [`mv_state::tasks::close_stranded`] computed is printed with its
+/// evidence, dry-run or not.
+///
+/// `STALLED` is refused alongside `RUNNING` (card `20261106-b-2c3d2f`
+/// Decision 1): the listing just called this row's pane live but not
+/// `Working`, and closing it in the same invocation would record an
+/// outcome for an agent the listing itself still shows live.
 fn close_stranded_and_report(
     root: &Path,
     rows: &[Row],
@@ -1045,16 +1103,16 @@ fn close_stranded_and_report(
     if live.is_none() {
         return;
     }
-    let running: Vec<&str> = rows
+    let live_agent_rows: Vec<&str> = rows
         .iter()
-        .filter(|row| row.state == "running")
+        .filter(|row| matches!(row.state, "running" | "stalled"))
         .map(|row| row.task_id.as_str())
         .collect();
-    if !running.is_empty() {
+    if !live_agent_rows.is_empty() {
         println!(
             "  refusing to close {} task(s) with a live agent — not stranded: {}",
-            running.len(),
-            running.join(", ")
+            live_agent_rows.len(),
+            live_agent_rows.join(", ")
         );
     }
 
@@ -1083,6 +1141,14 @@ fn close_stranded_and_report(
 /// `cmd_tasks`'s own order. `--yes` re-lists and only closes a pane that
 /// is still idle/done under the same agent; WORKING/BLOCKED/unknown fail
 /// closed (`cli.py:7583-7616` / `_reclaim_pane_confirmation`).
+///
+/// Card `20261115-b-9815fe`: `--reap` is checked only after a candidate's
+/// own pane is actually confirmed `"closed"` this pass — never for `"NOT
+/// closed"`, where the pane safety check itself refused, and the process
+/// this lane still shows may belong to an occupant this run never
+/// confirmed gone. Without `--yes` nothing closes, so every candidate's
+/// own lingering process is previewed as "would reap" there, the same
+/// shape `--prune --reap --dry-run` already uses.
 fn reclaimable_and_report(
     root: &Path,
     args: &ArgMatches,
@@ -1093,6 +1159,7 @@ fn reclaimable_and_report(
         return;
     }
     let apply = args.get_flag("yes");
+    let reap = args.get_flag("reap");
     let mut observed = ObservedAgents::new(agents, live);
     let (candidates, stale) = mv_state::tasks::reclaimable_panes(root, &mut observed);
 
@@ -1100,6 +1167,16 @@ fn reclaimable_and_report(
         agents.list_checked()
     } else {
         None
+    };
+    let lane_tasks = if reap {
+        mv_state::tasks::sweep_tasks(root)
+    } else {
+        Vec::new()
+    };
+    let ancestors = if reap {
+        mv_engine::dockerreport::own_ancestor_pids()
+    } else {
+        Vec::new()
     };
     for candidate in &candidates {
         let verb = if !apply {
@@ -1128,6 +1205,11 @@ fn reclaimable_and_report(
                  even with --yes"
             );
         }
+        if reap && (verb == "closed" || !apply) {
+            for note in reap_lane_notes(root, &lane_tasks, &candidate.task_id, apply, &ancestors) {
+                println!("{note}");
+            }
+        }
     }
     if !candidates.is_empty() && !apply {
         println!("  dry run: nothing was closed. Add --yes to close these panes.");
@@ -1152,6 +1234,46 @@ fn reclaimable_and_report(
             }
         }
     }
+}
+
+/// `candidate`'s own lane's lingering host processes, under `--reap`: the
+/// `20261115-b-9815fe` reaper's one call site in this file. `tasks` is a
+/// snapshot already read once by the caller — `sweep_tasks` reads the
+/// whole routing log, so this stays one read per `--reclaimable --reap`
+/// pass, not one per candidate. `apply` gates signaling exactly the way
+/// `verb == "closed"`/`!apply` already gate calling this at all: `true`
+/// reaps for real, `false` only previews "would reap".
+fn reap_lane_notes(
+    root: &Path,
+    tasks: &[mv_state::tasks::SweepTask],
+    task_id: &str,
+    apply: bool,
+    ancestors: &[u32],
+) -> Vec<String> {
+    let Some(task) = tasks.iter().find(|task| task.task_id == task_id) else {
+        return Vec::new();
+    };
+    let lane_path = root
+        .join(".multiverse/worktrees")
+        .join(mv_state::tasks::lane_task_id(task));
+    let Some(snapshot) = mv_engine::dockerreport::process_cwds() else {
+        return vec!["      warning: process-cwd probe unknown".to_string()];
+    };
+    let mut notes = Vec::new();
+    for process in mv_engine::dockerreport::processes_under(&lane_path, &snapshot) {
+        let label = mv_engine::dockerreport::process_label(&process);
+        if mv_engine::dockerreport::protected(&process, ancestors) {
+            notes.push(format!(
+                "      lane process {label} (protected, never reaped)"
+            ));
+        } else if apply {
+            notes.push(format!("      reaping {label}"));
+            mv_engine::dockerreport::reap(&process, mv_engine::dockerreport::DEFAULT_REAP_GRACE);
+        } else {
+            notes.push(format!("      would reap {label}"));
+        }
+    }
+    notes
 }
 
 /// `--reconcile`'s own write leg, run after the listing above has already
@@ -1352,7 +1474,7 @@ fn probe_blocking_prompt(
     if read_only_mode(args) {
         return;
     }
-    let state_dir = mv_config::load::config_state_dir_from_env(&config.source_path);
+    let state_dir = state_dir_from_config(&config.source_path);
     let _ = breaker::trip(
         &state_dir,
         &account.pool,
@@ -1430,7 +1552,7 @@ fn sync_seat_outages(config: &mv_config::load::Config, hub_root: &Path) -> Resul
     let state_dir = hub_root.join(".multiverse");
     let page =
         activity::read_inbox(&state_dir, &log, usize::MAX, false).map_err(|e| e.to_string())?;
-    let breaker_dir = mv_config::load::config_state_dir_from_env(&config.source_path);
+    let breaker_dir = state_dir_from_config(&config.source_path);
     let now = mv_core::time::now_utc();
     let mut tripped: Vec<(String, String, String)> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
@@ -1505,6 +1627,7 @@ fn sync_seat_outages(config: &mv_config::load::Config, hub_root: &Path) -> Resul
         let _ = activity::broadcast(
             mv_state::activity::HUB_PROJECT_NAME,
             &body,
+            false,
             &recipients,
             &msg_id,
             &mv_core::redact::redact,
@@ -1553,7 +1676,62 @@ fn recheck_fenced_seats(config: &mv_config::load::Config, breaker_dir: &Path) {
 mod tests {
     use super::*;
     use crate::args::command;
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
     use mv_state::tasks::LiveAgent;
+
+    /// Card `20261114-b-74029b`: `probe_blocking_prompt` (this file's own
+    /// `breaker::trip` call, line ~1355) reaches
+    /// `mv_config::load::config_state_dir_from_env`, the same failure
+    /// mode `commands::sweep`/`commands::dispatch`/`commands::council`/
+    /// `commands::review_policy`/`commands::seat` each close with a
+    /// guard of this same name — this module had none, so the one test
+    /// that reaches that call (`blocking_prompt_trips_the_pool_and_
+    /// records_event_limit`) relied on whatever `$MULTIVERSE_STATE_DIR`
+    /// happened to already be set to in this process.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        _dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                _dir: dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
 
     #[test]
     fn card68e9f5_unknown_live_pane_remains_running() {
@@ -1628,6 +1806,14 @@ mod tests {
         fail_next_probes: usize,
         visible: HashMap<String, String>,
         probes: usize,
+        /// `pane get`'s own `label`, by pane id — card `20261106-b-
+        /// 9d70c7`'s occupancy gate. A pane with no entry here models a
+        /// fake that was never told to answer this probe, same posture
+        /// as the trait default: `pane_label` returns `None`.
+        labels: HashMap<String, String>,
+        /// `agent get`'s own `cwd`, by pane id — the gate's second
+        /// witness, read through `confirm_live`.
+        cwds: HashMap<String, std::path::PathBuf>,
     }
 
     impl FakeAgents {
@@ -1644,6 +1830,8 @@ mod tests {
                 fail_next_probes: 0,
                 visible: HashMap::new(),
                 probes: 0,
+                labels: HashMap::new(),
+                cwds: HashMap::new(),
             }
         }
 
@@ -1667,6 +1855,16 @@ mod tests {
 
         fn with_visible(mut self, pane_id: &str, text: &str) -> Self {
             self.visible.insert(pane_id.to_string(), text.to_string());
+            self
+        }
+
+        fn with_label(mut self, pane_id: &str, label: &str) -> Self {
+            self.labels.insert(pane_id.to_string(), label.to_string());
+            self
+        }
+
+        fn with_cwd(mut self, pane_id: &str, cwd: impl Into<std::path::PathBuf>) -> Self {
+            self.cwds.insert(pane_id.to_string(), cwd.into());
             self
         }
     }
@@ -1696,6 +1894,25 @@ mod tests {
         fn read_visible(&mut self, pane_id: &str) -> Option<String> {
             self.visible.get(pane_id).cloned()
         }
+        fn pane_label(&mut self, pane_id: &str) -> Option<String> {
+            self.labels.get(pane_id).cloned()
+        }
+        fn confirm_live(
+            &mut self,
+            pane_id: &str,
+            name: &str,
+        ) -> Option<mv_state::tasks::LiveConfirmation> {
+            let agent = self
+                .panes
+                .iter()
+                .find(|a| a.pane_id == pane_id && a.name.as_deref().unwrap_or("") == name)?;
+            Some(mv_state::tasks::LiveConfirmation {
+                ready: agent.status.is_some_and(AgentState::is_ready_for_input),
+                state_change_seq: None,
+                cwd: self.cwds.get(pane_id).cloned(),
+                terminal_id: None,
+            })
+        }
     }
 
     fn live_ids(ids: &[&str]) -> Vec<LiveAgentStatus> {
@@ -1708,7 +1925,48 @@ mod tests {
             .collect()
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
+    /// A lane directory `reclaim_lane_checks`'s own clean-lane gate will
+    /// actually treat as clean: `lane_porcelain` runs `git status
+    /// --porcelain` in it and fail-closes (excludes the candidate from
+    /// `reclaimable_panes` entirely) on anything but a real, clean git
+    /// checkout — a plain directory with no `.git` makes that query fail
+    /// and the candidate silently vanish, which cost this file one
+    /// confusing failure before landing on this helper.
+    fn init_clean_lane(lane: &Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(lane).unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(lane)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        lane.to_path_buf()
+    }
+
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&dir`/`dir.join(...)` unchanged.
+    struct TempDir(std::path::PathBuf);
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "mv-cli-tasks-test-{tag}-{}-{}",
             std::process::id(),
@@ -1716,7 +1974,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     /// A `--config` file registering one project named `name` at
@@ -1855,8 +2113,6 @@ mod tests {
             "a sandboxed lane nested inside a real project must never auto-reconcile \
              (write to) that real project"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // `--close-stranded`/`--reclaimable` are ported (card 20261102-b-fde23e)
@@ -2008,8 +2264,6 @@ mod tests {
             after,
             "the same correction twice appends once"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2041,7 +2295,6 @@ mod tests {
         let err = run(&args).unwrap_err();
         assert_eq!(err.code(), 1);
         assert!(err.to_string().contains("has no outcome record at line 99"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2106,7 +2359,74 @@ mod tests {
             after,
             "acknowledging twice appends once"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supersede_rejects_a_tab_in_state_before_writing_anything() {
+        let dir = temp_dir("supersede-field-injection");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        write_result(&project, "20261101-fixer-dddddd");
+        let config = write_config(&dir, &project, "sandbox");
+        let log_path = project.join(".multiverse/routing.log");
+        let before = std::fs::read_to_string(&log_path).unwrap();
+
+        let args = matches_cfg(
+            &[
+                "tasks",
+                "sandbox",
+                "--supersede",
+                "20261101-fixer-dddddd",
+                "--supersedes",
+                "1",
+                "--status",
+                "blocked",
+                "--state",
+                "a\tstatus=X",
+                "--reason",
+                "r",
+                "--yes",
+            ],
+            &config,
+        );
+        let err = run(&args).unwrap_err();
+        assert_eq!(err.code(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            before,
+            "a --state value that could smuggle a field must write nothing"
+        );
+    }
+
+    #[test]
+    fn acknowledge_rejects_a_tab_in_task_before_writing_anything() {
+        let dir = temp_dir("acknowledge-field-injection");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        write_result(&project, "20261101-fixer-eeeeee");
+        let config = write_config(&dir, &project, "sandbox");
+        let log_path = project.join(".multiverse/routing.log");
+        let before = std::fs::read_to_string(&log_path).unwrap();
+
+        let args = matches_cfg(
+            &[
+                "tasks",
+                "sandbox",
+                "--acknowledge",
+                "20261101-fixer-eeeeee\tstatus=X",
+                "--acknowledges",
+                "1",
+                "--yes",
+            ],
+            &config,
+        );
+        let err = run(&args).unwrap_err();
+        assert_eq!(err.code(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            before,
+            "a --acknowledge value that could smuggle a field must write nothing"
+        );
     }
 
     #[test]
@@ -2145,8 +2465,6 @@ mod tests {
 
         let args = matches(&["tasks", "--task", "20261101-fixer-abcdef"]);
         assert!(list(&root, None, &args, &mut FakeAgents::new(&[]), None).is_ok());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2191,8 +2509,6 @@ mod tests {
             "only the logged task may ever become a row"
         );
         assert_eq!(needs_look, 1, "the one real task is still awaiting/flagged");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2200,7 +2516,6 @@ mod tests {
         let root = temp_dir("missing");
         let args = matches(&["tasks"]);
         assert!(list(&root, None, &args, &mut FakeAgents::new(&[]), None).is_ok());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2228,7 +2543,6 @@ mod tests {
         let args = matches(&["tasks"]);
         let (rows, _) = build_rows(&root, &args, Some(&[]), None);
         assert!(rows.is_empty(), "backlog cards are not dispatched tasks");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2278,7 +2592,6 @@ mod tests {
             items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
             vec!["first created", "second created"],
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2361,8 +2674,6 @@ mod tests {
             ),
             "the settled task's outcome must actually be recorded: {log:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2382,8 +2693,6 @@ mod tests {
 
         let after = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert_eq!(before, after, "--read-only must never record an outcome");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2397,8 +2706,6 @@ mod tests {
         // assertion is that this does not panic and records nothing.
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert!(!log.contains("state=reconciled"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2426,8 +2733,6 @@ mod tests {
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert!(log.contains("task=20261101-explorer-dddddd\tstatus=done\tstate=reconciled"));
         assert!(!log.contains("task=20261101-explorer-eeeeee\tstatus=done\tstate=reconciled"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2459,8 +2764,6 @@ mod tests {
             !log.contains("task=20261101-fixer-bbbbbb\tstatus="),
             "a task with a live agent is RUNNING, not stranded, and must never be closed"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2474,8 +2777,6 @@ mod tests {
 
         let after = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert_eq!(before, after, "a dry run must never write");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2489,8 +2790,6 @@ mod tests {
 
         let after = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert_eq!(before, after, "--read-only must never record an outcome");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2510,14 +2809,14 @@ mod tests {
             .unwrap();
 
         let args = matches(&["tasks", "--reclaimable", "--yes"]);
-        let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Idle);
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_status("w1:p1", AgentState::Idle)
+            .with_label("w1:p1", "fixer · 20261101-fixer-dddddd");
         assert!(list(&root, None, &args, &mut agents, None).is_ok());
         assert!(
             agents.list().is_empty(),
             "a live, recorded, clean-lane pane must be closed"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2546,8 +2845,105 @@ mod tests {
             }],
             "a dry run must never close a pane"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    /// Card `20261115-b-9815fe`: `--reclaimable --reap` without `--yes` is
+    /// "would-reap" only — the pane preview is "would close" (unchanged),
+    /// and the same candidate's lane process is only ever previewed, never
+    /// signaled.
+    #[test]
+    fn reclaimable_reap_without_yes_previews_and_signals_nothing() {
+        let root = temp_dir("reclaimable-reap-dry");
+        let task_id = "20261101-fixer-ffffff";
+        mv_state::log::ProjectLog::new(&root)
+            .append(&format!(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={task_id}\t\
+                 branch=multiverse/{task_id}\trole=fixer"
+            ))
+            .unwrap();
+        mv_state::log::ProjectLog::new(&root)
+            .append(&format!(
+                "2026-11-01T00:01:00+00:00\tevent=result\ttask={task_id}\tstatus=done\t\
+                 state=done\trevisions=0\tpane=w1:p1"
+            ))
+            .unwrap();
+        // `reclaim_lane_checks`'s own clean-lane gate treats a still-live
+        // pane with no terminal status file as a live occupant it must
+        // protect (`lane_clean_for_reclaim`) — a real dispatched task
+        // always has this file too, so write it here for the same reason
+        // `init_clean_lane` exists: without it the candidate silently
+        // never reaches `reclaimable_panes` at all.
+        write(
+            &root.join(".multiverse/tasks").join(task_id).join("status"),
+            "done\n",
+        );
+        let lane = init_clean_lane(&root.join(".multiverse/worktrees").join(task_id));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&lane)
+            .spawn()
+            .unwrap();
+
+        let args = matches(&["tasks", "--reclaimable", "--reap"]);
+        let mut agents = FakeAgents::new(&["w1:p1"]);
+        assert!(list(&root, None, &args, &mut agents, None).is_ok());
+        assert_eq!(
+            agents.list(),
+            vec![mv_state::tasks::LiveAgent {
+                pane_id: "w1:p1".to_string()
+            }],
+            "--reap without --yes must never close the pane"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "--reap without --yes must never signal the lane process"
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Proof item: after a successful close, `--reap` ends that lane's own
+    /// lingering process (SIGTERM, re-checked identity, SIGKILL).
+    #[test]
+    fn reclaimable_reap_with_yes_ends_the_lane_process_once_the_pane_closes() {
+        let root = temp_dir("reclaimable-reap-yes");
+        let task_id = "20261101-fixer-gggggg";
+        mv_state::log::ProjectLog::new(&root)
+            .append(&format!(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={task_id}\t\
+                 branch=multiverse/{task_id}\trole=fixer"
+            ))
+            .unwrap();
+        mv_state::log::ProjectLog::new(&root)
+            .append(&format!(
+                "2026-11-01T00:01:00+00:00\tevent=result\ttask={task_id}\tstatus=done\t\
+                 state=done\trevisions=0\tpane=w1:p1"
+            ))
+            .unwrap();
+        write(
+            &root.join(".multiverse/tasks").join(task_id).join("status"),
+            "done\n",
+        );
+        let lane = init_clean_lane(&root.join(".multiverse/worktrees").join(task_id));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&lane)
+            .spawn()
+            .unwrap();
+
+        let args = matches(&["tasks", "--reclaimable", "--yes", "--reap"]);
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_status("w1:p1", AgentState::Idle)
+            .with_label("w1:p1", &format!("fixer · {task_id}"))
+            .with_cwd("w1:p1", lane.clone());
+        assert!(list(&root, None, &args, &mut agents, None).is_ok());
+        assert!(
+            agents.list().is_empty(),
+            "a live, recorded, clean-lane pane must still be closed"
+        );
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "{status:?}");
     }
 
     fn write(path: &Path, text: &str) {
@@ -2609,8 +3005,6 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, vec!["zeta", "alpha"]);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The fallback `run` takes when cwd resolves to no project at all —
@@ -2650,8 +3044,6 @@ mod tests {
 
         let args = matches(&["tasks", "--config", config_path.to_str().unwrap()]);
         assert!(list_fleet(&args, &mut FakeAgents::new(&[])).is_ok());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Card 20261102-b-f507d9: `run` had no hub-widens-to-fleet rule, so a
@@ -2692,8 +3084,6 @@ mod tests {
 
         let args = matches(&["tasks", "--config", config_path.to_str().unwrap()]);
         assert!(list_hub_widened(&args, &mut FakeAgents::new(&[])).is_ok());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2710,8 +3100,6 @@ mod tests {
 
         let args = matches(&["tasks", "--config", config_path.to_str().unwrap()]);
         assert!(list_fleet(&args, &mut FakeAgents::new(&[])).is_ok());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2723,8 +3111,6 @@ mod tests {
         let args = matches(&["tasks", "--config", config_path.to_str().unwrap()]);
         let err = list_fleet(&args, &mut FakeAgents::new(&[])).unwrap_err();
         assert!(err.to_string().contains("no projects configured"));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2750,7 +3136,6 @@ mod tests {
         assert_eq!(suffix, "done #3");
         assert!(!flagged);
         assert!(note.is_none());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2777,7 +3162,6 @@ mod tests {
         assert_eq!(suffix, "done #4");
         assert!(!flagged);
         assert!(note.is_none());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2804,8 +3188,6 @@ mod tests {
             entry.result_status.is_none(),
             "the new round has no result of its own yet, and must not keep the old round's"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2822,7 +3204,6 @@ mod tests {
         assert_eq!(count, 1);
         assert!(rows[0].flagged);
         assert_eq!(rows[0].note.as_deref(), Some("dispatched 2 min ago, still running as '' — and still spending. Nothing here will stop it."));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2870,7 +3251,6 @@ mod tests {
             ["done", "blocked", "unfinished"]
         );
         assert_eq!(needs_look, 2);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2893,7 +3273,6 @@ mod tests {
         assert_eq!(build_rows(&root, &args, Some(&[]), None).1, 0);
         write(&log, &format!("{history}2020-01-01T00:00:00Z\tevent=supersede\ttask=task\tstatus=failed\tsupersedes=2\treason=reviewed\n"));
         assert_eq!(build_rows(&root, &args, Some(&[]), None).1, 0);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2911,8 +3290,6 @@ mod tests {
         let (rows, _needs_look) = build_rows(&root, &args, Some(&[]), None);
         let ids: Vec<&str> = rows.iter().map(|row| row.task_id.as_str()).collect();
         assert_eq!(ids, vec!["20260101-fixer-zzzzzz", "20260101-fixer-aaaaaa"]);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3055,7 +3432,6 @@ mod tests {
         assert!(list(&root, None, &args, &mut agents, None).is_ok());
         let (rows, _) = build_rows(&root, &args, None, None);
         assert_eq!(rows[0].state, "running");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3082,7 +3458,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, "unrecorded");
         assert_eq!(rows[0].suffix, "done");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3098,7 +3473,6 @@ mod tests {
         assert!(message.contains("no such project: nope"));
         assert!(message.contains("configured: sandbox"));
         assert!(message.contains("see `multiverse projects`"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3126,7 +3500,6 @@ mod tests {
         let beta_log = std::fs::read_to_string(beta.join(".multiverse/routing.log")).unwrap();
         assert!(alpha_log.contains("state=reconciled"));
         assert!(!beta_log.contains("state=reconciled"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3142,7 +3515,6 @@ mod tests {
             ),
             "plain tasks must auto-reconcile: {log:?}"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3177,7 +3549,6 @@ mod tests {
             list(&root, None, &args, &mut agents, None).unwrap();
             assert_eq!(std::fs::read(&log).unwrap(), before);
             assert_eq!(agents.probes, 1);
-            let _ = std::fs::remove_dir_all(root);
         }
     }
 
@@ -3189,7 +3560,6 @@ mod tests {
         let mut agents = FakeAgents::new(&[]);
         list(&root, None, &args, &mut agents, None).unwrap();
         assert_eq!(agents.probes, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3224,7 +3594,6 @@ mod tests {
             agents.panes.is_empty(),
             "the settled pane must actually close"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3247,7 +3616,6 @@ mod tests {
         // confirmation re-probe to skip a close with — just the one
         // top-level listing.
         assert_eq!(agents.probes, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3280,7 +3648,6 @@ mod tests {
             1,
             "a pane id reused by a different live agent must never be closed"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3298,7 +3665,9 @@ mod tests {
                  state=done\trevisions=0\tpane=w1:p1",
             )
             .unwrap();
-        let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Idle);
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_status("w1:p1", AgentState::Idle)
+            .with_label("w1:p1", "fixer · 20261108-fixer-222222");
         agents.panes[0].name = Some("x-fix-cl".into());
         let args = matches(&["tasks", "--reclaimable", "--yes"]);
         list(&root, None, &args, &mut agents, None).unwrap();
@@ -3306,7 +3675,6 @@ mod tests {
             agents.panes.is_empty(),
             "a pane still hosting the task's own dispatched agent must still be closed"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3317,7 +3685,6 @@ mod tests {
         assert!(list(&root, None, &args, &mut FakeAgents::new(&[]), None).is_ok());
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert!(!log.contains("state=reconciled"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3329,7 +3696,6 @@ mod tests {
         assert!(list(&root, None, &args, &mut agents, None).is_ok());
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert!(!log.contains("state=reconciled"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3356,11 +3722,11 @@ mod tests {
                 pane_id: "w1:p1".to_string()
             }],
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn blocking_prompt_trips_the_pool_and_records_event_limit() {
+        let _state = StateDirEnvGuard::new();
         let dir = temp_dir("blocking-prompt");
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -3395,7 +3761,6 @@ mod tests {
             log.contains("event=limit\ttask=20261101-fixer-llllll\trule="),
             "expected event=limit: {log:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -3480,7 +3845,6 @@ mod tests {
         let items = mv_state::backlog::read_items(&root, false);
         let reread = items.iter().find(|i| i.item == item.item).unwrap();
         assert_eq!(reread.state, "done");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

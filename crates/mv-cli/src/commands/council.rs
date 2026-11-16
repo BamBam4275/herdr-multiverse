@@ -57,9 +57,9 @@ use mv_engine::runner;
 use mv_engine::selector;
 use mv_engine::selector::LocalLivenessProbe as _;
 
-use crate::exit::Failure;
-
 use super::dispatch::RealDispatchStore;
+use super::doctor::state_dir_from_config;
+use crate::exit::Failure;
 
 /// Everything this command needs from Council's seat/convene logic.
 pub trait Engine {
@@ -67,12 +67,18 @@ pub trait Engine {
     fn convene(&self, request: &Request, roster: Roster) -> Result<Convened, EngineError>;
 }
 
+/// Everything one `council` invocation needs to run, parsed from argv.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub project_path: String,
     pub question: String,
     pub dry_run: bool,
     pub timeout_seconds: f64,
+    /// The global `--config PATH` override, threaded through so
+    /// [`load_config`] resolves the same path every other subcommand does
+    /// (`commands::mod::config_override`) instead of only ever honoring
+    /// `$MULTIVERSE_CONFIG`/the default (card `20261110-b-d73da7`).
+    pub config_override: Option<String>,
 }
 
 /// One seated vendor, before it has run — scout2-gaps.md #50
@@ -104,6 +110,7 @@ pub enum SeatOutcome {
     Failed(String),
 }
 
+/// One seat's outcome, paired with which account held it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatReport {
     pub account: String,
@@ -128,6 +135,8 @@ impl Convened {
     }
 }
 
+/// Every way seating or convening a council can fail, mapped to a process
+/// exit code by [`to_failure`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
@@ -170,6 +179,7 @@ fn request_from(args: &ArgMatches) -> Request {
             .get_one::<String>("timeout")
             .and_then(|raw| raw.parse::<f64>().ok())
             .unwrap_or(DEFAULT_TIMEOUT_SECONDS),
+        config_override: args.get_one::<String>("config").cloned(),
     }
 }
 
@@ -372,14 +382,17 @@ fn no_project_message(target: &Path, config: &Config) -> String {
     )
 }
 
-/// Read `config.toml` at the path `$MULTIVERSE_CONFIG`/`--config`/the
-/// default would resolve to, tolerating retired `[roles.<old>]` chain
-/// keys the same way `commands::dispatch`'s own `load_config` does
-/// (migrated in memory only, never written back) — `council`'s own role
-/// key was never renamed, but a config.toml using retired names for
-/// *other* roles must still load.
-fn load_config() -> Result<Config, EngineError> {
-    let path = load::resolve_config_path_from_env(None).map_err(|e| {
+/// Read `config.toml` at the path `cli_override`/`$MULTIVERSE_CONFIG`/the
+/// default would resolve to — the same precedence `commands::mod::
+/// load_config` gives every other subcommand's `--config` flag (card
+/// `20261110-b-d73da7`: this function used to hardcode `None` here, so
+/// `council --config PATH` silently fell back to the environment/default
+/// instead) — tolerating retired `[roles.<old>]` chain keys the same way
+/// `commands::dispatch`'s own `load_config` does (migrated in memory only,
+/// never written back) — `council`'s own role key was never renamed, but a
+/// config.toml using retired names for *other* roles must still load.
+fn load_config(cli_override: Option<&str>) -> Result<Config, EngineError> {
+    let path = load::resolve_config_path_from_env(cli_override.map(Path::new)).map_err(|e| {
         EngineError::ProjectResolution(format!("could not resolve config path: {e}"))
     })?;
     let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -467,6 +480,9 @@ fn latest_tasks_by_agent(config: &Config) -> HashMap<String, mv_state::tasks::Sw
 /// [`super::dispatch::resolve_task_account`] — Python's
 /// `account_by_short` (`accounts.py:784-804`). No post-start
 /// grace-window credit (see this file's module doc).
+/// Card `20261115-b-65fe80`: a busy Nexus pane never holds a seat's
+/// open-agent cap hostage here either — see `commands::dispatch`'s own
+/// `live_seat_counts` for the full rationale this mirrors.
 fn live_seat_counts(
     statuses: &HashMap<String, String>,
     latest: &HashMap<String, mv_state::tasks::SweepTask>,
@@ -480,6 +496,9 @@ fn live_seat_counts(
         let Some(task) = latest.get(name) else {
             continue;
         };
+        if super::dispatch::is_nexus_role(&task.role) {
+            continue;
+        }
         let Some(account) = super::dispatch::resolve_task_account(task, config) else {
             continue;
         };
@@ -726,8 +745,8 @@ impl RealEngine {
         let target =
             resolve_user_path(&request.project_path, &cwd).map_err(EngineError::Refused)?;
 
-        let config = load_config()?;
-        let config_dir = load::config_state_dir_from_env(&config.source_path);
+        let config = load_config(request.config_override.as_deref())?;
+        let config_dir = state_dir_from_config(&config.source_path);
 
         let Some((project_name, project_root)) = resolve_project(&config, &target) else {
             return Err(EngineError::NeedsConfig(no_project_message(
@@ -862,17 +881,11 @@ impl RealEngine {
     }
 }
 
-/// `project_slots_grace_counts`'s open-task reading, the same narrowed,
-/// local-only scope `commands::dispatch`'s own `open_task_count` uses.
-fn open_task_count(project_root: &Path) -> u32 {
-    mv_state::tasks::sweep_tasks(project_root)
-        .iter()
-        .filter(|task| !task.recorded)
-        .count() as u32
-}
-
-/// Fleet-wide open count plus each *other* project's own floor gap, the
-/// same shape `commands::dispatch`'s own `fleet_open_counts` builds.
+/// Fleet-wide open count of **worker** panes only, plus each *other*
+/// project's own floor gap, the same shape `commands::dispatch`'s own
+/// `fleet_open_counts` builds — card `20261115-b-65fe80`: the fleet-wide
+/// `max_concurrent` check excludes Nexus panes here too, so a Council
+/// convene sees the same fleet capacity a worker dispatch would.
 fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(String, u32)>) {
     let mut fleet_open = 0u32;
     let mut other_floor_gaps = Vec::new();
@@ -883,8 +896,15 @@ fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(Strin
         let Ok(root) = std::fs::canonicalize(raw) else {
             continue;
         };
-        let open = open_task_count(&root);
-        fleet_open += open;
+        let tasks = mv_state::tasks::sweep_tasks(&root);
+        let open_tasks = tasks
+            .iter()
+            .filter(|task| !task.recorded && task.file_status.is_none());
+        let open = open_tasks.clone().count() as u32;
+        let worker_open = open_tasks
+            .filter(|task| !super::dispatch::is_nexus_role(&task.role))
+            .count() as u32;
+        fleet_open += worker_open;
         if name != current_project {
             let gap = project.min_slots.saturating_sub(open);
             if gap > 0 {
@@ -994,7 +1014,7 @@ impl Engine for RealEngine {
                 let capacity = engine_dispatch::FleetCapacityInputs {
                     max_concurrent: config.max_concurrent,
                     fleet_open,
-                    project_open: open_task_count(project_root),
+                    project_open: super::dispatch::open_task_count(project_root),
                     project_min_slots: project.min_slots,
                     project_max_slots: project.max_slots,
                     other_floor_gaps,
@@ -1062,6 +1082,8 @@ impl Engine for RealEngine {
     }
 }
 
+/// `commands::run`'s `council` match arm: binds the real [`RealEngine`]
+/// and writes to stdout.
 pub fn run_default(args: &ArgMatches) -> Result<(), Failure> {
     run(args, &RealEngine, &mut std::io::stdout())
 }
@@ -1069,6 +1091,224 @@ pub fn run_default(args: &ArgMatches) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+
+    /// Backlog `20261108-b-49556b`: `RealEngine::resolve` (`council.rs`
+    /// line ~730) reads `mv_config::load::config_state_dir_from_env`
+    /// exactly like `commands::dispatch`'s own `RealEngine::resolve`
+    /// (`dispatch.rs` line ~2075, isolated by that file's own
+    /// `StateDirEnvGuard` since card `20261108-b-bdd00b`) — but this test
+    /// module had no isolation of its own. Confirmed by running
+    /// `real_engine_resolve_is_isolated_from_the_ambient_state_dir` below
+    /// with this struct's body replaced by a bare `HerdrEnvGuard::
+    /// unreachable()` and `$MULTIVERSE_STATE_DIR` pre-set, outside the
+    /// test, to a second tempdir standing in for "the live fleet dir":
+    /// `resolved.config_dir` came back equal to that stand-in rather than
+    /// anything scoped to the test, proving the ambient value wins
+    /// outright with no isolation in the way — on a dispatched lane,
+    /// `AGENTS.md`'s own env sets that var to the real fleet's state dir,
+    /// so a council test built this way would read and could write the
+    /// live `breaker-state.json`/`seat-state.json`.
+    ///
+    /// No *existing* test in this module reaches `resolve()`: every other
+    /// `RealEngine.seat(&resolved, ..)` call here builds its own `Resolved`
+    /// by hand with a `config_dir` it already owns, bypassing `resolve`
+    /// entirely, so only a test that goes through `resolve`/`plan`/
+    /// `convene` can hit this path at all.
+    ///
+    /// `RealEngine::resolve` honors `--config` through
+    /// [`Request::config_override`] (card `20261110-b-d73da7`), same as
+    /// `commands::dispatch`. Tests that still want the `$MULTIVERSE_CONFIG`
+    /// path leave `config_override` unset; this guard clears that var (as
+    /// dispatch's does) rather than pre-choosing a value: a test sets its
+    /// own afterward, and `Drop` still restores whatever was ambient
+    /// before the guard ran, not what the test set.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+
+        /// The tempdir this guard pinned `$MULTIVERSE_STATE_DIR`/
+        /// `$HERDR_PLUGIN_STATE_DIR` to — exposed so a test can assert a
+        /// resolved state dir actually landed under it, rather than
+        /// trusting the guard silently.
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
+    /// Proof for backlog `20261108-b-49556b`: see `StateDirEnvGuard`'s own
+    /// doc for how this was confirmed to fail without it. A valid
+    /// one-account `council` chain is enough to reach `resolve`'s
+    /// `config_state_dir_from_env` call — seating (which would need a
+    /// second distinct vendor) is never exercised here.
+    #[test]
+    fn real_engine_resolve_is_isolated_from_the_ambient_state_dir() {
+        let state_dir = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let account_dir = dir.path().join("account");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let toml = format!(
+            "[projects.p]\npath = \"{}\"\n[projects.p.chains]\ncouncil = [\"claude-a\"]\n\
+             [accounts.claude-a]\nkind = \"claude\"\nshort = \"ca\"\ncommand = \"wrap\"\n\
+             config_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{}\"\npool = \"claude:a\"\n",
+            project.display(),
+            account_dir.display(),
+        );
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+        std::env::set_var("MULTIVERSE_CONFIG", &config_path);
+
+        let request = Request {
+            project_path: project.display().to_string(),
+            question: "should we ship?".into(),
+            dry_run: true,
+            timeout_seconds: 1.0,
+            config_override: None,
+        };
+        let resolved = RealEngine.resolve(&request).unwrap();
+        assert!(
+            resolved.config_dir.starts_with(state_dir.path()),
+            "resolve() must read its state dir through this test's own \
+             isolation, not whatever $MULTIVERSE_STATE_DIR already held in \
+             this process: got {:?}, expected under {:?}",
+            resolved.config_dir,
+            state_dir.path()
+        );
+    }
+
+    /// Two distinct-vendor accounts with filled models/`config_dir`, so
+    /// [`RealEngine::plan`] can seat a roster rather than refusing on a
+    /// placeholder or a one-vendor chain.
+    fn two_vendor_council_toml(
+        project: &Path,
+        account_dir: &Path,
+        left: &str,
+        right: &str,
+    ) -> String {
+        format!(
+            "[projects.p]\npath = \"{project}\"\n[projects.p.chains]\ncouncil = [\"{left}\", \"{right}\"]\n\
+             [accounts.{left}]\nkind = \"claude\"\nshort = \"ca\"\ncommand = \"wrap\"\n\
+             model = \"{left}-model\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\n\
+             config_dir = \"{account_dir}/claude\"\npool = \"claude:a\"\n\
+             [accounts.{right}]\nkind = \"codex\"\nshort = \"cb\"\ncommand = \"wrap\"\n\
+             model = \"{right}-model\"\nconfig_dir_var = \"CODEX_HOME\"\n\
+             config_dir = \"{account_dir}/codex\"\npool = \"codex:b\"\n",
+            project = project.display(),
+            account_dir = account_dir.display(),
+        )
+    }
+
+    /// Card `20261110-b-d73da7`: `load_config` used to call
+    /// `resolve_config_path_from_env(None)`, so `--config` was parsed
+    /// (global in `args.rs`) and then ignored. Revert-check: if
+    /// `Request::config_override` is dropped or `load_config` goes back
+    /// to `None`, this seats the `$MULTIVERSE_CONFIG` roster (`env-claude`,
+    /// `env-codex`) instead of the `--config` roster (`flag-claude`,
+    /// `flag-codex`).
+    #[test]
+    fn real_engine_honors_config_over_multiverse_config() {
+        let _state_dir = StateDirEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let account_dir = dir.path().join("account");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(account_dir.join("claude")).unwrap();
+        std::fs::create_dir_all(account_dir.join("codex")).unwrap();
+
+        let flag_path = dir.path().join("flag.toml");
+        std::fs::write(
+            &flag_path,
+            two_vendor_council_toml(&project, &account_dir, "flag-claude", "flag-codex"),
+        )
+        .unwrap();
+        let env_path = dir.path().join("env.toml");
+        std::fs::write(
+            &env_path,
+            two_vendor_council_toml(&project, &account_dir, "env-claude", "env-codex"),
+        )
+        .unwrap();
+        std::env::set_var("MULTIVERSE_CONFIG", &env_path);
+
+        let flagged = matches(&[
+            "council",
+            project.to_str().unwrap(),
+            "should we ship?",
+            "--dry-run",
+            "--config",
+            flag_path.to_str().unwrap(),
+        ]);
+        let flagged_roster = RealEngine.plan(&request_from(&flagged)).unwrap();
+        let flagged_accounts: Vec<&str> = flagged_roster
+            .seats
+            .iter()
+            .map(|seat| seat.account.as_str())
+            .collect();
+        assert_eq!(
+            flagged_accounts,
+            ["flag-claude", "flag-codex"],
+            "council --config must seat that file's roster, not $MULTIVERSE_CONFIG's"
+        );
+
+        let from_env = matches(&[
+            "council",
+            project.to_str().unwrap(),
+            "should we ship?",
+            "--dry-run",
+        ]);
+        let env_roster = RealEngine.plan(&request_from(&from_env)).unwrap();
+        let env_accounts: Vec<&str> = env_roster
+            .seats
+            .iter()
+            .map(|seat| seat.account.as_str())
+            .collect();
+        assert_eq!(
+            env_accounts,
+            ["env-claude", "env-codex"],
+            "without --config, council must keep using $MULTIVERSE_CONFIG"
+        );
+    }
 
     struct Fake {
         plan: Result<Roster, EngineError>,
@@ -1130,12 +1370,29 @@ mod tests {
         assert_eq!(request.question, "what now");
         assert_eq!(request.timeout_seconds, 60.0);
         assert!(!request.dry_run);
+        assert_eq!(request.config_override, None);
     }
 
     #[test]
     fn request_from_defaults_the_timeout_to_900() {
         let args = matches(&["council", "proj", "question", "--yes"]);
         assert_eq!(request_from(&args).timeout_seconds, 900.0);
+    }
+
+    #[test]
+    fn request_from_captures_the_global_config_flag() {
+        let args = matches(&[
+            "council",
+            "proj",
+            "question",
+            "--yes",
+            "--config",
+            "/tmp/council-alt.toml",
+        ]);
+        assert_eq!(
+            request_from(&args).config_override.as_deref(),
+            Some("/tmp/council-alt.toml")
+        );
     }
 
     #[test]
@@ -1260,14 +1517,14 @@ mod tests {
         assert!(!error.to_string().contains("not implemented"));
     }
 
-    /// `RealEngine::seat` directly, bypassing `resolve`'s env-based
-    /// `load_config` (which `commands::dispatch`'s own `RealEngine` tests
-    /// also never exercise end to end — real config resolution is covered
-    /// by `conformance/scenarios/council-refusal-without-yes.json`
-    /// instead): two accounts sharing one vendor (`pool = "claude:*"`
-    /// derives `vendor = "claude"` for both, `mv_config::load`'s own
-    /// default) can seat at most one councillor, below
-    /// `council::MINIMUM_COUNCILLORS`.
+    /// `RealEngine::seat` directly, bypassing `resolve`'s
+    /// `--config`/`$MULTIVERSE_CONFIG` `load_config` (real config
+    /// resolution is covered by
+    /// `real_engine_honors_config_over_multiverse_config` below and
+    /// `conformance/scenarios/council-refusal-without-yes.json`): two
+    /// accounts sharing one vendor (`pool = "claude:*"` derives
+    /// `vendor = "claude"` for both, `mv_config::load`'s own default) can
+    /// seat at most one councillor, below `council::MINIMUM_COUNCILLORS`.
     #[test]
     fn real_engine_needs_two_distinct_vendors_to_seat() {
         let toml = "\
@@ -2218,6 +2475,63 @@ mod tests {
                 .councillors
                 .len(),
             2
+        );
+    }
+
+    /// Card `20261115-b-65fe80`: council's own `fleet_open_counts` mirrors
+    /// `commands::dispatch`'s — a busy Nexus pane must not count toward
+    /// the fleet-wide `max_concurrent` check here either.
+    #[test]
+    fn fleet_open_counts_excludes_a_busy_nexus_pane_from_the_fleet_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("here");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-builder-aaaaaa")).unwrap();
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-nexus-bbbbbb")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n\
+             2020-01-01T00:00:01+00:00\tevent=dispatch\ttask=20250101-nexus-bbbbbb\tproject=here\trole=nexus\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n",
+        )
+        .unwrap();
+        let toml = format!("[projects.here]\npath = \"{}\"\n", root.display());
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+
+        let (fleet_open, _) = fleet_open_counts(&config, "here");
+        assert_eq!(
+            fleet_open, 1,
+            "the busy Nexus pane must not count toward the fleet cap"
+        );
+    }
+
+    /// Card `20261115-b-65fe80`: council's own `live_seat_counts` mirrors
+    /// `commands::dispatch`'s — a busy Nexus pane must not occupy a
+    /// seat's worker cap during a council recheck either.
+    #[test]
+    fn live_seat_counts_excludes_a_busy_nexus_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".multiverse/tasks/20250101-nexus-aaaaaa")).unwrap();
+        std::fs::write(
+            project.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\tproject=p\trole=nexus\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tagent=mv-nexus-1-se\tbranch=main\n",
+        )
+        .unwrap();
+        let toml = format!(
+            "[projects.p]\npath = \"{}\"\n[accounts.seat]\nkind = \"codex\"\nshort = \"se\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{}/codex\"\npool = \"codex:test\"\n",
+            project.display(),
+            dir.path().display(),
+        );
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+        let latest = latest_tasks_by_agent(&config);
+
+        let mut statuses = HashMap::new();
+        statuses.insert("mv-nexus-1-se".to_string(), "working".to_string());
+        let counts = live_seat_counts(&statuses, &latest, &config);
+        assert_eq!(
+            counts.get("seat"),
+            None,
+            "a busy Nexus pane must not occupy the seat's worker cap"
         );
     }
 }

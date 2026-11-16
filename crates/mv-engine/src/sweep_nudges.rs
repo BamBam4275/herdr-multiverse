@@ -84,6 +84,19 @@
 //!   yet; every elapsed-time comparison below behaves as every Python
 //!   caller with no sleep total already does (`sleep_minutes=0`).
 //!
+//! Python has no analogue for `submit_unsubmitted_composers` (card
+//! `20261114-b-4d8baf`, design `20261115-seer-c2c967`): a lane idle with
+//! its own reconstructed dispatch brief still sitting, unsubmitted, in its
+//! composer gets exactly one `send-keys … Enter`, run from [`run`] before
+//! the three senders above so none of them types a competing canned prompt
+//! over it. Its own one-shot claim lives in a dedicated
+//! `composer-enter-memory.json`, kept local to this module rather than
+//! folded into [`mv_state::nudge_memory`] — this task's own write scope
+//! permits `mv-engine/src/sweep_nudges.rs` and a visibility-only change to
+//! `mv-engine/src/runner.rs`, not a new `mv-state` claim file or the
+//! `commands::sweep` print wiring a full board-facing rollout would also
+//! need; both are filed as follow-ups rather than attempted here.
+//!
 //! Hardened past Python, not narrowed from it: every `send()` below — the
 //! finish nudge, the stuck resume, and the runtime cap — is now gated on
 //! `pane_still_hosts_task_agent`, a fresh `agent list` taken right before
@@ -97,7 +110,8 @@
 //! identical gap (`herdr.agent_prompt(task.pane, ...)` with no re-check),
 //! so there is no Python targeting to match here (card `20261103-b-695405`).
 
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
@@ -108,7 +122,7 @@ use mv_state::tasks::{AgentPanes, LiveAgentStatus, SweepTask, TaskStatus};
 use regex::Regex;
 use time::OffsetDateTime;
 
-use crate::runner::{visible, Herdr};
+use crate::runner::{composer_marker, prompt_still_in_composer, visible, Herdr};
 
 /// The one canned text every finish nudge sends. Python's
 /// `FINISH_NUDGE_PROMPT` (`tasks.py`), verbatim.
@@ -213,6 +227,16 @@ pub struct RuntimeCap {
     pub sent: bool,
 }
 
+/// One task's outcome from `submit_unsubmitted_composers`: `sent` is
+/// `true` only once the one Enter for a positively matched, reconstructed
+/// dispatch brief has actually gone out (card `20261114-b-4d8baf`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerHold {
+    pub task_id: String,
+    pub pane: String,
+    pub sent: bool,
+}
+
 /// Every nudge/resume/cap outcome from one [`run`] pass, plus the
 /// report-only `"stuck: …"` notes Python prints on every confirmed-stuck
 /// pass even after the one-shot resume has already fired.
@@ -222,6 +246,14 @@ pub struct NudgeOutcome {
     pub resume: Vec<StuckResume>,
     pub cap: Vec<RuntimeCap>,
     pub stuck: Vec<String>,
+    /// `submit_unsubmitted_composers`'s own Enter-or-would-Enter
+    /// outcomes, one per task whose composer positively matched its own
+    /// reconstructed dispatch brief.
+    pub composer: Vec<ComposerHold>,
+    /// `"unsubmitted composer: <id>"`, one per task whose composer held
+    /// non-empty text that matched none of this task's own reconstructed
+    /// dispatch prompts — reported, never acted on.
+    pub unsubmitted_composer: Vec<String>,
 }
 
 /// The "RUNNING or STALLED" proxy every function below starts from: not
@@ -321,12 +353,14 @@ fn send(herdr: &mut impl Herdr, pane: &str, prompt: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `task` is a live local/codex-kind lane, idle or done at its own
-/// prompt, with no status file and no `result.md` — Python's
+/// Whether `task` is a live local/codex/claude-kind lane, idle or done at
+/// its own prompt, with no status file and no `result.md` — Python's
 /// `finish_nudge_eligible`, split here into the part answerable with no
 /// Herdr call ([`base_running_candidate`], account kind/vendor, startup
 /// grace, `has_usable_result`) so [`run`]'s own fast path can skip the
-/// listing call entirely when nothing qualifies.
+/// listing call entirely when nothing qualifies. Card `20261109-b-946582`:
+/// claude-kind accounts are eligible under exactly the same conditions as
+/// codex; every other kind (grok, ...) stays excluded.
 fn finish_nudge_base_eligible(
     task: &SweepTask,
     config: &Config,
@@ -339,7 +373,7 @@ fn finish_nudge_base_eligible(
     let Some(account) = account_for(task, config) else {
         return false;
     };
-    if account.vendor != "local" && account.kind != "codex" {
+    if account.vendor != "local" && account.kind != "codex" && account.kind != "claude" {
         return false;
     }
     if startup_grace_active(task, account, now) {
@@ -668,6 +702,230 @@ pub fn cap_long_running_lanes(
     results
 }
 
+/// Exactly [`crate::runner::deliver_prompt`]'s own format string
+/// (`runner.rs:1336-1337`), duplicated here rather than exposed from
+/// `runner.rs`: this task's own write scope (card `20261114-b-4d8baf`)
+/// permits a visibility-only change there, not a new function.
+fn dispatch_brief_prompt(brief: &Path) -> String {
+    format!(
+        "Read `{}` and execute it. Follow its write scope exactly. Write your findings to `{}` and then write `done`, `blocked`, or `failed` to `{}`.",
+        brief.display(),
+        brief.with_file_name("result.md").display(),
+        brief.with_file_name("status").display(),
+    )
+}
+
+/// Both brief roots a writing lane can actually hold its own reconstructed
+/// dispatch prompt under: the project's own task directory
+/// ([`mv_state::paths::TaskPaths`]), and the worktree lane's own copy of
+/// the same path — a worktree-only lane (design `20261115-seer-c2c967`'s
+/// own example, `20261115-builder-7abd49`) keeps its brief solely under
+/// the worktree path, so a project-only reconstruction would miss it.
+/// Neither path needs to exist on disk: only the string this task's own
+/// dispatch would have typed matters for the composer-text match below.
+fn reconstructed_dispatch_prompts(project_root: &Path, task_id: &str) -> Vec<String> {
+    let mut prompts = Vec::new();
+    if let Ok(paths) = mv_state::paths::TaskPaths::for_task(project_root, task_id) {
+        prompts.push(dispatch_brief_prompt(&paths.brief()));
+    }
+    let worktree_brief = project_root
+        .join(".multiverse")
+        .join("worktrees")
+        .join(task_id)
+        .join(".multiverse")
+        .join("tasks")
+        .join(task_id)
+        .join("brief.md");
+    prompts.push(dispatch_brief_prompt(&worktree_brief));
+    prompts
+}
+
+/// The composer's own inner line — `kind`'s own marker up to the next of
+/// `│`, `╰`, or a newline — trimmed, and read as empty when what remains
+/// is only a `─` rule. Deliberately narrower than
+/// [`crate::runner::prompt_still_in_composer`]'s own whitespace-and-
+/// border-stripped region: that region still reads as non-empty once a
+/// *known* composer's own footer chrome is in it (the grok empty-composer
+/// fixture, `tests/fixtures/rate-limit/grok-weekly-quota-remaining.txt`,
+/// keeps "Weekly limit left …" there), and this function exists
+/// specifically to tell that apart from genuinely unknown typed text.
+/// `None` when no marker is found at all — the same "not a recognisable
+/// composer" refusal [`crate::runner::prompt_still_in_composer`] gives.
+fn composer_inner_text(text: &str, kind: &str) -> Option<String> {
+    let marker = composer_marker(kind);
+    let start = text.rfind(marker)?;
+    let after = &text[start + marker.len()..];
+    let mut inner = String::new();
+    for ch in after.chars() {
+        if matches!(ch, '│' | '╰' | '\n') {
+            break;
+        }
+        inner.push(ch);
+    }
+    let trimmed = inner.trim();
+    if trimmed.chars().all(|c| c == '─') {
+        return Some(String::new());
+    }
+    Some(trimmed.to_string())
+}
+
+const COMPOSER_ENTER_MEMORY_FILENAME: &str = "composer-enter-memory.json";
+
+/// This module's own one-shot claim file for [`submit_unsubmitted_composers`]
+/// — not [`mv_state::nudge_memory`] (see the module doc comment for why).
+fn composer_enter_memory_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(".multiverse")
+        .join(COMPOSER_ENTER_MEMORY_FILENAME)
+}
+
+fn composer_enter_lock_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+fn load_composer_enter_map(path: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn composer_enter_already_sent(project_root: &Path, task_id: &str) -> bool {
+    load_composer_enter_map(&composer_enter_memory_path(project_root)).contains_key(task_id)
+}
+
+/// Atomically reserve `task_id`'s one composer Enter, the same
+/// claim-then-act contract every map in this module's companion
+/// [`mv_state::nudge_memory`] already uses: `true` only for the call that
+/// wins the reservation.
+fn claim_composer_enter(project_root: &Path, task_id: &str, now: OffsetDateTime) -> bool {
+    let path = composer_enter_memory_path(project_root);
+    let Ok(_guard) = mv_core::lock::acquire_default(
+        &composer_enter_lock_path(&path),
+        COMPOSER_ENTER_MEMORY_FILENAME,
+    ) else {
+        return false;
+    };
+    let mut map = load_composer_enter_map(&path);
+    if map.contains_key(task_id) {
+        return false;
+    }
+    map.insert(task_id.to_string(), mv_core::time::format_seconds_utc(now));
+    let bytes = serde_json::to_vec(&map).expect("claim map always serializes");
+    mv_core::atomic::write_atomic(&path, &bytes).is_ok()
+}
+
+fn send_enter(herdr: &mut impl Herdr, name: &str) -> bool {
+    herdr
+        .call(&argv::agent_send_keys(name, &["Enter"]), SEND_TIMEOUT)
+        .map(|result| result.ok())
+        .unwrap_or(false)
+}
+
+/// [`submit_unsubmitted_composers`]'s own result: the Enter-or-would-Enter
+/// outcomes, the report-only unsubmitted-composer notes, and the set of
+/// task ids held out of the three canned-prompt senders this pass —
+/// whether because their own Enter already claimed this task, or because
+/// their composer holds unknown text no sender may type over.
+#[derive(Debug, Default)]
+struct ComposerCheck {
+    holds: Vec<ComposerHold>,
+    unsubmitted: Vec<String>,
+    held: HashSet<String>,
+}
+
+/// Card `20261114-b-4d8baf`'s safety net, design `20261115-seer-c2c967`:
+/// press the one Enter a lane's own composer needs when it still holds
+/// this task's own reconstructed dispatch brief, unsubmitted — before any
+/// of the three canned-prompt senders below can type a competing prompt
+/// over it. Reuses [`finish_nudge_base_eligible`]'s own candidate set
+/// (not yet recorded, no status file, a recognised local/codex/claude
+/// account past its own startup grace, no result on disk) and
+/// [`safe_pane_text`]'s own dialog/menu/vendor-dialog refusal, so this
+/// never acts on any of the same five dialog shapes those already screen.
+///
+/// Three outcomes per eligible task:
+/// - the composer positively matches one of [`reconstructed_dispatch_prompts`]:
+///   one `send-keys … Enter`, [`claim_composer_enter`] spent either way, no
+///   second Enter once [`composer_enter_already_sent`] is already true.
+/// - the composer's own [`composer_inner_text`] is non-empty but matches
+///   neither reconstruction: no Enter, reported as `"unsubmitted composer:
+///   <id>"`, held out of the three senders below.
+/// - the composer's own inner text is empty (today's shape): no hold at
+///   all — the three senders below see this task exactly as before.
+#[allow(clippy::too_many_arguments)]
+fn submit_unsubmitted_composers(
+    project_root: &Path,
+    tasks: &[SweepTask],
+    live: &[LiveAgentStatus],
+    config: &Config,
+    apply: bool,
+    now: OffsetDateTime,
+    agents: &mut impl AgentPanes,
+    herdr: &mut impl Herdr,
+) -> ComposerCheck {
+    let mut check = ComposerCheck::default();
+    for task in tasks {
+        if !finish_nudge_base_eligible(task, config, project_root, now) {
+            continue;
+        }
+        let pane = task.pane.as_deref().expect("base_eligible checked pane");
+        if !pane_status(live, pane).is_some_and(AgentState::is_ready_for_input) {
+            continue;
+        }
+        let Some(account) = account_for(task, config) else {
+            continue;
+        };
+        let Some(text) = safe_pane_text(herdr, task, pane, &account.kind) else {
+            continue;
+        };
+        let matched = reconstructed_dispatch_prompts(project_root, &task.task_id)
+            .iter()
+            .any(|prompt| prompt_still_in_composer(&text, prompt, &account.kind));
+        if matched {
+            // Held out of the three senders below regardless of claim
+            // state: a brief still positively matched in the composer
+            // must never receive a competing canned prompt on top of it,
+            // whether this is the first pass to see it or a later one
+            // whose own Enter already claimed this task's one-time slot.
+            check.held.insert(task.task_id.clone());
+            if composer_enter_already_sent(project_root, &task.task_id) {
+                continue;
+            }
+            if !apply {
+                check.holds.push(ComposerHold {
+                    task_id: task.task_id.clone(),
+                    pane: pane.to_string(),
+                    sent: false,
+                });
+                continue;
+            }
+            if !claim_composer_enter(project_root, &task.task_id, now) {
+                continue;
+            }
+            let name = task.agent.as_deref().expect("base_eligible checked agent");
+            let sent = pane_still_hosts_task_agent(agents, task, pane) && send_enter(herdr, name);
+            check.holds.push(ComposerHold {
+                task_id: task.task_id.clone(),
+                pane: pane.to_string(),
+                sent,
+            });
+            continue;
+        }
+        if let Some(inner) = composer_inner_text(&text, &account.kind) {
+            if !inner.is_empty() {
+                check.held.insert(task.task_id.clone());
+                check
+                    .unsubmitted
+                    .push(format!("unsubmitted composer: {}", task.task_id));
+            }
+        }
+    }
+    check
+}
+
 /// Run all three nudges for one project's already-fetched `tasks`. Calls
 /// [`mv_state::tasks::AgentPanes::list_checked`] — the one Herdr `agent
 /// list` round trip every function above shares — only when at least one
@@ -690,11 +948,26 @@ pub fn run(
     let Some(live) = agents.list_checked() else {
         return NudgeOutcome::default();
     };
+    let composer_check = submit_unsubmitted_composers(
+        project_root,
+        tasks,
+        &live,
+        config,
+        apply,
+        now,
+        agents,
+        herdr,
+    );
+    let remaining: Vec<SweepTask> = tasks
+        .iter()
+        .filter(|task| !composer_check.held.contains(&task.task_id))
+        .cloned()
+        .collect();
     NudgeOutcome {
         stuck: stuck_notes(project_root, tasks, &live, config, now, herdr),
         finish: nudge_idle_lanes_to_finish(
             project_root,
-            tasks,
+            &remaining,
             &live,
             config,
             apply,
@@ -704,7 +977,7 @@ pub fn run(
         ),
         resume: resume_stuck_lanes(
             project_root,
-            tasks,
+            &remaining,
             &live,
             config,
             apply,
@@ -712,9 +985,11 @@ pub fn run(
             agents,
             herdr,
         ),
+        composer: composer_check.holds,
+        unsubmitted_composer: composer_check.unsubmitted,
         cap: cap_long_running_lanes(
             project_root,
-            tasks,
+            &remaining,
             &live,
             config,
             apply,
@@ -756,15 +1031,35 @@ mod tests {
     }
 
     /// A config with one named claude-kind account — never local vendor,
-    /// never codex kind, so [`finish_nudge_base_eligible`] always refuses
-    /// it.
-    fn config_with_claude_account() -> Config {
-        let content = "[accounts.claude-main]\n\
+    /// but [`finish_nudge_base_eligible`] now treats claude kind the same
+    /// as codex (card `20261109-b-946582`), so this account is eligible
+    /// once its own startup grace has elapsed.
+    fn config_with_claude_account(extra: &str) -> Config {
+        let content = format!(
+            "[accounts.claude-main]\n\
              kind = \"claude\"\n\
              config_dir_var = \"CLAUDE_CONFIG_DIR\"\n\
              config_dir = \"<<PLACEHOLDER: x>>\"\n\
-             command = \"claude\"\n";
-        mv_config::load::load_config_str(content, Path::new("config.toml")).unwrap()
+             command = \"claude\"\n\
+             {extra}\n"
+        );
+        mv_config::load::load_config_str(&content, Path::new("config.toml")).unwrap()
+    }
+
+    /// A config with one named grok-kind account — never local vendor,
+    /// never codex or claude kind, so [`finish_nudge_base_eligible`] always
+    /// refuses it (card `20261109-b-946582`: grok and any other kind stay
+    /// excluded from the finish nudge).
+    fn config_with_grok_account(extra: &str) -> Config {
+        let content = format!(
+            "[accounts.grok-main]\n\
+             kind = \"grok\"\n\
+             config_dir_var = \"GROK_HOME\"\n\
+             config_dir = \"<<PLACEHOLDER: x>>\"\n\
+             command = \"grok\"\n\
+             {extra}\n"
+        );
+        mv_config::load::load_config_str(&content, Path::new("config.toml")).unwrap()
     }
 
     fn task(task_id: &str, account: &str, pane: &str, age_minutes: i64) -> SweepTask {
@@ -787,7 +1082,30 @@ mod tests {
         }
     }
 
-    fn temp_project() -> std::path::PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&root`/`root.join(...)` unchanged.
+    struct TempProject(std::path::PathBuf);
+    impl std::ops::Deref for TempProject {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TempProject {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_project() -> TempProject {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
@@ -799,7 +1117,7 @@ mod tests {
             match std::fs::create_dir(&dir) {
                 Ok(()) => {
                     std::fs::create_dir_all(dir.join(".multiverse")).unwrap();
-                    return dir;
+                    return TempProject(dir);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("temporary project: {error}"),
@@ -859,6 +1177,22 @@ mod tests {
                         protocol_error: None,
                     })
                 }
+                ("agent", "send-keys") => {
+                    // Recorded as `"Enter:<name>"` in the same `prompts`
+                    // vec every canned-prompt assertion already reads —
+                    // no existing test's own pane text matches a
+                    // reconstructed dispatch brief, so no existing
+                    // assertion sees this new arm fire.
+                    self.prompts.push(format!("Enter:{}", command.argv[3]));
+                    Ok(CommandResult {
+                        argv: command.argv.clone(),
+                        returncode: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        payload: Some(json!({"result": {}})),
+                        protocol_error: None,
+                    })
+                }
                 other => panic!("unexpected call {other:?}"),
             }
         }
@@ -907,7 +1241,6 @@ mod tests {
         assert!(outcome.finish.is_empty());
         assert!(outcome.resume.is_empty());
         assert!(outcome.cap.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -954,7 +1287,6 @@ mod tests {
         );
         assert!(again.is_empty());
         assert_eq!(herdr.prompts.len(), 1, "no second send");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Card `20261103-b-695405`: `t1`'s pane looked idle and unclaimed in
@@ -1000,7 +1332,6 @@ mod tests {
             herdr.prompts.is_empty(),
             "the finish nudge must never reach other-agent's pane"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1029,7 +1360,6 @@ mod tests {
         );
         assert!(results.is_empty());
         assert!(herdr.prompts.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1061,7 +1391,6 @@ mod tests {
         assert!(!mv_state::nudge_memory::finish_nudge_already_sent(
             &root, "t1"
         ));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1097,7 +1426,6 @@ mod tests {
         assert!(!mv_state::nudge_memory::finish_nudge_already_sent(
             &root, "t1"
         ));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1126,7 +1454,6 @@ mod tests {
         );
         assert!(results.is_empty());
         assert!(herdr.prompts.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1159,14 +1486,13 @@ mod tests {
         assert!(!mv_state::nudge_memory::finish_nudge_already_sent(
             &root, "t1"
         ));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn a_non_local_non_codex_account_is_never_finish_nudged() {
+    fn a_grok_account_is_never_finish_nudged() {
         let root = temp_project();
-        let config = config_with_claude_account();
-        let t = task("t1", "claude-main", "w1:p1", 1);
+        let config = config_with_grok_account("");
+        let t = task("t1", "grok-main", "w1:p1", 1);
         let live = vec![LiveAgentStatus {
             pane_id: "w1:p1".to_string(),
             name: Some("t1-agent".to_string()),
@@ -1185,7 +1511,99 @@ mod tests {
             },
         );
         assert!(outcome.finish.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Card `20261109-b-946582`: a running claude-kind lane past its own
+    /// startup grace, with no status file, is finish-nudge eligible under
+    /// exactly the same conditions as codex.
+    #[test]
+    fn a_claude_lane_past_startup_grace_with_no_status_is_finish_nudge_eligible() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "ready for next instruction",
+            prompts: Vec::new(),
+        };
+        let results = nudge_idle_lanes_to_finish(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].sent);
+        assert_eq!(herdr.prompts, vec![FINISH_NUDGE_PROMPT.to_string()]);
+    }
+
+    /// Same shape as the claude case above — past its own startup grace,
+    /// no status file — but grok stays excluded (card `20261109-b-946582`:
+    /// only claude joins codex; every other kind does not).
+    #[test]
+    fn a_grok_lane_in_the_same_state_is_not_finish_nudge_eligible() {
+        let root = temp_project();
+        let config = config_with_grok_account("startup_grace_seconds = 30");
+        let t = task("t1", "grok-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "ready for next instruction",
+            prompts: Vec::new(),
+        };
+        let results = nudge_idle_lanes_to_finish(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(results.is_empty());
+        assert!(herdr.prompts.is_empty());
+    }
+
+    /// A claude lane still inside its own startup grace never gets the
+    /// finish nudge, the same grace codex already honors.
+    #[test]
+    fn a_claude_lane_inside_startup_grace_is_not_finish_nudge_eligible() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 600");
+        let t = task("t1", "claude-main", "w1:p1", 1);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "ready for next instruction",
+            prompts: Vec::new(),
+        };
+        let results = nudge_idle_lanes_to_finish(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(results.is_empty());
+        assert!(herdr.prompts.is_empty());
     }
 
     #[test]
@@ -1215,7 +1633,6 @@ mod tests {
             },
         );
         assert!(results.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1260,7 +1677,6 @@ mod tests {
         assert!(second[0].sent);
         assert!(!second[0].failed);
         assert_eq!(herdr.prompts, vec![STUCK_RESUME_PROMPT.to_string()]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1322,7 +1738,6 @@ mod tests {
             "the one-shot resume must not fire again"
         );
         assert_eq!(herdr.prompts.len(), 1);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Card `20261103-b-695405`: the same confirmed-stuck pane as above, but
@@ -1381,7 +1796,6 @@ mod tests {
             herdr.prompts.is_empty(),
             "the resume prompt must never reach other-agent's pane"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1418,7 +1832,6 @@ mod tests {
         );
         assert!(results.is_empty());
         assert!(herdr.prompts.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1541,7 +1954,6 @@ mod tests {
         } else {
             assert!(!log.contains("evidence:"), "do not link missing evidence");
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1568,7 +1980,6 @@ mod tests {
             },
         );
         assert!(results.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1598,7 +2009,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].sent);
         assert_eq!(herdr.prompts, vec![RUNTIME_CAP_PROMPT.to_string()]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Card `20261103-b-695405`: `t1` is well past its runtime cap in the
@@ -1643,7 +2053,6 @@ mod tests {
             herdr.prompts.is_empty(),
             "the runtime cap prompt must never reach other-agent's pane"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1670,6 +2079,275 @@ mod tests {
         assert!(outcome.finish.is_empty());
         assert!(outcome.resume.is_empty());
         assert!(outcome.cap.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- `submit_unsubmitted_composers` (card `20261114-b-4d8baf`, design
+    // `20261115-seer-c2c967`). ---
+
+    /// Fixed-width character wrap, oblivious to word boundaries — the same
+    /// bordered-composer shape `runner.rs`'s own `boxed_composer` test
+    /// helper builds (card `20261109-b-620eeb`), duplicated here rather
+    /// than exposed from `runner.rs`'s own test module: this task's write
+    /// scope permits only a visibility change there.
+    fn boxed_composer(prompt: &str, kind: &str, width: usize) -> String {
+        let marked: Vec<char> = format!("{} {prompt}", crate::runner::composer_marker(kind))
+            .chars()
+            .collect();
+        let border = "─".repeat(width + 2);
+        let mut out = format!("╭{border}╮\n");
+        let mut i = 0;
+        while i < marked.len() {
+            let end = (i + width).min(marked.len());
+            let row: String = marked[i..end].iter().collect();
+            out.push_str(&format!("│ {row:<width$} │\n"));
+            i = end;
+        }
+        out.push_str(&format!("╰{border}╯"));
+        out
+    }
+
+    #[test]
+    fn a_claude_lane_holding_its_own_reconstructed_worktree_brief_gets_exactly_one_enter_and_no_finish_nudge(
+    ) {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let worktree_brief = root.join(".multiverse/worktrees/t1/.multiverse/tasks/t1/brief.md");
+        let prompt = dispatch_brief_prompt(&worktree_brief);
+        let pane_text = boxed_composer(&prompt, "claude", 30);
+        let mut herdr = FakeHerdr {
+            pane_text: Box::leak(pane_text.into_boxed_str()),
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(outcome.composer.len(), 1);
+        assert!(outcome.composer[0].sent);
+        assert!(outcome.finish.is_empty(), "no competing finish nudge");
+        assert!(outcome.unsubmitted_composer.is_empty());
+        assert_eq!(herdr.prompts, vec!["Enter:t1-agent".to_string()]);
+        assert!(composer_enter_already_sent(&root, "t1"));
+
+        // A second pass over the same still-matching pane text must not
+        // press a second Enter, and must still refuse the competing
+        // finish nudge (the composer is still, as far as this pass can
+        // tell, holding the brief).
+        let second = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            mv_core::time::now_utc() + time::Duration::minutes(1),
+            &mut FakeAgents { live },
+            &mut herdr,
+        );
+        assert!(second.composer.is_empty());
+        assert!(second.finish.is_empty(), "still no competing finish nudge");
+        assert_eq!(herdr.prompts.len(), 1, "no second Enter");
+    }
+
+    #[test]
+    fn a_composer_holding_unrecognised_text_gets_no_enter_and_no_competing_finish_nudge() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "❯ check the log",
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live },
+            &mut herdr,
+        );
+        assert!(outcome.composer.is_empty());
+        assert!(outcome.finish.is_empty(), "no competing finish nudge");
+        assert_eq!(outcome.unsubmitted_composer, ["unsubmitted composer: t1"]);
+        assert!(herdr.prompts.is_empty(), "no Enter, no canned prompt");
+        assert!(!composer_enter_already_sent(&root, "t1"));
+    }
+
+    #[test]
+    fn an_empty_composer_keeps_todays_finish_nudge_behaviour() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "ready for next instruction",
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live },
+            &mut herdr,
+        );
+        assert!(outcome.composer.is_empty());
+        assert!(outcome.unsubmitted_composer.is_empty());
+        assert_eq!(outcome.finish.len(), 1);
+        assert!(outcome.finish[0].sent);
+        assert_eq!(herdr.prompts, vec![FINISH_NUDGE_PROMPT.to_string()]);
+    }
+
+    #[test]
+    fn composer_inner_text_reads_the_grok_empty_box_as_empty() {
+        // The grok fixture's own footer chrome ("Weekly limit left …")
+        // sits in the same region once the box border is gone; only this
+        // narrower, un-stripped line (ending at the first `│`) tells that
+        // apart from genuinely typed text.
+        let text =
+            include_str!("../../../tests/fixtures/rate-limit/grok-weekly-quota-remaining.txt");
+        assert_eq!(composer_inner_text(text, "grok"), Some(String::new()));
+    }
+
+    #[test]
+    fn composer_inner_text_reads_typed_text_as_non_empty() {
+        assert_eq!(
+            composer_inner_text("❯ check the log", "claude").as_deref(),
+            Some("check the log")
+        );
+    }
+
+    #[test]
+    fn composer_inner_text_is_none_with_no_marker_at_all() {
+        assert_eq!(composer_inner_text("no marker here", "claude"), None);
+    }
+
+    #[test]
+    fn a_trust_dialog_never_gets_a_composer_enter_or_an_unsubmitted_report() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "do you trust this folder?",
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live },
+            &mut herdr,
+        );
+        assert!(outcome.composer.is_empty());
+        assert!(outcome.unsubmitted_composer.is_empty());
+        assert!(outcome.finish.is_empty());
+        assert!(herdr.prompts.is_empty());
+    }
+
+    #[test]
+    fn dry_run_previews_the_composer_hold_without_sending_or_claiming() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let worktree_brief = root.join(".multiverse/worktrees/t1/.multiverse/tasks/t1/brief.md");
+        let prompt = dispatch_brief_prompt(&worktree_brief);
+        let pane_text = boxed_composer(&prompt, "claude", 30);
+        let mut herdr = FakeHerdr {
+            pane_text: Box::leak(pane_text.into_boxed_str()),
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            false,
+            mv_core::time::now_utc(),
+            &mut FakeAgents { live },
+            &mut herdr,
+        );
+        assert_eq!(outcome.composer.len(), 1);
+        assert!(!outcome.composer[0].sent);
+        assert!(outcome.finish.is_empty(), "preview never nudges either");
+        assert!(herdr.prompts.is_empty());
+        assert!(!composer_enter_already_sent(&root, "t1"));
+    }
+
+    /// Card `20261103-b-695405`'s own reclaim guard, re-checked here for
+    /// the composer Enter: `t1`'s own agent looked idle and unclaimed in
+    /// the snapshot `live` represents, but a fresh `agent list` taken
+    /// right before the send shows the same pane now hosts `other-agent`
+    /// — the Enter must never reach that live agent's own pane.
+    #[test]
+    fn a_pane_recycled_between_snapshot_and_send_is_never_composer_entered() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let worktree_brief = root.join(".multiverse/worktrees/t1/.multiverse/tasks/t1/brief.md");
+        let prompt = dispatch_brief_prompt(&worktree_brief);
+        let pane_text = boxed_composer(&prompt, "claude", 30);
+        let mut herdr = FakeHerdr {
+            pane_text: Box::leak(pane_text.into_boxed_str()),
+            prompts: Vec::new(),
+        };
+        let mut recycled = FakeAgents {
+            live: vec![LiveAgentStatus {
+                pane_id: "w1:p1".to_string(),
+                name: Some("other-agent".to_string()),
+                status: Some(AgentState::Idle),
+            }],
+        };
+        let check = submit_unsubmitted_composers(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &mut recycled,
+            &mut herdr,
+        );
+        assert_eq!(check.holds.len(), 1);
+        assert!(!check.holds[0].sent, "never send into the recycled pane");
+        assert!(
+            herdr.prompts.is_empty(),
+            "the composer Enter must never reach other-agent's pane"
+        );
     }
 }

@@ -468,6 +468,10 @@ pub(crate) fn canonicalize_project_path(raw_path: &str) -> Result<PathBuf, Failu
     }
 }
 
+/// `multiverse add`'s command handler: resolve and lock the config file,
+/// load it, verify `path` is an existing git repository (a project's first
+/// worktree write would otherwise fail later, far from this check), derive
+/// a project name when `--name` is absent, and hand off to [`register`].
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;

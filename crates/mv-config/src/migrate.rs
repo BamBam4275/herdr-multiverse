@@ -34,7 +34,9 @@ pub struct RoleKeyRename {
     /// The table that held the key, e.g. `"roles"` or
     /// `"projects.example.chains"`.
     pub location: String,
+    /// The retired key or role name, exactly as it was on disk.
     pub old_key: String,
+    /// The current key or role name it was rewritten to.
     pub new_key: String,
 }
 
@@ -45,10 +47,13 @@ pub struct RoleKeyRename {
 /// calls this "one-shot", not "run exactly once ever").
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrationReport {
+    /// Every rewrite this run made, in the order they were found.
     pub renames: Vec<RoleKeyRename>,
 }
 
 impl MigrationReport {
+    /// True when nothing was rewritten — see this struct's own doc for
+    /// why that is a normal, non-error outcome.
     pub fn is_empty(&self) -> bool {
         self.renames.is_empty()
     }

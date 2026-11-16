@@ -42,18 +42,21 @@ Only `--impl python` or `--impl both` requires `--python-repo` (or
 
 ## Matrix and exit status
 
-`run_all.py` prints a matrix row for every scenario step, including the
-recorded command arguments, implementation, step number, and PASS/FAIL.
-Dependent steps whose capture was not produced are explicitly
+`run_all.py` first runs the `test_diff_fuzz.py` normalizer unit tests
+in-process and prints a `diff_fuzz unit tests: N/N passed` line; these need
+no frozen Python reference. It then prints a matrix row for every scenario
+step, including the recorded command arguments, implementation, step number,
+and PASS/FAIL. Dependent steps whose capture was not produced are explicitly
 `NOT RUN (missing capture)`; their scenario fails. Independent commands still
 run after earlier failures. Each scenario also has a PASS/FAIL summary that
 includes its final tree assertions, followed by implementation totals.
 A command may pass while its scenario fails a final tree assertion.
 
-Exit 0 means all selected implementations pass; exit 1 means a recorded
-assertion failed; exit 2 means setup/build failed. Rust failures always count,
-including current `not implemented` handlers. There is no expected-failure
-allowlist, skipped Rust side, or `continue-on-error` CI gate.
+Exit 0 means all selected implementations and the unit tests pass; exit 1
+means a recorded assertion or a unit test failed; exit 2 means setup/build
+failed. Rust failures always count, including current `not implemented`
+handlers. There is no expected-failure allowlist, skipped Rust side, or
+`continue-on-error` CI gate.
 
 `.github/workflows/conformance.yml` runs harness regression checks and the
 Rust replay on pushes to main, pull requests, and manual dispatch. Until the
@@ -187,8 +190,9 @@ those (stateful pane/agent lifecycle, matching `tests/test_runner.py`'s
 not this lane's. A scenario that needs a live pane/agent — one that reads
 back what a prior Herdr call wrote, rather than a fixed ordered reply —
 declares `"herdr_seed"` instead (see below) and runs against that real
-binary; anything else (`dispatch --yes`, `start`'s full lifecycle) still
-needs additional scenarios and integration.
+binary. `dispatch --yes` (worktree creation, a real brief, pane split /
+agent start / agent prompt) is covered by `dispatch-real-builder` and
+`dispatch-real-wait`; see Status.
 
 ### Seeding a live pane/agent (`herdr_seed`)
 
@@ -357,11 +361,15 @@ memory, right before a scenario reaches Rust:
   untranslated, only that this harness bridges Python's free-text
   acceptance of one to Rust's new-names-only one.
 - **Role words embedded in a brief that a live dispatch would write** are
-  the third input surface the rename touches in principle, but no committed
-  scenario currently exercises it (`dispatch --yes` and anything that
-  writes a real brief are out of scope for this harness today — see "What
-  these scenarios intentionally do not cover"). Translate those the same
-  old->new way, the day a scenario needs it.
+  the third input surface the rename touches in principle.
+  `dispatch-real-builder` step 1 and `dispatch-real-wait` step 1 both
+  `inspect` the worktree `brief.md` a live `--yes` dispatch wrote, and
+  pin the current display name (`Builder`), the account (`builder-seat`),
+  the prompt, and the `README.md` write scope. Both scenarios author
+  `config_toml` and `--role` with current names already (see their
+  descriptions), so they do not exercise an old->new rewrite of role
+  words inside the brief; translate those the same old->new way the day
+  a scenario needs that.
 
 **Recorded `expect` text (stdout/stderr) is translated old->new only at the
 handful of fixed positions a *fresh* role-word rendering comes from, never
@@ -482,20 +490,47 @@ All three passed against the current Rust CLI on first replay — no
 divergence from the frozen oracle's behavior was found for any of the
 three commands this pass.
 
+Card `20261114-b-183513`: a live `dispatch --yes` (worktree creation, a
+real brief, pane split / agent start / agent prompt) is no longer out of
+scope. Both scenarios below are Rust-only (`"herdr_seed"`: `pane get
+w52:p1`), author current role names directly, and rely on fake-herdr's
+brief-in-prompt shortcut (`crates/mv-herdr/src/bin/fake-herdr.rs`
+`complete_prompt`) to write a terminal `status`/`result.md` so later
+`inspect`/`result` steps have something to read:
+
+| Scenario | Families it covers |
+| --- | --- |
+| `dispatch-real-builder` | `dispatch --yes` without `--wait`: worktree/branch/brief, live pane/agent, routing.log dispatch+started and no event=result |
+| `dispatch-real-wait` | `dispatch --yes --wait`: same launch, then settled-as-done and routing.log event=result |
+
+`dispatch-real-builder` step 0 runs `dispatch {{PROJECT:sandbox}} "check
+the scoped readme" --role builder --scope README.md --yes` and
+stdout-contains the worktree path, `multiverse/<ID>` branch, task id,
+and status-file path; its `expect_tree` pins `herdr-calls.jsonl` to
+`"pane","split"` then `"agent","start"` then `"agent","prompt"`, and
+routing.log to `event=dispatch` (`role=builder`, `account=builder-seat`,
+`outcome=chain-primary`) plus `event=started` (`pane=w52:p100`) with no
+`event=result`. Step 1 `inspect`s
+`.multiverse/worktrees/<ID>/.multiverse/tasks/<ID>/brief.md` for
+`# Task`, `Builder`, `builder-seat`, the prompt, and `README.md`.
+Steps 2–3 `inspect` `status` (`done`) and run `result` (the shortcut
+text `# Fake Herdr result`). `dispatch-real-wait` step 0 is the same
+argv plus `--wait --timeout 8`; stdout also contains `settled as done`,
+`status done`, and the result.md path, and routing.log also requires
+`event=result` `status=done` `state=done`. Its brief/status/result
+inspect steps match `dispatch-real-builder`.
+
 ## What these scenarios intentionally do not cover
 
-- **`dispatch --yes` and anything that drives a real pane** (families #9
-  concurrent dispatch cap, #12 start lifecycle, #13 stop safety). Needs a
-  stateful fake Herdr (pane split/agent start/agent prompt/agent read),
-  which is L5's `crates/mv-herdr/src/bin/fake-herdr.rs` — this harness's
-  `fake_herdr.py` is a strict transcript player, not that; `"herdr_seed"`
-  (see above) now gives individual scenarios that same binary, but
-  `dispatch --yes`'s own full lifecycle (worktree creation, the live
-  dispatch loop) is still out of scope here. #9 is
-  approximated instead by `dispatch-capacity-cap`, which exercises the same
-  cap-enforcement code path (`accounts.py`'s `_availability` check 5) via a
-  pre-set `seat-state.json` cap and an unreachable herdr reply, rather than
-  two genuinely concurrent dispatch processes.
+- **#9 concurrent dispatch cap** (two genuinely concurrent `dispatch
+  --yes` processes). Approximated by `dispatch-capacity-cap`, which
+  exercises the same cap-enforcement code path (`accounts.py`'s
+  `_availability` check 5) via a pre-set `seat-state.json` cap and an
+  unreachable herdr reply. A single `dispatch --yes` is covered by
+  `dispatch-real-builder` (no `--wait`) and `dispatch-real-wait`
+  (`--wait --timeout 8`); see Status. Families #12 start lifecycle and
+  #13 stop safety have their own `start-*` / `stop-*` scenarios and are
+  no longer in this gap list.
 - **#20 blocked-prompt classification** (a captured Codex/Claude/Grok
   dialog tripping the right pool without answering a human-owned prompt).
   `limits.classify` needs a real pane-text transcript as input; synthesizing
@@ -506,22 +541,18 @@ three commands this pass.
 - **#21 concurrent reconciliation** (two reconcilers racing on one task).
   Needs genuine process concurrency against a locked routing log; this
   harness runs one implementation process per step, sequentially.
-- **#23 worktree *creation*, #25 archive transaction, #26 late-write
-  quarantine.** `worktrees.create`/`archive_branch` run inside the real
-  dispatch flow (`cli.py` around the `worktrees.create` call near dispatch)
-  and, for archival, drive `git update-ref --stdin` through a herdr-adjacent
-  flow with its own occupant-liveness bookkeeping
-  (`cmd_worktrees`'s `live_guard_reason`/`live_agents_once` — ask Herdr only
-  when a lane's occupant is genuinely unsettled, not on every prunable
-  lane). Hand-building a worktree lane with raw `git worktree add` to skip
-  the dispatch path was considered and rejected on reading `cmd_worktrees`'s
-  own docstring and `live_guard_reason` — not tried and found broken, but
-  rejected before a scenario was written for it: it would reproduce the git
-  state but not the occupant-tracking metadata `cmd_worktrees` actually keys
-  its decisions on, which risks pinning behavior this harness cannot tell
-  apart from a lane `worktrees.create` itself would never produce. Left for
-  a scenario built through a real (not dry-run) dispatch, once `dispatch
-  --yes` is itself in scope (see the stateful-Herdr point above).
+- **#25 archive transaction, #26 late-write quarantine.**
+  `worktrees.create` now runs inside a real (not dry-run) dispatch:
+  `dispatch-real-builder` step 0 stdout-contains the created worktree
+  path and `multiverse/<ID>` branch, and step 1 inspects the brief
+  written inside that worktree. Archival still drives
+  `git update-ref --stdin` through a herdr-adjacent flow with its own
+  occupant-liveness bookkeeping (`cmd_worktrees`'s
+  `live_guard_reason`/`live_agents_once` — ask Herdr only when a lane's
+  occupant is genuinely unsettled, not on every prunable lane). The
+  `worktrees` fixture (see below) still hand-builds a registered
+  worktree for prune/restore scenarios without going through
+  `archive_branch`. Late-write quarantine has no committed scenario.
 - **#30 read-only plugin/report boundary.** Not investigated this pass —
   the manifest/report action tests/test_plugin_manifest.py and
   tests/test_read_only_plugin.py exercise looked like it may be a Herdr
@@ -542,8 +573,8 @@ three commands this pass.
 - **Herdr protocol matrix beyond a malformed JSON reply** (#10: a genuine
   timeout, a plain-text reply where JSON was expected, pane run/read
   specifically). `workers-malformed-herdr-json` covers the one slice
-  reachable without a stateful fake Herdr; the rest needs `dispatch --yes`
-  machinery too.
+  reachable without a stateful fake Herdr; the rest still has no
+  committed scenario even though `dispatch --yes` is now in scope.
 
 Project fixtures may also declare `"worktrees": ["<task-id>"]` alongside
 `"git": true`. Each entry creates a real registered worktree at

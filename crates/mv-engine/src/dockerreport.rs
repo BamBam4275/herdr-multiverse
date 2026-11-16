@@ -4,27 +4,38 @@
 //! This module never starts, stops, removes, or prunes containers. Ownership is
 //! read from labels, never inferred from an image or a matching name prefix.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mv_herdr::argv::HerdrCommand;
 use mv_herdr::error::HerdrError;
 use serde_json::Value;
 
+/// Docker label holding a workload's `project/task` owner, e.g.
+/// `multiverse.owner=demo/20261102-builder-abcdef`.
 pub const OWNER_LABEL: &str = "multiverse.owner";
+/// Docker label marking a workload as one this module may ever report on
+/// for cleanup purposes; absent or not `"1"` means "not ours to touch".
 pub const TEMP_LABEL: &str = "multiverse.temp";
 
+/// Why a labelled-workload probe or parse failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DockerReportError {
+    /// The `docker ps` subprocess itself could not be run.
     #[error("Docker report probe failed: {0}")]
     Probe(#[from] HerdrError),
+    /// `docker ps` ran but returned a non-zero exit status.
     #[error("Docker report probe exited with status {0}")]
     Exit(i32),
+    /// A line of `docker ps` output was not the JSON object this module
+    /// expects.
     #[error("Docker report line {line}: {message}")]
     Malformed { line: usize, message: String },
 }
 
+/// One row from `docker ps`, kept only when it carries [`OWNER_LABEL`] or
+/// [`TEMP_LABEL`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
     pub id: String,
@@ -45,6 +56,9 @@ impl Container {
     }
 }
 
+/// Labelled Multiverse workloads found by one `docker ps` probe, for
+/// `workers` and `stop`. Not the host-wide advisory scan — see
+/// [`HostReport`] for that.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DockerReport {
     pub containers: Vec<Container>,
@@ -89,6 +103,7 @@ pub fn collect_with_timeout(
     parse_ps(&output.stdout)
 }
 
+/// Production entry point: probes the real `docker` binary on `PATH`.
 pub fn collect() -> Result<DockerReport, DockerReportError> {
     collect_with(Path::new("docker"))
 }
@@ -176,6 +191,8 @@ fn clean(value: &str) -> String {
     value.replace(['\r', '\n', '\t'], " ")
 }
 
+/// Tab-separated listing of `report`'s containers and warnings, for direct
+/// display by `workers`/`stop`.
 pub fn render(report: &DockerReport) -> String {
     if report.containers.is_empty() {
         return "No Multiverse Docker workloads.\n".into();
@@ -295,6 +312,8 @@ pub fn host_probe(program: &str, args: &[&str]) -> Option<String> {
     (result.returncode == 0).then_some(result.stdout)
 }
 
+/// Production entry point for the host-wide advisory scan: probes the real
+/// `docker` binary on `PATH` via [`host_probe`].
 pub fn report() -> HostReport {
     report_with(&mut host_probe)
 }
@@ -389,6 +408,11 @@ pub fn report_with(probe: &mut impl FnMut(&str, &[&str]) -> Option<String>) -> H
     report_with_context(mv_core::time::now_utc(), None, probe)
 }
 
+/// Same as [`report_with`], but with an explicit clock and the set of
+/// task owners whose temp containers are still in progress (so
+/// `container_lines` doesn't flag them as stale leftovers). `None` means
+/// "no in-progress context" — every temp container with an owner is then
+/// eligible to be reported stale.
 pub fn report_with_context(
     now: time::OffsetDateTime,
     in_progress_owners: Option<&std::collections::BTreeSet<String>>,
@@ -592,6 +616,9 @@ fn container_lines(
     now: time::OffsetDateTime,
     in_progress_owners: Option<&std::collections::BTreeSet<String>>,
 ) -> Vec<String> {
+    // Fixed render order, not discovery order: 0=stopped, 1=loose running,
+    // 2=random-named unlabeled, 3=stale temp. Each row lands in at most one
+    // group; within a group, rows are sorted by name below.
     let mut groups: [Vec<(String, String)>; 4] = std::array::from_fn(|_| Vec::new());
     for row in rows {
         let name = host_field(row, "Names");
@@ -902,5 +929,463 @@ mod host_tests {
         );
         std::fs::write(&binary, "#!/bin/sh\nexit 7\n").unwrap();
         assert!(host_probe(binary.to_str().unwrap(), &["ps"]).is_none());
+    }
+}
+
+/// Card `20261115-b-9815fe`: one host process observed by the shared,
+/// bounded cwd probe below — used both by `sweep`'s own closed-lane report
+/// and the lane-exit reaper (`worktrees --prune --reap` /
+/// `tasks --reclaimable --reap`). Finding a process here is read-only
+/// evidence; nothing in this module signals it except [`reap`] itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessCwd {
+    pub pid: u32,
+    pub cwd: PathBuf,
+    pub command: String,
+    pub cpu_percent: String,
+}
+
+/// `ps`+`lsof` (macOS) / `/proc/<pid>/cwd` (Linux) snapshot of every host
+/// process and its working directory, through the shared [`host_probe`]
+/// subprocess seam already used for `sweep`'s own closed-lane report.
+/// `None` means the probe itself failed (unsupported OS, subprocess
+/// failure) — never read as "no processes". This process's own pid is
+/// always excluded: a reaper invoked with its cwd inside the very lane it
+/// is pruning must never find itself among the candidates.
+pub fn process_cwds() -> Option<Vec<ProcessCwd>> {
+    process_cwds_with(&mut host_probe)
+}
+
+/// Same as [`process_cwds`], with an injectable probe seam so [`reap`]'s
+/// own pid-identity recheck can share this one implementation instead of
+/// duplicating the `ps`/`lsof` parsing. `None` on any probe failure or an
+/// unsupported OS — the probe gives no further detail worth a dedicated
+/// error type here, and every caller already treats this the same way
+/// [`process_cwds`] does: unknown, never "no processes".
+pub fn process_cwds_with(
+    probe: &mut impl FnMut(&str, &[&str]) -> Option<String>,
+) -> Option<Vec<ProcessCwd>> {
+    let stdout = probe("ps", &["-axo", "pid=,pcpu=,comm="])?;
+    let mut metadata = HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(cpu) = parts.next() else {
+            continue;
+        };
+        let command = parts.collect::<Vec<_>>().join(" ");
+        if command.is_empty() {
+            continue;
+        }
+        metadata.insert(pid, (command, cpu.to_string()));
+    }
+    let mut cwds: HashMap<u32, PathBuf> = HashMap::new();
+    if cfg!(target_os = "macos") {
+        let stdout = probe("lsof", &["-a", "-d", "cwd", "-Fpcn"])?;
+        let mut pid = None;
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix('p') {
+                pid = rest.parse().ok();
+            } else if let Some(rest) = line.strip_prefix("n/") {
+                if let Some(pid) = pid {
+                    cwds.insert(pid, PathBuf::from(format!("/{rest}")));
+                }
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        for pid in metadata.keys().copied() {
+            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                cwds.insert(pid, cwd);
+            }
+        }
+    } else {
+        return None;
+    }
+    let own_pid = std::process::id();
+    let mut rows: Vec<ProcessCwd> = cwds
+        .into_iter()
+        .filter(|(pid, _)| *pid != own_pid)
+        .filter_map(|(pid, cwd)| {
+            let (command, cpu_percent) = metadata.get(&pid)?.clone();
+            Some(ProcessCwd {
+                pid,
+                cwd,
+                command,
+                cpu_percent,
+            })
+        })
+        .collect();
+    rows.sort_by_key(|p| p.pid);
+    Some(rows)
+}
+
+/// Processes from one [`process_cwds`] snapshot whose canonical cwd is at
+/// or under `lane_root`'s own canonical path. Shared by `sweep`'s own
+/// closed-lane matching (many lane roots, one snapshot) and the reaper
+/// (one root): both ask exactly this question, and `Path::starts_with`
+/// compares path components, not raw strings, so a sibling directory like
+/// `<lane>-other` is never mistaken for a child of `<lane>`. Neither a
+/// `lane_root` nor a process `cwd` that fails to canonicalize (already
+/// removed, or a dead process whose `/proc` entry raced away) matches
+/// anything.
+pub fn processes_under(lane_root: &Path, processes: &[ProcessCwd]) -> Vec<ProcessCwd> {
+    let Ok(root) = lane_root.canonicalize() else {
+        return Vec::new();
+    };
+    processes
+        .iter()
+        .filter(|process| {
+            process
+                .cwd
+                .canonicalize()
+                .map(|cwd| cwd == root || cwd.starts_with(&root))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// A pid-less label for one process, shared by every caller that prints a
+/// reap candidate: `sweep`'s own closed-lane report, and `--reap`'s own
+/// "kept"/"would reap"/"reaped" lines on `worktrees --prune` and
+/// `tasks --reclaimable`. Matches `sweep.rs`'s own pre-port formatting
+/// (command trimmed to 160 chars, whitespace collapsed) so none of those
+/// call sites changes its printed shape by switching to this one.
+pub fn process_label(process: &ProcessCwd) -> String {
+    let command: String = process
+        .command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command: String = command.chars().take(160).collect();
+    format!("pid {} {command}", process.pid)
+}
+
+/// Decision 6 (card `20261115-b-9815fe`): never a reap target even when its
+/// cwd matches a lane under prune/reclaim — a shell or Herdr itself by
+/// name, pid 1, or any ancestor of this very process. A leaked `cargo
+/// test` may share a shell's pgid with that shell; killing the shell by
+/// name takes down whatever else still runs under it, and this process's
+/// own ancestor chain is never a lane leftover no matter whose cwd it
+/// reports.
+const PROTECTED_COMMANDS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "nu",
+    "herdr",
+    "herdr-server",
+];
+
+fn command_name(command: &str) -> &str {
+    let first = command.split_whitespace().next().unwrap_or("");
+    first.rsplit('/').next().unwrap_or(first)
+}
+
+/// This process's own ancestor pids, immediate parent first, walked via
+/// `ps -o ppid=` one hop at a time — the same subprocess seam [`host_probe`]
+/// already uses, bounded to 64 hops so a cycle a stub test probe returns
+/// (never a cycle a real `ps` would) cannot loop forever. Stops at the
+/// first hop the probe cannot answer, or at pid 1.
+pub fn own_ancestor_pids() -> Vec<u32> {
+    own_ancestor_pids_with(std::process::id(), &mut host_probe)
+}
+
+/// Same as [`own_ancestor_pids`], with an injectable `ps` probe and a
+/// starting pid, so a test can walk a fabricated process tree instead of
+/// this process's real one.
+pub fn own_ancestor_pids_with(
+    mut pid: u32,
+    probe: &mut impl FnMut(&str, &[&str]) -> Option<String>,
+) -> Vec<u32> {
+    let mut ancestors = Vec::new();
+    for _ in 0..64 {
+        let Some(out) = probe("ps", &["-o", "ppid=", "-p", &pid.to_string()]) else {
+            break;
+        };
+        let Some(ppid) = out.trim().parse::<u32>().ok() else {
+            break;
+        };
+        if ancestors.contains(&ppid) {
+            break;
+        }
+        ancestors.push(ppid);
+        if ppid <= 1 {
+            break;
+        }
+        pid = ppid;
+    }
+    ancestors
+}
+
+/// Whether `process` must never be signaled — checked by every call site
+/// before it invokes [`reap`], not by `reap` itself: `own_ancestor_pids` is
+/// one `ps` walk a caller makes once per pass, not once per candidate.
+pub fn protected(process: &ProcessCwd, ancestors: &[u32]) -> bool {
+    process.pid == 1
+        || PROTECTED_COMMANDS.contains(&command_name(&process.command))
+        || ancestors.contains(&process.pid)
+}
+
+/// Default grace between a reaper's SIGTERM and its pid-identity recheck
+/// before SIGKILL. Short on purpose: a lingering lane process is almost
+/// always a leftover child (`sleep`, a background test run) with no
+/// cleanup of its own to do, so a short wait catches the common
+/// already-gone case without holding up `--prune`/`--reclaimable`
+/// noticeably.
+pub const DEFAULT_REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// What [`reap`] found once its grace window ended. Never a reason on its
+/// own to assume a *lane* is now clean — a caller re-checks that lane's
+/// own lingering-process list before deciding anything else followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapOutcome {
+    /// Gone by the time the grace window ended — SIGTERM alone was enough,
+    /// or it had already exited before this call ran.
+    Reaped,
+    /// Still the same process (same command, same cwd) after the grace
+    /// window, so SIGKILL was sent and the pid is now gone.
+    Killed,
+    /// Still the same process after SIGKILL too — signaling it failed
+    /// (no permission, or the OS never delivered it).
+    StillAlive,
+    /// The pid answered after the grace window, but as a different
+    /// process (different command or cwd): something else reused it
+    /// during the wait. The original is already gone; left alone.
+    IdentityChanged,
+}
+
+/// SIGTERM, wait `grace`, re-check the pid still identifies the same
+/// process (command and cwd unchanged) before SIGKILL — the one function
+/// in this module that signals anything. Wired to the real `kill`
+/// subprocess and a real sleep; [`reap_with`] takes injectable seams for a
+/// test that exercises the state machine without a real target process.
+pub fn reap(target: &ProcessCwd, grace: Duration) -> ReapOutcome {
+    reap_with(target, grace, &mut std::thread::sleep, &mut host_probe)
+}
+
+/// Same as [`reap`], with injectable sleep and probe seams so a test can
+/// drive the SIGTERM/grace/SIGKILL state machine against a fake process
+/// without signaling anything real.
+pub fn reap_with(
+    target: &ProcessCwd,
+    grace: Duration,
+    sleep: &mut impl FnMut(Duration),
+    probe: &mut impl FnMut(&str, &[&str]) -> Option<String>,
+) -> ReapOutcome {
+    let pid = target.pid.to_string();
+    if probe("kill", &["-TERM", &pid]).is_none() {
+        // No such process (ESRCH) or no permission to signal it at all —
+        // either way there is nothing left for this call to wait on.
+        return ReapOutcome::Reaped;
+    }
+    sleep(grace);
+    match process_cwds_with(probe)
+        .and_then(|processes| processes.into_iter().find(|p| p.pid == target.pid))
+    {
+        None => ReapOutcome::Reaped,
+        Some(current) if current.command == target.command && current.cwd == target.cwd => {
+            if probe("kill", &["-KILL", &pid]).is_some() {
+                ReapOutcome::Killed
+            } else {
+                ReapOutcome::StillAlive
+            }
+        }
+        Some(_) => ReapOutcome::IdentityChanged,
+    }
+}
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+
+    fn process(pid: u32) -> ProcessCwd {
+        ProcessCwd {
+            pid,
+            cwd: PathBuf::from("/lane"),
+            command: "sleep 300".into(),
+            cpu_percent: "0.0".into(),
+        }
+    }
+
+    #[test]
+    fn processes_under_matches_only_real_descendants_never_a_sibling_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = dir.path().join("lane");
+        let sibling = dir.path().join("lane-other");
+        std::fs::create_dir_all(lane.join("nested")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let processes = vec![
+            ProcessCwd {
+                pid: 1,
+                cwd: lane.clone(),
+                command: "a".into(),
+                cpu_percent: "0".into(),
+            },
+            ProcessCwd {
+                pid: 2,
+                cwd: lane.join("nested"),
+                command: "b".into(),
+                cpu_percent: "0".into(),
+            },
+            ProcessCwd {
+                pid: 3,
+                cwd: sibling,
+                command: "c".into(),
+                cpu_percent: "0".into(),
+            },
+        ];
+        let matched = processes_under(&lane, &processes);
+        assert_eq!(
+            matched.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn process_cwds_never_includes_this_process_own_pid() {
+        let own = std::process::id();
+        let mut probe = |program: &str, _args: &[&str]| -> Option<String> {
+            match program {
+                "ps" => Some(format!("{own} 0.0 sleep\n4242 0.0 sleep\n")),
+                "lsof" => Some(format!("p{own}\nn/lane\np4242\nn/lane\n")),
+                _ => None,
+            }
+        };
+        let rows = process_cwds_with(&mut probe).unwrap();
+        assert_eq!(rows.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![4242]);
+    }
+
+    #[test]
+    fn reap_signals_term_only_once_when_the_process_is_already_gone() {
+        let mut calls = Vec::new();
+        let outcome = reap_with(
+            &process(99),
+            Duration::from_secs(0),
+            &mut |_| {},
+            &mut |program, args| {
+                calls.push((
+                    program.to_owned(),
+                    args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                ));
+                None
+            },
+        );
+        assert_eq!(outcome, ReapOutcome::Reaped);
+        assert_eq!(
+            calls,
+            vec![("kill".to_owned(), vec!["-TERM".to_owned(), "99".to_owned()])]
+        );
+    }
+
+    #[test]
+    fn reap_waits_then_sigkills_a_process_still_alive_after_term() {
+        let target = process(99);
+        let mut slept = Vec::new();
+        let outcome = reap_with(
+            &target,
+            Duration::from_millis(5),
+            &mut |d| slept.push(d),
+            &mut |program, args| match (program, args) {
+                ("kill", ["-TERM", "99"]) => Some(String::new()),
+                ("kill", ["-KILL", "99"]) => Some(String::new()),
+                ("ps", _) => Some("99 1.0 sleep 300\n".into()),
+                ("lsof", _) => Some("p99\nn/lane\n".into()),
+                _ => None,
+            },
+        );
+        assert_eq!(outcome, ReapOutcome::Killed);
+        assert_eq!(slept, vec![Duration::from_millis(5)]);
+    }
+
+    #[test]
+    fn reap_leaves_a_pid_alone_once_it_identifies_a_different_process() {
+        let target = process(99);
+        let outcome = reap_with(
+            &target,
+            Duration::from_millis(0),
+            &mut |_| {},
+            &mut |program, args| match (program, args) {
+                ("kill", ["-TERM", "99"]) => Some(String::new()),
+                ("ps", _) => Some("99 1.0 unrelated-daemon\n".into()),
+                ("lsof", _) => Some("p99\nn/elsewhere\n".into()),
+                _ => panic!("must never SIGKILL once identity no longer matches: {args:?}"),
+            },
+        );
+        assert_eq!(outcome, ReapOutcome::IdentityChanged);
+    }
+
+    #[test]
+    fn reap_reports_still_alive_when_sigkill_itself_fails() {
+        let target = process(99);
+        let outcome = reap_with(
+            &target,
+            Duration::from_millis(0),
+            &mut |_| {},
+            &mut |program, args| match (program, args) {
+                ("kill", ["-TERM", "99"]) => Some(String::new()),
+                ("kill", ["-KILL", "99"]) => None,
+                ("ps", _) => Some("99 1.0 sleep 300\n".into()),
+                ("lsof", _) => Some("p99\nn/lane\n".into()),
+                _ => None,
+            },
+        );
+        assert_eq!(outcome, ReapOutcome::StillAlive);
+    }
+
+    #[test]
+    fn protected_refuses_a_shell_or_herdr_by_name_even_with_a_matching_cwd() {
+        let ancestors = Vec::new();
+        for command in ["zsh", "/bin/bash", "herdr", "herdr-server -daemon"] {
+            let candidate = ProcessCwd {
+                pid: 55,
+                cwd: PathBuf::from("/lane"),
+                command: command.into(),
+                cpu_percent: "0".into(),
+            };
+            assert!(protected(&candidate, &ancestors), "{command}");
+        }
+        assert!(!protected(&process(55), &ancestors));
+    }
+
+    #[test]
+    fn protected_refuses_pid_1_and_this_process_own_ancestors() {
+        assert!(protected(&process(1), &[]));
+        assert!(protected(&process(42), &[42, 7]));
+        assert!(!protected(&process(42), &[7]));
+    }
+
+    #[test]
+    fn own_ancestor_pids_with_walks_ppid_to_pid_1_and_stops() {
+        let ancestors = own_ancestor_pids_with(500, &mut |program, args| match (program, args) {
+            ("ps", ["-o", "ppid=", "-p", "500"]) => Some("200\n".into()),
+            ("ps", ["-o", "ppid=", "-p", "200"]) => Some("1\n".into()),
+            _ => panic!("must stop walking past pid 1: {args:?}"),
+        });
+        assert_eq!(ancestors, vec![200, 1]);
+    }
+
+    #[test]
+    fn own_ancestor_pids_with_stops_on_an_unreadable_hop() {
+        let ancestors = own_ancestor_pids_with(500, &mut |_, _| None);
+        assert!(ancestors.is_empty());
+    }
+
+    #[test]
+    fn process_label_trims_and_collapses_whitespace() {
+        let candidate = ProcessCwd {
+            pid: 4200,
+            cwd: PathBuf::from("/lane"),
+            command: "  cargo   test  --locked  ".into(),
+            cpu_percent: "1.0".into(),
+        };
+        assert_eq!(process_label(&candidate), "pid 4200 cargo test --locked");
     }
 }

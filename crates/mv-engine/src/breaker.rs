@@ -42,9 +42,16 @@ use crate::selector;
 /// Cooldowns and escalation constants (`spec-seats-quotas.md`,
 /// "FENCED / AVAILABLE" and "Half-open trials" sections).
 pub const DEFAULT_COOLDOWN: time::Duration = time::Duration::hours(5);
+/// The flat cooldown for a `Weekly`-kind trip.
 pub const WEEKLY_COOLDOWN: time::Duration = time::Duration::days(7);
+/// How long a claimed half-open trial stays active with no live pane.
 pub const TRIAL_TIMEOUT: time::Duration = time::Duration::minutes(30);
+/// The gap since the last trip of an escalating rule, past which the next
+/// trip restarts the escalation ladder at its first step instead of
+/// climbing further.
 pub const ESCALATION_RESET_WINDOW: time::Duration = time::Duration::minutes(30);
+/// The escalation ladder itself: 5, then 10, then 15 minutes, holding at
+/// the last step for any further trip within the window.
 pub const ESCALATION_STEPS_MINUTES: [i64; 3] = [5, 10, 15];
 
 /// A year far enough out that a `BUDGET` trip never auto-resets — a
@@ -61,10 +68,15 @@ pub fn is_escalating_rule(rule: &str) -> bool {
     rule == "codex_retry_limit_exceeded"
 }
 
+/// Which cooldown rule governs a trip: a fixed weekly window, a
+/// human-reset-only budget trip, or the default rolling cooldown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerKind {
+    /// Resets after [`WEEKLY_COOLDOWN`].
     Weekly,
+    /// Never resets automatically — see [`NO_AUTOMATIC_RESET_YEAR`].
     Budget,
+    /// Resets after [`DEFAULT_COOLDOWN`], or sooner via escalation.
     Rolling,
 }
 
@@ -344,10 +356,13 @@ pub fn owns_trial(entry: &BreakerEntry, task_id: &str, token: &str) -> bool {
         && entry.trial_token.as_deref() == Some(token)
 }
 
+/// Why [`claim_trial`] refused a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimRefused {
+    /// The pool is not currently half-open, so there is no trial to claim.
     #[error("pool is not half-open")]
     NotHalfOpen,
+    /// A different `(task_id, token)` already holds an unexpired trial.
     #[error("an unexpired trial is already claimed by another caller")]
     AlreadyClaimed,
 }
@@ -552,10 +567,13 @@ pub struct TripRequest<'a> {
     pub manual: bool,
 }
 
+/// Why [`trip`] failed to record a trip.
 #[derive(Debug, thiserror::Error)]
 pub enum TripError {
+    /// `vendor == "local"` was passed; a local seat has nothing to fence.
     #[error("vendor \"local\" cannot be fenced behind a breaker — nothing to trip")]
     LocalVendor,
+    /// The store write itself failed.
     #[error(transparent)]
     Store(#[from] breaker_store::StoreError),
 }
@@ -917,12 +935,16 @@ pub fn describe(pool: &str, status: &BreakerStatus) -> String {
     format!("{body}{suffix}")
 }
 
+/// Why [`manual_trip`] failed before it ever reached the store.
 #[derive(Debug, thiserror::Error)]
 pub enum ManualTripError {
+    /// The `--kind` argument was not one of `rolling`, `weekly`, `budget`.
     #[error("unknown breaker kind {0:?}; expected rolling, weekly, or budget")]
     Kind(String),
+    /// The `--until` argument did not parse as a timestamp.
     #[error("invalid breaker reset timestamp {0:?}")]
     Until(String),
+    /// The underlying trip itself failed (e.g. `vendor == "local"`).
     #[error(transparent)]
     Trip(#[from] TripError),
 }
@@ -973,6 +995,7 @@ pub fn manual_trip(
     )?)
 }
 
+/// Operator reset: closes `pool` with the fixed `"manual reset"` reason.
 pub fn manual_reset(state_dir: &Path, pool: &str) -> Result<(), breaker_store::StoreError> {
     // Python's `breaker.reset` hardcodes `close_reason: "manual reset"`,
     // independent of the CLI caller name recorded on a trip.

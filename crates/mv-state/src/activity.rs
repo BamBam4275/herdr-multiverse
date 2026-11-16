@@ -322,6 +322,9 @@ pub enum UpdatePhase {
 }
 
 impl UpdatePhase {
+    /// The on-disk `phase=` field value this variant encodes as
+    /// (`encode_update`) — also used to compare against the last update's
+    /// stored phase when checking the cooldown in [`post_update`].
     pub fn as_str(self) -> &'static str {
         match self {
             UpdatePhase::Working => "working",
@@ -330,6 +333,9 @@ impl UpdatePhase {
         }
     }
 
+    /// The inverse of [`Self::as_str`]: decode a `phase=` field read back
+    /// off disk. `None` for anything else, which `classify_update` turns
+    /// into a [`ActivityError::DamagedRecord`] rather than guessing.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "working" => Some(UpdatePhase::Working),
@@ -343,32 +349,63 @@ impl UpdatePhase {
 /// A validated `event=message` record (`activity.py:1014-1104`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecord {
+    /// This record's position in its log — the value cursors, markers and
+    /// `re=`/`Project#SEQ` references all key off.
     pub seq: u64,
+    /// When the message was appended, as an ISO-8601 UTC timestamp.
     pub when: String,
+    /// Caller-supplied id used to make sending idempotent: re-sending the
+    /// same `id` to the same recipient is a no-op (see [`send_message`]).
     pub id: String,
+    /// The sending project's name.
     pub from_project: String,
+    /// The recipient project's name — determines whose inbox this record
+    /// belongs to when scanning a shared log.
     pub to_project: String,
+    /// The decoded (un-escaped) message text.
     pub body: String,
+    /// Whether this message opened an ask awaiting a reply or an explicit
+    /// [`close_ask`].
     pub ask: bool,
+    /// `Some(seq)` when this message answers an earlier ask at that
+    /// sequence number; `None` for an ordinary, unlinked message.
     pub reply_to: Option<u64>,
+    /// `Some(asker)` when this reply was composed and posted by the ask's
+    /// own sender acting on the holder's behalf — `reply <Holder>#<seq>`
+    /// run from the asker's own directory (commit `c6e7738`) — naming that
+    /// asker. `None` for every other message, including a reply the holder
+    /// posted itself. Additive: a line written before this field existed
+    /// has no `relayed_by=` tag and decodes to `None` here, unchanged.
+    pub relayed_by: Option<String>,
 }
 
 /// A validated `event=update` record (`activity.py:1107-1161`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateRecord {
+    /// This record's position in its log.
     pub seq: u64,
+    /// When the update was posted, as an ISO-8601 UTC timestamp.
     pub when: String,
+    /// The task/card id this update reports progress on.
     pub task: String,
+    /// The phase reported by this update; `Wait` is the one phase the
+    /// cooldown in [`post_update`] never suppresses.
     pub phase: UpdatePhase,
+    /// Free-text note accompanying the phase.
     pub note: String,
 }
 
 /// A validated `event=close` record (`activity.py:1181-1231`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseRecord {
+    /// This record's position in its log.
     pub seq: u64,
+    /// When the ask was closed, as an ISO-8601 UTC timestamp.
     pub when: String,
+    /// The `seq` of the ask this close record resolves.
     pub reply_to: u64,
+    /// Free-text reason the ask was closed (e.g. `"answered"` from
+    /// [`reply`], or a caller-supplied decline reason from [`close_ask`]).
     pub reason: String,
 }
 
@@ -527,16 +564,34 @@ pub fn parse_ask_ref(raw: &str) -> Result<(Option<String>, u64), ActivityError> 
 
 /// Build one `v=1` line (without the trailing newline): shared envelope
 /// fields first, then `extra` in the order given, then the crc32 trailer.
-fn encode_v1(when: &str, seq: u64, event: &str, extra: &[(&str, String)]) -> String {
+///
+/// Rejects a tab, CR, LF or `=` in any key, and a tab, CR or LF in any
+/// value, mirroring [`crate::log::encode_versioned`]'s field guard — a
+/// value carrying one of those would otherwise forge a second
+/// tab-separated field or corrupt the envelope. Every caller already
+/// validates its own fields before reaching here, so this never rejects
+/// valid input; it is a second guard beside the first, not a relaxation
+/// of it.
+fn encode_v1(
+    when: &str,
+    seq: u64,
+    event: &str,
+    extra: &[(&str, String)],
+) -> Result<String, ActivityError> {
     let mut prefix = format!("{when}\tv=1\tseq={seq}\tevent={event}");
     for (key, value) in extra {
+        if key.contains(['=', '\t', '\r', '\n']) || value.contains(['\t', '\r', '\n']) {
+            return Err(ActivityError::DamagedRecord(
+                "unsafe field in routing record".into(),
+            ));
+        }
         prefix.push('\t');
         prefix.push_str(key);
         prefix.push('=');
         prefix.push_str(value);
     }
     let crc = support::crc32_hex(prefix.as_bytes());
-    format!("{prefix}\tcrc32={crc}")
+    Ok(format!("{prefix}\tcrc32={crc}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -549,7 +604,8 @@ fn encode_message(
     body: &str,
     ask: bool,
     reply_to: Option<u64>,
-) -> String {
+    relayed_by: Option<&str>,
+) -> Result<String, ActivityError> {
     let mut extra: Vec<(&str, String)> = vec![
         ("id", id.to_string()),
         ("from", from_project.to_string()),
@@ -562,10 +618,22 @@ fn encode_message(
     if let Some(re) = reply_to {
         extra.push(("re", re.to_string()));
     }
+    // Trailing and conditional, so a line written before this field
+    // existed — or any reply the holder posts itself — is byte-identical
+    // to what this function produced before `relayed_by` existed.
+    if let Some(by) = relayed_by {
+        extra.push(("relayed_by", by.to_string()));
+    }
     encode_v1(when, seq, "message", &extra)
 }
 
-fn encode_update(when: &str, seq: u64, task: &str, phase: UpdatePhase, note: &str) -> String {
+fn encode_update(
+    when: &str,
+    seq: u64,
+    task: &str,
+    phase: UpdatePhase,
+    note: &str,
+) -> Result<String, ActivityError> {
     let extra: Vec<(&str, String)> = vec![
         ("task", task.to_string()),
         ("phase", phase.as_str().to_string()),
@@ -574,7 +642,12 @@ fn encode_update(when: &str, seq: u64, task: &str, phase: UpdatePhase, note: &st
     encode_v1(when, seq, "update", &extra)
 }
 
-fn encode_close(when: &str, seq: u64, reply_to: u64, reason: &str) -> String {
+fn encode_close(
+    when: &str,
+    seq: u64,
+    reply_to: u64,
+    reason: &str,
+) -> Result<String, ActivityError> {
     let extra: Vec<(&str, String)> = vec![
         ("re", reply_to.to_string()),
         ("reason", support::json_quote_ascii(reason)),
@@ -611,6 +684,10 @@ fn classify_message(env: &RawEnvelope) -> Result<Option<MessageRecord>, Activity
         })?),
         None => None,
     };
+    // Absent on every line written before this field existed, and on any
+    // reply the holder posted itself — both decode to `None` here, the
+    // same as before this field was added.
+    let relayed_by = env.field("relayed_by").map(str::to_string);
     Ok(Some(MessageRecord {
         seq: env.seq,
         when: env.when.clone(),
@@ -620,6 +697,7 @@ fn classify_message(env: &RawEnvelope) -> Result<Option<MessageRecord>, Activity
         body,
         ask,
         reply_to,
+        relayed_by,
     }))
 }
 
@@ -697,14 +775,22 @@ impl ProjectLog {
         }
     }
 
+    /// The project name this log belongs to, used for addressing
+    /// (e.g. [`broadcast`]'s lock ordering, [`reply`]'s identity checks).
     pub fn project(&self) -> &str {
         &self.project
     }
 
+    /// The project's root directory (the parent of its `.multiverse/`
+    /// state), for callers that need to locate the project's other
+    /// on-disk state alongside this log.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// The `routing.log` file's own path, for callers (chiefly tests) that
+    /// need to read or corrupt the raw file directly rather than going
+    /// through this type's own parsing.
     pub fn log_path(&self) -> &Path {
         &self.log_path
     }
@@ -794,6 +880,16 @@ impl ProjectLog {
         #[cfg(not(unix))]
         fs::create_dir_all(dir)?;
         let log_existed = self.log_path.exists();
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&self.log_path)?
+        };
+        #[cfg(not(unix))]
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -801,7 +897,10 @@ impl ProjectLog {
         writeln!(file, "{line}")?;
         file.sync_all()?;
         #[cfg(unix)]
-        if !log_existed {
+        if log_existed {
+            // `.mode(0o600)` above already closes the create-then-chmod
+            // race for a file this `open` creates; this chmod only
+            // tightens one that already existed with a wider mode.
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
@@ -818,7 +917,7 @@ impl ProjectLog {
     fn append_message_if_absent(
         &self,
         id: &str,
-        build_line: impl Fn(u64) -> String,
+        build_line: impl Fn(u64) -> Result<String, ActivityError>,
     ) -> Result<AppendOutcome, ActivityError> {
         self.with_lock(|| -> Result<AppendOutcome, ActivityError> {
             if self.contains_id(id)? {
@@ -828,7 +927,8 @@ impl ProjectLog {
                 .high_water_seq()?
                 .checked_add(1)
                 .ok_or(ActivityError::SequenceExhausted)?;
-            self.append_line(&build_line(seq))?;
+            let line = build_line(seq)?;
+            self.append_line(&line)?;
             Ok(AppendOutcome::Appended { seq })
         })
     }
@@ -843,13 +943,14 @@ impl ProjectLog {
     /// take the lock a second time and deadlock against itself.
     fn append_versioned_locked(
         &self,
-        build_line: impl Fn(u64) -> String,
+        build_line: impl Fn(u64) -> Result<String, ActivityError>,
     ) -> Result<u64, ActivityError> {
         let seq = self
             .high_water_seq()?
             .checked_add(1)
             .ok_or(ActivityError::SequenceExhausted)?;
-        self.append_line(&build_line(seq))?;
+        let line = build_line(seq)?;
+        self.append_line(&line)?;
         Ok(seq)
     }
 
@@ -937,6 +1038,10 @@ pub enum SendOutcome {
 /// `[activity.pairs]` gate (`config.py:1570-1601`) — this module does not
 /// know the config schema, so it takes the already-evaluated decision
 /// rather than guessing at TOML shape `mv-config` has not landed to parse.
+///
+/// A thin, signature-frozen wrapper over [`send_message_relayed`] with
+/// `relayed_by: None` — every existing caller keeps writing an
+/// unmarked message, byte-identical to before that function existed.
 #[allow(clippy::too_many_arguments)]
 pub fn send_message(
     recipient_log: &ProjectLog,
@@ -949,9 +1054,44 @@ pub fn send_message(
     may_send: bool,
     redact: &dyn Fn(&str) -> String,
 ) -> Result<SendOutcome, ActivityError> {
+    send_message_relayed(
+        recipient_log,
+        id,
+        from_project,
+        to_project,
+        body,
+        ask,
+        reply_to,
+        None,
+        may_send,
+        redact,
+    )
+}
+
+/// [`send_message`] plus `relayed_by`: `Some(asker)` marks the appended
+/// reply as composed by that asker on the recipient-log-owner's behalf
+/// (card `20261116-b-57998b` finding 2). Kept separate from `send_message`
+/// itself so that function's signature — and every call site that already
+/// exists for it — never has to change for this.
+#[allow(clippy::too_many_arguments)]
+pub fn send_message_relayed(
+    recipient_log: &ProjectLog,
+    id: &str,
+    from_project: &str,
+    to_project: &str,
+    body: &str,
+    ask: bool,
+    reply_to: Option<u64>,
+    relayed_by: Option<&str>,
+    may_send: bool,
+    redact: &dyn Fn(&str) -> String,
+) -> Result<SendOutcome, ActivityError> {
     validate_identifier("message id", id)?;
     validate_identifier("sender project name", from_project)?;
     validate_identifier("recipient project name", to_project)?;
+    if let Some(by) = relayed_by {
+        validate_identifier("relayed-by project name", by)?;
+    }
     if !may_send {
         return Err(ActivityError::NotPermitted {
             from: from_project.to_string(),
@@ -979,6 +1119,7 @@ pub fn send_message(
             &redacted,
             ask,
             reply_to,
+            relayed_by,
         )
     })?;
     Ok(match outcome {
@@ -999,10 +1140,14 @@ pub enum FanOutResult {
 /// not just a count.
 #[derive(Debug, Clone, Default)]
 pub struct FanOutReport {
+    /// Each recipient's outcome, in the order [`broadcast`] processed them
+    /// (hub-first, then alphabetical).
     pub results: Vec<(String, FanOutResult)>,
 }
 
 impl FanOutReport {
+    /// Recipient project names that received (or already had) the
+    /// broadcast — everything but `Skipped`.
     pub fn sent(&self) -> impl Iterator<Item = &str> {
         self.results.iter().filter_map(|(p, r)| match r {
             FanOutResult::Sent { .. } | FanOutResult::AlreadySent => Some(p.as_str()),
@@ -1010,6 +1155,8 @@ impl FanOutReport {
         })
     }
 
+    /// Recipient project names paired with why each was skipped (e.g. not
+    /// permitted by `[activity.pairs]`).
     pub fn skipped(&self) -> impl Iterator<Item = (&str, &str)> {
         self.results.iter().filter_map(|(p, r)| match r {
             FanOutResult::Skipped { reason } => Some((p.as_str(), reason.as_str())),
@@ -1025,9 +1172,16 @@ impl FanOutReport {
 /// permitted recipient whose directory is missing raises
 /// [`ActivityError::RecipientDirectoryMissing`] before the first write;
 /// IO failures continue then raise [`ActivityError::FanOutPartial`].
+///
+/// `ask` carries the same semantics as `activity send --ask` (card
+/// `20261115-b-d4cf40`): each recipient gets its own `ask=1` message, so
+/// each sees it as an open ask in its own inbox, any one of them may
+/// `reply` to resolve it, and the sender's owed-replies count tracks one
+/// outstanding ask per recipient that has not yet replied.
 pub fn broadcast(
     from_project: &str,
     body: &str,
+    ask: bool,
     recipients: &[(ProjectLog, bool)],
     msg_id: &str,
     redact: &dyn Fn(&str) -> String,
@@ -1074,7 +1228,7 @@ pub fn broadcast(
             from_project,
             log.project(),
             body,
-            false,
+            ask,
             None,
             true,
             redact,
@@ -1121,8 +1275,13 @@ pub fn broadcast(
 /// has not yet been answered or explicitly closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAsk {
+    /// The ask message's sequence number in the holder's own log —
+    /// what [`reply`]/[`close_ask`] take to resolve it.
     pub seq: u64,
+    /// The project that sent the ask, i.e. whose log the reply must be
+    /// written into.
     pub from_project: String,
+    /// The ask's decoded message text.
     pub body: String,
 }
 
@@ -1168,6 +1327,22 @@ pub fn find_ask(log: &ProjectLog, seq: u64) -> Result<Option<MessageRecord>, Act
     Ok(None)
 }
 
+/// `find_ask`'s unfiltered sibling: the message at `seq` in `log`, ask or
+/// not, open or already closed — `activity show` (card `20261115-b-9ebad2`)
+/// reads one message in full regardless of its kind or state, unlike
+/// [`find_ask`]/[`find_open_ask`], which both exist to locate something a
+/// caller is about to act on.
+pub fn find_message(log: &ProjectLog, seq: u64) -> Result<Option<MessageRecord>, ActivityError> {
+    for env in log.envelopes()? {
+        if let Some(msg) = classify_message(&env)? {
+            if msg.seq == seq {
+                return Ok(Some(msg));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Open (unclosed) asks this project is holding, in file order.
 pub fn open_asks(log: &ProjectLog) -> Result<Vec<MessageRecord>, ActivityError> {
     let (messages, closed) = log.inbox_and_closes()?;
@@ -1184,13 +1359,22 @@ pub fn has_close_record(log: &ProjectLog, ask_seq: u64) -> Result<bool, Activity
     Ok(closes.iter().any(|c| c.reply_to == ask_seq))
 }
 
-/// `reply` (`activity.py:2007-2206`): the caller — the **recipient** of the
-/// original ask, holding it in `own_log` — resolves the ask against their
-/// own log (`find_open_ask`), writes the answer as an ordinary message
-/// into the **original asker's** log so the asker finds it in their own
-/// inbox, and then marks the ask closed in `own_log` so a second `reply`
-/// or `close_ask` against the same `seq` is refused. No reply-exemption in
-/// `may_send` — the reverse direction must itself be a permitted pair.
+/// `reply` (`activity.py:2007-2206`): the caller — ordinarily the
+/// **recipient** of the original ask, holding it in `own_log` — resolves
+/// the ask against their own log (`find_open_ask`), writes the answer as
+/// an ordinary message into the **original asker's** log so the asker
+/// finds it in their own inbox, and then marks the ask closed in `own_log`
+/// so a second `reply` or `close_ask` against the same `seq` is refused.
+/// No reply-exemption in `may_send` — the reverse direction must itself be
+/// a permitted pair.
+///
+/// `relayed_by` is `Some(asker)` when the caller is instead that ask's own
+/// *sender*, composing the answer on `own_log`'s owner's behalf (card
+/// `20261116-b-57998b` finding 2) — the written message still carries
+/// `own_log.project()` as its `from`, matching an ordinary reply, but is
+/// tagged so nobody reading it mistakes it for that project's own words.
+/// `None` reproduces the message byte-for-byte as it was before this
+/// parameter existed.
 #[allow(clippy::too_many_arguments)]
 pub fn reply(
     own_log: &ProjectLog,
@@ -1198,12 +1382,13 @@ pub fn reply(
     ask_seq: u64,
     reply_id: &str,
     reply_body: &str,
+    relayed_by: Option<&str>,
     may_send_reverse: bool,
     redact: &dyn Fn(&str) -> String,
 ) -> Result<SendOutcome, ActivityError> {
     let ask = find_open_ask(own_log, ask_seq)?;
     debug_assert_eq!(ask.from_project, asker_log.project());
-    let outcome = send_message(
+    let outcome = send_message_relayed(
         asker_log,
         reply_id,
         own_log.project(),
@@ -1211,6 +1396,7 @@ pub fn reply(
         reply_body,
         false,
         Some(ask_seq),
+        relayed_by,
         may_send_reverse,
         redact,
     )?;
@@ -1367,6 +1553,9 @@ pub fn read_marker(state_dir: &Path) -> Option<(u64, String)> {
     Some((seq, when))
 }
 
+/// Write `activity.lastseen` unconditionally (unlike [`write_cursor`], this
+/// is not monotonic — every [`read_inbox`] call, peek or not, overwrites it
+/// with the log's current high-water mark).
 pub fn write_marker(state_dir: &Path, seq: u64) -> Result<(), ActivityError> {
     let path = state_dir.join("activity.lastseen");
     let when = support::now_stamp();
@@ -1401,6 +1590,8 @@ fn write_lastack(state_dir: &Path, count: u64, through_seq: u64) -> Result<(), A
 /// One page of `read_inbox`/`peek` (`activity.py:2535-2780`).
 #[derive(Debug, Clone, Default)]
 pub struct InboxPage {
+    /// Unread messages shown by this read, in `seq` order, truncated to
+    /// `limit`.
     pub messages: Vec<MessageRecord>,
     /// The highest `seq` among `messages` — what `acknowledge` would
     /// advance the cursor to, capped by `limit` the same way
@@ -1420,6 +1611,7 @@ pub struct InboxPage {
     /// what the CLI's "last read/peeked at ..., through event N" line
     /// reports.
     pub marker_seq: u64,
+    /// The timestamp paired with `marker_seq` above.
     pub marker_at: String,
     /// Whether this call's `activity.lastseen` write actually succeeded.
     /// `false` means the write failed — a full disk, a permissions
@@ -1595,7 +1787,11 @@ pub fn mail_cursor_behind(project_root: &Path) -> Option<u64> {
 /// same read-only posture `board.find_unlinked_replies` takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlinkedReply {
+    /// The still-open ask held by `holder` that this candidate answer may
+    /// resolve.
     pub ask: MessageRecord,
+    /// The earliest ordinary (non-ask, unlinked) message `holder` sent to
+    /// the asker on or after the ask — the candidate answer.
     pub answer: MessageRecord,
     /// Whether `answer` carries concrete evidence it addresses `ask` (an
     /// explicit `#N` reference, an exact phrase match, or strong word
@@ -1846,6 +2042,41 @@ mod tests {
         ProjectLog::open(project, dir)
     }
 
+    /// Env var a re-exec'd child checks: when set, it is the child and
+    /// should run its real body now, under the umask it asked for.
+    /// Unsafe code is `forbid`den workspace-wide (`Cargo.toml`
+    /// `[workspace.lints.rust]`), so there is no in-process `libc::umask`
+    /// call available here; `sh`'s `umask` builtin sets it on the shell
+    /// process, which `exec` then hands straight to this same test
+    /// binary, umask and all — the same cross-process-child pattern
+    /// `mv_core::lock`'s
+    /// `a_second_process_times_out_while_another_process_holds_it` test
+    /// uses for a different process-wide property (a held `flock`).
+    #[cfg(unix)]
+    const UMASK_CHILD_MARKER_VAR: &str = "MV_STATE_ACTIVITY_TEST_UMASK_CHILD";
+
+    /// `true` if this call is running inside the umask-0 re-exec'd child
+    /// — `false` in the original process, which has already spawned that
+    /// child, asserted it passed, and so must *not* also run the body
+    /// itself under its own, uncontrolled umask.
+    #[cfg(unix)]
+    fn is_umask_000_child(test_name: &str) -> bool {
+        if std::env::var_os(UMASK_CHILD_MARKER_VAR).is_some() {
+            return true;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 000 && exec "$0" --exact "$1" --nocapture"#)
+            .arg(&exe)
+            .arg(test_name)
+            .env(UMASK_CHILD_MARKER_VAR, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "umask-0 child run of {test_name} failed");
+        false
+    }
+
     fn no_redact(s: &str) -> String {
         s.to_string()
     }
@@ -1887,6 +2118,29 @@ mod tests {
     }
 
     #[test]
+    fn encode_v1_rejects_a_tab_in_a_value_with_nothing_written() {
+        let err = encode_v1(
+            "2026-11-16T00:00:00+00:00",
+            1,
+            "update",
+            &[("note", "a\tstatus=X".to_string())],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ActivityError::DamagedRecord(_)));
+    }
+
+    #[test]
+    fn encode_v1_accepts_the_same_fields_once_the_hostile_byte_is_gone() {
+        assert!(encode_v1(
+            "2026-11-16T00:00:00+00:00",
+            1,
+            "update",
+            &[("note", "a status=X".to_string())],
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn json_quote_ascii_matches_ensure_ascii_true() {
         assert_eq!(support::json_quote_ascii("hello world"), "\"hello world\"");
         assert_eq!(
@@ -1908,7 +2162,9 @@ mod tests {
             "hello world",
             false,
             None,
-        );
+            None,
+        )
+        .unwrap();
         let prefix = "2026-11-02T12:00:00+00:00\tv=1\tseq=42\tevent=message\t\
                        id=20000101-fixer-000001\tfrom=multiverse\tto=example\t\
                        body=\"hello world\"";
@@ -2312,6 +2568,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn append_line_creates_routing_log_at_mode_0600_under_umask_000() {
+        if !is_umask_000_child(
+            "activity::tests::append_line_creates_routing_log_at_mode_0600_under_umask_000",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join(".multiverse/routing.log");
+        assert!(!log_path.exists());
+
+        let log = log_in(dir.path(), "example");
+        log.append_line("first line").unwrap();
+
+        let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "routing.log must be 0600 from the `open` that creates it, not from a later chmod"
+        );
+    }
+
+    #[test]
     fn concurrent_post_updates_for_the_same_task_cannot_both_bypass_the_cooldown() {
         let dir = tempdir().unwrap();
         let project_root = dir.path().to_path_buf();
@@ -2490,6 +2769,7 @@ mod tests {
         let err = broadcast(
             "not-the-hub",
             "announcement",
+            false,
             &[(recipient, true)],
             "bcast-1",
             &no_redact,
@@ -2508,6 +2788,7 @@ mod tests {
         let report = broadcast(
             HUB_PROJECT_NAME,
             "fleet announcement",
+            false,
             &[(a, true), (b, false)],
             "bcast-1",
             &no_redact,
@@ -2519,6 +2800,32 @@ mod tests {
         let skipped: Vec<(&str, &str)> = report.skipped().collect();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].0, "project-b");
+    }
+
+    #[test]
+    fn broadcast_with_ask_marks_every_sent_message_as_an_open_ask() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let a = log_in(dir_a.path(), "project-a");
+        let b = log_in(dir_b.path(), "project-b");
+
+        broadcast(
+            HUB_PROJECT_NAME,
+            "need a reply",
+            true,
+            &[(a, true), (b, true)],
+            "bcast-ask-1",
+            &no_redact,
+        )
+        .unwrap();
+
+        for (dir, name) in [(&dir_a, "project-a"), (&dir_b, "project-b")] {
+            let log = log_in(dir.path(), name);
+            let asks = open_asks(&log).unwrap();
+            assert_eq!(asks.len(), 1, "{name} should hold exactly one open ask");
+            assert!(asks[0].ask);
+            assert_eq!(asks[0].from_project, HUB_PROJECT_NAME);
+        }
     }
 
     #[test]
@@ -2549,6 +2856,7 @@ mod tests {
             1,
             "reply-1",
             "yes",
+            None,
             true,
             &no_redact,
         )
@@ -2559,8 +2867,79 @@ mod tests {
         assert_eq!(asker_inbox.len(), 1);
         assert_eq!(asker_inbox[0].body, "yes");
         assert_eq!(asker_inbox[0].reply_to, Some(1));
+        assert_eq!(asker_inbox[0].relayed_by, None);
 
         assert!(is_closed(&holder_log, 1).unwrap());
+    }
+
+    #[test]
+    fn reply_relayed_by_the_asker_tags_the_message_without_changing_from_project() {
+        let asker_dir = tempdir().unwrap();
+        let holder_dir = tempdir().unwrap();
+        let asker_log = log_in(asker_dir.path(), "asker");
+        let holder_log = log_in(holder_dir.path(), "holder");
+
+        send_message(
+            &holder_log,
+            "ask-1",
+            "asker",
+            "holder",
+            "will you do X?",
+            true,
+            None,
+            true,
+            &no_redact,
+        )
+        .unwrap();
+
+        let outcome = reply(
+            &holder_log,
+            &asker_log,
+            1,
+            "reply-1",
+            "yes",
+            Some("asker"),
+            true,
+            &no_redact,
+        )
+        .unwrap();
+        assert_eq!(outcome, SendOutcome::Sent { seq: 1 });
+
+        let asker_inbox = asker_log.inbox_messages().unwrap();
+        assert_eq!(asker_inbox.len(), 1);
+        assert_eq!(asker_inbox[0].from_project, "holder");
+        assert_eq!(asker_inbox[0].relayed_by.as_deref(), Some("asker"));
+
+        assert!(is_closed(&holder_log, 1).unwrap());
+    }
+
+    #[test]
+    fn a_pre_relay_message_line_parses_with_no_relayed_by() {
+        // A line written before `relayed_by` existed has no `relayed_by=`
+        // field at all; it must still decode cleanly, with `None` here,
+        // the same as before this field was added.
+        let dir = tempdir().unwrap();
+        let log = log_in(dir.path(), "holder");
+        std::fs::create_dir_all(dir.path().join(".multiverse")).unwrap();
+        let line = encode_v1(
+            "2026-01-01T00:00:00+00:00",
+            1,
+            "message",
+            &[
+                ("id", "m1".to_string()),
+                ("from", "holder".to_string()),
+                ("to", "asker".to_string()),
+                ("body", support::json_quote_ascii("yes")),
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".multiverse/routing.log"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        let message = find_message(&log, 1).unwrap().expect("message present");
+        assert_eq!(message.relayed_by, None);
     }
 
     #[test]
@@ -2589,6 +2968,54 @@ mod tests {
 
         // The close record never touched the asker's log.
         assert!(asker_log.inbox_messages().unwrap().is_empty());
+    }
+
+    /// `find_message` (card `20261115-b-9ebad2`'s `activity show`): unlike
+    /// [`find_ask`]/[`find_open_ask`], it returns a plain message too, and
+    /// still returns an ask after it has been closed — `show` is read-only
+    /// and never cares whether the record it is printing has since been
+    /// acted on.
+    #[test]
+    fn find_message_returns_a_plain_message_and_a_closed_ask_alike() {
+        let dir = tempdir().unwrap();
+        let log = log_in(dir.path(), "holder");
+        send_message(
+            &log,
+            "msg-1",
+            "asker",
+            "holder",
+            "just an update",
+            false,
+            None,
+            true,
+            &no_redact,
+        )
+        .unwrap();
+        send_message(
+            &log,
+            "ask-1",
+            "asker",
+            "holder",
+            "will you do X?",
+            true,
+            None,
+            true,
+            &no_redact,
+        )
+        .unwrap();
+
+        let plain = find_message(&log, 1).unwrap().expect("seq 1 exists");
+        assert_eq!(plain.body, "just an update");
+        assert!(!plain.ask);
+
+        close_ask(&log, 2, "declined", &no_redact).unwrap();
+        let closed = find_message(&log, 2)
+            .unwrap()
+            .expect("seq 2 still readable once closed");
+        assert_eq!(closed.body, "will you do X?");
+        assert!(closed.ask);
+
+        assert!(find_message(&log, 99).unwrap().is_none());
     }
 
     #[test]
@@ -2701,6 +3128,7 @@ mod tests {
         let err = broadcast(
             HUB_PROJECT_NAME,
             "hello",
+            false,
             &[(a, true), (ghost, true)],
             "shared-1",
             &no_redact,
@@ -2725,6 +3153,7 @@ mod tests {
         let err = broadcast(
             HUB_PROJECT_NAME,
             "hello",
+            false,
             &[(a, true), (b, true)],
             "shared-fanout",
             &no_redact,
@@ -2910,6 +3339,7 @@ mod tests {
             1,
             "reply-1",
             "yes, deployed",
+            None,
             true,
             &no_redact,
         )
@@ -3128,7 +3558,8 @@ mod tests {
                 ("re", "notanumber".to_string()),
                 ("reason", "\"x\"".to_string()),
             ],
-        );
+        )
+        .unwrap();
         bad_log.append_line(&damaged).unwrap();
 
         let projects = all_projects(&[("good", good_dir.path()), ("bad", bad_dir.path())]);

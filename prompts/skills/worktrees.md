@@ -90,6 +90,12 @@ directory and a branch; use it where that is cheaper than the mistake.
   anything but a normal result. If you count candidates from a preview,
   exclude the per-section totals (`removed N of M`, `reclaimed N of M`) —
   the command's own `--help` text has the pattern.
+- **`--reap` ends a lane's own lingering host process — only in answer to
+  a `lane processes still running` report from `sweep`, or a prune
+  keep-reason naming a live process cwd, never as a routine addition to a
+  plain `--prune`.** Preview first: `--prune --reap --dry-run` prints
+  `would reap` and kills nothing. Reap only the project whose report this
+  is — never another project's lanes on the strength of it.
 - **Never `git stash` bare.** The stash stack is shared across every worktree of
   the repository, so a bare `stash`/`stash pop` can pop somebody else's work.
   Make a temporary commit instead. If you must stash, tag it

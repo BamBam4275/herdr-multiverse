@@ -10,6 +10,9 @@ use mv_config::load::Project;
 use super::doctor::{project_path, resolve_config_path};
 use crate::exit::Failure;
 
+/// Loads the config and prints its projects, sorted by name — either
+/// bare names (`--names`) or name-aligned with each project's resolved
+/// path.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;

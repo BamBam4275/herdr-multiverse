@@ -1,5 +1,14 @@
 //! `routing.log`: tab-separated `key=value` records, `v=1` envelope,
 //! crc32 trailer, fsync + 0600 + project lock on append.
+//!
+//! This is the project's durable, append-only history of routing events
+//! (dispatches, messages, backlog items, etc.); other `mv-state` modules
+//! build their higher-level views on top of what this module decodes.
+//! Decoding also accepts legacy pre-`v=1` lines unmodified, so a project's
+//! existing history stays readable across the format upgrade — including
+//! records written with retired role names, which this module treats as
+//! opaque text (see `history_fixtures_keep_old_roles_and_free_text_backlog_roles`
+//! in the tests below).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -21,7 +30,12 @@ use crate::index::{self, Selector};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("damaged routing record: {reason}")]
 pub struct DamagedRecord {
+    /// Human-readable explanation of what failed to parse or validate;
+    /// this is also what the `Display`/error message above renders.
     pub reason: String,
+    /// The record's sequence number, when one could still be read before
+    /// the failure was detected — lets callers report which record in the
+    /// log is damaged even though the record itself is being rejected.
     pub seq: Option<u64>,
 }
 
@@ -29,13 +43,27 @@ pub struct DamagedRecord {
 /// Activity, task and backlog modules apply their own semantic validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRecord {
+    /// Raw timestamp field exactly as it appeared in the record. Kept as
+    /// text rather than a parsed type since this module only validates it;
+    /// callers parse it with their own flexible timestamp handling.
     pub when: String,
+    /// Every `key=value` field from the record, including `event`, `seq`,
+    /// `v` and `crc32` for versioned records. Deliberately untyped: this
+    /// module validates the envelope only, not role names or payloads.
     pub fields: BTreeMap<String, String>,
+    /// The record's sequence number, if its `seq` field was present and
+    /// parsed as a valid integer.
     pub seq: Option<u64>,
+    /// Whether this record was decoded under the `v=1` envelope rules
+    /// (and therefore had its sequence and checksum validated), as
+    /// opposed to a legacy, pre-versioning line.
     pub versioned: bool,
 }
 
 impl LogRecord {
+    /// Convenience accessor for the `event` field, defaulting to an empty
+    /// string rather than `Option` since every versioned record requires
+    /// one and callers mostly branch on its value directly.
     pub fn event(&self) -> &str {
         self.fields.get("event").map(String::as_str).unwrap_or("")
     }
@@ -89,6 +117,9 @@ pub fn parse(line: &str) -> Result<LogRecord, DamagedRecord> {
         if fields.get("event").is_none_or(String::is_empty) {
             return Err(damaged("missing event"));
         }
+        // A duplicate key would otherwise silently shadow one of its
+        // values once collected into `fields`'s map; reject that instead
+        // of picking a winner.
         let mut keys = std::collections::HashSet::new();
         for part in line.split('\t').skip(1) {
             let Some((key, _)) = part.split_once('=') else {
@@ -154,6 +185,9 @@ pub fn encode_versioned(
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Failure modes for acquiring the project lock and reading/writing
+/// `routing.log`. Distinct from [`DamagedRecord`], which is a decode
+/// failure on content already successfully read from disk.
 pub enum LogError {
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -172,25 +206,36 @@ pub struct ProjectLog {
 }
 
 impl ProjectLog {
+    /// Point at `project_root`'s `routing.log` without touching the
+    /// filesystem; the directory and lock are only created on first use.
     pub fn new(project_root: impl AsRef<Path>) -> Self {
         Self {
             path: project_root.as_ref().join(".multiverse/routing.log"),
         }
     }
 
+    /// The log file's path as constructed, before the canonicalization
+    /// [`Self::lock_timeout`] applies when actually opening it.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Acquire the project lock using the default timeout.
     pub fn lock(&self) -> Result<ProjectLock, LogError> {
         self.lock_timeout(lock::LOCK_ACQUIRE_TIMEOUT)
     }
 
+    /// Acquire the project lock, waiting up to `timeout`. Exposed
+    /// separately from [`lock`] so tests (and callers that only want a
+    /// quick "is this already locked" check) can pass a short timeout.
     pub fn lock_timeout(&self, timeout: Duration) -> Result<ProjectLock, LogError> {
         let parent = self.path.parent().expect("project log has a parent");
         ensure_state_dir(parent)?;
         let path = fs::canonicalize(parent)?.join("routing.log");
         let lock_path = path.with_extension("log.lock");
+        // Reuse an already-held guard for this thread so a nested call
+        // (e.g. an outer append holding the lock while an inner lookup
+        // also locks the same path) does not deadlock against itself.
         let existing = HELD_LOCKS.with(|held| held.borrow().get(&lock_path).cloned());
         let file = if let Some(file) = existing {
             file
@@ -214,10 +259,16 @@ impl ProjectLog {
         })
     }
 
+    /// Lock, then append one already-encoded line. Prefer
+    /// [`Self::append_versioned`] for new writes; this exists for legacy
+    /// callers and tests that already have a formatted line in hand.
     pub fn append(&self, line: &str) -> Result<u64, LogError> {
         self.lock()?.append(line)
     }
 
+    /// Lock, encode, and append one `v=1` record in a single call — the
+    /// common path for new writers. Callers that need to read and then
+    /// append under the same lock should hold a [`ProjectLock`] instead.
     pub fn append_versioned(
         &self,
         when: &str,
@@ -234,6 +285,10 @@ thread_local! {
     static HELD_LOCKS: RefCell<HashMap<PathBuf, Rc<LockGuard>>> = RefCell::new(HashMap::new());
 }
 
+/// A held project lock, returned by [`ProjectLog::lock`]/`lock_timeout`.
+/// Bundles the resolved log path with read/check/append so a caller can
+/// perform several operations without racing another process — or
+/// another lock already held on this same thread (see `HELD_LOCKS`).
 pub struct ProjectLock {
     path: PathBuf,
     lock_path: PathBuf,
@@ -265,12 +320,18 @@ impl ProjectLock {
         &self.path
     }
 
+    /// Assign the next sequence number, encode, and append — all while
+    /// already holding the lock, so no concurrent writer can observe or
+    /// claim the same sequence in between.
     pub fn append_versioned(
         &self,
         when: &str,
         event: &str,
         fields: &[(&str, &str)],
     ) -> Result<LogRecord, LogError> {
+        // Base the next sequence on the index's cached high-water mark
+        // rather than re-parsing every record; holding the lock already
+        // rules out a concurrent writer moving it underneath us.
         let seq = index::records(&self.path, Selector::All)?
             .last()
             .map_or(0, |record| record.entry.high_water_seq)
@@ -293,6 +354,9 @@ impl ProjectLock {
             .into());
         }
         parse(line)?;
+        // Remembered so the directory entry only needs an extra fsync
+        // below when this call is the one creating the file; an existing
+        // file's directory entry is already durable.
         let existed = self.path.exists();
         let mut file = private_file(&self.path, true)?;
         let offset = file.metadata()?.len();
@@ -325,6 +389,9 @@ impl ProjectLock {
 fn ensure_state_dir(path: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {
+            // Durably create the new state dir: fsync the directory
+            // itself, then fsync its parent so the new directory entry
+            // also survives a crash.
             fsync_dir(path)?;
             fsync_dir(path.parent().expect("state parent"))
         }

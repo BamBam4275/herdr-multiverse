@@ -51,6 +51,8 @@ pub struct MissingPromptError {
 }
 
 impl MissingPromptError {
+    /// Build the error from the prompt's kind (`"role"`/`"column"`/`"template"`),
+    /// the requested name, and the path that was checked for it.
     pub fn new(kind: impl Into<String>, name: impl Into<String>, path: PathBuf) -> Self {
         Self {
             kind: kind.into(),
@@ -258,7 +260,30 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_dir() -> PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&dir`/`dir.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir() -> TempDir {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
             let path = env::temp_dir().join(format!(
@@ -267,7 +292,7 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             match fs::create_dir(&path) {
-                Ok(()) => return path,
+                Ok(()) => return TempDir(path),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("temporary project: {error}"),
             }
@@ -359,9 +384,8 @@ mod tests {
         let sibling = temp_dir();
         assert_eq!(
             resolve_prompts_dir(&sibling),
-            Source::Directory(sibling.clone())
+            Source::Directory(sibling.to_path_buf())
         );
-        fs::remove_dir_all(&sibling).unwrap();
     }
 
     #[test]
@@ -374,9 +398,8 @@ mod tests {
     fn fallback_location_can_actually_load_a_prompt() {
         let dir = temp_dir();
         fs::write(dir.join("role-scout.md"), "# R\n\n---\n\nYou are a role.\n").unwrap();
-        let prompt = role_prompt_from("scout", &Source::Directory(dir.clone())).unwrap();
+        let prompt = role_prompt_from("scout", &Source::Directory(dir.to_path_buf())).unwrap();
         assert_eq!(prompt.body(), "You are a role.");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -407,9 +430,8 @@ mod tests {
     fn body_without_a_separator_returns_the_stripped_file() {
         let dir = temp_dir();
         fs::write(dir.join("role-scout.md"), "  just instructions  \n").unwrap();
-        let prompt = role_prompt_from("scout", &Source::Directory(dir.clone())).unwrap();
+        let prompt = role_prompt_from("scout", &Source::Directory(dir.to_path_buf())).unwrap();
         assert_eq!(prompt.body(), "just instructions");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -420,9 +442,8 @@ mod tests {
             "# N\n\n---\n\nYou are an override.\n",
         )
         .unwrap();
-        let prompt = role_prompt_from("nexus", &Source::Directory(dir.clone())).unwrap();
+        let prompt = role_prompt_from("nexus", &Source::Directory(dir.to_path_buf())).unwrap();
         assert_eq!(prompt.body(), "You are an override.");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

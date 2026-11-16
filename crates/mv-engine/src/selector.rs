@@ -279,14 +279,28 @@ pub enum FallbackPolicy {
 /// `accounts.py`). Checked, in this order, by `evaluate_candidate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cause {
+    /// The seat's vendor is in the caller's `exclude_vendors` list (e.g.
+    /// Critic's own §12.1 same-vendor exclusion).
     VendorExcluded,
+    /// The dispatched role has no model configured for this seat's `kind`.
     NoModel,
+    /// The seat's `roles_allowed` is set and does not include this role.
     RoleNotAllowed,
+    /// The task brief exceeds the seat's `max_brief_chars`.
     BriefTooLong,
+    /// A `claude`-kind seat has no command wrapper configured.
     NoCommand,
+    /// Operator-disabled, lent off, still inside a future
+    /// `unavailable_until`, fenced by an open breaker, or a failed local
+    /// liveness probe.
     Unavailable,
+    /// The seat's live open-agent count is at (or unreadable against) its
+    /// cap.
     AtCapacity,
+    /// Strictly below the reviewer's own quota floor
+    /// (`reviewer_min_quota_percent`).
     LowQuota,
+    /// At or below the fleet-wide quota floor (`fleet_min_quota_percent`).
     Draining,
 }
 
@@ -1065,6 +1079,7 @@ pub fn select(
 /// Something able to pause the calling thread, injected so
 /// [`select_or_wait`] is testable without a real 1800-second wait.
 pub trait Sleeper {
+    /// Block the calling thread for `duration`.
     fn sleep(&mut self, duration: Duration);
 }
 
@@ -1127,6 +1142,9 @@ pub struct WaitOptions<'a> {
 }
 
 impl<'a> WaitOptions<'a> {
+    /// Default timeout/poll-interval (`DEFAULT_SEAT_WAIT_TIMEOUT_SECS`/
+    /// `DEFAULT_POLL_INTERVAL_SECS`), with the caller's own `sleeper` and
+    /// `on_wait`.
     pub fn new(sleeper: &'a mut dyn Sleeper, on_wait: &'a mut dyn FnMut(&str)) -> Self {
         WaitOptions {
             timeout: Some(DEFAULT_SEAT_WAIT_TIMEOUT_SECS),

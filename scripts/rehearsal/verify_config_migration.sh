@@ -62,6 +62,8 @@ if [ ! -x "$BIN" ]; then
 fi
 
 WORK=$(mktemp -d -t mv-config-migration-rehearsal)
+# Runs on exit (trap below): removes the sandbox, or keeps it and prints
+# its path when --keep was given.
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then
         echo "kept working directory: $WORK"

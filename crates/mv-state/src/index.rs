@@ -1,5 +1,8 @@
 //! Sidecar index over `routing.log`: JSON-lines entries, a
 //! fingerprint, and a rebuild path when the fingerprint mismatches.
+//! Lets selectors (tasks/backlog/updates/versioned) find matching log lines
+//! by scanning the small index instead of the whole log, while always
+//! falling back to a full scan whenever the cache can't be trusted.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -21,12 +24,21 @@ const TASK_EVENTS: &[&str] = &[
     "stale-pane",
 ];
 
+/// Which subset of routing-log entries a caller wants back; interpreted by
+/// `Selector::matches` against each entry's indexed event/item/versioned
+/// fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selector {
+    /// Every entry, including damaged/invalid-UTF-8 lines.
     All,
+    /// Task lifecycle events (dispatch, started, result, …).
     Tasks,
+    /// Backlog items and annotations that reference a backlog item.
     Backlog,
+    /// Plain `update` events.
     Updates,
+    /// Entries written in the versioned (JSON-field) log format, as opposed
+    /// to legacy tab-separated lines.
     Versioned,
 }
 
@@ -47,6 +59,8 @@ impl Selector {
 impl std::str::FromStr for Selector {
     type Err = io::Error;
 
+    /// Parses a selector from its CLI-facing lowercase name (`"all"`,
+    /// `"tasks"`, `"backlog"`, `"updates"`, `"versioned"`).
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "all" => Ok(Self::All),
@@ -66,16 +80,37 @@ impl std::str::FromStr for Selector {
 /// including the line's terminating newline when present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
+    /// On-disk schema version for this entry; lets a future format change
+    /// be detected instead of silently misparsed.
     pub v: u32,
+    /// Zero-based position of this line within the log file, in read order.
     pub ordinal: u64,
+    /// Byte offset of this line's first byte within the log file.
     pub offset: u64,
+    /// Length of this line in bytes, including its trailing newline when
+    /// present.
     pub length: u64,
+    /// Highest `seq` value seen at or before this entry, carried forward
+    /// across lines that have no `seq` of their own. Lets a consistency
+    /// check anchored at this entry cover every earlier line too, not just
+    /// this one.
     pub high_water_seq: u64,
+    /// This line's `event` field, or empty if the line doesn't carry one
+    /// (e.g. a legacy or damaged line).
     pub event: String,
+    /// This line's `task` field, or empty if absent.
     pub task: String,
+    /// This line's `item` field (used for backlog/annotation entries), or
+    /// empty if absent.
     pub item: String,
+    /// This line's own `seq` field, if it has a parseable one (versioned
+    /// lines only).
     pub seq: Option<u64>,
+    /// Whether this line is in the versioned (JSON-field) log format rather
+    /// than legacy tab-separated.
     pub versioned: bool,
+    /// Whether this line's raw bytes fail to decode as UTF-8. Such lines
+    /// stay indexed and selectable rather than being dropped.
     pub invalid_utf8: bool,
 }
 
@@ -83,11 +118,16 @@ pub struct IndexEntry {
 /// callers can classify them rather than silently losing evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedRecord {
+    /// Indexed metadata for this line.
     pub entry: IndexEntry,
+    /// The line's raw bytes exactly as stored in the log, including its
+    /// trailing newline when present.
     pub bytes: Vec<u8>,
 }
 
 impl IndexedRecord {
+    /// Parses this record's raw bytes as a log record, surfacing invalid
+    /// UTF-8 or a malformed line as a `DamagedRecord` instead of panicking.
     pub fn parse(&self) -> Result<LogRecord, DamagedRecord> {
         let line = std::str::from_utf8(&self.bytes).map_err(|_| DamagedRecord {
             reason: "invalid UTF-8".into(),
@@ -137,12 +177,14 @@ impl Snapshot {
     }
 }
 
+/// Path of the sidecar index file for `log_path` (`<log>.index`).
 pub fn index_path(log_path: &Path) -> PathBuf {
     let mut name = log_path.as_os_str().to_os_string();
     name.push(".index");
     name.into()
 }
 
+/// Path of the fingerprint file guarding `log_path`'s index (`<log>.index.fp`).
 pub fn fingerprint_path(log_path: &Path) -> PathBuf {
     let mut name = index_path(log_path).into_os_string();
     name.push(".fp");
@@ -150,6 +192,9 @@ pub fn fingerprint_path(log_path: &Path) -> PathBuf {
 }
 
 fn metadata(bytes: &[u8], ordinal: u64, offset: u64, previous: u64) -> IndexEntry {
+    // Lossy conversion only to extract fields; `invalid_utf8` below is
+    // computed from the original bytes, so damage is still reported
+    // truthfully even though field parsing tolerates it.
     let text = String::from_utf8_lossy(bytes);
     let line = text.strip_suffix('\n').unwrap_or(&text);
     let (_, fields) = split_fields(line);
@@ -175,6 +220,8 @@ fn scan(bytes: &[u8]) -> Vec<IndexEntry> {
     let mut entries = Vec::new();
     let mut offset = 0;
     let mut high_water = 0;
+    // high_water threads across lines so each entry's high_water_seq covers
+    // every line scanned so far, not just its own seq.
     for (ordinal, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let entry = metadata(line, ordinal as u64, offset, high_water);
         offset += entry.length;
@@ -251,6 +298,10 @@ fn write_index(log_path: &Path, snapshot: &Snapshot, entries: &[IndexEntry]) -> 
     for entry in entries {
         bytes.extend(json_bytes(entry)?);
     }
+    // Write the index before the fingerprint: a crash between the two
+    // writes leaves a fingerprint that no longer matches the new index, so
+    // the next reader safely falls back to a full scan instead of trusting
+    // a half-updated cache.
     write_atomic(&index_path(log_path), &bytes)?;
     write_atomic(
         &fingerprint_path(log_path),
@@ -277,6 +328,13 @@ pub fn append(log_path: &Path, append_offset: u64) -> io::Result<()> {
     let old_fingerprint = fs::read(fingerprint_path(log_path))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Fingerprint>(&bytes).ok());
+    // Only trust the existing index as a prefix of the new one if: the old
+    // boundary still lies inside the file, falls exactly on a line end (not
+    // mid-line), the old fingerprint still matches the log up to that
+    // boundary (no rewrite/rotation of the prefix), and a fresh scan of
+    // that prefix matches what the old index actually recorded. If any of
+    // that fails, something other than a clean append happened, so a full
+    // rebuild is required instead of a cheap append.
     let boundary = usize::try_from(append_offset).ok();
     let valid = boundary.is_some_and(|boundary| {
         boundary <= snapshot.bytes.len()
@@ -288,6 +346,9 @@ pub fn append(log_path: &Path, append_offset: u64) -> io::Result<()> {
         return write_index(log_path, &snapshot, &entries);
     }
     let previous_count = old_entries.as_ref().map_or(0, Vec::len);
+    // Fast path: append only the new entries to the index file (opened for
+    // append, not rewritten), sync durably, then update the fingerprint to
+    // cover the whole file.
     let mut file = crate::log::private_file(&index_path(log_path), true)?;
     for entry in &entries[previous_count..] {
         file.write_all(&json_bytes(entry)?)?;

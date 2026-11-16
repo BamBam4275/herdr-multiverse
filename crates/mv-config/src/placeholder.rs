@@ -54,6 +54,9 @@ impl MaybePlaceholder {
         }
     }
 
+    /// Whether this field is still an unfilled placeholder rather than a
+    /// real value — the per-instance counterpart to the free function
+    /// [`is_placeholder`] that classified it in [`Self::parse`].
     pub fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder(_))
     }

@@ -21,13 +21,19 @@ pub use mv_state::tasks::TaskStatus;
 /// mv-core secure-file implementation has not landed; there is intentionally
 /// no insecure default adapter.
 pub trait SecureFiles {
+    /// Opens `relative` (a project-relative path) as a regular file, per
+    /// the safety rules on this trait's own doc comment.
     fn open_regular(&self, relative: &Path) -> io::Result<Box<dyn BufRead>>;
 }
 
+/// A rejected request, with a human-readable reason safe to surface
+/// directly (callers are expected to have already sanitized/redacted
+/// anything derived from untrusted input before building this).
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct Refusal(pub String);
 
+/// A task's terminal status and result text, as read by [`read_result`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct TaskResult {
     pub status: TaskStatus,
@@ -119,9 +125,13 @@ pub fn read_result(
     })
 }
 
+/// Shared UTF-8 output budget for one [`inspect`] call, across every
+/// requested file.
 pub const INSPECT_BYTE_LIMIT: usize = 64 * 1024;
+/// Appended once output is cut off by [`INSPECT_BYTE_LIMIT`].
 pub const TRUNCATION_NOTICE: &str = "\n[output truncated at 64 KiB]\n";
 
+/// A one-based, inclusive line range (`--lines` selector for [`inspect`]).
 #[derive(Debug, Clone, Copy)]
 pub struct LineRange {
     pub first: usize,
@@ -132,9 +142,13 @@ pub struct LineRange {
 /// the owning config/command adapter rather than adding a shared manifest
 /// dependency from this bounded implementation lane.
 pub trait Matcher {
+    /// Whether `line` matches (`--match` selector for [`inspect`]).
     fn is_match(&self, line: &str) -> bool;
 }
 
+/// One `inspect` call's full request: which file(s), which selector
+/// (exactly one of `lines`/`matcher`), and the mandatory `reason` recorded
+/// in the audit log.
 pub struct InspectRequest<'a> {
     /// Absolute, resolved project root and caller cwd. Relative file arguments
     /// are resolved against cwd, not against the project root.
@@ -146,6 +160,7 @@ pub struct InspectRequest<'a> {
     pub reason: &'a str,
 }
 
+/// One sanitized, redacted record of an [`inspect`] call, for [`AuditSink`].
 #[derive(Debug, Clone)]
 pub struct InspectAudit {
     pub project: String,
@@ -159,6 +174,7 @@ pub struct InspectAudit {
 /// .multiverse/inspect.log. Best effort, no fsync, no inspected content.
 /// The state adapter owns timestamp formatting and the append operation.
 pub trait AuditSink {
+    /// Appends one already-sanitized [`InspectAudit`] record.
     fn append(&mut self, record: &InspectAudit) -> io::Result<()>;
 }
 

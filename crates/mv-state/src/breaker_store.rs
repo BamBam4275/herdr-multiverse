@@ -37,16 +37,32 @@ use serde_json::Value;
 /// position, and a writer of only known fields has an empty map.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BreakerEntry {
+    /// Who or what tripped the breaker (e.g. `"cmd_accounts"`, `"gauge
+    /// exhausted"`) — shown by `describe`'s "tripped by" clause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller: Option<String>,
+    /// Why this entry was closed (e.g. `"manual reset"`, `"gauge shows
+    /// window open"`); always paired with `closed_at` on a tombstone, never
+    /// present on an active trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<String>,
+    /// When this entry was closed (tombstoned). Together with `tripped_at`
+    /// it is the "last change" timestamp a fresh gauge reading must be
+    /// newer than before it can retrip or reopen the pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<String>,
+    /// Path to the redacted pane text saved as evidence for this trip, if
+    /// any (`mv-engine`'s `write_evidence`); best-effort, so its absence
+    /// means nothing was captured, not an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_path: Option<String>,
+    /// The breaker kind (`"rolling"`, `"weekly"`, or `"budget"`) that
+    /// determined this trip's cooldown shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// When an escalating rule's prior trip fired; compared against the
+    /// escalation reset window to decide whether the next trip continues
+    /// climbing the escalation ladder or restarts it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tripped_at: Option<String>,
     /// Written `true` only — absence means automatic, never written
@@ -59,28 +75,54 @@ pub struct BreakerEntry {
     /// the absence-means-open convention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open: Option<bool>,
+    /// When this trip's cooldown ends (or, for a manual fence, when it
+    /// becomes eligible for a half-open trial), as an ISO-8601 timestamp
+    /// string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<String>,
+    /// The classification rule that caused this trip (e.g.
+    /// `"codex_usage_limit_reached"`), when the caller named one; absence
+    /// means no classification was made, not an unknown one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
+    /// The artifact root bound to the half-open pool's active trial, once a
+    /// prompt has launched (`bind_trial`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_artifact_root: Option<String>,
+    /// When the active trial was claimed; starts the trial timeout window
+    /// that (absent a live pane) expires the claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_claimed_at: Option<String>,
+    /// The harness name bound to the half-open pool's active trial, once a
+    /// prompt has launched (`bind_trial`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_harness: Option<String>,
+    /// The pane id bound to the active trial, used to check liveness past
+    /// the trial timeout (`with_active_trial`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_pane_id: Option<String>,
+    /// The project root bound to the half-open pool's active trial, once a
+    /// prompt has launched (`bind_trial`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_project_root: Option<String>,
+    /// The task id that currently owns a half-open pool's trial claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_task_id: Option<String>,
+    /// The capability token paired with `trial_task_id`; ownership checks
+    /// both together so a stale or guessed task id alone can't claim
+    /// another caller's trial.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_token: Option<String>,
+    /// Consecutive trips of an escalating rule since the escalation window
+    /// last reset; feeds the 5→10→15-minute escalation ladder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trip_count: Option<u32>,
+    /// When this trip occurred, as an ISO-8601 timestamp string; together
+    /// with `closed_at` it is the "last change" timestamp used to judge
+    /// whether a fresh gauge reading is newer than the last state change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tripped_at: Option<String>,
+    /// The vendor (e.g. `"codex"`, `"claude"`) this trip fenced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
     /// Any field this struct does not yet know about, preserved verbatim so
@@ -97,6 +139,7 @@ pub type BreakerMap = BTreeMap<String, BreakerEntry>;
 /// into the `support` shim directly.
 pub use support::StoreError;
 
+/// The breaker store's on-disk path within `config_dir`.
 pub fn store_path(config_dir: &Path) -> PathBuf {
     config_dir.join("breaker-state.json")
 }
@@ -171,11 +214,17 @@ pub(crate) mod support {
     #[derive(Debug, thiserror::Error)]
     #[error("could not acquire lock {path:?} within {timeout_secs}s (held by pid {holder_pid:?})")]
     pub struct LockTimeoutError {
+        /// Path to the lock file that could not be acquired.
         pub path: PathBuf,
+        /// The bound (in seconds) `acquire` waited before giving up.
         pub timeout_secs: u64,
+        /// Best-effort pid of the process currently holding the lock, read
+        /// from the lock file's own contents when that read succeeds.
         pub holder_pid: Option<i32>,
     }
 
+    /// Every way acquiring the store's lock or reading/writing its file can
+    /// fail.
     #[derive(Debug, thiserror::Error)]
     pub enum StoreError {
         #[error(transparent)]
@@ -197,6 +246,8 @@ pub(crate) mod support {
             }),
             LockError::Io(error) => StoreError::Io(error),
         })?;
+        // Best effort: a failure to record the pid must never fail the lock
+        // acquisition itself, only make a future timeout's holder_pid blank.
         let _ = fs::write(lock_path, std::process::id().to_string());
         Ok(guard)
     }

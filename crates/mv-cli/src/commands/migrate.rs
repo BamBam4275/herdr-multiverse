@@ -220,6 +220,12 @@ fn load_roster_migrations(roster_paths: Vec<PathBuf>) -> Result<Vec<RosterMigrat
     Ok(out)
 }
 
+/// `multiverse config migrate`'s handler: load the config (and every
+/// project roster it names) and run `mv_config::migrate::migrate_role_keys`
+/// over each. `--dry-run` prints a diff and writes nothing; otherwise
+/// `--backup` is required, and each changed file gets a timestamped backup
+/// before its atomic rewrite. Output goes through `out` (not a bare
+/// `println!`) so tests can capture it without touching real stdout.
 pub fn run(args: &ArgMatches, out: &mut dyn Write) -> Result<(), Failure> {
     let dry_run = args.get_flag("dry-run");
     let backup = args.get_flag("backup");
@@ -342,6 +348,10 @@ pub fn run(args: &ArgMatches, out: &mut dyn Write) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Entry point registered for the `config` subcommand: dispatches to
+/// [`run`] against real stdout. `config` has only the one nested verb
+/// today, so the `unreachable!()` below is clap's schema guarantee, not a
+/// runtime possibility.
 pub fn run_default(args: &ArgMatches) -> Result<(), Failure> {
     match args.subcommand() {
         Some(("migrate", nested)) => run(nested, &mut std::io::stdout()),

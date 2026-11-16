@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -47,6 +47,43 @@ fn fake_binary() -> &'static Path {
         assert!(path.is_file(), "fake-herdr must exist; never use real Herdr");
         path
     })
+}
+
+/// Kills and waits on the wrapped child when dropped without having been
+/// consumed, so a failed `assert!` between spawning a background process and
+/// its final `wait` never leaves it running. Call
+/// [`KillOnDrop::wait_with_output`] on the normal, non-panicking path — it
+/// takes the child out before `Drop` runs, so the kill-on-drop is purely a
+/// panic-path safety net, not a double `wait`.
+pub struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    pub fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    pub fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.0
+            .take()
+            .expect("child not already taken")
+            .wait_with_output()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// See [`Sandbox::dispatch_background_with_slow_pane_layout`].
+pub struct SlowPaneLayoutDispatch {
+    pub child: KillOnDrop,
+    pub layout_started: PathBuf,
+    pub layout_finished: PathBuf,
 }
 
 pub struct Sandbox {
@@ -199,6 +236,21 @@ recipient = ["sandbox"]
             .expect("run built multiverse binary")
     }
 
+    /// Like [`Sandbox::cli`], but with `PATH` replaced by an empty
+    /// directory so a test can force "the notify hook (`curl`) is not on
+    /// PATH" without touching the host's real `curl` (card
+    /// `20261115-b-51cb75`).
+    pub fn cli_without_curl(&self, args: &[&str]) -> Output {
+        let empty_path = self.root.join("no-curl-path");
+        fs::create_dir_all(&empty_path).unwrap();
+        self.command(env!("CARGO_BIN_EXE_multiverse"))
+            .current_dir(&self.project)
+            .env("PATH", &empty_path)
+            .args(args)
+            .output()
+            .expect("run built multiverse binary")
+    }
+
     pub fn herdr(&self, args: &[&str]) -> Output {
         let output = self
             .command(fake_binary())
@@ -221,6 +273,66 @@ recipient = ["sandbox"]
         ];
         args.extend_from_slice(extra);
         self.cli(&args)
+    }
+
+    /// Spawns `dispatch` in the background against a `HERDR_BIN_PATH`
+    /// wrapper that pauses for `sleep_secs` on the very first `pane layout`
+    /// call — the earliest Herdr round trip dispatch makes once pane
+    /// placement starts — then execs the repository's real `fake-herdr` for
+    /// every call, including that one, so the dispatch itself still
+    /// completes normally. The wrapper drops a marker file immediately
+    /// before and after that pause (`layout_started`/`layout_finished`), so
+    /// a test can observe whether the layout call is still in progress
+    /// without racing a wall-clock bound: it can assert a concurrent
+    /// `activity send` into the same project completed while
+    /// `layout_finished` does not yet exist, to prove dispatch's own
+    /// project lock (`routing.log.lock`) was not still held across that
+    /// Herdr call (card `20261115-b-c8bcb5`).
+    pub fn dispatch_background_with_slow_pane_layout(
+        &self,
+        task: &str,
+        sleep_secs: u64,
+    ) -> SlowPaneLayoutDispatch {
+        let script_path = self.root.join("slow-herdr.sh");
+        let layout_started = self.root.join("layout-started");
+        let layout_finished = self.root.join("layout-finished");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = layout ]; then\n  : > \"{started}\"\n  sleep {sleep_secs}\n  : > \"{finished}\"\nfi\nexec \"{real}\" \"$@\"\n",
+                started = layout_started.display(),
+                finished = layout_finished.display(),
+                real = fake_binary().display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let child = self
+            .command(env!("CARGO_BIN_EXE_multiverse"))
+            .env("HERDR_BIN_PATH", &script_path)
+            .args([
+                "dispatch",
+                self.project.to_str().unwrap(),
+                task,
+                "--role",
+                "scout",
+                "--timeout",
+                "5",
+                "--yes",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn background dispatch");
+        SlowPaneLayoutDispatch {
+            child: KillOnDrop::new(child),
+            layout_started,
+            layout_finished,
+        }
     }
 
     pub fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -298,4 +410,31 @@ pub fn stdout(output: &Output) -> String {
 
 pub fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("UTF-8 stderr")
+}
+
+/// Proves `KillOnDrop` actually kills a still-running child when dropped
+/// without `wait_with_output` ever being called — the panic path a failed
+/// `assert!` would take.
+#[test]
+fn kill_on_drop_kills_a_still_running_child() {
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn a long-running child to kill");
+    let pid = child.id();
+    drop(KillOnDrop::new(child));
+    let alive = || {
+        Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} was still alive 5s after KillOnDrop dropped it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

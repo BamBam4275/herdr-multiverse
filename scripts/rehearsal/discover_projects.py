@@ -22,6 +22,9 @@ _PATH_RE = re.compile(r'^path = "([^"]*)"')
 
 
 def main() -> int:
+    """Scan the given config.toml for `[projects.*]` sections, print each
+    one's `key:dirname` pair, and return 2 on a usage error or 0
+    otherwise."""
     if len(sys.argv) != 2:
         print("usage: discover_projects.py <config.toml>", file=sys.stderr)
         return 2

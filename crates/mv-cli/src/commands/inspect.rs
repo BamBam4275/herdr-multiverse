@@ -219,6 +219,10 @@ fn parse_line_range(raw: &str) -> Option<LineRange> {
     }
 }
 
+/// Resolves the current project and its config, builds an
+/// [`InspectRequest`] from the CLI args, and hands it to
+/// `gateway::inspect` along with the real filesystem and audit-log
+/// capabilities this module supplies.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;

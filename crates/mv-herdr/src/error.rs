@@ -24,6 +24,28 @@ pub enum HerdrError {
         source: std::io::Error,
     },
 
+    /// `exec` found and could run the binary, but the kernel refused the
+    /// `fork`/`exec` itself for a transient resource reason — EAGAIN
+    /// (`WouldBlock`), ENOMEM (`OutOfMemory`), EMFILE/ENFILE
+    /// (`TooManyOpenFiles`), or EINTR (`Interrupted`) — that was still
+    /// failing after [`crate::run`]'s bounded retry. Card
+    /// `20261115-b-5d9b72`: these came back from `Command::spawn()`
+    /// exactly like a missing binary (both are a bare `io::Error` with no
+    /// path check possible), but reporting them as `MissingBinary` sent an
+    /// operator chasing an install/PATH problem that was never there —
+    /// the binary is fine; the host was briefly out of some resource.
+    #[error(
+        "herdr binary {binary:?} could not be spawned (transient host condition): {source}.\n\
+         This is not a missing or non-executable binary; the host was briefly out of some \
+         resource (process slots, memory, or file descriptors). Retrying the command may \
+         succeed."
+    )]
+    SpawnFailed {
+        binary: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The subprocess did not return within its timeout and was killed
     /// (`runner.py:497-504`). The child is killed on timeout, so nothing
     /// of the command is still running; Herdr's own state for the agent

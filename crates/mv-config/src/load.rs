@@ -115,13 +115,21 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !matches!(
-                    out.components().next_back(),
-                    Some(Component::RootDir) | None
-                ) {
-                    out.pop();
-                } else if out.components().next_back().is_none() {
-                    out.push(Component::ParentDir.as_os_str());
+                // Four cases: the output so far ends in a real component
+                // to cancel against (pop it); it's already at the root
+                // (`/..` stays `/`, so drop the `..` silently); it's
+                // empty, or it already ends in a kept `..` (nothing to
+                // cancel against either way, so keep this `..` literally
+                // too — e.g. a relative path that climbs above its own
+                // start, where `..` components stack: `../..`, not `..`).
+                match out.components().next_back() {
+                    Some(Component::RootDir) => {}
+                    Some(Component::ParentDir) | None => {
+                        out.push(Component::ParentDir.as_os_str());
+                    }
+                    Some(_) => {
+                        out.pop();
+                    }
                 }
             }
             other => out.push(other.as_os_str()),
@@ -218,14 +226,45 @@ pub fn default_config_path_from_env() -> PathBuf {
     default_config_path(&home_dir_from_env())
 }
 
+/// The exact value `.cargo/config.toml` force-sets `MULTIVERSE_CONFIG` to
+/// for every `cargo build`/`test`/`run` (card `20261110-b-590e00`, the
+/// same mechanism as `20261103-b-1da16f`'s `HERDR_BIN_PATH` clearing). A
+/// worker pane's shell now exports the live `MULTIVERSE_CONFIG` into
+/// every process it spawns (merged `0f90860`), so a test that forgot an
+/// env guard would otherwise silently resolve against the real fleet's
+/// config. Cargo's own `[env]` table can force a value but, unlike a
+/// shell `unset`, can never clear one — so instead of a separate forbid
+/// *flag*, the forced value itself is the refusal signal: a literal no
+/// real install would ever choose, checked for exact equality in
+/// [`resolve_config_path_from_env`] below. This string must stay
+/// byte-identical to the one in `.cargo/config.toml`.
+pub const FORBIDDEN_LIVE_CONFIG_SENTINEL: &str = "/MV_TEST_FORBID_REAL_CONFIG";
+
+/// [`FORBIDDEN_LIVE_CONFIG_SENTINEL`], for `MULTIVERSE_STATE_DIR` and
+/// [`config_state_dir_from_env`] below.
+pub const FORBIDDEN_LIVE_STATE_DIR_SENTINEL: &str = "/MV_TEST_FORBID_REAL_STATE_DIR";
+
 /// `config_path` + `resolve_config_path`, reading `--config` (if any),
 /// `$MULTIVERSE_CONFIG`, `$HOME`, and the real current directory. The
 /// one entry point in this module mv-cli should call for an ordinary
 /// run; everything else here stays pure and takes its inputs
 /// explicitly so it can be unit-tested without mutating process state.
+///
+/// Refuses outright when `cli_override` is absent and `$MULTIVERSE_CONFIG`
+/// is exactly [`FORBIDDEN_LIVE_CONFIG_SENTINEL`] (see its doc) — a test
+/// that forgot to point this at an isolated temp config fails loudly
+/// here instead of silently resolving the real fleet's config path. A
+/// present `cli_override` always wins over `$MULTIVERSE_CONFIG` anyway
+/// (see `config_path`), so the forced sentinel is never actually used in
+/// that case and is not worth refusing.
 pub fn resolve_config_path_from_env(cli_override: Option<&Path>) -> io::Result<PathBuf> {
     let home = home_dir_from_env();
     let env = std::env::var_os("MULTIVERSE_CONFIG").map(PathBuf::from);
+    if cli_override.is_none() && env.as_deref() == Some(Path::new(FORBIDDEN_LIVE_CONFIG_SENTINEL)) {
+        return Err(io::Error::other(forbidden_live_env_message(
+            "MULTIVERSE_CONFIG",
+        )));
+    }
     let chosen = config_path(cli_override, env.as_deref(), &home);
     let cwd = std::env::current_dir()?;
     Ok(resolve_config_path(&chosen, &cwd))
@@ -241,16 +280,42 @@ pub fn resolve_config_path_from_env(cli_override: Option<&Path>) -> io::Result<P
 /// `os.path.abspath`) — a relative or `~`-prefixed override must not be
 /// taken as relative to wherever the fleet state directory happens to
 /// end up being read from next.
+///
+/// Panics when `$MULTIVERSE_STATE_DIR` is exactly
+/// [`FORBIDDEN_LIVE_STATE_DIR_SENTINEL`] — this function has no
+/// `cli_override`-style escape hatch (an override always "wins outright",
+/// see [`config_state_dir`]), so unlike its `MULTIVERSE_CONFIG` sibling
+/// above there is no call shape that can safely let the forced sentinel
+/// through. A `panic!` is the only loud failure available without
+/// widening this function's return type past `PathBuf`, which every
+/// existing `mv-cli` call site already depends on.
 pub fn config_state_dir_from_env(configured: &Path) -> PathBuf {
     let home = home_dir_from_env();
     let default = resolve_config_path(&default_config_path(&home), &home);
-    let over = std::env::var_os("MULTIVERSE_STATE_DIR")
-        .map(PathBuf::from)
-        .map(|p| {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            resolve_config_path(&expand_user(&p, &home), &cwd)
-        });
+    let raw = std::env::var_os("MULTIVERSE_STATE_DIR");
+    if raw.as_deref() == Some(std::ffi::OsStr::new(FORBIDDEN_LIVE_STATE_DIR_SENTINEL)) {
+        panic!("{}", forbidden_live_env_message("MULTIVERSE_STATE_DIR"));
+    }
+    let over = raw.map(PathBuf::from).map(|p| {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        resolve_config_path(&expand_user(&p, &home), &cwd)
+    });
     config_state_dir(configured, &default, over.as_deref())
+}
+
+/// The message both refusals above share, naming `var_name`
+/// (`MULTIVERSE_CONFIG` or `MULTIVERSE_STATE_DIR`) and what to do about
+/// it.
+fn forbidden_live_env_message(var_name: &str) -> String {
+    format!(
+        "{var_name} is still the `.cargo/config.toml`-forced sentinel (card \
+         20261110-b-590e00) — this process read it without first overriding it to an \
+         isolated temp directory. cargo's [env] table can force a value but never unset \
+         one, so the forced sentinel stands in for the live value a worker pane's shell \
+         exports and doubles as a refusal: set {var_name} explicitly (e.g. an env guard, \
+         or `--config`) before loading config in a test, rather than falling through to \
+         the real fleet's config/state."
+    )
 }
 
 /// The literal project name reserved for the home hub (backlog
@@ -398,6 +463,12 @@ fn require_table<'a>(value: &'a Value, scope: &str) -> Result<&'a Table, ConfigE
 fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
+    // Single-row space-optimized edit-distance DP: `row[j]` holds the
+    // distance between `a[..i]` and `b[..j]` for the row currently being
+    // computed. `prev` carries the previous row's `row[j-1]` (the
+    // diagonal/substitution cost) forward before `row[j-1]` itself gets
+    // overwritten with this row's value, since the loop below updates
+    // `row` in place rather than keeping two full rows.
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for i in 1..=a.len() {
         let mut prev = row[0];
@@ -465,6 +536,12 @@ pub struct Account {
     pub roles_allowed: Option<Vec<Role>>,
     pub max_runtime_minutes: Option<u32>,
     pub awaiting_lease_minutes_override: Option<u32>,
+    /// How many Nexus panes this seat hosts, counted separately from
+    /// `max_agents`/the seat's open-agent cap — card `20261115-b-65fe80`:
+    /// worker capacity and Nexus capacity are now reported and checked
+    /// independently, so a seat's Nexus pane never eats a worker slot.
+    /// `0` (the default) means this seat hosts no Nexus pane.
+    pub nexus_slots: u32,
 }
 
 /// The provider selected in a Codex seat's own `config.toml`.
@@ -520,6 +597,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "roles_allowed",
     "max_runtime_minutes",
     "awaiting_lease_minutes_override",
+    "nexus_slots",
 ];
 
 /// The env var each known `kind` must select its account with
@@ -599,6 +677,7 @@ fn parse_account(
     let max_runtime_minutes = optional_u32(table, &scope, "max_runtime_minutes", 1)?;
     let awaiting_lease_minutes_override =
         optional_u32(table, &scope, "awaiting_lease_minutes_override", 1)?;
+    let nexus_slots = u32_with_default(table, &scope, "nexus_slots", 0, 0)?;
 
     if interactive && kind == "claude" && command.trim().is_empty() {
         return Err(ConfigError::new(format!(
@@ -627,6 +706,7 @@ fn parse_account(
         roles_allowed,
         max_runtime_minutes,
         awaiting_lease_minutes_override,
+        nexus_slots,
     })
 }
 
@@ -734,6 +814,9 @@ impl FallbackPolicy {
         }
     }
 
+    /// The exact `on_exhausted` spelling this variant was (or would be)
+    /// parsed from — the inverse of `parse` above — for callers that need
+    /// to show or re-emit a resolved policy in its config-file form.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Degrade => "degrade",
@@ -1004,6 +1087,10 @@ fn project_declaration_order(content: &str, projects: &BTreeMap<String, Project>
             continue;
         }
         let inner = &line[1..line.len() - 1];
+        // `splitn(3, '.')` so a third segment (`[projects.<name>.chains]`)
+        // leaves something in `parts` after taking `head`/`name` — that's
+        // the signal below to skip a nested table rather than mistake it
+        // for a second top-level declaration of the same project.
         let mut parts = inner.splitn(3, '.');
         let (Some(head), Some(name)) = (parts.next(), parts.next()) else {
             continue;
@@ -1011,6 +1098,9 @@ fn project_declaration_order(content: &str, projects: &BTreeMap<String, Project>
         if head.trim() != "projects" || parts.next().is_some() {
             continue;
         }
+        // TOML allows a quoted table-header segment; strip matching quotes
+        // so `[projects."my-project"]` and `[projects.my-project]` name
+        // the same key this scan compares against `projects`.
         let name = name.trim().trim_matches(['"', '\'']).to_string();
         if projects.contains_key(&name) && seen.insert(name.clone(), ()).is_none() {
             order.push(name);
@@ -1280,6 +1370,74 @@ fn parse_review_policy(
     })
 }
 
+/// `[secrets_scan]`: the gitleaks/trufflehog gate `multiverse worktrees
+/// <path> --merge <task>` runs before landing a lane (card
+/// `20261114-b-069836` option (a)). `allowlist` is a path relative to
+/// *each* project's own root, not a per-project table — one scan
+/// configuration, applied against whichever project is being merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretsScan {
+    /// A bare command (resolved against `PATH`) or an explicit path.
+    pub gitleaks: String,
+    /// Same shape as `gitleaks`; `None` skips the trufflehog pass entirely.
+    pub trufflehog: Option<String>,
+    /// Missing `gitleaks` blocks the merge (exit 3) rather than skipping
+    /// the scan silently when true (the default); `false` only warns.
+    pub required: bool,
+    /// Project-relative path to a gitleaks allowlist/config file, used
+    /// only when it exists under the project being merged.
+    pub allowlist: String,
+}
+
+impl Default for SecretsScan {
+    fn default() -> Self {
+        Self {
+            gitleaks: "gitleaks".to_string(),
+            trufflehog: None,
+            required: true,
+            allowlist: ".gitleaks.toml".to_string(),
+        }
+    }
+}
+
+const SECRETS_SCAN_KEYS: &[&str] = &["gitleaks", "trufflehog", "required", "allowlist"];
+
+fn parse_secrets_scan(
+    value: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<SecretsScan, ConfigError> {
+    let scope = "secrets_scan";
+    let table = require_table(value, scope)?;
+    warn_unknown_keys(table, scope, SECRETS_SCAN_KEYS, warnings);
+
+    let defaults = SecretsScan::default();
+    let gitleaks = optional_str(table, scope, "gitleaks")?.unwrap_or(defaults.gitleaks);
+    if gitleaks.trim().is_empty() {
+        return Err(ConfigError::new(format!(
+            "{scope}: gitleaks must not be empty"
+        )));
+    }
+    let trufflehog = optional_str(table, scope, "trufflehog")?;
+    if trufflehog.as_deref().is_some_and(str::is_empty) {
+        return Err(ConfigError::new(format!(
+            "{scope}: trufflehog must not be empty"
+        )));
+    }
+    let required = bool_with_default(table, scope, "required", defaults.required)?;
+    let allowlist = optional_str(table, scope, "allowlist")?.unwrap_or(defaults.allowlist);
+    if allowlist.trim().is_empty() {
+        return Err(ConfigError::new(format!(
+            "{scope}: allowlist must not be empty"
+        )));
+    }
+    Ok(SecretsScan {
+        gitleaks,
+        trufflehog,
+        required,
+        allowlist,
+    })
+}
+
 /// `dashboard_tab` is `bool | list[str]` (spec-config.md §B).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardTab {
@@ -1388,6 +1546,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "host_disk_critical_gb",
     "board",
     "review_policy",
+    "secrets_scan",
     "activity",
     "mail",
 ];
@@ -1414,6 +1573,7 @@ pub struct Config {
     pub host_disk_critical_gb: u32,
     pub board: Board,
     pub review_policy: ReviewPolicy,
+    pub secrets_scan: SecretsScan,
     pub activity_pairs: BTreeMap<String, Vec<String>>,
     pub mail_pairs: BTreeMap<String, Vec<String>>,
     /// Unknown-key and non-default-risk-area warnings collected while
@@ -1548,6 +1708,13 @@ pub fn load_config_str(content: &str, path: &Path) -> Result<Config, ConfigError
         None => ReviewPolicy::default(),
     };
 
+    let secrets_scan = match root.get("secrets_scan") {
+        Some(v) => {
+            parse_secrets_scan(v, &mut warnings).map_err(|e| ConfigError::at(path, e.message()))?
+        }
+        None => SecretsScan::default(),
+    };
+
     let activity_pairs = match root.get("activity") {
         Some(v) => {
             let t = require_table(v, "activity").map_err(|e| ConfigError::at(path, e.message()))?;
@@ -1585,6 +1752,7 @@ pub fn load_config_str(content: &str, path: &Path) -> Result<Config, ConfigError
         host_disk_critical_gb,
         board,
         review_policy,
+        secrets_scan,
         activity_pairs,
         mail_pairs,
         warnings,
@@ -1984,6 +2152,15 @@ mod tests {
         // bare relative literal has no real parent directory to anchor
         // that resolution to.
         let dir = tempdir().unwrap();
+        // `[projects.multiverse]` omitting `path` makes `load_config_str`
+        // call `config_state_dir_from_env` for real (see its own comment
+        // a few lines down from here); under cargo that now reads the
+        // `.cargo/config.toml`-forced sentinel (card `20261110-b-590e00`)
+        // and panics unless something overrides it first, same as the
+        // hub-default test below.
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let _state = StateDirEnvGuard::set(&state_dir);
         let config_path = dir.path().join("config.example.toml");
         let content = include_str!("../../../config.example.toml");
         let config = load_config_str(content, &config_path).unwrap();
@@ -2079,6 +2256,26 @@ mod tests {
         assert_eq!(
             resolve_config_path(Path::new("/a/b/../c/./config.toml"), cwd),
             PathBuf::from("/a/c/config.toml")
+        );
+    }
+
+    #[test]
+    fn normalize_lexically_keeps_leading_parent_dir_components() {
+        assert_eq!(
+            normalize_lexically(Path::new("../../x")),
+            PathBuf::from("../../x")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("a/../../x")),
+            PathBuf::from("../x")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("/a/../..")),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
         );
     }
 
@@ -2225,6 +2422,83 @@ scout = ["claude-personal"]
         assert_eq!(config.warnings.len(), 1);
         assert!(config.warnings[0].contains("max_concurrennt"));
         assert!(config.warnings[0].contains("max_concurrent"));
+    }
+
+    /// Card `20261115-b-65fe80`, proof (c): `nexus_slots` is an optional
+    /// per-account integer, defaulting to `0` when absent.
+    #[test]
+    fn nexus_slots_defaults_to_zero() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root);
+        let config_path = dir.path().join("config.toml");
+
+        let config = load_config_str(&content, &config_path).unwrap();
+        assert!(config.warnings.is_empty());
+        assert_eq!(config.accounts["claude-personal"].nexus_slots, 0);
+    }
+
+    /// Card `20261115-b-65fe80`, proof (c): `nexus_slots` parses a
+    /// positive integer with no warning.
+    #[test]
+    fn nexus_slots_parses_a_configured_value() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "[accounts.claude-personal]\nkind = \"claude\"",
+            "[accounts.claude-personal]\nnexus_slots = 2\nkind = \"claude\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let config = load_config_str(&content, &config_path).unwrap();
+        assert!(
+            config.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            config.warnings
+        );
+        assert_eq!(config.accounts["claude-personal"].nexus_slots, 2);
+    }
+
+    /// Card `20261115-b-65fe80`, proof (c): a negative `nexus_slots` is
+    /// refused, the same as every other bounded account integer.
+    #[test]
+    fn nexus_slots_rejects_a_negative_value() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "[accounts.claude-personal]\nkind = \"claude\"",
+            "[accounts.claude-personal]\nnexus_slots = -1\nkind = \"claude\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let err = load_config_str(&content, &config_path).unwrap_err();
+        assert!(err.message().contains("nexus_slots"), "{}", err.message());
+    }
+
+    /// Card `20261115-b-65fe80`, proof (c): an unrecognized account key —
+    /// including a `nexus_slots` typo — is a warning, not a refusal, same
+    /// as every other account key.
+    #[test]
+    fn an_unknown_account_key_near_nexus_slots_warns_rather_than_refuses() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "[accounts.claude-personal]\nkind = \"claude\"",
+            "[accounts.claude-personal]\nnexus_slot = 1\nkind = \"claude\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let config = load_config_str(&content, &config_path).unwrap();
+        assert_eq!(config.warnings.len(), 1);
+        assert!(config.warnings[0].contains("nexus_slot"));
+        assert!(config.warnings[0].contains("nexus_slots"));
     }
 
     #[test]
@@ -2706,6 +2980,66 @@ short = "exam"
     }
 
     #[test]
+    fn secrets_scan_defaults_match_the_documented_defaults() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str("", &config_path).unwrap();
+        let scan = config.secrets_scan;
+        assert_eq!(scan.gitleaks, "gitleaks");
+        assert_eq!(scan.trufflehog, None);
+        assert!(scan.required);
+        assert_eq!(scan.allowlist, ".gitleaks.toml");
+    }
+
+    #[test]
+    fn secrets_scan_table_overrides_every_field() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let content = r#"
+[secrets_scan]
+gitleaks = "/opt/bin/gitleaks"
+trufflehog = "/opt/bin/trufflehog"
+required = false
+allowlist = "security/.gitleaks.toml"
+"#;
+        let config = load_config_str(content, &config_path).unwrap();
+        let scan = config.secrets_scan;
+        assert_eq!(scan.gitleaks, "/opt/bin/gitleaks");
+        assert_eq!(scan.trufflehog.as_deref(), Some("/opt/bin/trufflehog"));
+        assert!(!scan.required);
+        assert_eq!(scan.allowlist, "security/.gitleaks.toml");
+    }
+
+    #[test]
+    fn secrets_scan_rejects_an_empty_gitleaks_command() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let content = "[secrets_scan]\ngitleaks = \"\"\n";
+        let err = load_config_str(content, &config_path).unwrap_err();
+        assert!(
+            err.message().contains("gitleaks must not be empty"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn secrets_scan_rejects_an_unknown_key() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let content = "[secrets_scan]\nrequierd = true\n";
+        let config = load_config_str(content, &config_path).unwrap();
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("secrets_scan: unknown key \"requierd\"")
+                    && w.contains("did you mean \"required\"?")),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
     fn an_empty_config_loads_with_every_default() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -3048,6 +3382,108 @@ path = "{path}"
         let config_path = dir.path().join("config.toml");
         let err = load_config_str(content, &config_path).unwrap_err();
         assert!(err.message().contains("path"));
+    }
+
+    // -- card 20261110-b-590e00: the cargo-forced sentinel is refused ----
+    //
+    // Worker panes now export the live `MULTIVERSE_STATE_DIR`/
+    // `MULTIVERSE_CONFIG` into every process they spawn (merged `0f90860`);
+    // `.cargo/config.toml` force-sets both to a reserved sentinel for every
+    // `cargo build`/`test`/`run` so that value, not the ambient live path,
+    // is what an unguarded read actually sees. These tests cover the
+    // refusal logic in isolation, without needing `cargo test` itself to
+    // be mid-force: they set the sentinel by hand, the same literal
+    // `.cargo/config.toml` would force, and confirm these two env readers
+    // refuse it — proof that, pre-fix, nothing here would have stopped an
+    // unguarded read from returning whatever `$MULTIVERSE_STATE_DIR`/
+    // `$MULTIVERSE_CONFIG` held (these `assert_eq!`/`unwrap()` calls below
+    // are exactly what `FORBIDDEN_LIVE_*_SENTINEL`'s doc describes as the
+    // hazard, and fail on code from before this card without the
+    // `if ... == Some(sentinel)` checks in `resolve_config_path_from_env`/
+    // `config_state_dir_from_env`).
+
+    /// [`StateDirEnvGuard`]'s twin for `MULTIVERSE_CONFIG` — no earlier
+    /// test in this file touches that variable, so this is the first
+    /// guard for it.
+    struct ConfigEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigEnvGuard {
+        fn set(value: &std::ffi::OsStr) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_CONFIG", value);
+            Self {
+                previous,
+                _lock: held,
+            }
+        }
+    }
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_config_path_from_env_refuses_the_forced_sentinel_when_unguarded() {
+        let _config = ConfigEnvGuard::set(std::ffi::OsStr::new(FORBIDDEN_LIVE_CONFIG_SENTINEL));
+        let err = resolve_config_path_from_env(None).unwrap_err();
+        assert!(err.to_string().contains("MULTIVERSE_CONFIG"));
+    }
+
+    /// A `--config` override always beats `$MULTIVERSE_CONFIG` (`config_path`
+    /// above), so the forced sentinel is never actually consulted in this
+    /// shape — the same reason `review_policy.rs`'s
+    /// `a_missing_config_file_needs_config_not_a_bare_error` can safely
+    /// call this with no guard at all, cargo-forced sentinel or not.
+    #[test]
+    fn resolve_config_path_from_env_lets_a_cli_override_bypass_the_sentinel() {
+        let _config = ConfigEnvGuard::set(std::ffi::OsStr::new(FORBIDDEN_LIVE_CONFIG_SENTINEL));
+        let dir = tempdir().unwrap();
+        let explicit = dir.path().join("config.toml");
+        let resolved = resolve_config_path_from_env(Some(&explicit)).unwrap();
+        assert_eq!(resolved, explicit);
+    }
+
+    /// A test's own guard overriding `$MULTIVERSE_CONFIG` to a real temp
+    /// path (not the sentinel) must keep resolving normally — the whole
+    /// point is that only the forced sentinel itself is refused.
+    #[test]
+    fn resolve_config_path_from_env_accepts_a_guarded_override() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("config.toml");
+        let _config = ConfigEnvGuard::set(real.as_os_str());
+        let resolved = resolve_config_path_from_env(None).unwrap();
+        assert_eq!(resolved, real);
+    }
+
+    #[test]
+    #[should_panic(expected = "MULTIVERSE_STATE_DIR")]
+    fn config_state_dir_from_env_panics_on_the_forced_sentinel() {
+        let _state = StateDirEnvGuard::set(Path::new(FORBIDDEN_LIVE_STATE_DIR_SENTINEL));
+        let _ = config_state_dir_from_env(Path::new("/irrelevant/config.toml"));
+    }
+
+    /// Unlike `resolve_config_path_from_env`, this function has no
+    /// override parameter of its own to bypass the check on — a guarded,
+    /// non-sentinel `$MULTIVERSE_STATE_DIR` is the only way to keep using
+    /// it under cargo, and that must still work.
+    #[test]
+    fn config_state_dir_from_env_still_honors_a_guarded_override() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let _state = StateDirEnvGuard::set(&state_dir);
+        let resolved = config_state_dir_from_env(Path::new("/irrelevant/config.toml"));
+        assert_eq!(resolved, state_dir);
     }
 
     // -- finding 4: a project's local roster.toml is merged in --------

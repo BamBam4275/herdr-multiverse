@@ -46,6 +46,9 @@ REQUIRED_PROBE_PREFIXES = (
 
 
 class ReadProbeTests(unittest.TestCase):
+    """`read_probes` covers every required read-only command, scales
+    `backlog show` with known items, and translates dry-run roles for Rust."""
+
     def test_required_read_only_commands_are_present(self):
         probes = read_probes([])
         argvs = [tuple(p.argv) for p in probes]
@@ -84,6 +87,10 @@ class ReadProbeTests(unittest.TestCase):
 
 
 class SequenceTests(unittest.TestCase):
+    """`gen_sequence` interleaves writes with the full probe battery,
+    generates every live command kind, keeps notify in rotation, and the
+    shared config carries chains that translate for Rust."""
+
     def test_each_write_is_followed_by_the_probe_battery(self):
         seq = gen_sequence(random.Random(0), 5)
         self.assertTrue(seq)
@@ -130,6 +137,9 @@ class SequenceTests(unittest.TestCase):
 
 
 class FleetSeedTests(unittest.TestCase):
+    """`seed_fleet` produces identical normalized state/tree output for two
+    independent sandboxes, and `_register_task_ids` finds every seeded task."""
+
     def test_fleet_seed_is_identical_after_paths_are_normalized(self):
         sandboxes = [make_sandbox(), make_sandbox()]
         try:
@@ -303,6 +313,10 @@ class DryRunNormalizationTests(unittest.TestCase):
 
 
 class PromptTreeComparisonTests(unittest.TestCase):
+    """`_tree_contents_match`'s narrow exceptions for seed/brief prompt
+    files: only the documented facts may differ; everything else, and
+    every other file, stays byte-strict."""
+
     brief = (
         "# Task <TASK:6>\nRole: Scout\n"
         "Result path: .multiverse/tasks/<TASK:6>/result.md\n"
@@ -316,6 +330,7 @@ class PromptTreeComparisonTests(unittest.TestCase):
     brief_path = "sandbox/.multiverse/tasks/<TASK:6>/brief.md"
 
     def compare_file(self, path, python, rust):
+        """`compare()` two runs differing only in one tree file's content."""
         return compare(SequenceRun(tree={path: python}), SequenceRun(tree={path: rust}))
 
     def test_seed_prose_and_digest_values_are_allowed(self):
@@ -398,6 +413,10 @@ class PromptTreeComparisonTests(unittest.TestCase):
 
 
 class CompareTests(unittest.TestCase):
+    """`compare()`'s general diffing: Herdr call order, harness errors,
+    tree snapshotting (including binary files), probe labelling, notify
+    classification, and step-count mismatches."""
+
     def test_ordered_herdr_calls_are_compared_even_on_exit_mismatch(self):
         for exit_code in (0, 1):
             py_run = SequenceRun(outcomes=[StepOutcome(
@@ -469,7 +488,12 @@ class CompareTests(unittest.TestCase):
 
 
 class TableNormalizationTests(unittest.TestCase):
+    """`normalize_stdout`'s table-cell rewriting: fixed-width padding
+    across a role rename or a task-id substitution, and that prose/
+    non-task rows and genuine content changes stay strict."""
+
     def render(self, role, token, command, *, extra_space=False):
+        """One fixed-width task/role row, normalized as `command` would render it."""
         task = f"20261106-{role}-abcdef"
         paths = PathMap()
         paths.add(task, token)
@@ -584,7 +608,13 @@ class TableNormalizationTests(unittest.TestCase):
 
 
 class ElapsedNormalizationTests(unittest.TestCase):
+    """`normalize_elapsed`/`normalize_stdout`'s duration folding: every
+    elapsed form and unit boundary, padding that keeps borders aligned,
+    board clocks, `resets in`, and that unrelated text/whitespace and
+    genuine status changes still diverge."""
+
     def render(self, text, command):
+        """`text` normalized as `command` would render it."""
         return diff_fuzz.normalize_stdout(text, PathMap(), [command])
 
     def test_all_elapsed_forms_and_unit_boundaries(self):
@@ -641,7 +671,12 @@ class ElapsedNormalizationTests(unittest.TestCase):
 
 
 class CouncilCallTests(unittest.TestCase):
+    """`normalize_council_calls`'s per-seat comparison: each seat keeps
+    its own call order while seats may interleave with each other, and
+    the shared non-seat stream keeps its own strict order."""
+
     def seat(self, name, pane):
+        """One seat's full launch-through-close call sequence."""
         return [
             ["pane", "rename", pane, name],
             ["pane", "run", pane, "cd <PROJECT:sandbox> && unset TOKEN"],
@@ -653,6 +688,8 @@ class CouncilCallTests(unittest.TestCase):
         ]
 
     def diffs(self, py, rs, command="council"):
+        """`compare()` a `command` step with Python's `py` calls against
+        Rust's `rs` calls."""
         def run(calls):
             return SequenceRun(outcomes=[StepOutcome(
                 [command, ".", "--yes"], 0, "", "", herdr_calls=calls)])
@@ -722,6 +759,11 @@ class CouncilCallTests(unittest.TestCase):
 
 
 class HerdrAllowlistTests(unittest.TestCase):
+    """`normalize_herdr_calls`'s full allowlist: prompt-poll folding,
+    start's one extra under-lock roster call, repeated read-only poll
+    collapsing, and that every other call, target, source or flag stays
+    strict."""
+
     rename = ["agent", "rename", "w1:p1", "sandbox-scou-ex"]
     prompt = ["agent", "prompt", "sandbox-scou-ex", "read the brief"]
     py_poll = [["agent", "read", "sandbox-scou-ex", "--source", "visible"],
@@ -731,6 +773,8 @@ class HerdrAllowlistTests(unittest.TestCase):
                ["pane", "read", "w1:p1", "--source", "visible"]]
 
     def diffs(self, py, rs, command="dispatch"):
+        """`compare()` a `command` step with Python's `py` calls against
+        Rust's `rs` calls."""
         def run(calls):
             return SequenceRun(outcomes=[StepOutcome([command], 0, "", "", herdr_calls=calls)])
         return compare(run(py), run(rs))
@@ -861,6 +905,313 @@ class HerdrAllowlistTests(unittest.TestCase):
         self.assertTrue(self.diffs([self.rename, close, *self.py_poll],
                                    [self.rename, close, *self.rs_poll]))
         self.assertTrue(self.diffs(self.py_poll, self.rs_poll))
+
+
+class IntentionalDivergenceNormalizationTests(unittest.TestCase):
+    """Card 20261116-b-9dbf0d: diff_fuzz normalization of the Rust-only
+    divergence classes the Scout's triage (fuzz-triage-result-20261116.md)
+    labelled A-F. One equal-case and one near-miss per class; see result.md
+    for the manual revert check on class D (removing its rule fails the
+    equal-case there).
+    """
+
+    def diffs(self, py, rs, command="dispatch"):
+        def run(calls):
+            return SequenceRun(outcomes=[StepOutcome([command], 0, "", "", herdr_calls=calls)])
+        return compare(run(py), run(rs))
+
+    # --- C: runtime/pane-watch.json is excluded from the tree snapshot ---
+
+    def test_class_c_pane_watch_json_is_excluded_from_the_tree_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pane-watch.json").write_text('{"w1:p1": {"last_changed_at": "x"}}')
+            (root / "pane-watch.json.lock").write_text("")
+            (root / "breaker-state.json").write_text("{}")
+            tree = diff_fuzz._snapshot_tree({"runtime": root}, PathMap())
+            self.assertEqual(set(tree), {"runtime/breaker-state.json"})
+
+    def test_class_c_near_miss_a_differently_named_runtime_file_still_compares(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pane-watch-extra.json").write_text('{"a": 1}')
+            tree = diff_fuzz._snapshot_tree({"runtime": root}, PathMap())
+            self.assertEqual(tree, {"runtime/pane-watch-extra.json": '{"a": 1}'})
+
+    # --- D: dispatcher-resolved MULTIVERSE_CONFIG/MULTIVERSE_STATE_DIR ---
+
+    def test_class_d_pane_split_env_pair_is_dropped(self):
+        py = [["pane", "split", "--current", "--direction", "right", "--cwd", "/p",
+               "--env", "CODEX_HOME=/codex", "--no-focus"]]
+        rs = [["pane", "split", "--current", "--direction", "right", "--cwd", "/p",
+               "--env", "CODEX_HOME=/codex", "--env", "MULTIVERSE_CONFIG=/state/config.toml",
+               "--env", "MULTIVERSE_STATE_DIR=/runtime", "--no-focus"]]
+        self.assertEqual(self.diffs(py, rs), [])
+
+    def test_class_d_near_miss_a_third_env_var_still_diverges(self):
+        py = [["pane", "split", "--cwd", "/p", "--env", "CODEX_HOME=/codex"]]
+        rs = [["pane", "split", "--cwd", "/p", "--env", "CODEX_HOME=/codex",
+               "--env", "MULTIVERSE_CONFIG=/state/config.toml",
+               "--env", "MULTIVERSE_STATE_DIR=/runtime",
+               "--env", "SOME_OTHER_VAR=1"]]
+        self.assertTrue(self.diffs(py, rs))
+
+    def test_class_d_near_miss_only_pane_split_is_covered(self):
+        py = [["workspace", "create", "--env", "CODEX_HOME=/codex"]]
+        rs = [["workspace", "create", "--env", "CODEX_HOME=/codex",
+               "--env", "MULTIVERSE_CONFIG=/state/config.toml",
+               "--env", "MULTIVERSE_STATE_DIR=/runtime"]]
+        self.assertTrue(self.diffs(py, rs))
+
+    def test_class_d_dry_run_account_selection_env_lines_are_dropped(self):
+        header = "  env         CLAUDE_CONFIG_DIR=/claude-home\n"
+        py_stdout = "DRY RUN\n" + header + "WOULD LOG\n"
+        rs_stdout = (
+            "DRY RUN\n" + header
+            + "  env         MULTIVERSE_CONFIG=/state/config.toml\n"
+            + "  env         MULTIVERSE_STATE_DIR=/runtime\n"
+            + "WOULD LOG\n"
+        )
+        def run(text):
+            return SequenceRun(outcomes=[StepOutcome(["dispatch", "--dry-run"], 0, text, "")])
+        self.assertEqual(compare(run(py_stdout), run(rs_stdout)), [])
+
+    def test_class_d_near_miss_only_the_exact_two_line_pair_is_dropped(self):
+        header = "  env         CLAUDE_CONFIG_DIR=/claude-home\n"
+        py_stdout = "DRY RUN\n" + header + "WOULD LOG\n"
+        rs_stdout = (
+            "DRY RUN\n" + header
+            + "  env         MULTIVERSE_CONFIG=/state/config.toml\n"
+            + "  env         MULTIVERSE_STATE_DIR=/runtime\n"
+            + "  env         SOME_OTHER_VAR=1\n"
+            + "WOULD LOG\n"
+        )
+        def run(text):
+            return SequenceRun(outcomes=[StepOutcome(["dispatch", "--dry-run"], 0, text, "")])
+        self.assertTrue(compare(run(py_stdout), run(rs_stdout)))
+
+    # --- E: pane run argv compares quote-insensitively ---
+
+    def test_class_e_launch_tail_quoting_is_ignored(self):
+        py = [["pane", "run", "w1:p1",
+               "cd /tmp/project && fake-claude --model claude-test --effort high"]]
+        rs = [["pane", "run", "w1:p1",
+               "cd '/tmp/project' && 'fake-claude' '--model' 'claude-test' '--effort' 'high'"]]
+        self.assertEqual(self.diffs(py, rs), [])
+
+    def test_class_e_near_miss_a_changed_argument_value_still_diverges(self):
+        py = [["pane", "run", "w1:p1",
+               "cd /tmp/project && fake-claude --model claude-test --effort high"]]
+        rs = [["pane", "run", "w1:p1",
+               "cd '/tmp/project' && 'fake-claude' '--model' 'claude-test' '--effort' 'low'"]]
+        self.assertTrue(self.diffs(py, rs))
+
+    def test_class_e_near_miss_a_partially_quoted_tail_remains_strict(self):
+        py = [["pane", "run", "w1:p1", "cd /tmp/project && fake-claude --model claude-test"]]
+        rs = [["pane", "run", "w1:p1", "cd '/tmp/project' && 'fake-claude' --model claude-test"]]
+        self.assertTrue(self.diffs(py, rs))
+
+    def test_class_e_env_assignment_prefix_is_covered_too(self):
+        py = [["pane", "run", "w1:p1", "cd /tmp/project && CACHE=1 fake-claude"]]
+        rs = [["pane", "run", "w1:p1", "cd '/tmp/project' && CACHE='1' 'fake-claude'"]]
+        self.assertEqual(self.diffs(py, rs), [])
+
+    # --- F: start/start --reseed's extra pane list --workspace ---
+
+    def test_class_f_start_reseed_extra_pane_list_is_dropped(self):
+        py = [["agent", "list"]]
+        rs = [["agent", "list"], ["pane", "list", "--workspace", "w1"]]
+        self.assertEqual(self.diffs(py, rs, "start"), [])
+
+    def test_class_f_near_miss_other_commands_still_diverge(self):
+        py = [["agent", "list"]]
+        rs = [["agent", "list"], ["pane", "list", "--workspace", "w1"]]
+        for command in ("dispatch", "council", "sweep", "workers"):
+            with self.subTest(command=command):
+                self.assertTrue(self.diffs(py, rs, command))
+
+    def test_class_f_near_miss_a_differently_shaped_extra_call_still_diverges(self):
+        py = [["agent", "list"]]
+        self.assertTrue(self.diffs(py, [["agent", "list"], ["pane", "list"]], "start"))
+        self.assertTrue(self.diffs(
+            py, [["agent", "list"], ["pane", "list", "--workspace", "w1", "--extra"]], "start"))
+
+    def test_class_f_only_folds_on_the_rust_side(self):
+        extra = [["agent", "list"], ["pane", "list", "--workspace", "w1"]]
+        self.assertTrue(self.diffs(extra, [["agent", "list"]], "start"))
+
+    # --- A/B: workers' per-live-pane stalled-content read and rendering ---
+
+    def test_class_ab_pane_watch_read_calls_are_dropped(self):
+        py = [["agent", "list"]]
+        rs = [["agent", "list"], ["pane", "read", "w1:p1", "--lines", "200"],
+              ["pane", "read", "w1:p2", "--lines", "200"]]
+        self.assertEqual(self.diffs(py, rs, "workers"), [])
+
+    def test_class_ab_near_miss_a_different_lines_value_still_diverges(self):
+        py = [["agent", "list"]]
+        rs = [["agent", "list"], ["pane", "read", "w1:p1", "--lines", "50"]]
+        self.assertTrue(self.diffs(py, rs, "workers"))
+
+    def test_class_ab_near_miss_a_source_flagged_read_still_diverges(self):
+        py = [["agent", "list"]]
+        rs = [["agent", "list"], ["pane", "read", "w1:p1", "--source", "visible"]]
+        self.assertTrue(self.diffs(py, rs, "workers"))
+
+    def test_class_ab_outcome_column_is_dropped_from_workers_table(self):
+        py_stdout = (
+            "PROJECT TASK ROLE  SEAT   STATUS  AGE\n"
+            "—       —    scout seat-b working —\n\n"
+            "workers 1/3\n"
+            "orchestrators 0 (excluded from workers; they do not count against max_concurrent)"
+        )
+        rs_stdout = (
+            "PROJECT TASK ROLE  SEAT   STATUS  OUTCOME AGE\n"
+            "—       —    scout seat-b working —       —\n\n"
+            "workers 1/3\n"
+            "nexus sessions 0 (excluded from workers; they do not count against max_concurrent)"
+        )
+        # `compare()` itself never calls `normalize_stdout` -- that runs once,
+        # at capture time, in `run_sequence`. Pre-apply it here the same way,
+        # so this test exercises the real pipeline rather than skipping it.
+        def run(text):
+            normalized = diff_fuzz.normalize_stdout(text, PathMap(), ["workers"])
+            return SequenceRun(outcomes=[StepOutcome(["workers"], 0, normalized, "")])
+        self.assertEqual(compare(run(py_stdout), run(rs_stdout)), [])
+
+    def test_class_ab_near_miss_a_changed_outcome_value_still_diverges(self):
+        py_stdout = "PROJECT TASK ROLE  SEAT   STATUS  AGE\n— — scout seat-b working —\n"
+        rs_stdout = ("PROJECT TASK ROLE  SEAT   STATUS  OUTCOME AGE\n"
+                     "— — scout seat-b stalled —       done\n")
+        def run(text):
+            normalized = diff_fuzz.normalize_stdout(text, PathMap(), ["workers"])
+            return SequenceRun(outcomes=[StepOutcome(["workers"], 0, normalized, "")])
+        self.assertTrue(compare(run(py_stdout), run(rs_stdout)))
+
+    def test_class_ab_near_miss_outcome_only_folds_for_workers(self):
+        text = "PROJECT TASK ROLE  SEAT   STATUS  OUTCOME AGE\n— — scout seat-b working — —\n"
+        self.assertEqual(diff_fuzz.normalize_stdout(text, PathMap(), ["board"]), text)
+
+    def test_class_ab_nexus_sessions_wording_matches_the_full_phrase_only(self):
+        self.assertEqual(
+            diff_fuzz.normalize_role_names(
+                "orchestrators 2 (excluded from workers; they do not count against max_concurrent)"
+            ),
+            "nexus sessions 2 (excluded from workers; they do not count against max_concurrent)",
+        )
+        # Near miss: a differently-worded tail is not this summary line at
+        # all, so the bare role word still only gets the generic rename.
+        self.assertEqual(
+            diff_fuzz.normalize_role_names("orchestrators are great"),
+            "orchestrators are great",
+        )
+
+
+class ReclaimStaleNormalizationTests(unittest.TestCase):
+    """Card 20261106-b-2c3d2f Decision 2 (card-2c3d2f-seer-ruling.md): Rust's
+    `stale bookkeeping` listing and Python's `would close` listing for the
+    same reclaimable task are the accepted divergence -- Rust's reclaim gate
+    additionally requires pane label/agent name confirmation before it will
+    offer to close a pane; Python's gate accepts the pane id alone.
+    """
+
+    TASK = "20261106-fixer-aaaaaa"
+    OTHER_TASK = "20261106-fixer-bbbbbb"
+    REST = "(fixer, agent='seat', pane='w1:p1')"
+
+    def diffs(self, py_stdout, rs_stdout, argv=("tasks", "--reclaimable")):
+        def run(text):
+            return SequenceRun(outcomes=[StepOutcome(list(argv), 0, text, "", probe=True)])
+        return compare(run(py_stdout), run(rs_stdout))
+
+    def test_equal_case_same_task_id_folds(self):
+        py = f"  would close {self.TASK} {self.REST}\n"
+        rs = ("  stale bookkeeping — pane already gone, holds no slot:\n"
+              f"    {self.TASK} {self.REST}\n")
+        self.assertEqual(self.diffs(py, rs), [])
+
+    def test_revert_check_the_raw_lines_differ_without_the_rule(self):
+        # Pins the shapes the rule folds -- if `normalize_reclaim_stale`
+        # were removed, the equal-case test above would fail on this exact
+        # pair, because compare() would then see these two strings as-is.
+        py = f"  would close {self.TASK} {self.REST}\n"
+        rs = ("  stale bookkeeping — pane already gone, holds no slot:\n"
+              f"    {self.TASK} {self.REST}\n")
+        self.assertNotEqual(py, rs)
+
+    def test_near_miss_different_task_id_still_diverges(self):
+        py = f"  would close {self.TASK} {self.REST}\n"
+        rs = ("  stale bookkeeping — pane already gone, holds no slot:\n"
+              f"    {self.OTHER_TASK} {self.REST}\n")
+        self.assertTrue(self.diffs(py, rs))
+
+    def test_near_miss_stale_with_no_matching_would_close_line_still_diverges(self):
+        rs = ("  stale bookkeeping — pane already gone, holds no slot:\n"
+              f"    {self.TASK} {self.REST}\n")
+        self.assertTrue(self.diffs("", rs))
+
+    def test_near_miss_other_reclaim_wording_still_diverges(self):
+        py = f"  would close {self.TASK} {self.REST}\n"
+        for verb in ("closed", "NOT closed"):
+            with self.subTest(verb=verb):
+                rs = f"  {verb} {self.TASK} {self.REST}\n"
+                self.assertTrue(self.diffs(py, rs))
+
+    def test_normalize_reclaim_stale_is_narrow(self):
+        unrelated = "would close nothing here\nclosed elsewhere\n"
+        self.assertEqual(diff_fuzz.normalize_reclaim_stale(unrelated), unrelated)
+
+    def test_only_folds_for_the_reclaimable_argv(self):
+        py = f"  would close {self.TASK} {self.REST}\n"
+        rs = ("  stale bookkeeping — pane already gone, holds no slot:\n"
+              f"    {self.TASK} {self.REST}\n")
+        for argv in (("tasks", "--close-stranded"), ("tasks",), ("board",)):
+            with self.subTest(argv=argv):
+                self.assertTrue(self.diffs(py, rs, argv=argv))
+
+    def test_is_reclaimable_argv(self):
+        self.assertTrue(diff_fuzz.is_reclaimable_argv(["tasks", "--reclaimable"]))
+        self.assertTrue(diff_fuzz.is_reclaimable_argv(["tasks", "--reclaimable", "--yes"]))
+        self.assertFalse(diff_fuzz.is_reclaimable_argv(["tasks", "--close-stranded"]))
+        self.assertFalse(diff_fuzz.is_reclaimable_argv(["tasks"]))
+        self.assertFalse(diff_fuzz.is_reclaimable_argv([]))
+
+
+class SweepDiskLineNormalizationTests(unittest.TestCase):
+    """Card 20261106-b-59f1ab: Python and Rust sample real disk-free at
+    different instants, so near the warn/critical threshold `sweep`'s host
+    disk-floor line can report a different GB count, percent, or level
+    marker by chance alone. See result.md for the manual revert check
+    (disabling the rule fails the equal-case test below).
+    """
+
+    def run_sweep(self, text):
+        normalized = diff_fuzz.normalize_stdout(text, PathMap(), ["sweep"])
+        return SequenceRun(outcomes=[StepOutcome(["sweep"], 0, normalized, "")])
+
+    def test_equal_case_disk_free_number_percent_and_level_do_not_decide_equality(self):
+        py_stdout = "sandbox ok\ndisk: 20 GB free (20%) LOW\nstale scratch: none\n"
+        rs_stdout = "sandbox ok\ndisk: 3 GB free (3%) CRITICAL\nstale scratch: none\n"
+        self.assertEqual(compare(self.run_sweep(py_stdout), self.run_sweep(rs_stdout)), [])
+        # `sweep --dry-run` prints the same disk line; it must fold too.
+        self.assertEqual(
+            diff_fuzz.normalize_stdout(py_stdout, PathMap(), ["sweep", "--dry-run"]),
+            diff_fuzz.normalize_stdout(rs_stdout, PathMap(), ["sweep", "--dry-run"]),
+        )
+
+    def test_near_miss_disk_line_missing_on_one_side_still_diverges(self):
+        with_line = "sandbox ok\ndisk: 20 GB free (20%) LOW\nstale scratch: none\n"
+        without_line = "sandbox ok\nstale scratch: none\n"
+        self.assertTrue(compare(self.run_sweep(with_line), self.run_sweep(without_line)))
+
+    def test_near_miss_a_different_sweep_line_still_diverges(self):
+        py_stdout = "sandbox ok\ndisk: 20 GB free (20%) LOW\nstale scratch: none\n"
+        rs_stdout = "sandbox ok\ndisk: 3 GB free (3%) CRITICAL\nstale scratch: /tmp/foo\n"
+        self.assertTrue(compare(self.run_sweep(py_stdout), self.run_sweep(rs_stdout)))
+
+    def test_disk_line_normalization_is_scoped_to_sweep(self):
+        text = "disk: 20 GB free (20%) LOW\n"
+        self.assertEqual(diff_fuzz.normalize_stdout(text, PathMap(), ["tasks"]), text)
 
 
 if __name__ == "__main__":

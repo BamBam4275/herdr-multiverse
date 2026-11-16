@@ -89,6 +89,11 @@ fn has_commits(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolves the target path, refuses a non-empty, unregistered directory
+/// unless it is only a half-finished `new` resume (see
+/// [`is_resumable_leftover`]), then (behind `--yes`, or just prints the
+/// plan behind `--dry-run`) creates/git-inits the directory, registers it
+/// with `add`'s own [`register`] if needed, and starts it.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let name = args.get_one::<String>("name").expect("name is required");
     let dry_run = args.get_flag("dry-run");
@@ -192,13 +197,15 @@ mod tests {
 
     #[test]
     fn resumable_leftover_allows_git_and_gitignore_only() {
-        let dir =
-            std::env::temp_dir().join(format!("mv-new-test-resumable-{}", std::process::id()));
+        // `tempfile::tempdir()` removes this on drop, including on panic
+        // (card `20261115-b-c8065f`: the plain `create_dir_all` this
+        // replaced only cleaned up past the assertions below).
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".gitignore"), "x\n").unwrap();
-        assert!(is_resumable_leftover(&dir).unwrap());
+        assert!(is_resumable_leftover(dir).unwrap());
         std::fs::write(dir.join("README.md"), "hi\n").unwrap();
-        assert!(!is_resumable_leftover(&dir).unwrap());
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(!is_resumable_leftover(dir).unwrap());
     }
 }

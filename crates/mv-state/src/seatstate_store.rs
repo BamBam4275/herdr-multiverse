@@ -39,15 +39,27 @@ use crate::breaker_store::support;
 /// behavior here, not a per-field one).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatEntry {
+    /// Explicit capacity override set by `accounts limit`. `None` (or a
+    /// stored value the read side rejects) leaves the seat uncapped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cap: Option<u32>,
+    /// Whether the seat is lent to other projects, set by `accounts lend`.
+    /// `None` (or a non-bool value) reads as lent (`true`) on the engine
+    /// side, so an unmentioned seat is never accidentally blocked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lend: Option<bool>,
+    /// Whether the seat is preferred for assignment, set by `accounts
+    /// prefer`. `None` (or a non-bool value) reads as not preferred
+    /// (`false`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefer: Option<bool>,
 }
 
 impl SeatEntry {
+    /// True once `cap`, `lend`, and `prefer` are all unset, i.e. this
+    /// entry has nothing left worth keeping. Callers that clear the last
+    /// set field should pair this with [`prune_if_empty`] so the seat is
+    /// dropped rather than left behind as a stray `{}`.
     pub fn is_empty(&self) -> bool {
         self.cap.is_none() && self.lend.is_none() && self.prefer.is_none()
     }
@@ -56,6 +68,7 @@ impl SeatEntry {
 /// Seat state keyed by seat name.
 pub type SeatMap = BTreeMap<String, SeatEntry>;
 
+/// Path to this project's seat-state store, inside its config dir.
 pub fn store_path(config_dir: &Path) -> PathBuf {
     config_dir.join("seat-state.json")
 }

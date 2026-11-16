@@ -64,6 +64,10 @@ pub fn load_roster_str(content: &str, path: &Path) -> Result<RosterOverride, Con
             .as_table()
             .ok_or_else(|| ConfigError::at(path, "chains must be a table"))?;
         for (key, list_value) in chains_table {
+            // `council`'s key is both legacy and current (the rename left
+            // it unchanged), so testing is_legacy_key alone would wrongly
+            // reject it as retired; only reject when the key is legacy
+            // *and* is not also a valid current key.
             if Role::is_legacy_key(key) && Role::from_config_key(key).is_err() {
                 return Err(ConfigError::at(
                     path,

@@ -33,6 +33,9 @@ impl FleetHealth for LiveFleet {
     }
 }
 
+/// Resolves config, performs a live fleet scan, and reports via
+/// [`run_with`] — the only entry point this module registers in
+/// `commands::run`.
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     let path = mv_config::load::resolve_config_path_from_env(
         args.get_one::<String>("config").map(std::path::Path::new),

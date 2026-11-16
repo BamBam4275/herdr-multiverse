@@ -53,11 +53,31 @@ fn bearer_re() -> &'static Regex {
 fn credential_stem_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)(?:^|_)(?:password|passwd|secret|token|api_?key)(?:_|$)")
+        Regex::new(r"(?i)(?:^|_)(?:password|passwd|secret|token|api_?key|key)(?:_|$)")
             .expect("static regex compiles")
     })
 }
 
+/// Database/indexing terms that end or begin with `key` but are not
+/// credential-shaped: the generic `key` stem added to [`credential_stem_re`]
+/// and [`camel_credential_suffix_re`] would otherwise also catch
+/// `foreign_key`, `primary_key`, `sort_key`, `cache_key`, `partition_key`,
+/// and `key_count`. Checked before either stem regex in [`is_credential_key`].
+fn non_credential_key_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:foreign|primary|sort|cache|partition)_key$|^key_count$")
+            .expect("static regex compiles")
+    })
+}
+
+/// Matches the zero-width boundary inside a camelCase word — between a
+/// lowercase letter/digit and the following uppercase one (`apiKey` ->
+/// boundary before `K`), or between two consecutive uppercase letters
+/// where the second starts a new word (`myAPIKey` -> boundary before the
+/// final `K`). [`is_credential_key`] replaces every such boundary with
+/// `_` so the same delimited-stem regexes written for `snake_case` keys
+/// also catch camelCase ones like `apiKey` or `clientSecret`.
 fn camel_boundary_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -70,7 +90,7 @@ fn camel_credential_suffix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:^|_)(?:password|passwd|secret|token|api_?key|secret_key|secret_access_key)$",
+            r"(?i)(?:^|_)(?:password|passwd|secret|token|api_?key|secret_key|secret_access_key|key)$",
         )
         .expect("static regex compiles")
     })
@@ -96,15 +116,28 @@ fn assignment_re() -> &'static Regex {
 }
 
 /// Mirrors `_is_credential_key`: a delimited credential stem (`password`,
-/// `secret`, `token`, `api_key`/`apikey`, …) or a camelCase key ending in
-/// one, as opposed to a key that merely contains those letters
-/// (`passwordlessEnabled`, `tokenizerCount`).
+/// `secret`, `token`, `api_key`/`apikey`, a generic `key`, …) or a camelCase
+/// key ending in one, as opposed to a key that merely contains those letters
+/// (`passwordlessEnabled`, `tokenizerCount`) or a database/indexing term that
+/// happens to end or begin with `key` (`foreign_key`, `key_count`).
 fn is_credential_key(key: &str) -> bool {
     let delimited = key.replace('-', "_");
+    if non_credential_key_re()
+        .is_match(&delimited)
+        .unwrap_or(false)
+    {
+        return false;
+    }
     if credential_stem_re().is_match(&delimited).unwrap_or(false) {
         return true;
     }
     let normalized = camel_boundary_re().replace_all(&delimited, "_");
+    if non_credential_key_re()
+        .is_match(normalized.as_ref())
+        .unwrap_or(false)
+    {
+        return false;
+    }
     camel_credential_suffix_re()
         .is_match(normalized.as_ref())
         .unwrap_or(false)
@@ -213,6 +246,52 @@ mod tests {
 
         let ordinary = "passwordlessEnabled=true tokenizerCount=500 apiKeyboard=standard";
         assert_eq!(redact_text(ordinary), ordinary);
+    }
+
+    #[test]
+    fn masks_generic_key_credential_stems_without_touching_identifiers() {
+        for key in [
+            "PRIVATE_KEY",
+            "SSH_KEY",
+            "ACCESS_KEY",
+            "DEPLOY_KEY",
+            "SIGNING_KEY",
+            "ENCRYPTION_KEY",
+        ] {
+            let text = format!("{key}=fake1234567890abcdef");
+            let redacted = redact_text(&text);
+            assert!(!redacted.contains("fake1234567890abcdef"));
+            assert!(redacted.contains(&format!("{key}={REDACTED_MARKER}")));
+            assert_eq!(redact_text(&redacted), redacted);
+        }
+
+        for key in ["privateKey", "accessKey"] {
+            let text = format!(r#"{key}=fake1234567890abcdef "{key}": "fake1234567890abcdef""#);
+            let redacted = redact_text(&text);
+            assert!(!redacted.contains("fake1234567890abcdef"));
+            assert!(redacted.contains(&format!("{key}={REDACTED_MARKER}")));
+            assert!(redacted.contains(&format!(r#""{key}": "{REDACTED_MARKER}""#)));
+            assert_eq!(redact_text(&redacted), redacted);
+        }
+    }
+
+    #[test]
+    fn preserves_non_credential_key_suffixed_names() {
+        // Every value below is the same credential-shaped string
+        // `masks_generic_key_credential_stems_without_touching_identifiers`
+        // uses to prove the generic `key` stem redacts it; here each name is
+        // paired with that value to pin that the denylist, not an
+        // innocuous-looking value, is what keeps these names untouched.
+        let text = concat!(
+            "foreign_key=fake1234567890abcdef primary_key=fake1234567890abcdef ",
+            "sort_key=fake1234567890abcdef cache_key=fake1234567890abcdef ",
+            "partition_key=fake1234567890abcdef key_count=fake1234567890abcdef ",
+            "FOREIGN_KEY=fake1234567890abcdef PRIMARY_KEY=fake1234567890abcdef ",
+            "SORT_KEY=fake1234567890abcdef CACHE_KEY=fake1234567890abcdef ",
+            "PARTITION_KEY=fake1234567890abcdef KEY_COUNT=fake1234567890abcdef ",
+            "foreignKey=fake1234567890abcdef primaryKey=fake1234567890abcdef"
+        );
+        assert_eq!(redact_text(text), text);
     }
 
     #[test]

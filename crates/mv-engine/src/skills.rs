@@ -84,6 +84,8 @@ pub struct UnknownSkillError {
 }
 
 impl UnknownSkillError {
+    /// `name` is the unrecognized grant token; `where_` is the config
+    /// location it came from, for the error message only.
     pub fn new(name: impl Into<String>, where_: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -109,8 +111,10 @@ impl std::error::Error for UnknownSkillError {}
 /// skill whose file is missing from the resolved source.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SkillError {
+    /// A grant token names a skill not in [`SKILLS`].
     #[error(transparent)]
     Unknown(#[from] UnknownSkillError),
+    /// A known skill's playbook file is missing from the resolved source.
     #[error(transparent)]
     Missing(#[from] MissingPromptError),
 }
@@ -187,14 +191,23 @@ pub fn playbook_from(name: &str, source: &Source) -> Result<String, SkillError> 
 
 /// The granted playbooks as one Markdown section, or empty for no grants.
 ///
-/// `()` → `""` — no heading emitted at all (`skills.py:198-212`).
+/// `names` is a raw grant list — `*` / `!name` / `!*` tokens included —
+/// resolved through [`resolve`] before each surviving name is turned
+/// into a playbook. Callers (the one production caller is a role's
+/// `skills = [...]` config) pass grants straight through; resolving
+/// them here, rather than trusting every caller to resolve first, is
+/// what keeps `!*` a real "deny everything" instead of an unknown
+/// skill name (`skills.py:198-212`).
+///
+/// `()` → `""` — no heading emitted at all.
 pub fn render(names: &[&str]) -> Result<String, SkillError> {
     render_from(names, &prompts::current_prompts_source())
 }
 
 /// Like [`render`], from an explicit prompt source.
 pub fn render_from(names: &[&str], source: &Source) -> Result<String, SkillError> {
-    if names.is_empty() {
+    let granted = resolve(names.iter().copied(), "render()")?;
+    if granted.is_empty() {
         return Ok(String::new());
     }
     let mut blocks = vec![
@@ -206,7 +219,7 @@ pub fn render_from(names: &[&str], source: &Source) -> Result<String, SkillError
             .to_string(),
         String::new(),
     ];
-    for name in names {
+    for name in &granted {
         blocks.push(playbook_from(name, source)?);
         blocks.push(String::new());
     }
@@ -372,6 +385,54 @@ mod tests {
     #[test]
     fn render_is_empty_when_nothing_is_granted() {
         assert_eq!(render_from(&[], &Source::Embedded).unwrap(), "");
+    }
+
+    // --- Card 20261110-b-5ede8e: `render`/`playbook` must apply the
+    // grant algebra themselves, not trust a caller to have called
+    // `resolve` first. `dispatch`'s `build_brief` passes a role's raw
+    // `skills = [...]` config straight to `render`, so `!*` reached
+    // `playbook_from` unresolved and failed as an unknown skill named
+    // "!*" instead of denying everything. ------------------------------
+
+    #[test]
+    fn render_resolves_deny_all_to_nothing_instead_of_an_unknown_skill() {
+        assert_eq!(render_from(&["!*"], &Source::Embedded).unwrap(), "");
+    }
+
+    #[test]
+    fn render_applies_the_full_grant_algebra_not_just_bare_names() {
+        assert_eq!(render_from(&["*", "!*"], &Source::Embedded).unwrap(), "");
+        let rendered = render_from(&["*", "!reflect"], &Source::Embedded).unwrap();
+        assert!(rendered.contains("## Skill: codemap"));
+        assert!(!rendered.contains("## Skill: reflect"));
+    }
+
+    #[test]
+    fn every_roles_skill_grant_renders_including_watchers_deny_all() {
+        // One representative `skills = [...]` grant per role that takes
+        // one (`council` and `nexus` do not dispatch with a skills
+        // grant, so they are not part of this brief's eight). Watcher's
+        // `["!*"]` is the documented "deny all, said out loud" form
+        // (`config.example.toml`) — a real, valid grant, not a
+        // malformed entry — and is the one that failed on current main
+        // before this fix.
+        let per_role_grants: &[(&str, &[&str])] = &[
+            ("scout", &["codemap"]),
+            ("builder", &["simplify"]),
+            ("archivist", &[]),
+            ("critic", &["simplify"]),
+            ("seer", &["deepwork"]),
+            ("council", &[]),
+            ("artisan", &["simplify"]),
+            ("watcher", &["!*"]),
+        ];
+        for (role, grants) in per_role_grants {
+            let rendered = render_from(grants, &Source::Embedded)
+                .unwrap_or_else(|err| panic!("{role} failed to resolve its skills: {err}"));
+            if *role == "watcher" {
+                assert_eq!(rendered, "", "watcher's deny-all must grant nothing");
+            }
+        }
     }
 
     #[test]

@@ -10,7 +10,11 @@ use crate::error::HerdrError;
 /// errors exit 2. Check the herdr process's own status, never a
 /// pipeline's.
 pub const EXIT_OK: i32 = 0;
+/// The CLI printed a JSON error envelope on stderr (a server-side failure,
+/// not a usage mistake).
 pub const EXIT_API_ERROR: i32 = 1;
+/// The CLI rejected its own invocation (bad flags/args) before reaching the
+/// server; no JSON envelope is produced.
 pub const EXIT_USAGE_ERROR: i32 = 2;
 
 /// Herdr's agent lifecycle states.

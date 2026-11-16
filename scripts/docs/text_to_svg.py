@@ -97,6 +97,7 @@ def parse_line(line: str) -> list[tuple[str, str | None, bool]]:
 
 
 def escape(text: str) -> str:
+    """Escape text for literal use inside SVG markup (XML entities only)."""
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -114,10 +115,15 @@ def escape_body(text: str) -> str:
 
 
 def visible_length(line: str) -> int:
+    """Character count of `line` with ANSI SGR escapes stripped out."""
     return len(ANSI_RE.sub("", line))
 
 
 def render_svg(transcript: str, title: str) -> str:
+    """Render the full transcript as a self-contained SVG document: a
+    terminal-chrome header bar followed by one `<text>` element per line,
+    each colored per `parse_line` and width-pinned by `visible_length` so
+    fallback-font glyph variance can't misalign the right-hand border."""
     lines = transcript.splitlines()
     max_len = max((visible_length(line) for line in lines), default=0)
     content_width = max(max_len * CHAR_WIDTH, 200.0)
@@ -166,6 +172,7 @@ def render_svg(transcript: str, title: str) -> str:
 
 
 def main(argv: list[str]) -> int:
+    """CLI entry point: read INPUT, render it to SVG, write OUTPUT."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="Captured transcript (plain text, ANSI SGR allowed)")
     parser.add_argument("output", help="SVG file to write")

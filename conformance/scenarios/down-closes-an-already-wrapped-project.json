@@ -1,0 +1,60 @@
+{
+  "id": "down-closes-an-already-wrapped-project",
+  "description": "`down` on a project whose `.multiverse/passdown.state` already reads `wrapped`, with a non-empty `PASSDOWN.md` behind it, never re-prompts the Nexus and closes the workspace, exiting 0 (card `20261116-b-f0612d` Lane B). `down`/`up` are a Rust-only surface with no Python analogue; this is a stateful fake Herdr lifecycle scenario (herdr_seed), --impl rust only.",
+  "dirs": {
+    "claude-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/PASSDOWN.md": "## STATE\n\nNothing to restart.\n",
+        ".multiverse/passdown.state": "wrapped"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.nexus-seat]\nkind = \"claude\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"{{DIR:claude-home}}\"\npool = \"claude:test\"\ninteractive = true\ncommand = \"claude-interactive\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "herdr_seed": [
+    ["workspace", "create", "--label", "sandbox", "--cwd", "{{PROJECT:sandbox}}", "--focus"],
+    ["agent", "start", "sandbox-nexu-ne", "--kind", "claude", "--pane", "w100:p1"]
+  ],
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["down", "sandbox", "--timeout", "2"],
+      "env": {
+        "MV_FAKE_HERDR_CALLS": "{{PROJECT:sandbox}}/down-calls.jsonl"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "already wrapped",
+          "closed"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["stop", "sandbox"],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "no project workspaces are open"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    {
+      "root": "sandbox",
+      "files": {
+        "down-calls.jsonl": {
+          "regex": "\\A(?![\\s\\S]*\"agent\",\"prompt\")(?=[\\s\\S]*\"workspace\",\"close\")"
+        }
+      }
+    }
+  ]
+}

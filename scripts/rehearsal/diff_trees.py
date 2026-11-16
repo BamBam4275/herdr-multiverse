@@ -34,6 +34,10 @@ _MISSING = "<missing>"
 
 
 def roots_for(env_var: str) -> list[tuple[str, str]]:
+    """Parse one side's newline-separated `literal=placeholder` env var into
+    (literal, placeholder) pairs, longest literal first, for `normalize`.
+    Same parsing as `compare.py`'s own `roots_for`, duplicated rather than
+    imported since it's a closure there."""
     pairs = []
     for chunk in os.environ.get(env_var, "").split("\n"):
         if not chunk.strip() or "=" not in chunk:
@@ -45,6 +49,10 @@ def roots_for(env_var: str) -> list[tuple[str, str]]:
 
 
 def walk(root: Path, excludes: list[str]) -> set[str]:
+    """Return every regular file's path relative to `root`, skipping `.git`,
+    symlinks, and anything under an `--exclude` prefix. Returns an empty set
+    for a root that doesn't exist, so a side that was never created shows
+    every file on the other side as missing rather than erroring."""
     paths: set[str] = set()
     if not root.is_dir():
         return paths
@@ -61,6 +69,8 @@ def walk(root: Path, excludes: list[str]) -> set[str]:
 
 
 def read(path: Path) -> str | None:
+    """Return a file's text, or None if it doesn't exist or can't be read as
+    a regular file -- the caller treats None as "missing on this side"."""
     try:
         return path.read_text(errors="replace")
     except (FileNotFoundError, IsADirectoryError, PermissionError):
@@ -68,9 +78,16 @@ def read(path: Path) -> str | None:
 
 
 def main() -> int:
+    """Parse argv, walk both directory trees, normalize and diff every file
+    that exists on at least one side, print one PASS/DIFF line per relative
+    path followed by unified diffs for the DIFFs, and return 2 on a usage
+    error or 0 otherwise -- a DIFF is reported in the table, not via a
+    nonzero exit."""
     args = sys.argv[1:]
     excludes: list[str] = []
     positional: list[str] = []
+    # Hand-rolled flag parsing rather than argparse, so `--exclude` can
+    # repeat and interleave freely with the two positional directories.
     i = 0
     while i < len(args):
         if args[i] == "--exclude" and i + 1 < len(args):

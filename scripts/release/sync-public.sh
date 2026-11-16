@@ -45,6 +45,11 @@ case "$PUBLIC_DIR/" in
         ;;
 esac
 
+# Refuses to proceed unless the public clone is clean, on main, has an
+# up-to-date origin/main, and has no existing v$VERSION tag. Called once
+# before the disposable export (fail fast) and again right before the
+# tree is replaced, since the checks above can take a while and the clone
+# must not have changed underneath them in the meantime.
 check_public() {
     PUBLIC_STATUS=$(git -C "$PUBLIC_DIR" status --porcelain --untracked-files=all)
     if [ -n "$PUBLIC_STATUS" ]; then
@@ -75,6 +80,9 @@ trap 'exit 1' HUP INT TERM
 # git-backed private-name checking. Its fresh history never enters the clone.
 sh "$SCRIPT_DIR/export-fresh.sh" "$EXPORT_DIR"
 
+# Refuse to continue unless both manifests already report VERSION, so the
+# clone's tree is only ever replaced with a release that was actually tagged
+# at that version in source.
 python3 - "$EXPORT_DIR" "$VERSION" <<'PY'
 from pathlib import Path
 import sys

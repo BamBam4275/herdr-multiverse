@@ -64,6 +64,11 @@ fn do_open(project: &Path, root: &Path, task: &str, herdr: &mut impl Herdr) -> R
     Ok(())
 }
 
+/// Resolves the current lane/task from `$HERDR_PANE_ID` and cwd, then
+/// dispatches to [`do_open`]/[`do_read`]/[`do_close`]. For `read`/`close`,
+/// an explicit `pane` argument is checked against the lane's own recorded
+/// pane first and refused on any mismatch — a caller never acts on a pane
+/// this lane did not open.
 pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
     let pane = std::env::var("HERDR_PANE_ID").ok();
     let cwd = std::env::current_dir().map_err(|error| Failure::Operation(error.to_string()))?;
@@ -137,12 +142,40 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mv-cli-scratch-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure
+    /// left it behind in `TMPDIR`). `Deref`s to `Path` so every existing
+    /// call site keeps reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("mv-cli-scratch-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(tag)
     }
 
     const TASK: &str = "20261101-fixer-abcdef";
@@ -262,9 +295,8 @@ mod tests {
     fn do_open_reserves_a_private_record_under_the_project_lock_before_split() {
         let root = temp_dir("open-intent");
         let mut herdr = fake_herdr("w1:p9");
-        herdr.probe_root = Some(root.clone());
+        herdr.probe_root = Some(root.to_path_buf());
         assert!(do_open(&root, &root, TASK, &mut herdr).is_ok());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -284,8 +316,6 @@ mod tests {
         let store = ScratchStore::new(&root).unwrap();
         let record = store.load(TASK).unwrap().unwrap();
         assert_eq!(record.pane, "w1:p9");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -299,8 +329,6 @@ mod tests {
 
         assert!(do_open(&root, &root, TASK, &mut herdr).is_err());
         assert!(herdr.calls.is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -312,8 +340,6 @@ mod tests {
         assert!(do_open(&root, &root, TASK, &mut herdr).is_err());
         let store = ScratchStore::new(&root).unwrap();
         assert!(store.load(TASK).unwrap().is_none());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -326,8 +352,6 @@ mod tests {
         let store = ScratchStore::new(&root).unwrap();
         assert!(store.load(TASK).unwrap().is_none());
         assert_eq!(herdr.calls.last(), Some(&("pane".into(), "close".into())));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -339,7 +363,6 @@ mod tests {
         assert!(do_open(&root, &root, TASK, &mut herdr).is_err());
         assert!(store.load(TASK).unwrap().is_none());
         assert_eq!(herdr.calls.last(), Some(&("pane".into(), "close".into())));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -356,8 +379,6 @@ mod tests {
         assert!(do_close(&root, TASK, &mut panes).is_ok());
         // A second close finds nothing left to close, which is not an error.
         assert!(do_close(&root, TASK, &mut panes).is_ok());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -367,7 +388,6 @@ mod tests {
             label: "irrelevant".into(),
         };
         assert!(do_read(&root, TASK, &mut panes).is_err());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -382,7 +402,6 @@ mod tests {
             "refusing scratch outside a dispatched lane: HERDR_PANE_ID is unset"
         );
         assert!(mv_state::scratch::resolve_context(Some("w1:p1"), &lane).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

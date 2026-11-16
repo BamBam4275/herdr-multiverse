@@ -102,6 +102,8 @@ binding — see each one's own module doc for the complete list.
 | `halt on\|off\|status` | Fleet halt | Real |
 | `scratch open\|read\|close` | Isolated scratch panes | Real |
 | `start` | Start Nexus for selected projects | Real: opens a live Nexus pane through `mv-engine::fleet_start`, and `--reseed` on an already-open project now re-points its live session (dialog/blocked detection, agent-identity-by-name matching, retry-with-probe landing confirmation) (see `commands::start`'s own module doc for what is not yet ported to full Python parity: the project-level concurrency lock, the Claude deny-list launch wrapper, the dashboard tab, the per-role dispatch-availability table, and Python's exact agent-naming scheme) |
+| `down` | Halt dispatch, ask each project's Nexus to wrap, then close its workspace | Real, Rust-only: thin CLI orchestration over `halt on` (reason prefixed `fleet down: `), a wrap prompt delivered to each open project's live Nexus through the same `deliver_prompt_to` path `start --reseed` uses, and a poll of `.multiverse/passdown.state` until it reads `wrapped` behind a non-empty `.multiverse/PASSDOWN.md`. Closes a wrapped workspace only once every live agent in it — not only the Nexus — is idle or done. Never runs `docker`/`compose`/`sync-public`, never commits or merges, never passes `--force` to a close; a project with no open Nexus is skipped with a warning, never started as a side effect (see `commands::lifecycle`'s own module doc) |
+| `up` | Start project Nexus sessions and clear a halt `down` set | Real, Rust-only: starts every targeted project in-process through `start`'s own launch path (so a pending PASSDOWN resumes through the seed resume hook in `mv-engine::nexus_seed`), waits on whichever projects were pending/wrapped before the call until their sidecar reads `up`, then clears the fleet halt only when its reason still carries the exact `fleet down: ` prefix `down` wrote — never a `maintenance` halt or any other operator-set reason (see `commands::lifecycle`'s own module doc) |
 | `projects` | List configured projects | Real |
 | `stop` | Stop project sessions | Real |
 | `add` | Register an existing project | Real (plain-text append, not yet through `mv-config::edit`) |
@@ -114,6 +116,7 @@ binding — see each one's own module doc for the complete list.
 | `worktrees` | Inspect, prune, rescue, or restore task worktrees | Real |
 | `check` | Readiness (exit 0 ready, 3 needs configuration) | Real |
 | `doctor` | Installation prerequisites (exit 0 pass, 1 fail) | Real |
+| `import-python` | Copy a standalone Python install's config and fleet state into this install's config/state directories | Real: copies only, never moves or deletes the source; refuses to overwrite an existing destination file without `--force` |
 | `presence` | Operator presence (exit 2 if unknown) | Real; always reports `unknown` — no idle-probe exists yet |
 | `health` | Fleet health | Real |
 | `review-policy` | Effective review policy | Real |
@@ -140,8 +143,9 @@ are refused together with each other, with `--peek`, or with `--as-nexus`.
 Plugin actions in `herdr-plugin.toml` invoke the same binary:
 `multiverse-doctor`, `multiverse-check`, `multiverse-accounts`,
 `multiverse-tasks`, `multiverse-board`, `multiverse-start`,
-`multiverse-workers`, and the `dashboard` pane (`board --all --watch
---read-only`). `multiverse-start` shares `start`'s scope cuts above.
+`multiverse-workers`, `multiverse-import-python`, and the `dashboard` pane
+(`board --all --watch --read-only`). `multiverse-start` shares `start`'s
+scope cuts above.
 `dispatch` and `council` are deliberately absent from the action list.
 See [`docs/install.md`](install.md) for the install path.
 

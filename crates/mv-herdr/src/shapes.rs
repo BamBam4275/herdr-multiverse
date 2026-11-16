@@ -8,17 +8,24 @@ use thiserror::Error;
 /// works outside a source checkout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shape {
+    /// A Herdr workspace record.
     Workspace,
+    /// A Herdr pane record.
     Pane,
+    /// A Herdr agent record.
     Agent,
+    /// A Herdr tab record.
     Tab,
 }
 
+/// A record or override failed [`Shape::validate`]: an unknown field, or a
+/// value that is not the JSON object shape expects.
 #[derive(Debug, Error)]
 #[error("invalid Herdr shape: {0}")]
 pub struct ShapeError(String);
 
 impl Shape {
+    /// The envelope's plural field name (`workspaces`, `panes`, ...).
     pub fn plural(self) -> &'static str {
         match self {
             Self::Workspace => "workspaces",
@@ -28,6 +35,8 @@ impl Shape {
         }
     }
 
+    /// The envelope's singular noun (`workspace`, `pane`, ...), used in
+    /// error messages and `id` fields.
     pub fn singular(self) -> &'static str {
         match self {
             Self::Workspace => "workspace",
@@ -37,6 +46,8 @@ impl Shape {
         }
     }
 
+    /// The committed Herdr 0.9.3 capture for this shape, embedded at
+    /// compile time so the fixture works outside a source checkout.
     pub fn capture(self) -> Value {
         let source = match self {
             Self::Workspace => include_str!("../../../fixtures/herdr/workspace-list.json"),
@@ -47,6 +58,8 @@ impl Shape {
         serde_json::from_str(source).expect("committed Herdr capture must be JSON")
     }
 
+    /// The capture's record array for this shape, cloned out of the
+    /// embedded 0.9.3 fixture.
     pub fn records(self) -> Vec<Value> {
         self.capture()["result"][self.plural()]
             .as_array()
@@ -67,6 +80,8 @@ impl Shape {
         serde_json::from_str(source).expect("committed 0.9.5 Herdr capture must be JSON")
     }
 
+    /// The 0.9.5 capture's record array for this shape, cloned out of the
+    /// embedded fixture.
     pub fn records_0_9_5(self) -> Vec<Value> {
         self.capture_0_9_5()["result"][self.plural()]
             .as_array()
@@ -127,6 +142,8 @@ impl Shape {
         Ok(record)
     }
 
+    /// Wrap `records` in the `{"id": ..., "result": {...}}` envelope shape
+    /// Herdr's list commands return, after validating each record.
     pub fn envelope(self, records: Vec<Value>) -> Result<Value, ShapeError> {
         for record in &records {
             self.validate(record)?;

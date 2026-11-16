@@ -46,6 +46,10 @@ pub const LOCK_FILENAME: &str = "notify-state.json.lock";
 /// picker episode must have stood open before it is alert-worthy.
 pub const PICKER_ALERT_AFTER: Duration = Duration::minutes(30);
 
+/// Where this hub project keeps its own episode table — always under the
+/// project's own `.multiverse/`, distinct from [`crate::notify`]'s
+/// fleet-wide rate-limiter file under the selected config directory (see
+/// this module's own doc comment for why the two must not be confused).
 pub fn state_path(hub_root: &Path) -> PathBuf {
     hub_root.join(".multiverse").join(STATE_FILENAME)
 }
@@ -58,13 +62,27 @@ fn lock_path(hub_root: &Path) -> PathBuf {
 /// fields, plus `picker_alert`'s own `activity_posted` flag.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Episode {
+    /// When this episode was first observed, formatted the way
+    /// `support::format_seconds_utc` produces, so it round-trips through
+    /// `support::parse_flexible` on the next load.
     pub first_seen: String,
+    /// Whether this episode has already triggered its one alert. Once
+    /// true, [`process_episode`] never alerts on it again — the episode
+    /// has to close (be removed) and reopen before it can alert again.
     #[serde(default)]
     pub alerted: bool,
+    /// Whether the hub activity post for this episode has already landed.
+    /// Tracked separately from `alerted` because the activity post and the
+    /// ntfy push are independent one-shot sends — see
+    /// [`report_and_alert_picker_episode`]'s own doc comment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub activity_posted: bool,
 }
 
+/// Keyed by `(condition, subject)` — see each condition's own key format
+/// (e.g. [`picker_key`]) — mapping to that episode's own bookkeeping.
+/// A `BTreeMap` rather than a `HashMap` so [`save`]'s key order is stable
+/// and matches `_save_state`'s `sort_keys=True` output at this level too.
 pub type EpisodeTable = BTreeMap<String, Episode>;
 
 /// The persisted table, and whether this load just recovered from a corrupt
@@ -270,6 +288,9 @@ pub fn advance_picker_episode(
     let key = picker_key(project_name, question);
     let prefix = picker_prefix(project_name);
 
+    // Find this project's oldest still-open picker episode, if any — there
+    // should only ever be one, but scan rather than assume, since a prior
+    // run's cleanup below could in principle have been interrupted.
     let mut previous_first_seen: Option<OffsetDateTime> = None;
     for (old_key, entry) in table.iter() {
         if old_key.starts_with(&prefix) {
@@ -280,6 +301,9 @@ pub fn advance_picker_episode(
             }
         }
     }
+    // Only one picker episode can be open per project at a time, so a
+    // changed question retires every other key for this project outright
+    // rather than letting them accumulate.
     let stale: Vec<String> = table
         .keys()
         .filter(|candidate| candidate.starts_with(&prefix) && **candidate != key)
@@ -290,6 +314,9 @@ pub fn advance_picker_episode(
     }
     if !table.contains_key(&key) {
         if let Some(first_seen) = previous_first_seen {
+            // Carry the retired episode's first_seen onto the new key
+            // before process_episode opens it below — otherwise a changed
+            // question would restart the min-age clock from scratch.
             table.insert(
                 key.clone(),
                 Episode {
@@ -438,18 +465,40 @@ mod tests {
     use super::*;
     use time::macros::datetime;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-state-notify-episodes-test-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced left every one of these behind in
+    /// `TMPDIR`). `Deref`s to `Path` so every existing call site keeps
+    /// reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mv-state-notify-episodes-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(tag)
     }
 
     // --- load/save -----------------------------------------------------

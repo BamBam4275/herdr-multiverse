@@ -76,6 +76,9 @@ and refusal of dirty, off-main, behind, or diverged public clones. Build,
 conformance, and scanner commands are fixtures in these tests.
 
 Set `MV_PRIVATE_NAMES` to the operator's external deny-list to enable the
-name check. The exporter skips the Docker-based gitleaks scan when Docker is
-absent; a successful export with a skipped check does not prove that check
-passed.
+name check. The exporter prefers a local `gitleaks` binary at or above the
+minimum version pinned in `scripts/release/gitleaks-version.sh` (checked
+via `gitleaks version`), falling back to Docker (`zricethezav/gitleaks`,
+same pinned tag) when no local binary is found. If neither is available,
+or the local binary is older than the pinned minimum, the export fails
+outright rather than silently skipping the scan.

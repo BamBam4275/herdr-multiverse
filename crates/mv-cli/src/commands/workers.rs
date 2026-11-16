@@ -5,6 +5,20 @@
 //! Unreachable Herdr renders unknown counts and still exits successfully.
 //! Historical role names remain readable while current live role labels use
 //! the current vocabulary.
+//!
+//! The STATUS column can also show `stalled`, overriding Herdr's own
+//! `agent_status` display-only: Herdr cannot tell a lane quietly waiting on
+//! its own background job from a dead one, since both can report the same
+//! status indefinitely. Herdr's `revision`/`state_change_seq` cannot stand
+//! in for that either — they sit still for the whole length of a long
+//! build even though the agent is genuinely working, which would flag a
+//! busy lane as stalled (card `20261115-b-59e017`). [`stalled_panes`]
+//! instead watches a hash of each pane's own content (`herdr pane read
+//! <pane> --lines` [`STALL_CONTENT_LINES`], via
+//! [`mv_state::pane_watch_store`]) and flags one only once that hash has
+//! gone unchanged for [`STALL_THRESHOLD`]. Seat and project occupancy
+//! still read Herdr's raw status exactly as before — only the printed
+//! STATUS cell changes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -12,6 +26,7 @@ use std::path::Path;
 use clap::ArgMatches;
 use mv_config::load::{Config, Project};
 use mv_config::roles::Role;
+use sha2::{Digest, Sha256};
 
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
 use crate::exit::Failure;
@@ -333,6 +348,72 @@ fn fetch_live_agents(binary: &str) -> Option<Vec<LiveAgent>> {
     )
 }
 
+/// How many trailing lines of a pane's own content [`stalled_panes`] reads
+/// to decide whether it has moved. A named const rather than a magic
+/// number, since it is the one knob that trades a longer read for less
+/// sensitivity to a pane that is merely scrolling the same handful of
+/// lines (a spinner, a progress bar) without ever truly going quiet.
+const STALL_CONTENT_LINES: u32 = 200;
+
+/// Identical semantics to `mv_herdr::argv`'s own private `looks_like_flag`
+/// (duplicated locally for the same reason `herdr_binary` above is: that
+/// one is private to `argv.rs`, and `mv_herdr::argv::pane_read` itself
+/// cannot be reused here without also taking on its `--source` flag,
+/// which `fetch_pane_content`'s own conformance fixture pins the exact
+/// absence of).
+fn looks_like_flag(value: &str) -> bool {
+    value.starts_with('-') && value != "-"
+}
+
+/// `pane read <pane_id> --lines` [`STALL_CONTENT_LINES`], with the
+/// positional guard split out so it is testable without spawning a
+/// process: flags before `--` so a dash-leading pane id cannot be parsed
+/// as `--lines`/`--help` — the same guard `mv_herdr::argv::pane_read`
+/// carries for its own callers, restated here (rather than reused)
+/// because that function always appends `--source`, a call shape this
+/// one's conformance fixture does not expect.
+fn pane_read_args(pane_id: &str) -> Vec<String> {
+    let mut args = vec!["pane".to_string(), "read".to_string()];
+    if looks_like_flag(pane_id) {
+        args.push("--lines".to_string());
+        args.push(STALL_CONTENT_LINES.to_string());
+        args.push("--".to_string());
+        args.push(pane_id.to_string());
+    } else {
+        args.push(pane_id.to_string());
+        args.push("--lines".to_string());
+        args.push(STALL_CONTENT_LINES.to_string());
+    }
+    args
+}
+
+/// One [`pane_read_args`] call. `None` means Herdr could not be asked
+/// (spawn failure or nonzero exit) — callers must treat that the same as
+/// "no signal this cycle," never as "the pane is empty," so a fetch
+/// hiccup never looks like content that vanished.
+fn fetch_pane_content(binary: &str, pane_id: &str) -> Option<String> {
+    let output = std::process::Command::new(binary)
+        .args(pane_read_args(pane_id))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A stable digest of one pane read, so the store never has to hold a
+/// whole screen's worth of text just to notice it has not moved.
+fn content_hash(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 // --- recognition and rendering -----------------------------------------
 
 /// `<project>-<role_short>-<seat_short>`: split off the last two
@@ -438,12 +519,63 @@ pub(super) fn is_dispatched_name(config: &Config, name: &str) -> bool {
     recognize(config, name).is_some_and(|(_, worker)| worker.role != Role::Nexus)
 }
 
-const PROJECT_WIDTH: usize = 17;
-const TASK_WIDTH: usize = 27;
-const ROLE_WIDTH: usize = 11;
-const SEAT_WIDTH: usize = 17;
-const STATUS_WIDTH: usize = 11;
 const DASH: &str = "\u{2014}";
+
+/// A pane whose own content has not moved in this long is shown `stalled`
+/// regardless of what Herdr's own `agent_status` claims — Mike's rule.
+/// Herdr alone cannot tell a lane quietly waiting on its own background
+/// job from a dead one, since both can report the same status
+/// indefinitely; a pane that has produced no new content for this long is
+/// worth a human's look either way. Display only: this never closes or
+/// signals the pane, it only changes what this table prints.
+const STALL_THRESHOLD: time::Duration = time::Duration::minutes(30);
+
+/// One `herdr pane read` per live agent with a pane id, hashed via
+/// [`content_hash`] — the per-pane signal [`stalled_panes`] persists.
+/// `None` (a failed read) is kept as `None` rather than dropped, so that
+/// pane still fails open to "just changed" instead of silently vanishing
+/// from this cycle's observation.
+fn fetch_pane_hashes(binary: &str, agents: &[LiveAgent]) -> HashMap<String, Option<String>> {
+    agents
+        .iter()
+        .filter(|agent| !agent.pane.is_empty())
+        .map(|agent| {
+            let hash = fetch_pane_content(binary, &agent.pane).map(|text| content_hash(&text));
+            (agent.pane.clone(), hash)
+        })
+        .collect()
+}
+
+/// Persist this cycle's content hash for every pane in `pane_hashes` (via
+/// [`mv_state::pane_watch_store`]), and return the `pane_id` of every one
+/// that has gone unchanged for at least [`STALL_THRESHOLD`]. A lock
+/// timeout or other store error fails open — an empty set, so a transient
+/// store problem costs this cycle's staleness signal, never the table
+/// itself.
+fn stalled_panes(
+    state_dir: &Path,
+    pane_hashes: &HashMap<String, Option<String>>,
+    now: time::OffsetDateTime,
+) -> HashSet<String> {
+    if pane_hashes.is_empty() {
+        return HashSet::new();
+    }
+    let signals: Vec<_> = pane_hashes
+        .iter()
+        .map(|(pane_id, hash)| mv_state::pane_watch_store::PaneSignal {
+            pane_id,
+            content_hash: hash.clone(),
+        })
+        .collect();
+    let Ok(last_changed) = mv_state::pane_watch_store::observe(state_dir, &signals, now) else {
+        return HashSet::new();
+    };
+    last_changed
+        .into_iter()
+        .filter(|(_, changed_at)| now - *changed_at >= STALL_THRESHOLD)
+        .map(|(pane_id, _)| pane_id)
+        .collect()
+}
 
 #[derive(Default)]
 struct WorkerRow {
@@ -453,13 +585,60 @@ struct WorkerRow {
     role: String,
     seat: String,
     status: String,
+    outcome: String,
 }
 
 fn render_table(rows: &[WorkerRow]) -> String {
-    let mut out = format!(
-        "{:PROJECT_WIDTH$}{:TASK_WIDTH$}{:ROLE_WIDTH$}{:SEAT_WIDTH$}{:STATUS_WIDTH$}AGE",
-        "PROJECT", "TASK", "ROLE", "SEAT", "STATUS",
-    );
+    let header = [
+        "PROJECT", "TASK", "ROLE", "SEAT", "STATUS", "OUTCOME", "AGE",
+    ];
+    let cells: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            [
+                &row.project,
+                &row.task,
+                &row.role,
+                &row.seat,
+                &row.status,
+                &row.outcome,
+                &row.age,
+            ]
+            .map(|cell| {
+                // Keep each sanitized cell a single whitespace-delimited field,
+                // including elapsed ages such as "2 min" and empty metadata.
+                let cell = mv_board::layout::sanitize_title(cell)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join("-");
+                if cell.is_empty() {
+                    DASH.into()
+                } else {
+                    cell
+                }
+            })
+        })
+        .collect();
+    let mut widths = header.map(str::len);
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let format_row = |row: [&str; 7]| {
+        row.iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                if index + 1 == row.len() {
+                    (*cell).to_owned()
+                } else {
+                    format!("{cell:width$}", width = widths[index])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut out = format_row(header);
     if rows.is_empty() {
         // Python `format_workers_table`: an ok empty `agent list` is a
         // live fleet of zero, so the header is followed by `(none)` rather
@@ -470,21 +649,9 @@ fn render_table(rows: &[WorkerRow]) -> String {
         out.push_str("(none)");
         return out;
     }
-    for row in rows {
+    for row in &cells {
         out.push('\n');
-        out.push_str(&format!(
-            "{:PROJECT_WIDTH$}{:TASK_WIDTH$}{:ROLE_WIDTH$}{:SEAT_WIDTH$}{:STATUS_WIDTH$}{}",
-            mv_board::layout::sanitize_title(if row.project.is_empty() {
-                DASH
-            } else {
-                &row.project
-            }),
-            mv_board::layout::sanitize_title(if row.task.is_empty() { DASH } else { &row.task }),
-            mv_board::layout::sanitize_title(&row.role),
-            mv_board::layout::sanitize_title(&row.seat),
-            mv_board::layout::sanitize_title(&row.status),
-            if row.age.is_empty() { DASH } else { &row.age },
-        ));
+        out.push_str(&format_row(row.each_ref().map(String::as_str)));
     }
     out
 }
@@ -593,12 +760,36 @@ fn open_seat_counts<'a>(
     counts
 }
 
+/// [`render_with_stalled`] with no pane known to be stalled — every
+/// existing test that has no notion of pane staleness. `run` always goes
+/// through `render_with_stalled` directly, so this wrapper is test-only.
+#[cfg(test)]
+fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
+    render_with_stalled(config, agents, &HashSet::new())
+}
+
 /// Builds the full `workers` report. Takes already-fetched live agents
 /// (`None` means Herdr was unreachable or unparseable) so this stays unit
 /// testable without a subprocess; see the module docs for why a live
 /// fetch's output can only be compared to the recorded conformance
 /// scenarios once the config-loading gap they both hit is fixed elsewhere.
-fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
+///
+/// `stalled_panes` (pane ids, from [`stalled_panes`]) overrides only the
+/// STATUS column's displayed text — never seat/project occupancy, which
+/// still reads `agent.status` exactly as Herdr reported it, so a pane
+/// shown `stalled` here still occupies its seat precisely as before.
+fn render_with_stalled(
+    config: &Config,
+    agents: Option<&[LiveAgent]>,
+    stalled_panes: &HashSet<String>,
+) -> String {
+    let display_status = |agent: &LiveAgent| {
+        if !agent.pane.is_empty() && stalled_panes.contains(&agent.pane) {
+            "stalled".to_string()
+        } else {
+            agent.status.clone()
+        }
+    };
     let mut projects: Vec<&String> = config.projects.keys().collect();
     projects.sort();
     let mut accounts: Vec<&String> = config.accounts.keys().collect();
@@ -675,13 +866,24 @@ fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
                         role: Role::from_any_config_key(&task.role)
                             .map_or_else(|_| task.role.clone(), |role| role.config_key().into()),
                         seat: seat.into(),
-                        status: agent.status.clone(),
+                        status: display_status(agent),
+                        outcome: task.status.map_or_else(
+                            || {
+                                if task.file_status.is_some() {
+                                    "done-unrecorded"
+                                } else {
+                                    "running"
+                                }
+                                .into()
+                            },
+                            |status| status.as_str().into(),
+                        ),
                     });
                 } else if let Some((_project, recognized)) = recognize(config, &agent.name) {
                     rows.push(WorkerRow {
                         role: recognized.role.config_key().into(),
                         seat: recognized.seat.into(),
-                        status: agent.status.clone(),
+                        status: display_status(agent),
                         ..Default::default()
                     });
                 } else if !agent.cwd.is_empty() {
@@ -781,6 +983,10 @@ fn halt_banner(state: &mv_state::halt::HaltState) -> Option<String> {
     }
 }
 
+/// `multiverse workers`'s entry point: loads config, prints the fleet halt
+/// banner if one is on disk, fetches live agents from Herdr (best-effort —
+/// an unreachable fleet still renders, with `?` where live counts would
+/// go), and prints [`render_with_stalled`]'s report.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -800,7 +1006,17 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
 
     let binary = herdr_binary();
     let agents = fetch_live_agents(&binary);
-    println!("{}", render(&config, agents.as_deref()));
+    let stalled = agents
+        .as_deref()
+        .map(|agents| {
+            let pane_hashes = fetch_pane_hashes(&binary, agents);
+            stalled_panes(&state_dir, &pane_hashes, mv_core::time::now_utc())
+        })
+        .unwrap_or_default();
+    println!(
+        "{}",
+        render_with_stalled(&config, agents.as_deref(), &stalled)
+    );
     Ok(())
 }
 
@@ -852,6 +1068,147 @@ mod tests {
     }
 
     #[test]
+    fn regression_long_project_keeps_a_column_gap_and_the_header_field_count() {
+        let rows = [WorkerRow {
+            project: "LongExampleProjectNameXYZ".into(),
+            task: "20261110-builder-f04153".into(),
+            role: "builder".into(),
+            seat: "seat-with-a-long-account-name".into(),
+            status: "working".into(),
+            age: "2 min".into(),
+            ..Default::default()
+        }];
+        let output = render_table(&rows);
+        let mut lines = output.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        let gap = row
+            .strip_prefix("LongExampleProjectNameXYZ")
+            .unwrap()
+            .split("20261110-builder-f04153")
+            .next()
+            .unwrap();
+        assert!(
+            !gap.is_empty() && gap.chars().all(|ch| ch == ' '),
+            "{output}"
+        );
+        assert_eq!(
+            row.split_whitespace().count(),
+            header.split_whitespace().count(),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn regression_herdr_done_without_a_task_status_file_still_has_a_running_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.projects.get_mut("sandbox").unwrap().path =
+            mv_config::placeholder::MaybePlaceholder::parse(root.path().to_str().unwrap());
+        std::fs::create_dir(root.path().join(".multiverse")).unwrap();
+        std::fs::write(root.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20261110-builder-f04153\trole=builder\taccount=seat-b\tagent=sandbox-scou-sb\n"
+        ).unwrap();
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            status: "done".into(),
+            ..Default::default()
+        }];
+        let output = render(&config, Some(&agents));
+        let mut lines = output.lines();
+        let header: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let row: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let status = header.iter().position(|cell| *cell == "STATUS").unwrap();
+        assert_eq!(row[status], "done", "{output}");
+        let outcome = header
+            .iter()
+            .position(|cell| *cell == "OUTCOME")
+            .expect("OUTCOME column");
+        assert_eq!(row[outcome], "running", "{output}");
+        assert_eq!(row.len(), header.len(), "{output}");
+    }
+
+    #[test]
+    fn task_file_completion_and_recorded_outcomes_are_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.projects.get_mut("sandbox").unwrap().path =
+            mv_config::placeholder::MaybePlaceholder::parse(root.path().to_str().unwrap());
+        let task = "20261110-builder-f04153";
+        let task_dir = root.path().join(".multiverse/tasks").join(task);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let log = root.path().join(".multiverse/routing.log");
+        let dispatch = format!(
+            "2020-01-01T00:00:00Z\tevent=dispatch\ttask={task}\trole=builder\taccount=seat-b\tagent=sandbox-scou-sb\n"
+        );
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            status: "working".into(),
+            ..Default::default()
+        }];
+        for status in ["done", "blocked", "failed"] {
+            std::fs::write(&log, &dispatch).unwrap();
+            std::fs::write(task_dir.join("status"), status).unwrap();
+            let output = render(&config, Some(&agents));
+            let row: Vec<_> = output.lines().nth(1).unwrap().split_whitespace().collect();
+            assert_eq!(row[4], "working", "{output}");
+            assert_eq!(row[5], "done-unrecorded", "{output}");
+
+            // A recorded result remains authoritative after its lane is pruned.
+            std::fs::remove_file(task_dir.join("status")).unwrap();
+            std::fs::write(
+                &log,
+                format!(
+                    "{dispatch}2020-01-01T00:00:01Z\tevent=result\ttask={task}\tstatus={status}\n"
+                ),
+            )
+            .unwrap();
+            let output = render(&config, Some(&agents));
+            let row: Vec<_> = output.lines().nth(1).unwrap().split_whitespace().collect();
+            assert_eq!(row[4], "working", "{output}");
+            assert_eq!(row[5], status, "{output}");
+        }
+    }
+
+    #[test]
+    fn table_sizes_all_columns_and_sanitizes_every_cell_before_measuring() {
+        let rows = [
+            WorkerRow {
+                project: "project with spaces".into(),
+                task: "a-longer-task-than-the-header".into(),
+                role: "a-long-role".into(),
+                seat: "a-long-seat".into(),
+                status: "a-long-status".into(),
+                outcome: "done-unrecorded".into(),
+                age: "100 hours".into(),
+            },
+            WorkerRow {
+                status: "\u{1b}]52;c;EVIL\u{07}   ".into(),
+                ..Default::default()
+            },
+        ];
+        let output = render_table(&rows);
+        let lines: Vec<_> = output.lines().collect();
+        let column_starts = |line: &str| {
+            let mut in_cell = false;
+            line.chars()
+                .enumerate()
+                .filter_map(|(index, ch)| {
+                    let start = !ch.is_whitespace() && !in_cell;
+                    in_cell = !ch.is_whitespace();
+                    start.then_some(index)
+                })
+                .collect::<Vec<_>>()
+        };
+        for line in &lines[1..] {
+            assert_eq!(column_starts(line), column_starts(lines[0]), "{output}");
+        }
+        assert!(lines[1].contains("project-with-spaces"), "{output}");
+        assert!(lines[1].ends_with("100-hours"), "{output}");
+        assert!(!output.contains("EVIL"), "{output}");
+    }
+
+    #[test]
     fn split_dispatched_name_takes_the_last_two_segments() {
         assert_eq!(
             split_dispatched_name("sandbox-scou-sb"),
@@ -898,8 +1255,8 @@ mod tests {
         }];
         let output = render(&config, Some(&agents));
         let expected = "\
-PROJECT          TASK                       ROLE       SEAT             STATUS     AGE\n\
-\u{2014}                \u{2014}                          scout      seat-b           working    \u{2014}\n\
+PROJECT TASK ROLE  SEAT   STATUS  OUTCOME AGE\n\
+\u{2014}       \u{2014}    scout seat-b working \u{2014}       \u{2014}\n\
 \n\
 workers 1/3\n\
 seats: seat-b 0\n\
@@ -918,8 +1275,8 @@ nexus sessions 0 (excluded from workers; they do not count against max_concurren
         }];
         let output = render(&config, Some(&agents));
         let expected = "\
-PROJECT          TASK                       ROLE       SEAT             STATUS     AGE\n\
-\u{2014}                \u{2014}                          scout      seat-b           working    \u{2014}\n\
+PROJECT TASK ROLE  SEAT   STATUS  OUTCOME AGE\n\
+\u{2014}       \u{2014}    scout seat-b working \u{2014}       \u{2014}\n\
 \n\
 workers 1/3\n\
 seats: seat-b 0\n\
@@ -1008,8 +1365,8 @@ nexus sessions 0 (excluded from workers; they do not count against max_concurren
         assert!(text.contains("sandbox 1 open"), "{text}");
         // Python's `format_elapsed` (`tasks.py:335-349`, ported as
         // `mv_state::tasks::format_elapsed`) spells out the unit — "2 min",
-        // never "2m". Found via `conformance/diff_fuzz.py` seed 50000.
-        assert!(text.contains("2 min"), "{text}");
+        // rendered as one field, "2-min", in the workers table.
+        assert!(text.contains("2-min"), "{text}");
         // A recorded result does not mean the session is closed: project
         // occupancy still follows the live pane. Seat occupancy does not —
         // `open_agent_counts` skips RECORDED (`accounts.py:794-795`).
@@ -1189,5 +1546,119 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
         assert!(!output.contains('\u{07}'));
         assert!(!output.contains("]52;"));
         assert!(output.contains("working"));
+    }
+
+    /// Card `20261115-b-59e017`'s three-state proof: a pane's content hash
+    /// unchanged past [`STALL_THRESHOLD`] is `stalled`; a pane whose
+    /// content changed is not; a pane seen for the first time is never
+    /// `stalled`, regardless of how far in the past `now` is handed in
+    /// (there is no prior observation to compare against yet).
+    ///
+    /// The second case is also this card's revert check: `4e8d178`'s
+    /// detector keyed solely on Herdr's `revision`/`state_change_seq`,
+    /// which sit still for the whole length of a long-running command even
+    /// though the agent is genuinely busy — "status working, revision
+    /// unchanged, content changed" would still have read as stalled to
+    /// that detector once those two counters stopped moving, which is
+    /// exactly the false positive the card reports. This call site cannot
+    /// reproduce that failure even by construction: `pane_hashes` is built
+    /// from pane content alone ([`fetch_pane_hashes`]), and [`LiveAgent`]
+    /// no longer carries a `revision` or `state_change_seq` field for
+    /// anything to key on — a changed hash is the only way the age here
+    /// ever resets. The store-level half of the same proof is
+    /// `pane_watch_store::a_changed_hash_resets_the_last_changed_instant_even_with_other_fields_held_constant`.
+    #[test]
+    fn stalled_panes_matches_the_cards_three_state_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let pane_hash = |hash: &str| HashMap::from([("w1:p1".to_string(), Some(hash.to_string()))]);
+
+        let first_seen = mv_core::time::now_utc();
+        assert!(
+            stalled_panes(dir.path(), &pane_hash("hash-a"), first_seen).is_empty(),
+            "first observation must never be stalled"
+        );
+
+        let past_threshold = first_seen + STALL_THRESHOLD + time::Duration::seconds(1);
+        assert_eq!(
+            stalled_panes(dir.path(), &pane_hash("hash-a"), past_threshold),
+            HashSet::from(["w1:p1".to_string()]),
+            "unchanged content past the threshold must be stalled"
+        );
+
+        assert!(
+            stalled_panes(dir.path(), &pane_hash("hash-b"), past_threshold).is_empty(),
+            "a pane whose content changed since its last observation must not be stalled"
+        );
+    }
+
+    #[test]
+    fn stalled_panes_fails_open_to_empty_when_no_pane_carries_a_change_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let pane_hashes = HashMap::from([("w1:p1".to_string(), None)]);
+        assert!(stalled_panes(dir.path(), &pane_hashes, mv_core::time::now_utc()).is_empty());
+    }
+
+    #[test]
+    fn fetch_pane_hashes_keeps_a_failed_read_as_a_missing_signal_not_a_dropped_pane() {
+        // `herdr_binary()` never resolves to a real executable under
+        // `cargo test`, so this exercises the same fail-open path a real
+        // spawn failure would: the pane is still a key in the map, just
+        // with no hash to compare — never silently absent from the cycle.
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            pane: "w1:p1".into(),
+            ..Default::default()
+        }];
+        let pane_hashes = fetch_pane_hashes(&herdr_binary(), &agents);
+        assert_eq!(pane_hashes, HashMap::from([("w1:p1".to_string(), None)]));
+    }
+
+    #[test]
+    fn pane_read_args_matches_the_conformance_fixture_for_an_ordinary_pane_id() {
+        assert_eq!(
+            pane_read_args("w1:p1"),
+            ["pane", "read", "w1:p1", "--lines", "200"]
+        );
+    }
+
+    #[test]
+    fn pane_read_args_guards_a_flag_looking_pane_id_with_a_double_dash() {
+        assert_eq!(
+            pane_read_args("--help"),
+            ["pane", "read", "--lines", "200", "--", "--help"]
+        );
+    }
+
+    #[test]
+    fn render_with_stalled_overrides_display_only_not_seat_occupancy() {
+        // A stalled pane must never read as freed: occupancy still comes
+        // from Herdr's own `agent_status` ("working" here), never from the
+        // display override — the card's "display only, never signal
+        // anything" constraint.
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.projects.get_mut("sandbox").unwrap().path =
+            mv_config::placeholder::MaybePlaceholder::parse(root.path().to_str().unwrap());
+        std::fs::create_dir(root.path().join(".multiverse")).unwrap();
+        let task = "20261105-builder-abcdef";
+        let stamp = "2020-01-01T00:00:00Z";
+        std::fs::write(
+            root.path().join(".multiverse/routing.log"),
+            format!(
+                "{stamp}\tevent=dispatch\ttask={task}\tproject=sandbox\trole=builder\taccount=seat-b\tagent=sandbox-scou-sb\n\
+                 {stamp}\tevent=started\ttask={task}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".into(),
+            status: "working".into(),
+            pane: "w1:p1".into(),
+            ..Default::default()
+        }];
+        let stalled: HashSet<String> = ["w1:p1".to_string()].into_iter().collect();
+        let text = render_with_stalled(&config, Some(&agents), &stalled);
+        assert!(text.contains("stalled"), "{text}");
+        assert!(text.contains("seats: seat-b 1"), "{text}");
     }
 }

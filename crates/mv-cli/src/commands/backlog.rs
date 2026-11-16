@@ -192,6 +192,10 @@ fn print_item(item: &BacklogItem) {
     print!("{}", render_item(item));
 }
 
+/// `backlog`'s subcommand router. Loads config and validates the cwd-scoped
+/// positional before dispatch for every verb but `list` (which instead
+/// takes explicit project names), matching Python's own ordering: explain
+/// surplus positionals before any pane check or write.
 pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
     let (name, args) = matches.subcommand().expect("backlog requires a subcommand");
     // Like Python, load config before explaining surplus positionals, but
@@ -224,11 +228,26 @@ fn validate_cwd_value(command: &str, args: &ArgMatches) -> Result<(), Failure> {
         "ask" => "question",
         _ => "item",
     };
-    let values: Vec<&str> = args
-        .get_many::<String>(field)
-        .expect("required")
-        .map(String::as_str)
-        .collect();
+    // Every other verb takes `item` as a single-value positional, with
+    // surplus tokens landing in the hidden `extra` positional instead of
+    // clap's own `<item>...`; rejoin them here so the overflow diagnostics
+    // below see the same argument list as before.
+    let values: Vec<&str> = if field == "item" {
+        let item = args.get_one::<String>("item").expect("required").as_str();
+        std::iter::once(item)
+            .chain(
+                args.get_many::<String>("extra")
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .collect()
+    } else {
+        args.get_many::<String>(field)
+            .expect("required")
+            .map(String::as_str)
+            .collect()
+    };
     if values.len() == 1 {
         return Ok(());
     }
@@ -344,14 +363,11 @@ fn today_str(now: OffsetDateTime) -> String {
     )
 }
 
-/// `Config.project_for_path`'s own longest-prefix containment match, not
-/// the exact-path equality `commands::current_project`/`board_data::
-/// cwd_project` use elsewhere in this crate: those two exist to answer "is
-/// cwd *exactly* a project root" (the first because `current_project_root`
-/// needs an existing `.multiverse/` to walk up to; the second predates this
-/// change). A read-only scope lookup has no such reason to be stricter than
-/// Python, so this is its own small copy rather than a third caller of
-/// either — see this task's `result.md` for why it is not shared.
+/// Longest-prefix containment: every `[projects.<name>]` whose canonical
+/// `path` is cwd or an ancestor of it is a candidate, and the deepest one
+/// wins. Same rule as `commands::current_project` (`project_for_path` in
+/// `mod.rs`) and `board_data::cwd_project`. Kept as a local copy rather
+/// than a third caller of either.
 fn cwd_project(config: &Config) -> Option<Project> {
     let cwd = std::env::current_dir().ok()?;
     let canonical_cwd = std::fs::canonicalize(&cwd).ok()?;
@@ -696,12 +712,40 @@ fn answer(args: &ArgMatches) -> Result<(), Failure> {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mv-cli-backlog-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed on drop, including on panic (card `20261115-b-c8065f`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure
+    /// left it behind in `TMPDIR`). `Deref`s to `Path` so every existing
+    /// call site keeps reading `&root`/`root.join(...)` unchanged.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("mv-cli-backlog-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(tag)
     }
 
     #[test]
@@ -733,8 +777,6 @@ mod tests {
         let done = backlog::done(&root, &item.item, "Verified in fixture", None).unwrap();
         assert_eq!(done.state, "done");
         assert_eq!(done.evidence, "Verified in fixture");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -748,7 +790,6 @@ mod tests {
     fn resolving_an_unknown_item_refuses() {
         let root = temp_dir("unknown");
         assert!(resolve(&root, "no-such-item").is_err());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `cli.py`'s `show`/`done`/`reopen`/`annotate`/`reprioritize` branches
@@ -768,8 +809,6 @@ mod tests {
         backlog::add(&root, "two", "sandbox", "", None, None, None, "P2", None).unwrap();
         let ambiguous = resolve(&root, "2026").unwrap_err();
         assert_eq!(ambiguous.code(), crate::exit::NEEDS_CONFIG);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The command-specific wrong-state errors (`reopen` on an open item,
@@ -846,8 +885,6 @@ mod tests {
             !text.contains("role:") && !text.contains("source:"),
             "show must not print role:/source: lines (Python's show predates both fields): {text}"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

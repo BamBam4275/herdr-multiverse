@@ -1,5 +1,7 @@
 //! `TaskPaths`: containment rules so a task id can never traverse
-//! above its own task directory.
+//! above its own task directory, plus the fixed layout of a task's
+//! artifact files (`brief.md`, `result.md`, `status`, `revise`,
+//! `retire`) once that directory is resolved.
 
 use std::io;
 use std::path::{Path, PathBuf, StripPrefixError};
@@ -77,6 +79,9 @@ pub fn task_dir(project_root: &Path, task_id: &str) -> Result<PathBuf, TaskPathE
     let resolved_root = resolve_best_effort(&root)
         .map_err(|_| TaskPathError::OutsideTaskRoot(task_id.to_string()))?;
 
+    // Reject exact equality too: a task id whose directory resolves (e.g.
+    // via a symlink) to the tasks root itself is not a strict descendant of
+    // it.
     if resolved_root == resolved_tasks_root || !resolved_root.starts_with(&resolved_tasks_root) {
         return Err(TaskPathError::OutsideTaskRoot(task_id.to_string()));
     }
@@ -157,7 +162,30 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&dir`/`dir.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -167,7 +195,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     #[test]
@@ -196,7 +224,6 @@ mod tests {
                 TaskPaths::for_task(&dir, task_id).is_err(),
                 "{task_id:?} should be rejected"
             );
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -209,7 +236,6 @@ mod tests {
                 paths.root().strip_prefix(&dir).unwrap(),
                 Path::new(".multiverse").join("tasks").join(task_id)
             );
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -230,8 +256,6 @@ mod tests {
 
             let err = TaskPaths::for_task(&dir, "20261101-explorer-abc123").unwrap_err();
             assert!(matches!(err, TaskPathError::OutsideTaskRoot(_)));
-
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -246,7 +270,6 @@ mod tests {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
         assert_eq!(components, vec![".multiverse", "tasks", "t1"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

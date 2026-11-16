@@ -69,17 +69,27 @@ fn migrate_legacy_sibling(path: &Path) -> io::Result<Option<PathBuf>> {
 /// names are exposed; history readers elsewhere still accept retired names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SeedRole {
+    /// Fast, read-only codebase reconnaissance that returns a compressed map.
     Scout,
+    /// Implements a scoped, already-decided change inside an isolated worktree.
     Builder,
+    /// External knowledge retrieval (library docs, API references, release notes).
     Archivist,
+    /// Adversarial review of another agent's work, on a different vendor CLI.
     Critic,
+    /// Architecture, risk, and hard debugging, escalated when being wrong is costly.
     Seer,
+    /// Multi-vendor decision support convened on a question judged too consequential
+    /// for a single model.
     Council,
+    /// UI/UX design, the edits that implement it, and design review.
     Artisan,
+    /// Visual and media analysis, converted into concise structured text.
     Watcher,
 }
 
 impl SeedRole {
+    /// Lowercase slug used on the dispatch command line (`--role <key>`).
     pub fn key(self) -> &'static str {
         match self {
             Self::Scout => "scout",
@@ -93,6 +103,7 @@ impl SeedRole {
         }
     }
 
+    /// Capitalized name shown to a human in the rendered seed's role table.
     pub fn display(self) -> &'static str {
         match self {
             Self::Scout => "Scout",
@@ -107,6 +118,8 @@ impl SeedRole {
     }
 }
 
+/// A role entry for the seed's dispatch table: which role, and whether it
+/// currently has an account to route to.
 #[derive(Debug, Clone)]
 pub struct DispatchableRole {
     pub role: SeedRole,
@@ -199,6 +212,70 @@ fn handoff_instruction(handoff: &Handoff) -> String {
     }
 }
 
+/// Conventional path of the fleet-down/up wrap document a Nexus writes
+/// before going idle (card `20261116-b-f0612d`). Local only, never checked
+/// into git. Section completeness is prompt-enforced, not parsed here.
+pub const PASSDOWN_FILE: &str = ".multiverse/PASSDOWN.md";
+
+/// One-line sidecar deciding whether a PASSDOWN is pending. Its *content*
+/// gates the resume hook below, never [`PASSDOWN_FILE`]'s mere existence —
+/// this project's own hand-written `PASSDOWN.md` is a standing archive with
+/// no sidecar, and keying on existence alone would re-run BRING-UP on every
+/// `start`.
+const PASSDOWN_STATE_FILE: &str = ".multiverse/passdown.state";
+
+/// Resolve whether `repository` (or the home root, for the hub) is sitting
+/// on a pending fleet-down wrap. `None` only when the sidecar is absent —
+/// an ordinary project with a stale or archival `PASSDOWN.md` and no
+/// sidecar resumes exactly as it did before this hook existed. An existing
+/// sidecar that cannot be read, or whose content is neither `pending` nor
+/// `wrapped` nor `up`, fails closed as pending (the sidecar contract's own
+/// fail-closed row); `up` means BRING-UP already ran and is not pending.
+/// Either way, `Some` additionally requires [`PASSDOWN_FILE`] to exist as a
+/// file, so a sidecar with no document behind it resolves to `None` too.
+pub fn resolve_passdown(repository: &Path) -> Option<PathBuf> {
+    let pending = match fs::read_to_string(repository.join(PASSDOWN_STATE_FILE)) {
+        Ok(text) => text.trim() != "up",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    if !pending {
+        return None;
+    }
+    let passdown = repository.join(PASSDOWN_FILE);
+    passdown.is_file().then_some(passdown)
+}
+
+/// Shared by `seed_body` and `home_seed_body`: the sentence placed before
+/// the existing handoff/resume text when a PASSDOWN is pending. Ends with a
+/// trailing space so a caller concatenating it directly before another
+/// sentence (`seed_body`) needs no separator of its own; a caller giving it
+/// its own paragraph (`home_seed_body`) trims it.
+fn pending_passdown_block(path: &Path) -> String {
+    format!(
+        "A pending PASSDOWN is at `{}`. Read it now. Execute its BRING-UP section before \
+         dispatching. When checks pass, replace `.multiverse/passdown.state` with the single \
+         line `up`, then continue Every cycle. ",
+        path.display()
+    )
+}
+
+/// Delivered by `down` (Lane B, card `20261116-b-f0612d`) into a live Nexus
+/// through the same `deliver_prompt_to` path `start --reseed` already uses.
+/// Defined here rather than in Lane B's own module because every detail it
+/// names — the sidecar values and [`PASSDOWN_FILE`]'s section names — is
+/// this module's own contract.
+pub const WRAP_PROMPT: &str = "The fleet is going down. Let any live lane finish, or commit \
+    its work to its own lane branch — never main, never a merge. Write `.multiverse/PASSDOWN.md` \
+    with `## STATE`, `## IN FLIGHT`, `## DECISIONS`, `## NEXT UP`, `## BRING-UP`, and \
+    `## GOTCHAS` sections; `BRING-UP` names exact commands for this project, or says \"nothing \
+    to restart\" when there is none. After a verified backup, stop this project's own remote \
+    stack with `compose down`, never `-v`. Then replace `.multiverse/passdown.state` with the \
+    single line `wrapped` and go idle. Do not close your own pane.";
+
+/// Everything `seed_body`/`render_seed` needs to render a project's Nexus
+/// seed: resolved config, resolved handoff, and the roles currently
+/// dispatchable in this fleet.
 pub struct SeedContext<'a> {
     pub project: &'a str,
     pub repository: &'a Path,
@@ -258,6 +335,15 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
     let directive_path = context
         .directives_root
         .join(format!("{}.md", context.project));
+    let passdown = resolve_passdown(context.repository);
+    let resume_line = match &passdown {
+        Some(path) => format!(
+            "{}{}",
+            pending_passdown_block(path),
+            handoff_instruction(&context.handoff)
+        ),
+        None => handoff_instruction(&context.handoff),
+    };
     let mut text = format!(
         "# Nexus — {}\n\n\
          You are assigned to repository `{}`. Manage this project's work; specialists implement it.\n\n\
@@ -276,7 +362,7 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
          Reversible work within your scope may proceed when the human is absent; irreversible decisions \
          outside existing authority wait for the human. Do not use AskUserQuestion to park authorized reversible work.\n\n\
          <!-- multiverse:directives-digest {} -->\n\n",
-        cell(context.project), context.repository.display(), handoff_instruction(&context.handoff),
+        cell(context.project), context.repository.display(), resume_line,
         directive_path.display(), directive_digest,
     );
     if let Some(warning) = warning {
@@ -317,6 +403,8 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
         frontend against its spec, security boundaries, and human-readable comments. Dispatch concrete gaps.\n\n\
         ## What you may dispatch here\n\n");
     let mut roles: Vec<_> = context.roles.iter().collect();
+    // Stable order regardless of config/caller iteration order, so the
+    // rendered table (and its digest) doesn't change on every call.
     roles.sort_by_key(|route| route.role.key());
     let available: Vec<_> = roles.iter().filter(|route| route.account.is_ok()).collect();
     if available.is_empty() {
@@ -387,6 +475,9 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
         context.max_concurrent, context.dispatch_min_quota_percent,
     ));
     let shipped = include_str!("../../../prompts/role-nexus.md");
+    // Drop the file's leading title/commentary section (above the `---`
+    // divider); only the role body below it belongs in a rendered seed.
+    // `context.role_prompt`, when given, is expected to already be stripped.
     let prompt = context.role_prompt.unwrap_or_else(|| {
         shipped
             .split_once("\n---\n")
@@ -400,6 +491,8 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
     text
 }
 
+/// Content digest of the rendered seed body, used to decide whether an
+/// on-disk seed is stale against the current config/handoff/roles.
 pub fn seed_digest(context: &SeedContext<'_>) -> String {
     content_digest(seed_body(context, &multiverse_invocation()).as_bytes())
 }
@@ -415,6 +508,8 @@ fn finalize_seed(body: String) -> String {
     )
 }
 
+/// Render the full project Nexus seed, ready to write to disk: the body
+/// from `seed_body` wrapped with `finalize_seed`'s digest marker.
 pub fn render_seed(context: &SeedContext<'_>) -> String {
     finalize_seed(seed_body(context, &multiverse_invocation()))
 }
@@ -454,6 +549,9 @@ fn digest_is_stale(path: &Path, digest: &str) -> io::Result<Option<bool>> {
     }
 }
 
+/// Whether the seed at `path` needs rewriting: `None` if it doesn't exist
+/// yet, `Some(true)`/`Some(false)` if its stored digest disagrees/agrees
+/// with `context`'s current digest.
 pub fn seed_is_stale(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<bool>> {
     digest_is_stale(path, &seed_digest(context))
 }
@@ -532,12 +630,38 @@ fn write_rendered_seed(path: &Path, rendered: &str) -> io::Result<Option<PathBuf
     Ok(backup.or(legacy_backup))
 }
 
+/// Render and write a project's seed to `path`, preserving any hand edits
+/// and migrating a legacy-named sibling (see `write_rendered_seed`).
 pub fn write_seed(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<PathBuf>> {
     write_rendered_seed(path, &render_seed(context))
 }
 
+/// First-turn prompt delivered into a freshly started or reseeded project
+/// Nexus: points it at its seed and, on `reseed`, tells it to continue
+/// straight into its standing duties rather than wait to be asked.
 pub fn seed_prompt(project: &str, path: &Path, reseed: bool) -> String {
-    let mut prompt = format!("Read `{}` now and follow it. You are the Nexus for {project}. Read the project's handoff card and resume its history. Report, in two lines, which repository you own and which roles you may route.", path.display());
+    // `path` is always `seed_path(repository)` (`repository/.multiverse/<SEED_FILENAME>`),
+    // so its grandparent recovers the repository root without widening this
+    // function's signature past what every existing caller already passes.
+    let passdown = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(resolve_passdown);
+    let mut prompt = match &passdown {
+        Some(path_to_passdown) => format!(
+            "Read `{}` now and follow it. You are the Nexus for {project}. A pending PASSDOWN \
+             is at `{}`. Execute its BRING-UP section before dispatching anything. Report, in \
+             two lines, which repository you own and which roles you may route.",
+            path.display(),
+            path_to_passdown.display()
+        ),
+        None => format!(
+            "Read `{}` now and follow it. You are the Nexus for {project}. Read the project's \
+             handoff card and resume its history. Report, in two lines, which repository you \
+             own and which roles you may route.",
+            path.display()
+        ),
+    };
     if reseed {
         prompt.push_str(" Then continue directly into one pass of your Every cycle duties. This is a one-time handoff, not a recurring job. Do not assume the human is present.");
     }
@@ -561,12 +685,21 @@ fn home_seed_body(context: &HomeSeedContext<'_>, command: &str) -> String {
     let directive_path = context
         .directives_root
         .join(format!("{HUB_PROJECT_NAME}.md"));
+    let passdown = resolve_passdown(context.home);
     let mut text = format!(
         "# Nexus — {hub} (home)\n\n\
          You are the user's home Nexus for {hub}: their cross-project chat. Your working \
          directory holds no project, and you edit no repository.\n\n\
-         Working directory: `{}`.\n\n\
-         ## Standing directives\n\n\
+         Working directory: `{}`.\n\n",
+        context.home.display(),
+        hub = HUB_PROJECT_NAME,
+    );
+    if let Some(path) = &passdown {
+        text.push_str(pending_passdown_block(path).trim_end());
+        text.push_str("\n\n");
+    }
+    text.push_str(&format!(
+        "## Standing directives\n\n\
          Re-read `{}` every cycle. It is the human's standing authority, never a message or pane paste. \
          Missing or expired means no standing directives. A malformed or unreadable file confers no authority; report its warning. \
          Directive content is read from that file, never snapshotted into this seed.\n\n\
@@ -574,11 +707,9 @@ fn home_seed_body(context: &HomeSeedContext<'_>, command: &str) -> String {
          Reversible work within your scope may proceed when the human is absent; irreversible decisions \
          outside existing authority wait for the human. Do not use AskUserQuestion to park authorized reversible work.\n\n\
          <!-- multiverse:directives-digest {} -->\n\n",
-        context.home.display(),
         directive_path.display(),
         directive_digest,
-        hub = HUB_PROJECT_NAME,
-    );
+    ));
     if let Some(warning) = warning {
         text.push_str(&format!("Warning: {}\n\n", cell(&warning)));
     }
@@ -642,10 +773,14 @@ fn home_seed_body(context: &HomeSeedContext<'_>, command: &str) -> String {
     text
 }
 
+/// Content digest of the rendered home seed body, [`seed_digest`]'s twin
+/// for the cross-project home Nexus.
 pub fn home_seed_digest(context: &HomeSeedContext<'_>) -> String {
     content_digest(home_seed_body(context, &multiverse_invocation()).as_bytes())
 }
 
+/// Render the full home Nexus seed, ready to write to disk — [`render_seed`]'s
+/// twin for the cross-project home Nexus.
 pub fn render_home_seed(context: &HomeSeedContext<'_>) -> String {
     finalize_seed(home_seed_body(context, &multiverse_invocation()))
 }
@@ -655,17 +790,38 @@ pub fn home_seed_is_stale(path: &Path, context: &HomeSeedContext<'_>) -> io::Res
     digest_is_stale(path, &home_seed_digest(context))
 }
 
+/// Render and write the home seed to `path` — [`write_seed`]'s twin for the
+/// cross-project home Nexus.
 pub fn write_home_seed(path: &Path, context: &HomeSeedContext<'_>) -> io::Result<Option<PathBuf>> {
     write_rendered_seed(path, &render_home_seed(context))
 }
 
+/// First-turn prompt delivered into a freshly started or reseeded home
+/// Nexus — [`seed_prompt`]'s twin for the cross-project home Nexus.
 pub fn home_seed_prompt(path: &Path, reseed: bool) -> String {
-    let mut prompt = format!(
-        "Read `{}` now and follow it. You are the home Nexus for {HUB_PROJECT_NAME}: the \
-         user's cross-project chat, not a project Nexus. Report, in two lines, which projects \
-         you can see and how you route to each.",
-        path.display()
-    );
+    // `path` is always `seed_path(home)` (`home/.multiverse/<SEED_FILENAME>`),
+    // so its grandparent recovers the home root the same way `seed_prompt`
+    // recovers a project's repository root.
+    let passdown = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(resolve_passdown);
+    let mut prompt = match &passdown {
+        Some(path_to_passdown) => format!(
+            "Read `{}` now and follow it. You are the home Nexus for {HUB_PROJECT_NAME}: the \
+             user's cross-project chat, not a project Nexus. A pending PASSDOWN is at `{}`. \
+             Execute its BRING-UP section before dispatching anything. Report, in two lines, \
+             which projects you can see and how you route to each.",
+            path.display(),
+            path_to_passdown.display()
+        ),
+        None => format!(
+            "Read `{}` now and follow it. You are the home Nexus for {HUB_PROJECT_NAME}: the \
+             user's cross-project chat, not a project Nexus. Report, in two lines, which \
+             projects you can see and how you route to each.",
+            path.display()
+        ),
+    };
     if reseed {
         prompt.push_str(" Then continue directly into one pass of your Every cycle duties. This is a one-time handoff, not a recurring job. Do not assume the human is present.");
     }
@@ -1141,5 +1297,156 @@ mod tests {
             format!("{original}Human edit.\n")
         );
         assert_eq!(home_seed_is_stale(&path, &context).unwrap(), Some(false));
+    }
+
+    // --- resolve_passdown and the pending-PASSDOWN resume hook (card
+    // `20261116-b-f0612d`, Lane A) -----------------------------------------
+
+    fn write_sidecar(repository: &Path, text: &str) {
+        let dir = repository.join(".multiverse");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("passdown.state"), text).unwrap();
+    }
+
+    fn write_passdown(repository: &Path) {
+        let dir = repository.join(".multiverse");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("PASSDOWN.md"), "## STATE\n\nnothing in flight\n").unwrap();
+    }
+
+    #[test]
+    fn resolve_passdown_is_none_when_passdown_exists_but_the_sidecar_is_missing() {
+        // This project's own `.multiverse/PASSDOWN.md` is exactly this
+        // shape today: a hand-written archive with no sidecar. Keying on
+        // existence instead of the sidecar would make every `start` of
+        // this project re-run BRING-UP.
+        let dir = TempDir::new();
+        write_passdown(&dir.0);
+        assert_eq!(resolve_passdown(&dir.0), None);
+    }
+
+    #[test]
+    fn resolve_passdown_is_some_when_pending_or_wrapped() {
+        let dir = TempDir::new();
+        write_passdown(&dir.0);
+        write_sidecar(&dir.0, "pending");
+        assert_eq!(
+            resolve_passdown(&dir.0),
+            Some(dir.0.join(".multiverse").join("PASSDOWN.md"))
+        );
+        write_sidecar(&dir.0, "wrapped");
+        assert_eq!(
+            resolve_passdown(&dir.0),
+            Some(dir.0.join(".multiverse").join("PASSDOWN.md"))
+        );
+    }
+
+    #[test]
+    fn resolve_passdown_fails_closed_on_an_unreadable_or_unrecognized_sidecar() {
+        let dir = TempDir::new();
+        write_passdown(&dir.0);
+        // A directory where the sidecar file should be: `read_to_string`
+        // errors with something other than `NotFound`.
+        fs::create_dir_all(dir.0.join(".multiverse").join("passdown.state")).unwrap();
+        assert!(resolve_passdown(&dir.0).is_some());
+        fs::remove_dir(dir.0.join(".multiverse").join("passdown.state")).unwrap();
+        write_sidecar(&dir.0, "garbage\n");
+        assert!(resolve_passdown(&dir.0).is_some());
+    }
+
+    #[test]
+    fn resolve_passdown_is_none_once_the_sidecar_reads_up() {
+        let dir = TempDir::new();
+        write_passdown(&dir.0);
+        write_sidecar(&dir.0, "up");
+        assert_eq!(resolve_passdown(&dir.0), None);
+    }
+
+    #[test]
+    fn resolve_passdown_is_none_when_pending_but_passdown_itself_is_missing() {
+        let dir = TempDir::new();
+        write_sidecar(&dir.0, "pending");
+        assert_eq!(resolve_passdown(&dir.0), None);
+    }
+
+    #[test]
+    fn render_seed_contains_the_absolute_passdown_path_iff_pending() {
+        let directives = TempDir::new();
+        let repository = TempDir::new();
+        let mut context = context(&directives.0);
+        context.repository = &repository.0;
+        let passdown = repository.0.join(".multiverse").join("PASSDOWN.md");
+
+        let seed = render_seed(&context);
+        assert!(!seed.contains("A pending PASSDOWN is at"));
+        assert!(!seed.contains(&passdown.to_string_lossy().to_string()));
+
+        write_passdown(&repository.0);
+        write_sidecar(&repository.0, "pending");
+        let seed = render_seed(&context);
+        assert!(seed.contains("A pending PASSDOWN is at"));
+        assert!(seed.contains(&passdown.to_string_lossy().to_string()));
+        assert!(seed.contains("Execute its BRING-UP section"));
+    }
+
+    #[test]
+    fn seed_is_stale_flips_when_a_sidecar_appears() {
+        let directives = TempDir::new();
+        let repository = TempDir::new();
+        let mut context = context(&directives.0);
+        context.repository = &repository.0;
+        let path = repository.0.join(SEED_FILENAME);
+
+        assert!(write_seed(&path, &context).unwrap().is_none());
+        assert_eq!(seed_is_stale(&path, &context).unwrap(), Some(false));
+
+        write_passdown(&repository.0);
+        write_sidecar(&repository.0, "pending");
+        assert_eq!(seed_is_stale(&path, &context).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn seed_prompt_names_passdown_only_when_pending() {
+        let repository = TempDir::new();
+        let path = seed_path(&repository.0);
+        let passdown = repository.0.join(".multiverse").join("PASSDOWN.md");
+
+        let prompt = seed_prompt("demo", &path, false);
+        assert!(!prompt.contains("PASSDOWN"));
+
+        write_passdown(&repository.0);
+        write_sidecar(&repository.0, "wrapped");
+        let prompt = seed_prompt("demo", &path, false);
+        assert!(prompt.contains(&passdown.to_string_lossy().to_string()));
+        assert!(prompt.contains("BRING-UP"));
+    }
+
+    #[test]
+    fn home_seed_names_pending_passdown_only_when_pending() {
+        let directives = TempDir::new();
+        let home = TempDir::new();
+        let none: [(String, PathBuf); 0] = [];
+        let mut context = home_context(&directives.0, &none);
+        context.home = &home.0;
+        let path = seed_path(&home.0);
+
+        // The shipped `role-nexus-home.md` prompt's own "Fleet down / Fleet
+        // up" section mentions "pending PASSDOWN" in static prose and is
+        // always appended here (unlike `seed_body`, `home_seed_body` has no
+        // `role_prompt` override to suppress it) — so this checks for the
+        // dynamic block's exact lead sentence, never present in that static
+        // text, rather than the bare phrase.
+        let seed = render_home_seed(&context);
+        assert!(!seed.contains("A pending PASSDOWN is at"));
+        let prompt = home_seed_prompt(&path, false);
+        assert!(!prompt.contains("PASSDOWN"));
+
+        write_passdown(&home.0);
+        write_sidecar(&home.0, "pending");
+        let seed = render_home_seed(&context);
+        assert!(seed.contains("A pending PASSDOWN is at"));
+        let prompt = home_seed_prompt(&path, false);
+        assert!(prompt.contains("PASSDOWN"));
+        assert!(prompt.contains("BRING-UP"));
     }
 }

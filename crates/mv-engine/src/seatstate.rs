@@ -8,9 +8,11 @@
 //! is never validated here; an unknown seat simply reads as all-defaults,
 //! same as an empty entry.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use mv_config::load::SeatProvider;
+use mv_config::roles::Role;
 use mv_state::breaker_store::StoreError;
 use mv_state::seatstate_store::{self, SeatEntry};
 
@@ -47,12 +49,19 @@ fn entry(config_dir: &Path, seat: &str) -> SeatEntry {
 /// lets a caller write the cap-vs-uncapped distinction ambiguously.
 #[derive(Debug, thiserror::Error)]
 pub enum SetCapError {
+    /// The requested cap was below 1 — `seatstate.py`'s own floor for a
+    /// stored cap, kept so the uncapped/capped distinction on disk is
+    /// never ambiguous.
     #[error("seat capacity must be at least 1, got {0}")]
     InvalidCap(u32),
+    /// The seatstate store could not be read or written.
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
+/// `accounts limit <seat> <cap>` / `accounts limit <seat> --off`'s entry
+/// point: validates `cap` (see [`SetCapError::InvalidCap`]) before handing
+/// off to the locked write.
 pub fn set_cap(config_dir: &Path, seat: &str, cap: Option<u32>) -> Result<(), SetCapError> {
     if let Some(cap) = cap {
         if cap < 1 {
@@ -102,13 +111,105 @@ pub fn open_count_from_payload(payload: &serde_json::Value, short: &str) -> Opti
     Some(count)
 }
 
-/// `seat show` always probes once; Herdr errors fail open to an unknown count.
+/// Count every live agent matching `short`, including idle/done and Nexus
+/// panes. Herdr errors fail open to an unknown count. Kept with this
+/// `&str -> Option<u32>` signature so existing fn-pointer call sites stay
+/// valid; `seat show` uses [`live_seat_open_counts`] (card
+/// `20261115-b-4ded07`).
 pub fn live_open_count(short: &str) -> Option<u32> {
     let result = mv_herdr::run::run(&mv_herdr::argv::agent_list(), None).ok()?;
     if !result.ok() {
         return None;
     }
     open_count_from_payload(result.payload.as_ref()?, short)
+}
+
+/// Whether a routing-log `role=` field (current or retired config key)
+/// names Nexus — mirrors `commands::dispatch`'s own `is_nexus_role`, so a
+/// busy Nexus pane is identified the same way on every surface that reads
+/// a seat's open count (card `20261115-b-234610`).
+pub fn is_nexus_role(role: &str) -> bool {
+    Role::from_any_config_key(role).is_ok_and(|role| role == Role::Nexus)
+}
+
+/// Every live agent name whose *newest* routing-log dispatch, across the
+/// given project roots, is Nexus-role — the same per-name dedup
+/// `commands::dispatch`'s `latest_tasks_by_agent` applies (a name is
+/// reissued once its previous occupant is no longer live, so an older
+/// dispatch under the same name must never outvote a newer one). Feeds
+/// [`seat_open_counts_from_payload`]'s worker/Nexus split so `check`/
+/// `accounts`/`review_policy`/`seat show` agree with `dispatch`/`council`
+/// about what counts against a seat's own cap (cards `20261115-b-234610`,
+/// `20261115-b-4ded07`).
+pub fn nexus_agent_names(project_roots: &[PathBuf]) -> HashSet<String> {
+    let mut latest: HashMap<String, (u64, bool)> = HashMap::new();
+    for root in project_roots {
+        let mut tasks = mv_state::tasks::sweep_tasks(root);
+        tasks.sort_by_key(|task| task.dispatch_ordinal);
+        for task in tasks {
+            let Some(agent) = task.agent else {
+                continue;
+            };
+            latest.insert(agent, (task.dispatch_ordinal, is_nexus_role(&task.role)));
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|(_, (_, nexus))| *nexus)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// A seat's live open count, split into worker vs. Nexus panes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeatOpenCounts {
+    pub workers: u32,
+    pub nexus: u32,
+}
+
+/// Role-aware sibling of [`open_count_from_payload`]: same trailing
+/// `-<short>` name match, but a matched name present in `nexus_agents`
+/// ([`nexus_agent_names`]) counts toward `nexus` rather than `workers` — so
+/// a busy Nexus pane never inflates a worker seat's cap count, and an
+/// account's own `nexus_slots` cap can be read against `nexus` directly
+/// (card `20261115-b-234610`).
+pub fn seat_open_counts_from_payload(
+    payload: &serde_json::Value,
+    short: &str,
+    nexus_agents: &HashSet<String>,
+) -> Option<SeatOpenCounts> {
+    let agents = payload.get("result")?.get("agents")?.as_array()?;
+    let mut counts = SeatOpenCounts::default();
+    for agent in agents {
+        let name = agent.get("name")?.as_str()?;
+        let base = name
+            .rsplit_once('-')
+            .filter(|(_, suffix)| suffix.parse::<u32>().is_ok())
+            .map_or(name, |(base, _)| base);
+        if name.ends_with(&format!("-{short}")) || base.ends_with(&format!("-{short}")) {
+            if nexus_agents.contains(name) {
+                counts.nexus += 1;
+            } else {
+                counts.workers += 1;
+            }
+        }
+    }
+    Some(counts)
+}
+
+/// Role-aware sibling of [`live_open_count`]: one Herdr probe per call,
+/// split by [`seat_open_counts_from_payload`]. Herdr errors fail open to an
+/// unknown count, same as [`live_open_count`]. `seat show` reports
+/// [`SeatOpenCounts::workers`] (card `20261115-b-4ded07`).
+pub fn live_seat_open_counts(
+    short: &str,
+    nexus_agents: &HashSet<String>,
+) -> Option<SeatOpenCounts> {
+    let result = mv_herdr::run::run(&mv_herdr::argv::agent_list(), None).ok()?;
+    if !result.ok() {
+        return None;
+    }
+    seat_open_counts_from_payload(result.payload.as_ref()?, short, nexus_agents)
 }
 
 /// JSON values are individually escaped before joining with the historical
@@ -340,6 +441,87 @@ mod tests {
         assert_eq!(get_cap(dir.path(), "seat-a"), Some(2));
         set_lend(dir.path(), "seat-a", true).unwrap();
         assert!(is_lent(dir.path(), "seat-a"));
+    }
+
+    /// Card `20261115-b-234610`, proof: a busy Nexus pane's agent name is
+    /// identified off its own routing-log dispatch, the same signal
+    /// `commands::dispatch`'s `is_nexus_role` reads.
+    #[test]
+    fn nexus_agent_names_identifies_a_nexus_role_dispatch() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".multiverse")).unwrap();
+        std::fs::write(
+            project.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\t\
+             role=nexus\tagent=mv-nexus-1-se\tbranch=main\n",
+        )
+        .unwrap();
+        let names = nexus_agent_names(&[project.path().to_path_buf()]);
+        assert!(names.contains("mv-nexus-1-se"));
+    }
+
+    #[test]
+    fn nexus_agent_names_excludes_a_worker_role_dispatch() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".multiverse")).unwrap();
+        std::fs::write(
+            project.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\t\
+             role=builder\tagent=mv-builder-1-se\tbranch=main\n",
+        )
+        .unwrap();
+        let names = nexus_agent_names(&[project.path().to_path_buf()]);
+        assert!(!names.contains("mv-builder-1-se"));
+    }
+
+    /// A reissued agent name (the Nexus pane under it ended, and the same
+    /// name was later given to a worker dispatch) must read by its *newest*
+    /// dispatch only — an older Nexus record must never outvote the
+    /// worker dispatch that reused the name.
+    #[test]
+    fn nexus_agent_names_keeps_only_the_newest_dispatch_for_a_reissued_name() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".multiverse")).unwrap();
+        std::fs::write(
+            project.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\t\
+             role=nexus\tagent=mv-shared-1-se\tbranch=main\n\
+             2020-01-02T00:00:00+00:00\tevent=dispatch\ttask=20250102-builder-bbbbbb\t\
+             role=builder\tagent=mv-shared-1-se\tbranch=main\n",
+        )
+        .unwrap();
+        let names = nexus_agent_names(&[project.path().to_path_buf()]);
+        assert!(
+            !names.contains("mv-shared-1-se"),
+            "the later worker dispatch must win over the earlier Nexus one"
+        );
+    }
+
+    #[test]
+    fn seat_open_counts_from_payload_splits_worker_and_nexus_panes() {
+        let payload = serde_json::json!({"result": {"agents": [
+            {"name": "mv-nexus-1-se", "agent_status": "working"},
+            {"name": "mv-builder-2-se", "agent_status": "working"},
+            {"name": "mv-critic-1-cx", "agent_status": "working"}
+        ]}});
+        let mut nexus_agents = HashSet::new();
+        nexus_agents.insert("mv-nexus-1-se".to_string());
+        let counts = seat_open_counts_from_payload(&payload, "se", &nexus_agents).unwrap();
+        assert_eq!(
+            counts,
+            SeatOpenCounts {
+                workers: 1,
+                nexus: 1
+            }
+        );
+        let other = seat_open_counts_from_payload(&payload, "cx", &nexus_agents).unwrap();
+        assert_eq!(
+            other,
+            SeatOpenCounts {
+                workers: 1,
+                nexus: 0
+            }
+        );
     }
 
     #[test]

@@ -142,6 +142,8 @@ pub enum Priority {
 }
 
 impl Priority {
+    /// The exact on-disk `priority=` token for this value (also what
+    /// [`Display`](std::fmt::Display) prints).
     pub fn as_str(self) -> &'static str {
         match self {
             Priority::P1 => "P1",
@@ -183,8 +185,11 @@ fn normalize_priority(value: &str) -> Result<String, BacklogError> {
 /// One append-only note against an existing item, never a mutation of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
+    /// The free-text note itself, already redacted before it was stored.
     pub note: String,
+    /// The identifier (role, project name, or `human`) that wrote this note.
     pub by: String,
+    /// When this annotation was recorded, as the shared UTC-seconds stamp.
     pub when: String,
 }
 
@@ -192,18 +197,33 @@ pub struct Annotation {
 /// plus every `event=annotation` line naming it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacklogItem {
+    /// The minted `YYYYMMDD-b-<6hex>` id this item is addressed by.
     pub item: String,
+    /// One of `open`, `asked`, or `done` — the current folded state.
     pub state: String,
+    /// The last-wins sort key (`P1`/`P2`/`P3`); defaults to `P2` when never set.
     pub priority: String,
+    /// The one-line summary of the item, last-wins across mutation lines.
     pub title: String,
+    /// The optional rationale for why this item exists; empty when never given.
     pub why: String,
+    /// The `YYYY-MM-DD` due date badge, or empty when none was set.
     pub due: String,
+    /// The role that raised this item, when one was recorded.
     pub role: String,
+    /// The originating subsystem or command that raised this item, when recorded.
     pub source: String,
+    /// The project (or other identifier) that created this item.
     pub by: String,
+    /// The reason recorded when the item was closed; empty until `done`.
     pub evidence: String,
+    /// The UTC-seconds stamp of the first `event=backlog` line for this item.
     pub created_at: String,
+    /// The UTC-seconds stamp of the most recent line (backlog or annotation)
+    /// that touched this item.
     pub updated_at: String,
+    /// Every annotation recorded against this item, in the order they were
+    /// appended.
     pub annotations: Vec<Annotation>,
     /// The numbered menu an `asked` item carries — empty for an `open` or
     /// `done` item.
@@ -346,6 +366,8 @@ pub(crate) fn json_encode_str(value: &str) -> String {
         } else if cp <= 0xFFFF {
             out.push_str(&format!("\\u{cp:04x}"));
         } else {
+            // Above the BMP: emit a UTF-16 surrogate pair, the same escape
+            // `ensure_ascii=True` produces for e.g. emoji.
             let n = cp - 0x10000;
             let hi = 0xD800 + (n >> 10);
             let lo = 0xDC00 + (n & 0x3FF);
@@ -487,6 +509,9 @@ fn classify_backlog(record: &LogRecord) -> Option<DecodedBacklog> {
             return None;
         }
         let recommendation: u32 = raw.parse().ok()?;
+        // `options` is decoded above, so this always checks against the
+        // menu on the *same* line — a `recommendation` with no (or a
+        // shorter) `options` on that line is rejected, not left dangling.
         let options_len = decoded.options.as_ref().map_or(0, Vec::len);
         if recommendation < 1 || recommendation as usize > options_len {
             return None;
@@ -553,6 +578,9 @@ fn fold(records: &[LogRecord]) -> (Vec<String>, HashMap<String, FoldedEntry>) {
     let mut folded: HashMap<String, FoldedEntry> = HashMap::new();
     for record in records {
         if let Some(decoded) = classify_backlog(record) {
+            // First time this item is seen: seed open/P2 defaults (the same
+            // ones `add` would have written) so a line that only sets, say,
+            // `due=` on an otherwise-implicit item still folds correctly.
             let entry = folded.entry(decoded.item.clone()).or_insert_with(|| {
                 order.push(decoded.item.clone());
                 FoldedEntry {
@@ -602,6 +630,8 @@ fn fold(records: &[LogRecord]) -> (Vec<String>, HashMap<String, FoldedEntry>) {
             continue;
         }
         if let Some(annotated) = classify_annotation(record) {
+            // Silently dropped when the item itself is unknown here — an
+            // annotation never creates a backlog entry on its own.
             if let Some(entry) = folded.get_mut(&annotated.item) {
                 entry.updated_at = annotated.when.clone();
                 entry.annotations.push(Annotation {
@@ -811,6 +841,9 @@ pub fn add(
             ("priority", priority_value.as_str()),
             ("title", title_json.as_str()),
         ];
+        // Omit each unset field entirely rather than writing it empty: the
+        // shared last-wins fold treats a missing field as "unchanged", so
+        // writing e.g. `due=` here would wrongly blank it on a later read.
         if !why_r.is_empty() {
             fields.push(("why", why_json.as_str()));
         }
@@ -994,6 +1027,9 @@ pub fn append_annotation_if_absent(
     with_project_lock(project_root, |lock, records| {
         let (_order, folded) = fold(records);
         let (resolved_id, entry) = lookup_folded(&folded, item_id)?;
+        // Dedup against already-redacted notes, so a repeat call with the
+        // same raw text is recognized as the same note even though neither
+        // side still carries the secret that was stripped from it.
         if entry
             .annotations
             .iter()

@@ -12,15 +12,18 @@ After each write a read-only probe battery renders the resulting state. We
 compare exit status, stdout/stderr, every ordered Herdr argv (including failed
 calls), and the durable config/runtime/project .multiverse trees, including
 briefs, results and status files. Locks, internal read indexes, Git metadata,
-and cosmetic .gitignore scaffolding are excluded. Paths, timestamps, generated
-ids and the intentional role rename are normalized; task ids retain distinct
-per-sequence identities. Existing accepted dry-run rendering exceptions remain
-limited to dry-run reports. Herdr calls stay ordered; only the documented
-prompt-polling, repeated read-only polls, start-roster, and cd-quoting
-allowlist below is folded. Council calls are compared in order within each
-seat and within the non-seat stream, allowing concurrent seats to interleave.
-Generated seed/brief prose uses the narrow tree-comparison exception table
-below; other tree content retains the existing strict comparison.
+cosmetic .gitignore scaffolding, and the Rust-only pane-watch store are
+excluded. Paths, timestamps, generated ids and the intentional role rename
+are normalized; task ids retain distinct per-sequence identities. Existing
+accepted dry-run rendering exceptions remain limited to dry-run reports.
+Herdr calls stay ordered; only the documented prompt-polling, repeated
+read-only polls, start-roster, cd-quoting, launch-command-quoting,
+dispatcher-env-propagation, workers' stalled-pane read, and reseed's extra
+pane lookup allowlist below is folded. Council calls are compared in order
+within each seat and within the non-seat stream, allowing concurrent seats
+to interleave. Generated seed/brief prose uses the narrow tree-comparison
+exception table below; other tree content retains the existing strict
+comparison.
 COLUMNS=80 / NO_COLOR=1 pin terminal rendering width.
 
 Unlike `scenarios/*.json`, there is no pre-recorded expectation — each
@@ -190,6 +193,12 @@ def read_probes(items: list[str]) -> list[Action]:
 
 
 def gen_sequence(rng: random.Random, length: int) -> list[Action]:
+    """Build one fuzz sequence: `length` random writes, each immediately
+    followed by the full read-only probe battery over the items known so
+    far. Each nested generator below appends exactly one write `Action`;
+    several fall back to `add_item()` when they need an item that does
+    not exist yet.
+    """
     writes: list[Action] = []
     items: list[str] = []  # "<item:N>" tokens for items created so far
     msg_counter = 0
@@ -342,6 +351,9 @@ _CAPTURE_TOKEN_RE = re.compile(r"<item:(\d+)>")
 
 
 def _substitute(argv: list[str], captures: dict[str, str]) -> list[str] | None:
+    """Resolve each `<item:N>` token in `argv` to that impl's own captured
+    item id, or `None` if a referenced item was never captured (e.g. its
+    creating step failed)."""
     out = []
     for token in argv:
         if _CAPTURE_TOKEN_RE.fullmatch(token):
@@ -354,6 +366,9 @@ def _substitute(argv: list[str], captures: dict[str, str]) -> list[str] | None:
 
 
 def _wrapper_script(sandbox: Sandbox, binary: str) -> Path:
+    """A one-line exec shim so `HERDR_BIN_PATH` names a single executable
+    token regardless of where `binary` lives, with a bare-`herdr`-on-PATH
+    guard pointed at the same shim."""
     path = sandbox.root / "fake-herdr"
     path.write_text(f'#!/bin/sh\nexec {shlex.quote(binary)} "$@"\n', encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -364,6 +379,9 @@ def _wrapper_script(sandbox: Sandbox, binary: str) -> Path:
 
 
 def _base_env(sandbox: Sandbox, fake_herdr: Path) -> dict[str, str]:
+    """The isolated environment every sequence step runs under: no real
+    fleet config/state dir, no real Herdr, and a pinned terminal size so
+    rendering is independent of the host tty."""
     return {
         "PATH": f"{sandbox.root / 'bin'}:{_BASE_PATH}",
         "HOME": str(sandbox.home),
@@ -385,6 +403,9 @@ def _base_env(sandbox: Sandbox, fake_herdr: Path) -> dict[str, str]:
 
 @dataclass
 class StepOutcome:
+    """One implementation's result for one sequence step, ready for
+    `compare()` against the other implementation's `StepOutcome`."""
+
     argv: list[str]
     exit_code: int | None
     stdout: str
@@ -396,6 +417,9 @@ class StepOutcome:
 
 @dataclass
 class SequenceRun:
+    """One implementation's full run of a generated sequence: every step's
+    outcome plus the final durable-file tree, ready for `compare()`."""
+
     outcomes: list[StepOutcome] = field(default_factory=list)
     tree: dict[str, str] = field(default_factory=dict)  # relpath -> normalized content
     sandbox_root: Path | None = None
@@ -405,13 +429,23 @@ class SequenceRun:
 # scaffolding are excluded. Task briefs/results/status and activity mail are
 # durable state and must be compared, including files inside task worktrees.
 def _snapshot_tree(roots: dict[str, Path], paths) -> dict[str, str]:
+    """Normalized `"label/relpath" -> content` for every durable file under
+    each of `roots` (binary files are hashed instead of read as text)."""
     out: dict[str, str] = {}
     for label, root in roots.items():
         if not root.exists():
             continue
         for path in sorted(root.rglob("*")):
+            # worktree-state/ is Rust-only durability (card 20261106-b-3d2774): its
+            # quarantine copies age out on a schedule the Python reference doesn't share.
+            # pane-watch.json (card 20261116-b-9dbf0d class C) is the stalled-pane
+            # content-hash store (mv_state::pane_watch_store) backing `workers`'
+            # staleness detection (backlog 20261115-b-59e017) — Rust-only, no Python
+            # equivalent file.
             if (not path.is_file() or path.name in (".gitignore", ".git")
                     or ".git" in path.relative_to(root).parts
+                    or "worktree-state" in path.relative_to(root).parts
+                    or path.name == "pane-watch.json"
                     or path.name.endswith((".lock", ".index", ".index.fp"))):
                 continue
             rel = normalize_text(f"{label}/{path.relative_to(root)}", paths)
@@ -495,6 +529,9 @@ def seed_fleet(sandbox: Sandbox, seed: int) -> None:
 
 
 def _register_task_ids(sandbox: Sandbox, task_ids: dict[str, str]) -> None:
+    """Scan every project's routing.log for task ids not yet seen this
+    sequence and give each a stable `<TASK:N>` placeholder, so the same
+    task id keeps the same token across every later normalization."""
     for root in sandbox.projects.values():
         log = root / ".multiverse" / "routing.log"
         if log.exists():
@@ -506,10 +543,68 @@ def _register_task_ids(sandbox: Sandbox, task_ids: dict[str, str]) -> None:
 
 
 def _read_calls(path: Path, paths) -> list[list[str]]:
+    """Every Herdr call this step made, in order, each argv normalized."""
     if not path.exists():
         return []
     return [[normalize_text(arg, paths) for arg in json.loads(line)]
             for line in path.read_text().splitlines()]
+
+
+_TABLE_CELL_RE = re.compile(r"(?<!\S)(\S+)( +)(?=\S|$)")
+
+
+def _drop_outcome_column(text: str) -> str:
+    """Card 20261116-b-9dbf0d classes A/B: `workers`' stalled-pane feature
+    (backlog 20261115-b-59e017) added an OUTCOME column between STATUS and
+    AGE (`workers.rs`); Python's oracle has no such column. Found by its
+    own header cell's position, so a column that only shifted width is
+    still dropped at the matching position in every row above the first
+    blank line (the table's own extent); text with no `OUTCOME` header
+    cell — including Python's own, column-less table — is untouched.
+    """
+    lines = text.split("\n")
+    if not lines:
+        return text
+    header_cells = list(_TABLE_CELL_RE.finditer(lines[0]))
+    index = next((n for n, m in enumerate(header_cells) if m.group(1) == "OUTCOME"), None)
+    if index is None:
+        return text
+
+    def drop(line: str) -> str:
+        """Remove the cell at the header's OUTCOME column position, if
+        `line` has one there."""
+        cells = list(_TABLE_CELL_RE.finditer(line))
+        if index >= len(cells):
+            return line
+        match = cells[index]
+        return line[:match.start()] + line[match.end():]
+
+    out: list[str] = []
+    in_table = True
+    for line in lines:
+        if in_table and line.strip() == "":
+            in_table = False
+        out.append(drop(line) if in_table else line)
+    return "\n".join(out)
+
+
+_SWEEP_DISK_LINE_RE = re.compile(
+    r"^disk: \d+ GB free \(\d+%\) (?:OK|LOW|CRITICAL)$", re.MULTILINE
+)
+
+
+def normalize_sweep_disk_line(text: str) -> str:
+    """Card 20261106-b-59f1ab: Python and Rust each sample real disk-free at
+    a different instant, so near the warn/critical threshold `sweep`'s host
+    disk-floor line can report a different GB count, percent, or level
+    marker by chance alone, not because the two implementations disagree.
+    Fold all three to a fixed placeholder; the line itself is left alone to
+    diverge when one side omits it, since a side that drops the line leaves
+    no placeholder behind for `compare()` to match against.
+    """
+    return _SWEEP_DISK_LINE_RE.sub(
+        "disk: <normalized -- card 20261106-b-59f1ab>", text
+    )
 
 
 def normalize_stdout(text: str, paths, argv: list[str]) -> str:
@@ -521,11 +616,17 @@ def normalize_stdout(text: str, paths, argv: list[str]) -> str:
     for cell rewrites. Elapsed tokens are folded across those renderers;
     all other text and whitespace remain strict.
     """
+    if argv[:1] == ["workers"]:
+        text = _drop_outcome_column(text)
+    if argv[:1] == ["sweep"]:
+        text = normalize_sweep_disk_line(text)
     if argv[:1] in (["tasks"], ["board"], ["workers"]):
         task_tokens = {concrete: token for concrete, token in paths.entries
                        if token.startswith("<TASK:")}
 
         def renamed(value: str) -> str:
+            """Translate a table cell's old role word or short-code to its
+            current spelling, or return it unchanged."""
             # `translate_prose_roles` only rewrites whole words (a hyphen
             # keeps `explorer-seat` from matching) — the short agent-name
             # code embedded in an id-only cell (`sandbox-fix-ex`) needs the
@@ -537,6 +638,8 @@ def normalize_stdout(text: str, paths, argv: list[str]) -> str:
             )
 
         def row(line: str) -> str:
+            """Rewrite only the changed cells of a task/id-bearing row,
+            preserving every cell's rendered width."""
             # Tasks start with a four-column status marker; workers start
             # with a padded project cell. A board card has an id-only cell
             # bounded by vertical rails. A task id inside prose is neither.
@@ -549,6 +652,7 @@ def normalize_stdout(text: str, paths, argv: list[str]) -> str:
             boxed = re.search(r"(?:^|│) +([^\s│]+) {2,}│", line)
 
             def changed(token: str) -> bool:
+                """True if `token` is a known task id or a renamed role word/short-code."""
                 return token in task_tokens or renamed(token) != token
 
             if not any(m and changed(m.group(1)) for m in (table, boxed)):
@@ -558,6 +662,8 @@ def normalize_stdout(text: str, paths, argv: list[str]) -> str:
                 return line
 
             def cell(match: re.Match[str]) -> str:
+                """Replace one cell's value with its renamed form,
+                re-padding to keep the cell's original rendered width."""
                 value, padding = match.groups()
                 replacement = task_tokens.get(value, renamed(value))
                 if replacement == value:
@@ -585,6 +691,9 @@ def run_sequence(
     fake_herdr_bin: str | None = None,
     fleet_seed: int = 0,
 ) -> SequenceRun:
+    """Build a fresh sandbox, seed its fleet/config, and replay every
+    action in `actions` against `impl`, returning each step's outcome plus
+    the final durable-file tree."""
     sandbox = make_sandbox()
     sandbox.add_dir("codex-home")
     sandbox.add_dir("claude-home")
@@ -675,11 +784,13 @@ def run_sequence(
 
 
 def _step_label(index: int, outcome: StepOutcome) -> str:
+    """A `compare()` diff line's human-readable step identifier."""
     kind = " probe" if outcome.probe else ""
     return f"step {index}{kind} {outcome.argv!r}"
 
 
 def is_notify_argv(argv: list[str]) -> bool:
+    """True for a `notify` command's own argv (not a probe reading its state)."""
     return bool(argv) and argv[0] == "notify"
 
 
@@ -719,6 +830,17 @@ _ROLE_FILE_RE = re.compile(
 )
 _LINE_COUNT_RE = re.compile(r"\(\d+ lines\)")
 _SECTION_HEADER_RE = re.compile(r"(?m)^([A-Z][^\n]*)\n─+$")
+# Card 20261116-b-9dbf0d class D, stdout half: `render_card`'s ACCOUNT
+# SELECTION section (dispatch.rs) prints the same dispatcher-resolved
+# MULTIVERSE_CONFIG/MULTIVERSE_STATE_DIR pair the real `pane split --env`
+# now carries (commit d2eedc5); Python's `--dry-run` report predates it.
+# The `WOULD RUN` section's own copy of these two lines is already inside
+# that section's wholesale `_section_span` normalization above, so only
+# this ACCOUNT SELECTION pair needs its own rule. Anchored to both exact
+# keys together so a single extra/changed env line still diverges.
+_RESOLVED_ENV_LINES_RE = re.compile(
+    r"^  env {2,}MULTIVERSE_CONFIG=.*\n  env {2,}MULTIVERSE_STATE_DIR=.*\n", re.MULTILINE
+)
 # The reseed prompt intentionally replaced the oracle's human name with "the human".
 _SEED_PROMPT_HUMAN_RE = re.compile(
     r"\bDo not assume [A-Z][a-z]+(?:[ '-][A-Z][a-z]+)* is present\."
@@ -726,6 +848,7 @@ _SEED_PROMPT_HUMAN_RE = re.compile(
 
 
 def is_dry_run_argv(argv: list[str]) -> bool:
+    """True for a `dispatch --dry-run` step's argv."""
     return len(argv) >= 2 and argv[0] == "dispatch" and argv[1] == "--dry-run"
 
 
@@ -753,6 +876,7 @@ def normalize_dry_run(text: str) -> str:
     text = _SHORT_CODE_RE.sub(lambda m: _OLD_SHORT_CODE_RENAME[m.group(1)], text)
     text = _ROLE_FILE_RE.sub(lambda m: f"role-{ROLE_RENAME[m.group(1)]}.md", text)
     text = _LINE_COUNT_RE.sub("(N lines)", text)
+    text = _RESOLVED_ENV_LINES_RE.sub("", text)
     for header in ("WOULD RUN", "PROMPT  (what the agent would receive)"):
         span = _section_span(text, header)
         if span is not None:
@@ -765,8 +889,72 @@ def normalize_dry_run(text: str) -> str:
     return text
 
 
+# Card 20261106-b-2c3d2f Decision 2 (Seer ruling card-2c3d2f-seer-ruling.md):
+# Rust's reclaim gate confirms a recorded task's pane occupant by pane
+# label (containing the task id) plus agent name, and lane cwd when a
+# worktree exists, before treating the pane as safe to close
+# (`reclaimable_panes`, `crates/mv-state/src/tasks.rs:3483-3566`). A task
+# it cannot confirm prints under its own "stale bookkeeping — pane already
+# gone, holds no slot" list (`crates/mv-cli/src/commands/tasks.rs:1209-
+# 1226`) instead of as a `would close` candidate. Python's oracle confirms
+# by pane id alone, so it still lists that same task as a `would close`
+# candidate. Fold only that one pairing, by task id: the rewrite only ever
+# touches the verb/header text, never the task id or the trailing
+# "(role, agent=..., pane=...)" fields, so a different task id, "closed"/
+# "NOT closed", or a stale entry with no matching `would close` line still
+# diverges.
+_RECLAIM_CANDIDATE_RE = re.compile(r"^  would close (\S+) (\(.*\))$", re.MULTILINE)
+_STALE_SECTION_RE = re.compile(
+    r"^  stale bookkeeping — pane already gone, holds no slot:\n"
+    r"((?:    \S+ \(.*\)\n)+)",
+    re.MULTILINE,
+)
+_STALE_ENTRY_RE = re.compile(r"^    (\S+) (\(.*\))$", re.MULTILINE)
+
+
+def is_reclaimable_argv(argv: list[str]) -> bool:
+    """True for a `tasks --reclaimable` step's argv."""
+    return argv[:1] == ["tasks"] and "--reclaimable" in argv
+
+
+def normalize_reclaim_stale(text: str) -> str:
+    """Fold card 20261106-b-2c3d2f Decision 2's one accepted divergence:
+    Rust's `stale bookkeeping` entries and Python's `would close` lines
+    for the same task id, role, agent and pane. Both shapes rewrite to the
+    same `  RECLAIM <task> (...)` line; nothing else in the text changes.
+    """
+    text = _RECLAIM_CANDIDATE_RE.sub(r"  RECLAIM \1 \2", text)
+
+    def fold_section(match: re.Match[str]) -> str:
+        """Fold every `stale bookkeeping` entry inside the matched section."""
+        return "".join(
+            _STALE_ENTRY_RE.sub(r"  RECLAIM \1 \2", line) + "\n"
+            for line in match.group(1).splitlines()
+        )
+
+    return _STALE_SECTION_RE.sub(fold_section, text)
+
+
+# Card 20261116-b-9dbf0d classes A/B, stdout half: `workers`' live-count
+# summary line now reads "nexus sessions" where Python's oracle (predating
+# the orchestrator->nexus rename for this compound noun) reads
+# "orchestrators" — not a plain word-for-word rename `translate_prose_
+# roles` already covers, since that function deliberately skips a role
+# word immediately followed by another word character, such as this
+# plural "s" (see its `_PROSE_ROLE_RE` lookahead). Anchored to the full
+# trailing phrase, so a differently-worded summary line still diverges.
+_NEXUS_SESSIONS_RE = re.compile(
+    r"\borchestrators(?= \d+ \(excluded from workers; "
+    r"they do not count against max_concurrent\))"
+)
+
+
 def normalize_role_names(text: str) -> str:
+    """Fold every old->new role-rename divergence (prose words, short
+    codes, the reseed human-name substitution, and the "nexus sessions"
+    compound noun) out of live Python prose."""
     text = _SEED_PROMPT_HUMAN_RE.sub("Do not assume the human is present.", text)
+    text = _NEXUS_SESSIONS_RE.sub("nexus sessions", text)
     text = translate_prose_roles(text)
     return _SHORT_CODE_RE.sub(lambda m: _OLD_SHORT_CODE_RENAME[m.group(1)], text)
 
@@ -775,6 +963,68 @@ _CD_PATH_RE = re.compile(
     r"^cd ('(?:[^']|'\"'\"')*'|(?:[A-Za-z0-9_@%+=:,./-]+|"
     r"<PROJECT:[A-Za-z0-9_-]+>|<TASK:\d+>|<ID>)+)(?= && |$)"
 )
+
+# Card 20261116-b-9dbf0d class D: commit d2eedc5 made a dispatched/council
+# pane inherit the dispatcher's own resolved config/state dir via two extra
+# `--env` entries on `pane split`; Python's oracle predates that fix and
+# never sends them. Narrow to these two exact keys so a third, unrelated
+# `--env` entry (or either of these two with a different value shape) still
+# diverges.
+_RESOLVED_ENV_KEY_RE = re.compile(r"^(?:MULTIVERSE_CONFIG|MULTIVERSE_STATE_DIR)=")
+
+
+def _drop_resolved_env(call: list[str]) -> list[str]:
+    """Remove `call`'s `--env MULTIVERSE_CONFIG=...`/`--env
+    MULTIVERSE_STATE_DIR=...` pair if it is a `pane split` call (see the
+    class D comment above); any other call is returned unchanged."""
+    if call[:2] != ["pane", "split"]:
+        return call
+    out: list[str] = []
+    i = 0
+    while i < len(call):
+        if (call[i] == "--env" and i + 1 < len(call)
+                and _RESOLVED_ENV_KEY_RE.match(call[i + 1])):
+            i += 2
+            continue
+        out.append(call[i])
+        i += 1
+    return out
+
+
+# Card 20261116-b-9dbf0d classes A/B: `workers`' stalled-pane content-hash
+# detector (`mv_state::pane_watch_store`, backlog 20261115-b-59e017) reads
+# every live agent's pane once per render (`workers.rs::fetch_pane_hashes`,
+# `STALL_CONTENT_LINES = 200`); Python's oracle has no such store and never
+# issues these reads. Narrow to this exact shape so a differently sized or
+# differently targeted read still diverges.
+def _is_pane_watch_read(call: list[str]) -> bool:
+    """True for `workers`' per-live-pane stalled-content poll."""
+    return (len(call) == 5 and call[:2] == ["pane", "read"]
+            and call[3:] == ["--lines", "200"])
+
+
+# Card 20261116-b-9dbf0d class E: `mv_engine::runner::quote` wraps every
+# word of the launch command spliced after `cd ... && ` in single quotes
+# (`'fake-claude' '--model' ...`); Python's oracle joins the same words
+# bare. A `NAME=value` env-assignment prefix keeps its bare `NAME=`, only
+# the value quoted, the same way `quote_command_words` builds it.
+_QUOTED_WORD = r"(?:[A-Za-z_]\w*=)?'(?:[^']|'\"'\"')*'"
+_QUOTED_TAIL_RE = re.compile(r"^" + _QUOTED_WORD + r"(?: " + _QUOTED_WORD + r")*$")
+
+
+def _normalize_pane_run_tail(rest: str) -> str:
+    """Unquote a `cd ... && <tail>` tail to a plain space join, but only
+    when `rest` is *exactly* `" && "` followed by nothing but a sequence of
+    fully-quoted words end to end — so a genuinely different tail (extra
+    text, stray whitespace, a tail that was never quoted at all) is left
+    untouched and still compares byte-strict.
+    """
+    if not rest.startswith(" && "):
+        return rest
+    body = rest[4:]
+    if _QUOTED_TAIL_RE.fullmatch(body):
+        return " && " + " ".join(shlex.split(body))
+    return rest
 
 
 def normalize_herdr_calls(calls: list[list[str]], argv: list[str], *, rust: bool,
@@ -791,11 +1041,22 @@ def normalize_herdr_calls(calls: list[list[str]], argv: list[str], *, rust: bool
        after its second workspace-list/pane-list pair. Only Rust may omit
        that one call from comparison; all other fleet listings stay ordered.
     3. Rust always shell-quotes pane-run's initial cd path. Canonicalize just
-       that word, preserving the entire remaining script byte-for-byte.
+       that word, preserving the entire remaining script byte-for-byte. A
+       launch-command tail fully composed of `runner.rs::quote`d words
+       (card 20261116-b-9dbf0d class E) compares by its shlex tokens instead
+       of by its quoting; anything else after the cd word, including a bare
+       (unquoted) tail, is untouched and stays byte-strict.
     4. Host load changes counts of identical consecutive read-only polls.
        Fold each run to one on both sides, in every command. Only exact
        agent-list/get and visible agent/pane reads qualify; writes, other
        reads, different targets, and intervening calls stay ordered.
+    5. `pane split`'s dispatcher-resolved `MULTIVERSE_CONFIG`/
+       `MULTIVERSE_STATE_DIR` `--env` pair (class D) and `workers`'
+       per-live-pane stalled-content read (classes A/B) are dropped
+       wherever they occur, in every command — Python never issues either.
+    6. `start`/`start --reseed`'s one extra `['pane','list','--workspace',X]`
+       issued immediately after `agent list` (class F, `find_labelled_nexus_
+       pane`'s reseed-target fallback) is dropped, Rust-only.
 
     These are hardened beyond Python intentionally (runner's prompt landing
     checks and start's fresh duplicate-Nexus guard). No sorting, global read
@@ -810,7 +1071,7 @@ def normalize_herdr_calls(calls: list[list[str]], argv: list[str], *, rust: bool
         if polling and collapsed and collapsed[-1] == call:
             continue
         collapsed.append(call)
-    calls = collapsed
+    calls = [_drop_resolved_env(call) for call in collapsed if not _is_pane_watch_read(call)]
     if argv[:1] not in (["dispatch"], ["council"], ["start"]):
         return calls
     if bindings is None:
@@ -829,6 +1090,12 @@ def normalize_herdr_calls(calls: list[list[str]], argv: list[str], *, rust: bool
                 active = None
                 i += 2
                 continue
+        if (rust and argv[:1] == ["start"] and call == ["agent", "list"]
+                and len(calls[i + 1:i + 2]) == 1
+                and len(calls[i + 1]) == 4 and calls[i + 1][:3] == ["pane", "list", "--workspace"]):
+            out.append(call)
+            i += 2
+            continue
         if (not active and argv[:1] == ["start"] and len(call) == 5
                 and call[:2] == ["agent", "read"] and call[3:] == ["--source", "visible"]
                 and call[2] in bindings):
@@ -857,7 +1124,8 @@ def normalize_herdr_calls(calls: list[list[str]], argv: list[str], *, rust: bool
             match = _CD_PATH_RE.match(call[3])
             if match:
                 path = shlex.split(match.group(1))[0]
-                call = call[:3] + ["cd " + shlex.quote(path) + call[3][match.end():]]
+                rest = _normalize_pane_run_tail(call[3][match.end():])
+                call = call[:3] + ["cd " + shlex.quote(path) + rest]
         out.append(call)
         if len(call) == 4 and call[:2] == ["agent", "rename"]:
             active = (call[3], call[2])
@@ -892,6 +1160,8 @@ def normalize_council_calls(calls: list[list[str]], argv: list[str], *, rust: bo
                 targets[call[pane_index]] = targets[call[2]] = call[2]
 
     def seat(call: list[str]) -> str | None:
+        """The seat name owning `call`'s target, or `None` if untargeted
+        (i.e. it belongs to the shared, non-seat stream)."""
         if len(call) >= 3 and call[0] in ("agent", "pane"):
             return targets.get(call[2])
         return None
@@ -950,6 +1220,9 @@ def _brief_facts(text: str) -> tuple[str, tuple[str, ...], str, str] | None:
 
 
 def _tree_contents_match(relpath: str, python: str | None, rust: str | None) -> bool:
+    """True if two implementations' content for `relpath` agree — either
+    byte-for-byte, or, for a file matching `_PROMPT_TREE_EXCEPTIONS`, on
+    just the narrow set of facts that exception allows to differ."""
     if python is None or rust is None:
         return python == rust
     for pattern, kind in _PROMPT_TREE_EXCEPTIONS:
@@ -968,6 +1241,11 @@ def _tree_contents_match(relpath: str, python: str | None, rust: str | None) -> 
 
 
 def compare(py_run: SequenceRun, rs_run: SequenceRun) -> list[str]:
+    """Diff two implementations' runs of the same sequence: step count,
+    ordered Herdr calls (allowlist-normalized), exit code, stdout/stderr
+    (role/dry-run/reclaim-normalized), and the final durable-file tree.
+    Returns a human-readable diff line per divergence found, empty if none.
+    """
     diffs: list[str] = []
     p_bindings: dict[str, str] = {}
     r_bindings: dict[str, str] = {}
@@ -999,6 +1277,9 @@ def compare(py_run: SequenceRun, rs_run: SequenceRun) -> list[str]:
         if is_dry_run_argv(p.argv):
             p_stdout = normalize_dry_run(p_stdout)
             r_stdout = normalize_dry_run(r_stdout)
+        if is_reclaimable_argv(p.argv):
+            p_stdout = normalize_reclaim_stale(p_stdout)
+            r_stdout = normalize_reclaim_stale(r_stdout)
         if p_stdout != r_stdout:
             diffs.append(
                 f"{label}: stdout mismatch\n"
@@ -1096,6 +1377,9 @@ def self_test() -> None:
 
 def run_seed(seed: int, length: int, python_repo: str, rust_bin: str,
              fake_herdr_bin: str, keep_sandboxes: bool):
+    """Generate one seed's sequence, run it against both implementations,
+    and return `(seed, non-probe writes, diffs, python sandbox root, rust
+    sandbox root)` — the unit of work handed to the process pool."""
     actions = gen_sequence(random.Random(seed), length)
     py_run = run_sequence(actions, impl="python", python_repo=python_repo,
                           rust_bin=None, keep_sandbox=keep_sandboxes,
@@ -1107,6 +1391,9 @@ def run_seed(seed: int, length: int, python_repo: str, rust_bin: str,
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse CLI args and either self-test the normalizers, or build Rust
+    and run the requested number of fuzz sequences (in parallel if
+    `--jobs` > 1), printing each divergence found."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--self-test", action="store_true",
                         help="check comparison normalization without an oracle or Rust build")

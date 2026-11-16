@@ -1,0 +1,48 @@
+# Secrets-scan config for this repository (herdr-multiverse itself, not the
+# fleet-wide multiverse merge/release gate, which is designed separately).
+#
+# Extends gitleaks' default ruleset rather than replacing it, and allowlists
+# only this repo's own known-fake credential fixtures: exact file path plus
+# a regex matching the specific placeholder text, never a blanket path
+# allow. A real secret landing in one of these files still trips the scan.
+#
+# gitleaks' `git` subcommand (used here and in CI, pinned to v8.21.2) does
+# not honor the newer `[[allowlists]]` array-of-tables form for history
+# scans in that version -- verified empirically against the pinned binary.
+# The single legacy `[allowlist]` table below works across both the pinned
+# CI version and newer local installs, so it is the only form used here.
+#
+# Run locally with: gitleaks git --config .gitleaks.toml
+
+title = "herdr-multiverse"
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''^crates/mv-core/src/redact\.rs$''',
+  '''^conformance/scenarios/inspect-preserves-content-warns-audit-failure\.json$''',
+]
+regexes = [
+  # crates/mv-core/src/redact.rs: synthetic credential-shaped strings the
+  # redactor's own tests assert get masked (prefixed tokens, an AWS-shaped
+  # access key id, assignment-style secrets, a PEM header with a fake body)
+  # -- never real credentials.
+  '''sk-(?:fake-)?(?:1234567890|other-0987654321)''',
+  '''ghp_fake1234567890''',
+  '''xoxb-fake1234567890''',
+  '''glpat-abcdefghijklmnop''',
+  '''(?:AKIA|ASIA)1234567890ABCDEF''',
+  '''abc123xyz(?:def)?''',
+  '''hunter2hunter2''',
+  '''supersecret(?:value)?''',
+  '''key-secret''',
+  '''private-material''',
+  '''fake-bearer-token''',
+  # conformance/scenarios/inspect-preserves-content-warns-audit-failure.json:
+  # a sandboxed `inspect` scenario asserting that the CLI's inspect command
+  # shows file content verbatim (redaction there is audit-log-only) -- the
+  # token is a fixed placeholder, not a live credential.
+  '''abcdef1234567890''',
+]

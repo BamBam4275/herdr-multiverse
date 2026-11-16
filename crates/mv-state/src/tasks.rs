@@ -147,11 +147,20 @@ pub fn safe_lane_root(project_root: &Path, lane_task_id: &str) -> Option<PathBuf
     )
 }
 
-fn status_path_under(parent: &Path, task_id: &str) -> PathBuf {
-    parent
-        .join(".multiverse/tasks")
-        .join(task_id)
-        .join("status")
+/// `None` when `task_id` is not a single identifier component — the same
+/// guard [`safe_lane_root`] applies to `lane_task_id`, just above, before
+/// either is joined into a path. A hostile `task_id` (e.g. `../x`) must
+/// never be joined past `.multiverse/tasks/`.
+fn status_path_under(parent: &Path, task_id: &str) -> Option<PathBuf> {
+    if !mv_core::id::is_valid_identifier(task_id) {
+        return None;
+    }
+    Some(
+        parent
+            .join(".multiverse/tasks")
+            .join(task_id)
+            .join("status"),
+    )
 }
 
 fn read_status_maybe_since(
@@ -176,19 +185,24 @@ pub fn read_writer_status(
 ) -> Option<TaskStatus> {
     let since = since.and_then(offset_to_system_time);
     if let Some(lane) = safe_lane_root(root, lane_task_id) {
-        if let Some(status) = read_status_maybe_since(&status_path_under(&lane, task_id), since) {
+        if let Some(status) =
+            status_path_under(&lane, task_id).and_then(|path| read_status_maybe_since(&path, since))
+        {
             return Some(status);
         }
     }
-    read_status_maybe_since(&status_path_under(root, task_id), since)
+    status_path_under(root, task_id).and_then(|path| read_status_maybe_since(&path, since))
 }
 
 fn lane_holds_current_status(root: &Path, task: &SweepTask) -> bool {
     let Some(lane) = safe_lane_root(root, lane_task_id(task)) else {
         return false;
     };
+    let Some(path) = status_path_under(&lane, &task.task_id) else {
+        return false;
+    };
     read_status_maybe_since(
-        &status_path_under(&lane, &task.task_id),
+        &path,
         task.started_at
             .or(task.dispatched_at)
             .and_then(offset_to_system_time),
@@ -267,8 +281,16 @@ const MAX_REASON_BYTES: usize = 4096;
 /// crate already uses for `#<line>`).
 #[derive(Debug, Default, Clone)]
 pub struct OutcomeTargets {
+    /// Ordinals of every `event=result`/`event=supersede` line that carries
+    /// a complete set of outcome fields — the only lines `--supersedes`/
+    /// `--acknowledges` may name.
     pub targetable: BTreeSet<u64>,
+    /// Ordinal of an already-superseded target mapped to the
+    /// `(status, state)` it was corrected to, so a repeat of the same
+    /// correction can be recognized as a no-op instead of a conflict.
     pub applied: BTreeMap<u64, (String, String)>,
+    /// Ordinal mapped to that line's own `when`, kept only so error text can
+    /// list known outcome lines for a human to recognize.
     pub when_by_ordinal: BTreeMap<u64, String>,
 }
 
@@ -382,6 +404,29 @@ fn known_lines_listing(when_by_ordinal: &BTreeMap<u64, String>) -> String {
         .join("\n")
 }
 
+/// Rejects a `task`/`status`/`state` value that could smuggle a duplicate
+/// field into the tab-separated routing-log line: a tab, CR, or LF breaks
+/// the line's own field separator, and `=` lets the value be read back as
+/// `key=value` once it lands inside a field that is itself `key=<this>`
+/// (card `20261116-b-5f49bd` — a tab in `--state` let a duplicate `status=`
+/// field through, after which `outcome_targets` and `current_outcome_fields`
+/// disagreed about what the line said). Leading/trailing space is rejected
+/// too, as a value that was never meant to look like this.
+fn validate_log_field(flag: &str, value: &str) -> Result<(), String> {
+    if value.contains(['\t', '\r', '\n', '=']) {
+        return Err(format!(
+            "{flag}: must not contain a tab, carriage return, line feed, or '=' — any of those \
+             could smuggle an extra field into the tab-separated routing-log line (got {value:?})"
+        ));
+    }
+    if value.starts_with(' ') || value.ends_with(' ') {
+        return Err(format!(
+            "{flag}: must not have a leading or trailing space (got {value:?})"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_reason(reason: &str) -> Result<(), SupersedeError> {
     let bytes = reason.as_bytes();
     if bytes.contains(&0) {
@@ -403,12 +448,19 @@ fn validate_reason(reason: &str) -> Result<(), SupersedeError> {
 /// (`clippy::result_large_err`).
 #[derive(Debug)]
 pub struct ConflictingSupersede {
+    /// The task whose outcome record is being superseded.
     pub task: String,
+    /// Ordinal of the outcome record the new correction targets.
     pub supersedes: u64,
+    /// `when` of the correction already on file for this target.
     pub when: String,
+    /// `status` the existing correction recorded.
     pub existing_status: String,
+    /// `state` the existing correction recorded.
     pub existing_state: String,
+    /// `status` the new, refused correction tried to record.
     pub attempted_status: String,
+    /// `state` the new, refused correction tried to record.
     pub attempted_state: String,
 }
 
@@ -441,6 +493,8 @@ pub enum SupersedeError {
     MissingReason { task: String, supersedes: u64 },
     #[error("--reason: {0}")]
     InvalidReason(String),
+    #[error("{0}")]
+    InvalidField(String),
     #[error(
         "{task} has no outcome record at line {supersedes} to supersede.\nknown outcome record \
          lines for {task}:\n{listing}"
@@ -474,6 +528,9 @@ pub fn append_supersede_if_absent(
     revisions: i64,
     when: Option<OffsetDateTime>,
 ) -> Result<bool, SupersedeError> {
+    validate_log_field("--supersede", task).map_err(SupersedeError::InvalidField)?;
+    validate_log_field("--status", status).map_err(SupersedeError::InvalidField)?;
+    validate_log_field("--state", state).map_err(SupersedeError::InvalidField)?;
     if reason.is_empty() {
         return Err(SupersedeError::MissingReason {
             task: task.to_string(),
@@ -544,6 +601,8 @@ pub enum AcknowledgeError {
         acknowledges: u64,
         listing: String,
     },
+    #[error("{0}")]
+    InvalidField(String),
     #[error(transparent)]
     Log(#[from] LogError),
 }
@@ -559,6 +618,7 @@ pub fn append_acknowledge_if_absent(
     acknowledges: u64,
     when: Option<OffsetDateTime>,
 ) -> Result<bool, AcknowledgeError> {
+    validate_log_field("--acknowledge", task).map_err(AcknowledgeError::InvalidField)?;
     let log = ProjectLog::new(root);
     let lock = log.lock()?;
     let targets = outcome_targets(root, task);
@@ -588,6 +648,7 @@ pub fn append_acknowledge_if_absent(
 /// sweep's reconcile/reclaim comparisons need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveAgent {
+    /// The Herdr pane id this live agent occupies.
     pub pane_id: String,
 }
 
@@ -598,8 +659,14 @@ pub struct LiveAgent {
 /// and fake keeps compiling unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveAgentStatus {
+    /// The Herdr pane id this live agent occupies.
     pub pane_id: String,
+    /// The agent's dispatch-time name, when Herdr's listing includes one —
+    /// used to confirm a pane's current occupant still matches who it was
+    /// handed to, not just that the pane id is still live.
     pub name: Option<String>,
+    /// The agent's current Herdr status token, when known — lets a reclaim
+    /// confirmation check readiness without a second round trip.
     pub status: Option<AgentState>,
 }
 
@@ -613,10 +680,37 @@ pub struct LiveAgentStatus {
 /// session now answering to the same name in the same pane — not a stale
 /// read of the one it found before. `None` means "can't tell" and must
 /// never be read as "no change" or "reset to zero".
+///
+/// `cwd` and `terminal_id` (card `20261106-b-9d70c7`) exist for the same
+/// reason: a reissued deterministic name occupying a *recycled* pane id
+/// (after a Herdr restart) still matches on name, pane id, and even
+/// readiness — `unfinished_agent_names` is empty in this port, so
+/// uniqueness at mint time is only the live `agent list`. `cwd` is the
+/// one field here that is actually dispatch-unique for a task with its
+/// own worktree (`occupant_cwd_confirms_lane`'s own caller requires it to
+/// canonicalize to that lane). `terminal_id` is carried for the same
+/// "can't tell" posture but is not itself a gate: this port has no
+/// evidence it survives a Herdr restart, only that `fake-herdr` derives
+/// it from the pane id (so a unit test against the fake could not prove
+/// reuse with it either way).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConfirmation {
+    /// Whether the confirmed agent is currently ready for input.
     pub ready: bool,
+    /// Herdr's state-change counter at confirmation time, when the
+    /// implementor can read it. `None` means "can't tell"; a lower value
+    /// than one captured earlier proves a different session now answers to
+    /// this name in this pane (see the struct doc above).
     pub state_change_seq: Option<u64>,
+    /// The confirmed agent's current working directory, when known — the
+    /// one field here that is dispatch-unique for a task with its own
+    /// worktree, so callers use it to confirm the occupant is actually
+    /// this task's lane and not a reissued name elsewhere.
+    pub cwd: Option<PathBuf>,
+    /// The confirmed agent's terminal id, when known. Carried for the same
+    /// "can't tell" posture as `state_change_seq`, but is not itself a gate
+    /// — this port has no evidence it survives a Herdr restart.
+    pub terminal_id: Option<String>,
 }
 
 /// Reads Herdr's live agent list and closes a settled pane.
@@ -625,7 +719,12 @@ pub struct LiveConfirmation {
 /// `HerdrPanes` already establishes, so `cargo test` never reaches a real
 /// Herdr socket.
 pub trait AgentPanes {
+    /// Every pane Herdr currently reports as live. A failed probe must
+    /// collapse to an empty list here — callers that need to tell that
+    /// apart from a confirmed-empty fleet should use
+    /// [`AgentPanes::list_checked`] instead.
     fn list(&mut self) -> Vec<LiveAgent>;
+    /// Closes `pane_id`. Returns whether Herdr itself reported success.
     fn close(&mut self, pane_id: &str) -> bool;
 
     /// Same probe as [`AgentPanes::list`], but distinguishes "Herdr
@@ -683,10 +782,32 @@ pub trait AgentPanes {
         Some(LiveConfirmation {
             ready: agent.status.is_some_and(AgentState::is_ready_for_input),
             state_change_seq: None,
+            cwd: None,
+            terminal_id: None,
         })
+    }
+
+    /// Direct `pane get <pane_id>`'s own `label` right now — read
+    /// separately from [`AgentPanes::confirm_live`]'s `agent get <name>`
+    /// because the label lives on the *pane* record, not the agent's.
+    /// `runner::pane_rename` always ends a dispatched pane's label with
+    /// the dispatching task's own id, so this is the occupancy witness
+    /// `supersede_collision_predecessor` and the reclaim paths use to
+    /// catch a reissued name occupying a pane this codebase itself
+    /// labelled for a different task (card `20261106-b-9d70c7`). `None`
+    /// means "can't tell" (the read failed, or the reply had no label at
+    /// all) — the caller must fail closed, exactly like every other probe
+    /// failure here. Default forwards to nothing (`None`): a fake that
+    /// never models labels keeps compiling but never confirms this gate.
+    fn pane_label(&mut self, pane_id: &str) -> Option<String> {
+        let _ = pane_id;
+        None
     }
 }
 
+/// The real [`AgentPanes`] implementation, talking to Herdr over the
+/// `run::run`/`argv` subprocess helpers. Unit-less marker type: all state
+/// lives in the Herdr process itself, not here.
 pub struct HerdrAgents;
 
 impl AgentPanes for HerdrAgents {
@@ -780,10 +901,33 @@ impl AgentPanes for HerdrAgents {
             .as_str()
             .and_then(|s| s.parse::<AgentState>().ok())
             .is_some_and(AgentState::is_ready_for_input);
+        // Python `_cwd_of`: `foreground_cwd`, else `cwd`.
+        let cwd = agent["foreground_cwd"]
+            .as_str()
+            .or_else(|| agent["cwd"].as_str())
+            .map(PathBuf::from);
+        let terminal_id = agent["terminal_id"].as_str().map(str::to_owned);
         Some(LiveConfirmation {
             ready,
             state_change_seq: agent["state_change_seq"].as_u64(),
+            cwd,
+            terminal_id,
         })
+    }
+
+    /// `pane get <pane_id>`, sanity-checking the reply actually names the
+    /// pane asked about before trusting its `label` — the same posture
+    /// `confirm_live` already takes with `agent get`'s own `pane_id`.
+    fn pane_label(&mut self, pane_id: &str) -> Option<String> {
+        let result = run::run(&argv::pane_get(pane_id), None).ok()?;
+        if !result.ok() {
+            return None;
+        }
+        let pane = result.payload.as_ref()?.get("result")?.get("pane")?;
+        if pane["pane_id"].as_str() != Some(pane_id) {
+            return None;
+        }
+        pane["label"].as_str().map(str::to_owned)
     }
 }
 
@@ -797,11 +941,23 @@ impl AgentPanes for HerdrAgents {
 /// whether a `result`/`supersede` event already closed the loop.
 #[derive(Debug, Clone)]
 pub struct SweepTask {
+    /// This task's own identifier, as used under `.multiverse/tasks/`.
     pub task_id: String,
+    /// The branch this task's dispatch record named — `worktrees::
+    /// dispatched_lane_is_clean`'s input for reclaim condition 3.
     pub branch: String,
+    /// The role this task was dispatched to (e.g. Builder, Critic) — feeds
+    /// [`is_writing_role`] so write-capable roles get the stricter
+    /// dirty-lane handling non-writing roles don't need.
     pub role: String,
+    /// The most recently known pane for this task: `result`'s own `pane`
+    /// field when a result was already written, else `started`'s.
     pub pane: Option<String>,
+    /// This task's status *file* contents, when readable — distinct from
+    /// [`Self::status`] (the routing log's recorded outcome).
     pub file_status: Option<TaskStatus>,
+    /// Whether an `event=result`/`event=supersede` record already closed
+    /// this task's loop in the routing log.
     pub recorded: bool,
     /// The Herdr agent name this task was dispatched under (`agent=` on
     /// its `dispatch` line) — reclaim's same-agent-name confirmation
@@ -1045,6 +1201,34 @@ pub fn lane_task_id(task: &SweepTask) -> &str {
         .unwrap_or(&task.task_id)
 }
 
+/// Whether a pane's own label (`AgentPanes::pane_label`) names `task_id`
+/// as a contiguous substring — the occupancy witness
+/// `supersede_collision_predecessor` and `reclaimable_panes` both require
+/// in addition to the bare name match, since a reissued dispatch name can
+/// still answer at a pane this codebase labelled for someone else's task
+/// (card `20261106-b-9d70c7`). `None` (the read failed, or found no
+/// label) never confirms — the caller fails closed exactly like every
+/// other probe failure here.
+pub fn label_names_task(label: Option<&str>, task_id: &str) -> bool {
+    label.is_some_and(|label| label.contains(task_id))
+}
+
+/// Whether `cwd` canonicalizes to the same path as `lane_root` — the
+/// second occupancy witness alongside [`label_names_task`], required only
+/// when the task actually has its own worktree (card `20261106-b-9d70c7`).
+/// `None`, or either path failing to canonicalize (gone, or never
+/// existed), is "can't tell" and never reads as a match.
+pub fn cwd_confirms_lane(cwd: Option<&Path>, lane_root: &Path) -> bool {
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    let (Ok(cwd), Ok(lane_root)) = (std::fs::canonicalize(cwd), std::fs::canonicalize(lane_root))
+    else {
+        return false;
+    };
+    cwd == lane_root
+}
+
 /// Whether `task`'s own lane still holds uncommitted work — the one
 /// contradiction `reconcile` refuses to paper over: a status file saying
 /// `done` while the tree disagrees (`_dirty_done`/`_dirty_lane_detail`).
@@ -1056,11 +1240,11 @@ pub fn lane_task_id(task: &SweepTask) -> &str {
 /// that fails to run, or reports anything other than a clean exit, is
 /// likewise read as "nothing to show" rather than "dirty" — a failed
 /// read is not evidence either way.
-fn lane_is_dirty(root: &Path, task: &SweepTask) -> bool {
+fn lane_is_dirty(root: &Path, task: &SweepTask, cache: &mut LaneProbeCache) -> bool {
     if task.file_status != Some(TaskStatus::Done) || !is_writing_role(&task.role) {
         return false;
     }
-    lane_porcelain(root, lane_task_id(task)).is_some_and(|text| !text.is_empty())
+    cached_lane_porcelain(root, lane_task_id(task), cache).is_some_and(|text| !text.is_empty())
 }
 
 /// What's dirty in an unrecorded writing-role `done` lane, or `None` when
@@ -1069,11 +1253,31 @@ fn lane_is_dirty(root: &Path, task: &SweepTask) -> bool {
 /// (modified/untracked counts and up to three paths; no commits-ahead).
 /// `cmd_sweep` prints this as Python's `needs a decision:` line
 /// (`cli.py:12882-12899`).
+///
+/// The dirty check and the detail text share a single
+/// `git status --porcelain` spawn — this function used to probe the same
+/// worktree twice (card `20261115-b-ca59eb`).
 pub fn dirty_done_detail(root: &Path, task: &SweepTask) -> Option<String> {
-    if task.recorded || !lane_is_dirty(root, task) {
+    let mut cache = LaneProbeCache::new();
+    dirty_done_detail_cached(root, task, &mut cache)
+}
+
+/// Like [`dirty_done_detail`], but reuses a [`LaneProbeCache`] the caller
+/// already has instead of spawning a fresh one — what
+/// `collect_dirty_details` calls, once per task, off the exact cache
+/// `sweep_project_with_live`'s own reconcile/reclaim gating already built
+/// this pass, so a lane that check already probed is a cache hit here,
+/// never a second `git status --porcelain` for the same worktree (card
+/// `20261115-b-1ba758`).
+pub fn dirty_done_detail_cached(
+    root: &Path,
+    task: &SweepTask,
+    cache: &mut LaneProbeCache,
+) -> Option<String> {
+    if task.recorded || !lane_is_dirty(root, task, cache) {
         return None;
     }
-    let porcelain = lane_porcelain(root, lane_task_id(task))?;
+    let porcelain = cached_lane_porcelain(root, lane_task_id(task), cache)?;
     if porcelain.is_empty() {
         return None;
     }
@@ -1116,11 +1320,23 @@ fn describe_dirty(porcelain: &str) -> String {
 /// not be read; a caller that needs "unreadable" to mean something other
 /// than "clean" (`--reclaimable`'s own gate) checks the directory itself
 /// first rather than trusting this return alone.
+///
+/// Spawns `git` every time it is called; callers that may ask about the
+/// same lane more than once in a single sweep/reconcile/close-stranded
+/// pass (a lane revisited by a later `--into` dispatch sharing the same
+/// branch, or [`dirty_done_detail`] following [`lane_is_dirty`]) should
+/// go through [`cached_lane_porcelain`] instead so the second ask costs a
+/// map lookup, not a second subprocess — git's own status plumbing has no
+/// way to answer for more than one worktree in a single invocation, so a
+/// repeat ask of the *same* worktree is the only spawn this file can avoid
+/// (card `20261115-b-ca59eb`, mirroring `board_data`'s `LaneProbeCache`).
 fn lane_porcelain(root: &Path, lane_task_id: &str) -> Option<String> {
     let lane_root = root.join(".multiverse/worktrees").join(lane_task_id);
     if !lane_root.is_dir() {
         return None;
     }
+    #[cfg(test)]
+    LANE_GIT_PROBES.with(|count| count.set(count.get() + 1));
     match std::process::Command::new("git")
         .arg("-C")
         .arg(&lane_root)
@@ -1132,6 +1348,53 @@ fn lane_porcelain(root: &Path, lane_task_id: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+// Counts actual `git` spawns from `lane_porcelain` — a thread-local so
+// parallel `#[test]` functions (cargo's default) never see each other's
+// probes, since each test runs on its own OS thread. Test-only: this is
+// the "counting fake" a real git runner seam does not exist for here,
+// proving a pass's [`LaneProbeCache`] actually elides a repeat spawn
+// rather than merely returning the same string by coincidence. Mirrors
+// `board_data`'s `LANE_GIT_PROBES`.
+#[cfg(test)]
+thread_local! {
+    static LANE_GIT_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_lane_git_probe_count() {
+    LANE_GIT_PROBES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn lane_git_probe_count() -> u32 {
+    LANE_GIT_PROBES.with(std::cell::Cell::get)
+}
+
+/// One pass's worth of `lane_porcelain` results, keyed by
+/// `lane_task_id`, scoped to a single [`sweep_project_with_live`] /
+/// [`reconcile_project`] / [`close_stranded`] / [`reclaimable_panes`]
+/// call — the unit of batching git's per-worktree status actually allows,
+/// since a `git status` reads one worktree's own index and cannot answer
+/// for several at once. Several historical task ids can name the same
+/// lane (a task dispatched `--into` an existing lane keeps dispatching
+/// more work into that same branch/worktree), and each one reaching the
+/// UNRECORDED-done check used to re-spawn `git` for a directory this same
+/// pass had already read.
+pub type LaneProbeCache = HashMap<String, Option<String>>;
+
+fn cached_lane_porcelain(
+    root: &Path,
+    lane_task_id: &str,
+    cache: &mut LaneProbeCache,
+) -> Option<String> {
+    if let Some(hit) = cache.get(lane_task_id) {
+        return hit.clone();
+    }
+    let result = lane_porcelain(root, lane_task_id);
+    cache.insert(lane_task_id.to_string(), result.clone());
+    result
 }
 
 /// A `done` outcome needs a readable, non-empty `result.md` in its own
@@ -1167,6 +1430,7 @@ fn is_reconcile_candidate(
     root: &Path,
     task: &SweepTask,
     is_working: &impl Fn(&str) -> bool,
+    cache: &mut LaneProbeCache,
 ) -> bool {
     if task.recorded {
         return false;
@@ -1177,7 +1441,7 @@ fn is_reconcile_candidate(
     if task.pane.as_deref().is_some_and(is_working) {
         return false;
     }
-    if lane_is_dirty(root, task) {
+    if lane_is_dirty(root, task, cache) {
         return false;
     }
     if task.file_status == Some(TaskStatus::Done) && !has_usable_result_for(root, task) {
@@ -1191,7 +1455,12 @@ fn is_reconcile_candidate(
 /// pane so `_close_settled_panes` can tidy it. Distinct from
 /// [`is_reconcile_candidate`], which sweep uses and which treats any live
 /// pane as still in flight.
-fn is_tasks_reconcile_candidate(root: &Path, task: &SweepTask, live: &[LiveAgentStatus]) -> bool {
+fn is_tasks_reconcile_candidate(
+    root: &Path,
+    task: &SweepTask,
+    live: &[LiveAgentStatus],
+    cache: &mut LaneProbeCache,
+) -> bool {
     if task.recorded || task.file_status.is_none() {
         return false;
     }
@@ -1203,7 +1472,7 @@ fn is_tasks_reconcile_candidate(root: &Path, task: &SweepTask, live: &[LiveAgent
             return false;
         }
     }
-    if lane_is_dirty(root, task) {
+    if lane_is_dirty(root, task, cache) {
         return false;
     }
     if task.file_status == Some(TaskStatus::Done) && !has_usable_result_for(root, task) {
@@ -1215,14 +1484,23 @@ fn is_tasks_reconcile_candidate(root: &Path, task: &SweepTask, live: &[LiveAgent
 /// Options for [`reconcile_project`] — the shared write path `tasks`
 /// listing (auto and `--reconcile`) and, next, `board` both call.
 pub struct ReconcileRequest<'a> {
+    /// Restrict reconcile to one task id, or scan every candidate task when
+    /// absent — `tasks --reconcile <id>` vs. a full sweep.
     pub only_task: Option<&'a str>,
     /// Close each just-recorded pane when a fresh listing shows it idle/done
     /// (never WORKING/BLOCKED). Python `reconcile(close_panes=...)`.
     pub close_panes: bool,
     /// Run `converge_stale` (auto-supersede then lease-expire AWAITING).
     pub expire_stale: bool,
+    /// Default lease length, in minutes, before an AWAITING task is treated
+    /// as stale by [`expire_awaiting`].
     pub lease_minutes: u32,
+    /// Per-account overrides of `lease_minutes`, keyed by the seat name a
+    /// task was dispatched under — [`expire_awaiting`]'s finding-4 gate.
     pub lease_overrides: &'a HashMap<String, u32>,
+    /// The instant this reconcile pass treats as "now", for every elapsed-
+    /// time comparison it makes — passed in rather than read live so a
+    /// caller's whole pass is consistent and a test can fix it.
     pub now: OffsetDateTime,
     /// Automatic listing must not guess when Herdr is down. Explicit
     /// `--reconcile` is allowed to record without a live listing.
@@ -1232,10 +1510,19 @@ pub struct ReconcileRequest<'a> {
 /// What [`reconcile_project`] actually wrote.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileOutcome {
+    /// Task ids whose settled-but-unrecorded outcome this pass just wrote
+    /// to the routing log.
     pub recorded: Vec<String>,
+    /// How many just-recorded panes this pass confirmed idle/done and
+    /// closed.
     pub closed_panes: usize,
+    /// How many AWAITING tasks this pass lease-expired.
     pub expired: usize,
+    /// Every auto-supersede this pass applied while converging stale tasks.
     pub superseded: Vec<SupersedeResult>,
+    /// Set when `require_live` was set and the live listing itself failed —
+    /// every other field is then left at its default, since this pass
+    /// refused to record anything without a live listing to check against.
     pub herdr_down: bool,
 }
 
@@ -1255,8 +1542,21 @@ pub fn reconcile_project(
         };
     }
     let live_status = live.unwrap_or_default();
-    let is_live = |pane: &str| live_status.iter().any(|agent| agent.pane_id == pane);
+    // Feeds `auto_supersede`/`expire_awaiting`'s own `is_awaiting` gate
+    // below, not a same-occupant check by itself: `None` when the pane id
+    // is gone from the listing, `Some(name)` (possibly empty) when it is
+    // still listed. Card 20261108-b-152b33 keeps the reused-pane half (a
+    // confirmed *different* name reads as gone); card 20261106-b-2c3d2f
+    // Decision 1 keeps a merely unconfirmed (missing/empty) name from
+    // reading as gone too.
+    let live_name = |pane: &str| {
+        live_status
+            .iter()
+            .find(|current| current.pane_id == pane)
+            .map(|current| current.name.clone().unwrap_or_default())
+    };
     let tasks = sweep_tasks(root);
+    let mut lane_probe_cache = LaneProbeCache::new();
 
     let mut recorded_ids = Vec::new();
     let mut recorded_panes: Vec<(String, Option<AgentState>, Option<String>)> = Vec::new();
@@ -1266,7 +1566,7 @@ pub fn reconcile_project(
                 continue;
             }
         }
-        if !is_tasks_reconcile_candidate(root, task, &live_status) {
+        if !is_tasks_reconcile_candidate(root, task, &live_status, &mut lane_probe_cache) {
             continue;
         }
         let status = task
@@ -1293,7 +1593,7 @@ pub fn reconcile_project(
     let mut expired = 0;
     if req.expire_stale {
         let mut remaining = sweep_tasks(root);
-        superseded = auto_supersede(root, &mut remaining, true, &is_live);
+        superseded = auto_supersede(root, &mut remaining, true, &live_name);
         let handled: HashSet<&str> = superseded.iter().map(|r| r.task_id.as_str()).collect();
         let expire_candidates: Vec<SweepTask> = remaining
             .iter()
@@ -1311,7 +1611,7 @@ pub fn reconcile_project(
             // call below does (critic-codex-areas.md H1).
             0,
             true,
-            &is_live,
+            &live_name,
         );
         expired = expiries.iter().filter(|expiry| expiry.recorded).count();
     }
@@ -1488,9 +1788,15 @@ fn record_reconciled(root: &Path, task_id: &str, status: TaskStatus, pane: Optio
 /// One project's `multiverse sweep` pass.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SweepReport {
+    /// How many tasks this pass found still unrecorded before it ran.
     pub in_progress_before: usize,
+    /// How many of those remain unrecorded after this pass — the delta
+    /// against [`Self::in_progress_before`] is what this pass settled.
     pub in_progress_after: usize,
+    /// How many settled-but-unrecorded tasks this pass just wrote an
+    /// outcome for.
     pub recorded: usize,
+    /// How many already-recorded tasks' still-open panes this pass closed.
     pub reclaimed: usize,
     /// AWAITING tasks [`expire_awaiting`] recorded `failed` this pass for
     /// outliving their lease (finding 4) — previews the would-be count
@@ -1521,6 +1827,17 @@ pub struct SweepReport {
     /// the pane vanished — Python's `awaiting_partial`, same exclusion
     /// rule as [`Self::awaiting_gone`].
     pub awaiting_partial: Vec<AwaitingNamed>,
+    /// Every unrecorded, writing-role, `done`-status task whose lane still
+    /// holds uncommitted work, keyed by `task_id` — [`dirty_done_detail`]'s
+    /// own text, computed once per task off this pass's own
+    /// [`LaneProbeCache`] (the same one `is_reconcile_candidate`'s own
+    /// `lane_is_dirty` check already built) rather than left for a caller
+    /// to recompute with a fresh cache of its own. `commands::sweep`'s
+    /// `dirty_done_notes` used to call [`dirty_done_detail`] again for
+    /// exactly these tasks after this pass had already probed their lane,
+    /// spawning `git status --porcelain` twice per lane each pass (card
+    /// `20261115-b-1ba758`); it now reads this field instead.
+    pub dirty_details: BTreeMap<String, String>,
 }
 
 /// One AWAITING task named in [`SweepReport::awaiting_gone`] or
@@ -1531,7 +1848,11 @@ pub struct SweepReport {
 /// unreadable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwaitingNamed {
+    /// The still-AWAITING task's own id.
     pub task_id: String,
+    /// Elapsed time since dispatch, pre-formatted for display (see the
+    /// struct doc above) — `"unknown age"` when `dispatched_at` itself
+    /// could not be read.
     pub age: String,
 }
 
@@ -1682,7 +2003,11 @@ pub fn sweep_project_with_live(
     let Some(live) = live else {
         // Herdr unreachable or itself reported failure: fail every leg
         // open for this project this pass, never promoting a failed
-        // probe into "every pane is gone" (finding 2).
+        // probe into "every pane is gone" (finding 2). The dirty-done scan
+        // is pure git, not Herdr, so it still runs here, same as every
+        // other branch below.
+        let mut lane_probe_cache = LaneProbeCache::new();
+        let dirty_details = collect_dirty_details(root, &tasks, &mut lane_probe_cache);
         return (
             SweepReport {
                 in_progress_before,
@@ -1694,6 +2019,7 @@ pub fn sweep_project_with_live(
                 expired_tasks: Vec::new(),
                 awaiting_gone: Vec::new(),
                 awaiting_partial: Vec::new(),
+                dirty_details,
             },
             tasks,
         );
@@ -1703,6 +2029,20 @@ pub fn sweep_project_with_live(
         live.iter()
             .any(|agent| agent.pane_id == pane && agent.status == Some(AgentState::Working))
     };
+    // Feeds `auto_supersede`/`expire_awaiting`/`is_awaiting`'s own gate
+    // below, not a same-occupant check by itself: `None` when the pane id
+    // is gone from the listing, `Some(name)` (possibly empty) when it is
+    // still listed. Card 20261108-b-152b33 keeps the reused-pane half (a
+    // confirmed *different* name reads as gone); card 20261106-b-2c3d2f
+    // Decision 1 keeps a merely unconfirmed (missing/empty) name from
+    // reading as gone too. Only `is_awaiting`'s own callers below need
+    // this; `reclaim_lane_checks` keeps the pane-only `is_live` above,
+    // matching its own existing occupant guard.
+    let pane_live_name = |pane: &str| {
+        live.iter()
+            .find(|current| current.pane_id == pane)
+            .map(|current| current.name.clone().unwrap_or_default())
+    };
 
     // `is_reconcile_candidate` only shells out to `git status --porcelain`
     // for a "done but unrecorded" writing-role task (`lane_is_dirty`). A
@@ -1710,11 +2050,17 @@ pub fn sweep_project_with_live(
     // warm `board --all` before the task-event index — costs more than it
     // saves: at fleet scale that is thousands of spawns for checks that
     // return false on `task.recorded` without touching git. Filter
-    // sequentially; git round-trips stay rare.
+    // sequentially; git round-trips stay rare. `lane_probe_cache` keeps
+    // those remaining round-trips to one spawn per distinct lane: a later
+    // `--into` dispatch naming the same worktree, or reclaim's own
+    // porcelain check after this pass just recorded the occupant, must
+    // not re-ask git for a directory this pass already read (card
+    // `20261115-b-ca59eb`, mirroring `board_data`'s `LaneProbeCache`).
+    let mut lane_probe_cache = LaneProbeCache::new();
     let stale_indices: Vec<usize> = tasks
         .iter()
         .enumerate()
-        .filter(|(_, task)| is_reconcile_candidate(root, task, &is_working))
+        .filter(|(_, task)| is_reconcile_candidate(root, task, &is_working, &mut lane_probe_cache))
         .map(|(i, _)| i)
         .collect();
     let recorded = stale_indices.len();
@@ -1747,7 +2093,7 @@ pub fn sweep_project_with_live(
             Some((task, agent))
         })
         .collect();
-    let lane_checks = reclaim_lane_checks(root, &tasks, &is_live);
+    let lane_checks = reclaim_lane_checks(root, &tasks, &is_live, &mut lane_probe_cache);
     let candidates: Vec<(&SweepTask, &LiveAgentStatus)> = pane_matched
         .into_iter()
         .filter(|(task, _)| reclaim_lane_is_safe(task, &lane_checks))
@@ -1810,7 +2156,7 @@ pub fn sweep_project_with_live(
     // same task under both `superseded` and `expired` (mirrors
     // `converge_stale`'s own `handled` filter, which holds "even with
     // `apply=False`, where nothing actually mutates").
-    let superseded = auto_supersede(root, &mut tasks, !dry_run, &is_live);
+    let superseded = auto_supersede(root, &mut tasks, !dry_run, &pane_live_name);
     let handled: HashSet<&str> = superseded.iter().map(|r| r.task_id.as_str()).collect();
     let expire_candidates: Vec<SweepTask> = tasks
         .iter()
@@ -1826,7 +2172,7 @@ pub fn sweep_project_with_live(
         now,
         sleep_minutes,
         !dry_run,
-        &is_live,
+        &pane_live_name,
     );
     let expired = if dry_run {
         expiries.len()
@@ -1850,7 +2196,10 @@ pub fn sweep_project_with_live(
         .collect();
     let mut awaiting_gone = Vec::new();
     let mut awaiting_partial = Vec::new();
-    for task in tasks.iter().filter(|task| is_awaiting(task, &is_live)) {
+    for task in tasks
+        .iter()
+        .filter(|task| is_awaiting(task, &pane_live_name))
+    {
         if just_expired.contains(task.task_id.as_str()) {
             continue;
         }
@@ -1889,6 +2238,12 @@ pub fn sweep_project_with_live(
         in_progress_before - recorded - superseded_in_progress - expired
     };
 
+    // Reuses `lane_probe_cache` as it stands after reconcile and reclaim
+    // have both already read it — a lane either of those already probed
+    // this pass is a cache hit here, never a second `git status
+    // --porcelain` spawn for the same worktree (card `20261115-b-1ba758`).
+    let dirty_details = collect_dirty_details(root, &tasks, &mut lane_probe_cache);
+
     (
         SweepReport {
             in_progress_before,
@@ -1900,9 +2255,30 @@ pub fn sweep_project_with_live(
             expired_tasks: expiries,
             awaiting_gone,
             awaiting_partial,
+            dirty_details,
         },
         tasks,
     )
+}
+
+/// Builds [`SweepReport::dirty_details`]: every task in `tasks` whose
+/// [`dirty_done_detail_cached`] is `Some`, keyed by `task_id`. Shares one
+/// [`LaneProbeCache`] across every task, so two historical task ids naming
+/// the same lane (a task dispatched `--into` another's worktree) probe
+/// that lane at most once between them, same as every other cache user in
+/// this file.
+fn collect_dirty_details(
+    root: &Path,
+    tasks: &[SweepTask],
+    cache: &mut LaneProbeCache,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for task in tasks {
+        if let Some(detail) = dirty_done_detail_cached(root, task, cache) {
+            out.insert(task.task_id.clone(), detail);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------
@@ -1936,9 +2312,16 @@ pub enum SweepLock {
     Held { pid: u64, since: String },
 }
 
+/// Tries, without blocking, to take the fleet-wide sweep lock at
+/// `<state_dir>/sweep.lock`. Returns [`SweepLock::Acquired`] with a guard
+/// that releases the flock on drop, or [`SweepLock::Held`] (never an error)
+/// when another process already holds it — only a genuine I/O failure
+/// opening or locking the file is an `Err`.
 pub fn try_acquire_sweep_lock(state_dir: &Path) -> std::io::Result<SweepLock> {
     let path = state_dir.join("sweep.lock");
     let mut file = crate::activity::support::open_lock_file(&path)?;
+    // Non-blocking: a second sweep must find out immediately that another
+    // one is running, never queue up and wait its turn.
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {
             use std::io::{Seek, SeekFrom, Write};
@@ -1947,6 +2330,9 @@ pub fn try_acquire_sweep_lock(state_dir: &Path) -> std::io::Result<SweepLock> {
                 std::process::id(),
                 mv_core::time::now_stamp(),
             );
+            // Stamp the lock file with who holds it and since when, purely
+            // for a human reading `SweepLock::Held`'s message — truncate
+            // first since a previous holder's marker may be longer.
             let _ = file.set_len(0);
             let _ = file.seek(SeekFrom::Start(0));
             let _ = file.write_all(payload.as_bytes());
@@ -1954,6 +2340,9 @@ pub fn try_acquire_sweep_lock(state_dir: &Path) -> std::io::Result<SweepLock> {
             Ok(SweepLock::Acquired(SweepLockGuard { file }))
         }
         Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => {
+            // Already held elsewhere. Read back the other holder's marker
+            // on a best-effort basis (see `SweepLock::Held`'s own doc) —
+            // this is purely informational, so a bad read never fails here.
             let (pid, since) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -2006,19 +2395,48 @@ pub const ABANDONED_PARTIAL_RESULT: &str = "abandoned-partial-result";
 /// `apply` was true, so a dry run and a real run share one shape.
 #[derive(Debug, Clone)]
 pub struct StrandedClosure {
+    /// The stranded task's own id.
     pub task_id: String,
+    /// The terminal status `close_stranded` determined for this task —
+    /// `Done` only for [`RECONCILED_BY_MERGE`], `Failed`/`Blocked` for
+    /// every other outcome constant above.
     pub status: TaskStatus,
+    /// Which of the outcome constants above (e.g. [`ABANDONED_UNMERGED`],
+    /// [`UNKNOWN_NEEDS_HUMAN`]) this determination landed on.
     pub state: &'static str,
+    /// Human-readable evidence backing this determination — what
+    /// `close_stranded` actually found on the branch/lane.
     pub evidence: String,
+    /// Whether this was actually written to the routing log, as opposed
+    /// to only previewed under a dry run.
     pub recorded: bool,
 }
 
-/// Whether `root`'s own `routing.log` shows `task` as AWAITING: no
-/// result/supersede event, no status file, and no live pane — the only
-/// state `close_stranded` (and `--reclaimable`'s own RECORDED gate, the
-/// opposite test) ever acts on.
-fn is_awaiting(task: &SweepTask, is_live: &impl Fn(&str) -> bool) -> bool {
-    !task.recorded && task.file_status.is_none() && !task.pane.as_deref().is_some_and(is_live)
+/// Whether `task` is a genuine AWAITING candidate for `close_stranded`/
+/// `expire_awaiting`/`auto_supersede`: not yet recorded, no status file,
+/// and the pane it started in can be *confirmed* gone — not merely
+/// unconfirmed. `live_name` answers "what does the live listing say
+/// occupies this pane right now": `None` when the pane id is not listed
+/// at all, `Some("")` when it is listed but no name could be read back,
+/// `Some(name)` when it is listed under `name`. A missing pane id, or a
+/// listed pane id under a confirmed *different*, non-empty name (card
+/// `20261108-b-152b33`: a reused pane id now hosting a different agent),
+/// both read as gone. A listed pane id with a missing/empty live name is
+/// neither — it is unconfirmed, and must not read as gone either (card
+/// `20261106-b-2c3d2f` Decision 1): recording `failed` for a still-live
+/// agent just because its name could not be read back invents a terminal
+/// outcome the agent may still be about to settle itself.
+fn is_awaiting(task: &SweepTask, live_name: &impl Fn(&str) -> Option<String>) -> bool {
+    !task.recorded
+        && task.file_status.is_none()
+        && match task.pane.as_deref() {
+            None => true,
+            Some(pane) => match live_name(pane) {
+                None => true,
+                Some(name) if name.is_empty() => false,
+                Some(name) => name != task.agent.as_deref().unwrap_or(""),
+            },
+        }
 }
 
 /// Where `task_id` left its `result.md`, if anywhere — the lane's own copy
@@ -2434,18 +2852,46 @@ pub fn record_stranded_closure(
 /// every determination and writes nothing (the dry run a caller should
 /// offer before ever passing `true`); `apply=true` records through
 /// [`record_stranded_closure`].
+///
+/// A failed live listing is a no-op — no task is examined, nothing is
+/// recorded, and this returns empty — never a fallback to treating the
+/// listing as empty. An empty listing reads as "every pane is confirmed
+/// gone", which `is_awaiting` would then take as license to close every
+/// AWAITING task; collapsing a *failed probe* into that same empty shape
+/// would fail open exactly when Herdr itself cannot be asked. The sole
+/// caller today, `close_stranded_and_report`
+/// (`crates/mv-cli/src/commands/tasks.rs`), already pre-checks this before
+/// calling in here; the guard now lives with the risk, not only with that
+/// one caller, so a future second call site cannot reintroduce it by
+/// omitting the same check.
 pub fn close_stranded(
     root: &Path,
     apply: bool,
     agents: &mut impl AgentPanes,
 ) -> Vec<StrandedClosure> {
+    // `list_checked`, not `list`: only it carries the agent name a
+    // same-occupant check needs (`list`'s own `LiveAgent` has no name
+    // field at all).
+    let Some(live) = agents.list_checked() else {
+        return Vec::new();
+    };
     let tasks = sweep_tasks(root);
-    let live = agents.list();
-    let is_live = |pane: &str| live.iter().any(|agent| agent.pane_id == pane);
+    // Feeds `is_awaiting`'s own gate below, not a same-occupant check by
+    // itself: `None` when the pane id is gone from the listing, `Some(name)`
+    // (possibly empty) when it is still listed. Card 20261108-b-152b33
+    // keeps the reused-pane half (a confirmed *different* name reads as
+    // gone); card 20261106-b-2c3d2f Decision 1 keeps a merely unconfirmed
+    // (missing/empty) name from reading as gone too.
+    let live_name = |pane: &str| {
+        live.iter()
+            .find(|current| current.pane_id == pane)
+            .map(|current| current.name.clone().unwrap_or_default())
+    };
+    let mut lane_probe_cache = LaneProbeCache::new();
 
     let mut closures = Vec::new();
     for task in &tasks {
-        if !is_awaiting(task, &is_live) {
+        if !is_awaiting(task, &live_name) {
             continue;
         }
         let lane = lane_task_id(task);
@@ -2475,14 +2921,16 @@ pub fn close_stranded(
                     (BranchVerdict::Gone, evidence) => {
                         (TaskStatus::Blocked, UNKNOWN_NEEDS_HUMAN, evidence)
                     }
-                    (BranchVerdict::Empty, evidence) => match lane_porcelain(root, lane) {
-                        Some(dirty) if !dirty.is_empty() => (
-                            TaskStatus::Blocked,
-                            STRANDED_UNCOMMITTED_WORK,
-                            stranded_uncommitted_evidence(&dirty),
-                        ),
-                        _ => (TaskStatus::Failed, ABANDONED_EMPTY_LANE, evidence),
-                    },
+                    (BranchVerdict::Empty, evidence) => {
+                        match cached_lane_porcelain(root, lane, &mut lane_probe_cache) {
+                            Some(dirty) if !dirty.is_empty() => (
+                                TaskStatus::Blocked,
+                                STRANDED_UNCOMMITTED_WORK,
+                                stranded_uncommitted_evidence(&dirty),
+                            ),
+                            _ => (TaskStatus::Failed, ABANDONED_EMPTY_LANE, evidence),
+                        }
+                    }
                     (BranchVerdict::Landed, evidence) => {
                         (TaskStatus::Done, RECONCILED_BY_MERGE, evidence)
                     }
@@ -2518,10 +2966,17 @@ pub fn close_stranded(
 /// whether it was actually recorded. Mirrors `tasks.SupersedeResult`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupersedeResult {
+    /// The stale record's own task id.
     pub task_id: String,
+    /// The terminal status this auto-supersede determined.
     pub status: TaskStatus,
+    /// Which auto-supersede reason this landed on — e.g.
+    /// [`SUPERSEDED_REDISPATCHED`] or [`SUPERSEDED_MERGED`].
     pub state: &'static str,
+    /// Human-readable reason text accompanying the correction.
     pub reason: String,
+    /// Whether this was actually appended to the routing log, as opposed
+    /// to only previewed under a dry run.
     pub recorded: bool,
 }
 
@@ -2609,7 +3064,7 @@ pub fn auto_supersede(
     root: &Path,
     tasks: &mut [SweepTask],
     apply: bool,
-    is_live: &impl Fn(&str) -> bool,
+    live_name: &impl Fn(&str) -> Option<String>,
 ) -> Vec<SupersedeResult> {
     let reuse_index = lane_reuse_index(tasks);
     let mut results = Vec::new();
@@ -2618,7 +3073,7 @@ pub fn auto_supersede(
         let is_candidate = if tasks[i].recorded {
             tasks[i].status == Some(TaskStatus::Blocked)
         } else {
-            is_awaiting(&tasks[i], is_live)
+            is_awaiting(&tasks[i], live_name)
         };
         if !is_candidate || !is_writing_role(&tasks[i].role) {
             continue;
@@ -2713,8 +3168,12 @@ pub fn auto_supersede(
 /// [`expire_awaiting`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseExpiry {
+    /// The AWAITING task's own id.
     pub task_id: String,
+    /// Free-text reason this lease was treated as expired, for display.
     pub state: String,
+    /// Whether this was actually recorded `failed` in the routing log, as
+    /// opposed to only previewed under a dry run.
     pub recorded: bool,
 }
 
@@ -2760,7 +3219,9 @@ fn has_current_status_file(root: &Path, task: &SweepTask) -> bool {
         .and_then(offset_to_system_time);
     let lane = safe_lane_root(root, lane_task_id(task));
     for parent in [lane.as_deref(), Some(root)].into_iter().flatten() {
-        let path = status_path_under(parent, &task.task_id);
+        let Some(path) = status_path_under(parent, &task.task_id) else {
+            continue;
+        };
         match std::fs::metadata(&path).and_then(|meta| meta.modified()) {
             Ok(modified) => {
                 let predates_run = since.is_some_and(|since| modified < since);
@@ -2804,10 +3265,13 @@ fn has_current_status_file(root: &Path, task: &SweepTask) -> bool {
 /// the generic lease sentence, and the file itself is left exactly where
 /// it was found — this never touches the branch, worktree, or result file.
 ///
-/// `is_live` is the same pane-liveness probe a caller already took for
+/// `live_name` is the same pane-liveness probe a caller already took for
 /// its own reconcile/reclaim pass — this never takes a probe of its own,
 /// so a caller folding this into one sweep never pays for (or risks
-/// disagreeing across) a second listing.
+/// disagreeing across) a second listing. It answers with the live name at
+/// a pane id, or `None` when the pane id is gone (see `is_awaiting`): a
+/// reused pane id now hosting a different, non-empty name reads as gone,
+/// but a listed pane id whose name could not be read back does not.
 #[allow(clippy::too_many_arguments)]
 pub fn expire_awaiting(
     root: &Path,
@@ -2817,11 +3281,11 @@ pub fn expire_awaiting(
     now: OffsetDateTime,
     sleep_minutes: i64,
     apply: bool,
-    is_live: &impl Fn(&str) -> bool,
+    live_name: &impl Fn(&str) -> Option<String>,
 ) -> Vec<LeaseExpiry> {
     let mut expiries = Vec::new();
     for task in tasks {
-        if !is_awaiting(task, is_live) {
+        if !is_awaiting(task, live_name) {
             continue;
         }
         let effective_lease = task
@@ -2913,8 +3377,11 @@ pub fn format_elapsed(elapsed: time::Duration) -> String {
 /// bookkeeping (the pane is already gone by some other route).
 #[derive(Debug, Clone)]
 pub struct ReclaimCandidate {
+    /// The recorded task's own id.
     pub task_id: String,
+    /// The role this task was dispatched to.
     pub role: String,
+    /// The still-open pane this candidate's reclaim would close.
     pub pane: String,
     /// Dispatched agent name (`agent=`), for `--reclaimable --yes`'s
     /// same-occupant confirmation.
@@ -2928,6 +3395,7 @@ fn reclaim_lane_checks(
     root: &Path,
     tasks: &[SweepTask],
     is_live: &impl Fn(&str) -> bool,
+    cache: &mut LaneProbeCache,
 ) -> HashMap<String, Option<bool>> {
     let mut checks = HashMap::new();
     for task in tasks
@@ -2937,9 +3405,12 @@ fn reclaim_lane_checks(
         if !is_writing_role(&task.role) {
             continue;
         }
-        checks
-            .entry(lane_task_id(task).to_string())
-            .or_insert_with(|| lane_clean_for_reclaim(root, task, tasks, is_live));
+        let lane = lane_task_id(task).to_string();
+        if checks.contains_key(&lane) {
+            continue;
+        }
+        let verdict = lane_clean_for_reclaim(root, task, tasks, is_live, cache);
+        checks.insert(lane, verdict);
     }
     checks
 }
@@ -2954,6 +3425,7 @@ fn lane_clean_for_reclaim(
     task: &SweepTask,
     tasks: &[SweepTask],
     is_live: &impl Fn(&str) -> bool,
+    cache: &mut LaneProbeCache,
 ) -> Option<bool> {
     let lane = lane_task_id(task);
     let lane_root =
@@ -2962,7 +3434,7 @@ fn lane_clean_for_reclaim(
     if !lane_root.try_exists().ok()? {
         return Some(true);
     }
-    if !lane_root.is_dir() || !lane_porcelain(root, lane)?.is_empty() {
+    if !lane_root.is_dir() || !cached_lane_porcelain(root, lane, cache)?.is_empty() {
         return Some(false);
     }
     let mut occupants = BTreeSet::from([lane.to_string()]);
@@ -3161,12 +3633,26 @@ pub fn append_stale_pane_if_absent(root: &Path, task: &str, pane: &str) -> bool 
 /// different agent). Mirrors `runner.reclaimable_panes`'s four conditions,
 /// with one status read per lane and a live-unsettled-occupant guard for
 /// adopted lanes.
+///
+/// A failed live listing is a no-op — no task is examined, nothing is
+/// reclaimable, and nothing is marked stale — never a fallback to treating
+/// the listing as empty. An empty listing reads as "every pane is
+/// confirmed gone", which `occupant_matches` would then take as license to
+/// call every live-paned task `stale`; collapsing a *failed probe* into
+/// that same empty shape would fail open exactly when Herdr itself cannot
+/// be asked. Both callers today, `reclaimable_and_report`
+/// (`crates/mv-cli/src/commands/tasks.rs`) and `reclaim_stale_panes`
+/// (`crates/mv-cli/src/commands/dispatch.rs`), already guard around this
+/// before or after calling in here; the guard now lives with the risk
+/// too, not only with those call sites.
 pub fn reclaimable_panes(
     root: &Path,
     agents: &mut impl AgentPanes,
 ) -> (Vec<ReclaimCandidate>, Vec<ReclaimCandidate>) {
+    let Some(live) = agents.list_checked() else {
+        return (Vec::new(), Vec::new());
+    };
     let tasks = sweep_tasks(root);
-    let live = agents.list_checked().unwrap_or_default();
     let is_live = |pane: &str| live.iter().any(|agent| agent.pane_id == pane);
     // A pane id is reusable — after a Herdr restart, a finished task's old
     // pane id can belong to an unrelated live agent. Matching by pane id
@@ -3182,7 +3668,8 @@ pub fn reclaimable_panes(
             .is_some_and(|current| current.name.as_deref().unwrap_or("") == agent.unwrap_or(""))
     };
     let already_marked = stale_pane_marked_tasks(root);
-    let lane_checks = reclaim_lane_checks(root, &tasks, &is_live);
+    let mut lane_probe_cache = LaneProbeCache::new();
+    let lane_checks = reclaim_lane_checks(root, &tasks, &is_live, &mut lane_probe_cache);
 
     let mut reclaimable = Vec::new();
     let mut stale = Vec::new();
@@ -3202,7 +3689,42 @@ pub fn reclaimable_panes(
             pane: pane.clone(),
             agent: task.agent.clone(),
         };
-        if occupant_matches(&pane, task.agent.as_deref()) {
+        if !occupant_matches(&pane, task.agent.as_deref()) {
+            if !already_marked.contains(&task.task_id) {
+                stale.push(candidate);
+            }
+            continue;
+        }
+        // Card 20261106-b-9d70c7: same pane id + same dispatched agent
+        // name, even both still live, is not durable identity across a
+        // Herdr restart that reissues this exact deterministic name into
+        // a recycled pane (`unfinished_agent_names` is empty in this
+        // port; uniqueness at mint time is only the live `agent list`).
+        // The pane's own label (always ending in the dispatching task's
+        // id, `runner::pane_rename`) and, for a task with its own
+        // worktree, the live cwd (`agent get`) are both dispatch-unique
+        // in a way the bare name match above is not — require both
+        // before trusting this occupant as the task's own, exactly like
+        // `supersede_collision_predecessor`'s close-time gate. A task
+        // with no recorded `agent=` at all (a pre-naming-era dispatch
+        // line) has no name to reissue in the first place, so there is
+        // nothing for this gate to add over the existing nameless match —
+        // skip it rather than spend an extra Herdr round trip proving a
+        // race that cannot exist for this occupant.
+        let (label_ok, cwd_ok) = if task.agent.is_none() {
+            (true, true)
+        } else {
+            let label_ok = label_names_task(agents.pane_label(&pane).as_deref(), &task.task_id);
+            let lane_root = root.join(".multiverse/worktrees").join(lane_task_id(task));
+            let cwd_ok = !lane_root.is_dir()
+                || agents
+                    .confirm_live(&pane, task.agent.as_deref().unwrap_or(""))
+                    .is_some_and(|confirmed| {
+                        cwd_confirms_lane(confirmed.cwd.as_deref(), &lane_root)
+                    });
+            (label_ok, cwd_ok)
+        };
+        if label_ok && cwd_ok {
             reclaimable.push(candidate);
         } else if !already_marked.contains(&task.task_id) {
             stale.push(candidate);
@@ -3218,7 +3740,30 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    /// Removed on drop, including on panic (card `20261115-b-3e0fde`: the
+    /// plain `PathBuf` this replaced only cleaned up on each test's own
+    /// trailing `remove_dir_all` call, so an earlier assertion failure left
+    /// it behind in `TMPDIR`). `Deref`s to `Path` so every existing call
+    /// site keeps reading `&dir`/`dir.join(...)` unchanged.
+    struct TempDir(PathBuf);
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3228,7 +3773,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     fn write_status(path: &Path, contents: &str) {
@@ -3250,7 +3795,6 @@ mod tests {
     fn absence_reads_as_still_running() {
         let dir = temp_dir("absent");
         assert_eq!(read_status(&dir.join("status")), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3266,8 +3810,6 @@ mod tests {
 
         write_status(&path, "  FAILED  \n");
         assert_eq!(read_status(&path), Some(TaskStatus::Failed));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3280,8 +3822,14 @@ mod tests {
 
         write_status(&path, "");
         assert_eq!(read_status(&path), None);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn status_path_under_rejects_a_traversal_shaped_task_id_with_nothing_written() {
+        let dir = temp_dir("status-path-traversal");
+        assert_eq!(status_path_under(&dir, "../x"), None);
+        assert!(!dir.join("x").join("status").exists());
+        assert!(status_path_under(&dir, "20261101-fixer-aaaaaa").is_some());
     }
 
     #[test]
@@ -3302,8 +3850,6 @@ mod tests {
             read_status_since(&path, run_started_before_the_write),
             Some(TaskStatus::Done)
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3329,8 +3875,6 @@ mod tests {
             read_status_verbose(&path),
             StatusRead::Terminal(TaskStatus::Done)
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write_result(root: &Path, task: &str, status: &str, state: &str) {
@@ -3353,7 +3897,70 @@ mod tests {
             targets.when_by_ordinal.get(&1).unwrap(),
             "2026-11-01T00:00:00+00:00"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_log_field_rejects_every_injection_shape_and_nothing_else() {
+        for bad in [
+            "a\tstatus=X",
+            "a\rstatus=X",
+            "a\nstatus=X",
+            "a=b",
+            " leading",
+            "trailing ",
+        ] {
+            assert!(
+                validate_log_field("--state", bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        for ok in ["merged", "reconciled-by-merge", ""] {
+            assert!(
+                validate_log_field("--state", ok).is_ok(),
+                "{ok:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn supersede_rejects_a_tab_in_state_before_writing_anything() {
+        let dir = temp_dir("supersede-tab-state");
+        write_result(&dir, "20261101-fixer-tabstat", "done", "merged");
+        let log_path = ProjectLog::new(&dir).path().to_path_buf();
+        let before = std::fs::read(&log_path).unwrap();
+        let err = append_supersede_if_absent(
+            &dir,
+            "20261101-fixer-tabstat",
+            1,
+            "blocked",
+            "a\tstatus=X",
+            "corrected after review",
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SupersedeError::InvalidField(_)));
+        let after = std::fs::read(&log_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected field must leave the log byte-unchanged"
+        );
+    }
+
+    #[test]
+    fn acknowledge_rejects_a_tab_in_task_before_writing_anything() {
+        let dir = temp_dir("acknowledge-tab-task");
+        write_result(&dir, "20261101-fixer-tabtask", "done", "merged");
+        let log_path = ProjectLog::new(&dir).path().to_path_buf();
+        let before = std::fs::read(&log_path).unwrap();
+        let err = append_acknowledge_if_absent(&dir, "20261101-fixer-tabtask\tstatus=X", 1, None)
+            .unwrap_err();
+        assert!(matches!(err, AcknowledgeError::InvalidField(_)));
+        let after = std::fs::read(&log_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected field must leave the log byte-unchanged"
+        );
     }
 
     #[test]
@@ -3372,7 +3979,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SupersedeError::MissingReason { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3391,7 +3997,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SupersedeError::UnknownTarget { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3428,7 +4033,6 @@ mod tests {
         )
         .unwrap();
         assert!(!appended_again, "the same correction twice appends once");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3459,7 +4063,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SupersedeError::Conflicting(_)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3477,7 +4080,6 @@ mod tests {
         let appended_again =
             append_acknowledge_if_absent(&dir, "20261101-fixer-ffffff", 1, None).unwrap();
         assert!(!appended_again, "acknowledging twice appends once");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3492,7 +4094,6 @@ mod tests {
             current_outcome_fields(&dir, 99),
             ("?".to_string(), "?".to_string())
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Scripted in-memory stand-in for [`HerdrAgents`], with the same
@@ -3516,6 +4117,15 @@ mod tests {
         /// one still counted in `list_calls` (a failed probe is still a
         /// probe), then resumes answering from `panes`.
         fail_next_probes: usize,
+        /// `pane get`'s own `label`, by pane id — card `20261106-b-
+        /// 9d70c7`'s occupancy gate. Absent (the default) models a fake
+        /// that was never told to answer this probe, same posture as the
+        /// trait default: `pane_label` returns `None`, not an empty
+        /// label.
+        labels: HashMap<String, String>,
+        /// `agent get`'s own `cwd`, by pane id — the gate's second
+        /// witness, read through `confirm_live`.
+        cwds: HashMap<String, PathBuf>,
     }
 
     impl FakeAgents {
@@ -3536,6 +4146,8 @@ mod tests {
                 list_calls: 0,
                 closed: Vec::new(),
                 fail_next_probes: 0,
+                labels: HashMap::new(),
+                cwds: HashMap::new(),
             }
         }
 
@@ -3554,6 +4166,8 @@ mod tests {
                 list_calls: 0,
                 closed: Vec::new(),
                 fail_next_probes: 0,
+                labels: HashMap::new(),
+                cwds: HashMap::new(),
             }
         }
 
@@ -3572,6 +4186,16 @@ mod tests {
                     status: Some(status),
                 });
             }
+            self
+        }
+
+        fn with_label(mut self, pane_id: &str, label: &str) -> Self {
+            self.labels.insert(pane_id.to_string(), label.to_string());
+            self
+        }
+
+        fn with_cwd(mut self, pane_id: &str, cwd: impl Into<PathBuf>) -> Self {
+            self.cwds.insert(pane_id.to_string(), cwd.into());
             self
         }
     }
@@ -3607,6 +4231,20 @@ mod tests {
                     })
                     .collect(),
             )
+        }
+        fn pane_label(&mut self, pane_id: &str) -> Option<String> {
+            self.labels.get(pane_id).cloned()
+        }
+        fn confirm_live(&mut self, pane_id: &str, name: &str) -> Option<LiveConfirmation> {
+            let agent = self.panes.iter().find(|agent| {
+                agent.pane_id == pane_id && agent.name.as_deref().unwrap_or("") == name
+            })?;
+            Some(LiveConfirmation {
+                ready: agent.status.is_some_and(AgentState::is_ready_for_input),
+                state_change_seq: None,
+                cwd: self.cwds.get(pane_id).cloned(),
+                terminal_id: None,
+            })
         }
     }
 
@@ -3649,7 +4287,6 @@ mod tests {
         assert_eq!(report.in_progress_before, 1);
         assert_eq!(report.recorded, 1);
         assert_eq!(report.reclaimed, 0);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3675,7 +4312,6 @@ mod tests {
         let mut agents = FakeAgents::new(&["w1:p1"]).with_status("w1:p1", AgentState::Done);
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report.recorded, 1);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3705,7 +4341,6 @@ mod tests {
             "must reclaim the pane in this same pass"
         );
         assert_eq!(agents.closed, vec!["w1:p1".to_string()]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3735,6 +4370,7 @@ mod tests {
                 expired_tasks: Vec::new(),
                 awaiting_gone: Vec::new(),
                 awaiting_partial: Vec::new(),
+                dirty_details: BTreeMap::new(),
             }
         );
         assert_eq!(agents.list_calls, 1);
@@ -3744,8 +4380,6 @@ mod tests {
             2,
             "a dry run must leave the routing log exactly as it was"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3775,6 +4409,7 @@ mod tests {
                 expired_tasks: Vec::new(),
                 awaiting_gone: Vec::new(),
                 awaiting_partial: Vec::new(),
+                dirty_details: BTreeMap::new(),
             }
         );
         assert_eq!(
@@ -3786,8 +4421,6 @@ mod tests {
         assert!(last.ends_with(
             "event=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=reconciled\trevisions=0\tpane=w1:p1"
         ));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3803,8 +4436,6 @@ mod tests {
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report.recorded, 0, "a pane still live has not settled yet");
         assert_eq!(report.in_progress_after, 1);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3844,8 +4475,6 @@ mod tests {
             "the loose file must never be read back as a second task"
         );
         assert_eq!(tasks[0].task_id, "20250101-fixer-aaaaaa");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3877,8 +4506,6 @@ mod tests {
         let tasks = sweep_tasks(&root);
         assert_eq!(tasks.len(), 1, "only the logged task is a task at all");
         assert_eq!(tasks[0].task_id, "20260101-explorer-aaaaaa");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3901,8 +4528,6 @@ mod tests {
             !tasks[0].recorded,
             "a bogus status=none result must not count as a recorded outcome"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3928,8 +4553,6 @@ mod tests {
             "the new round has no result of its own yet"
         );
         assert_eq!(tasks[0].pane.as_deref(), Some("w2:p2"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3951,8 +4574,6 @@ mod tests {
             "a done outcome with no usable result.md must not be recorded"
         );
         assert_eq!(report.in_progress_after, 1);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -4002,8 +4623,184 @@ mod tests {
             detail.contains("uncommitted.txt"),
             "detail should name the dirty path, got {detail}"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    fn init_git_lane(lane: &Path) {
+        std::fs::create_dir_all(lane).unwrap();
+        git(lane, &["init", "-q", "-b", "main"]);
+        git(lane, &["config", "user.email", "lane@example.invalid"]);
+        git(lane, &["config", "user.name", "Lane Test"]);
+    }
+
+    /// Card `20261115-b-ca59eb`: `dirty_done_detail` used to call
+    /// `lane_is_dirty` (one `git status --porcelain`) and then
+    /// `lane_porcelain` again for the same worktree, doubling the spawn
+    /// for a single public call. The one-shot cache collapses that to one.
+    #[test]
+    fn dirty_done_detail_probes_a_lane_once() {
+        let root = temp_dir("dirty-done-one-probe");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask=20261102-builder-dirtyaa\trole=builder\tbranch=multiverse/20261102-builder-dirtyaa\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20261102-builder-dirtyaa/status"),
+            "done",
+        );
+        let lane = root.join(".multiverse/worktrees/20261102-builder-dirtyaa");
+        init_git_lane(&lane);
+        std::fs::write(lane.join("uncommitted.txt"), "dirty\n").unwrap();
+
+        let tasks = sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        reset_lane_git_probe_count();
+        let detail = dirty_done_detail(&root, &tasks[0]).expect("dirty-done detail");
+        assert!(
+            detail.contains("uncommitted.txt"),
+            "detail should name the dirty path, got {detail}"
+        );
+        assert_eq!(
+            lane_git_probe_count(),
+            1,
+            "dirty_done_detail must not re-probe the same lane for the detail text"
+        );
+    }
+
+    /// Card `20261115-b-1ba758`: `is_reconcile_candidate`'s own `lane_is_dirty`
+    /// check already spawns `git status --porcelain` once for a done-but-dirty
+    /// writing lane; `commands::sweep::dirty_done_notes` used to call
+    /// `dirty_done_detail` again for the exact same task afterward, with a
+    /// fresh, empty cache of its own, spawning a second `git status
+    /// --porcelain` for the same worktree every pass. `SweepReport::
+    /// dirty_details` now carries that detail text straight off the pass's
+    /// own `LaneProbeCache`, so the one `git` call above already covers
+    /// both — two before this fix, one after.
+    #[test]
+    fn sweep_report_carries_dirty_detail_from_the_passs_own_probe_not_a_second_one() {
+        let root = temp_dir("sweep-dirty-details-one-probe");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask=20261102-builder-dirtyaa\trole=builder\tbranch=multiverse/20261102-builder-dirtyaa\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20261102-builder-dirtyaa/status"),
+            "done",
+        );
+        let lane = root.join(".multiverse/worktrees/20261102-builder-dirtyaa");
+        init_git_lane(&lane);
+        std::fs::write(lane.join("uncommitted.txt"), "dirty\n").unwrap();
+
+        reset_lane_git_probe_count();
+        let mut agents = FakeAgents::new(&[]);
+        let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
+
+        assert_eq!(
+            report.recorded, 0,
+            "a dirty writing lane must never be recorded done"
+        );
+        let detail = report
+            .dirty_details
+            .get("20261102-builder-dirtyaa")
+            .expect("dirty_details must carry this task's own detail");
+        assert!(
+            detail.contains("uncommitted.txt"),
+            "detail should name the dirty path, got {detail}"
+        );
+        assert_eq!(
+            lane_git_probe_count(),
+            1,
+            "one sweep pass must spawn git for this lane once, not once for \
+             reconcile's own dirty check and again for the report's detail text"
+        );
+    }
+
+    /// Card `20261115-b-ca59eb`: a lane revisited by a later `--into`
+    /// dispatch (two task ids, one branch) used to cost one
+    /// `git status --porcelain` spawn per task id reaching
+    /// `is_reconcile_candidate`, even though both ask about the identical
+    /// worktree directory in the same sweep pass. `lane_probe_cache`
+    /// collapses that to one spawn per pass, mirroring `board_data`.
+    #[test]
+    fn a_lane_shared_by_two_unrecorded_done_tasks_is_probed_once() {
+        let root = temp_dir("shared-lane-one-probe");
+        let lane_id = "20261102-builder-shared";
+        let first = lane_id.to_string();
+        let second = "20261103-builder-followup".to_string();
+        init_git_lane(&root.join(".multiverse/worktrees").join(lane_id));
+        for task_id in [&first, &second] {
+            write(
+                &root.join(".multiverse/tasks").join(task_id).join("status"),
+                "done",
+            );
+            write(
+                &root
+                    .join(".multiverse/tasks")
+                    .join(task_id)
+                    .join("result.md"),
+                "# Result\ndone.\n",
+            );
+        }
+        write(
+            &root.join(".multiverse/routing.log"),
+            &format!(
+                "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={first}\trole=builder\tbranch=multiverse/{lane_id}\n\
+                 2026-11-03T00:00:00+00:00\tevent=dispatch\ttask={second}\trole=builder\tbranch=multiverse/{lane_id}\n"
+            ),
+        );
+
+        reset_lane_git_probe_count();
+        let mut agents = FakeAgents::new(&[]);
+        let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
+        assert_eq!(report.recorded, 2, "both unrecorded done tasks settle");
+        assert_eq!(
+            lane_git_probe_count(),
+            1,
+            "both task ids name the same lane; it should be probed once per pass"
+        );
+    }
+
+    /// Card `20261115-b-ca59eb`: a writing-role task this pass just
+    /// recorded is then considered for reclaim in the same
+    /// `sweep_project_with_live` call. Reclaim's porcelain check must
+    /// reuse the spawn reconcile already made, not re-ask git for a
+    /// directory this pass already read.
+    #[test]
+    fn a_just_reconciled_lane_is_not_reprobed_for_reclaim() {
+        let root = temp_dir("reconcile-reclaim-one-probe");
+        let task_id = "20261102-builder-aaaaaa";
+        init_git_lane(&root.join(".multiverse/worktrees").join(task_id));
+        write(
+            &root.join(".multiverse/routing.log"),
+            &format!(
+                "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={task_id}\trole=builder\tagent=x-buil-cl\tbranch=multiverse/{task_id}\n\
+                 2026-11-02T00:01:00+00:00\tevent=started\ttask={task_id}\tpane=w1:p1\n"
+            ),
+        );
+        write(
+            &root.join(".multiverse/tasks").join(task_id).join("status"),
+            "done",
+        );
+        write(
+            &root
+                .join(".multiverse/tasks")
+                .join(task_id)
+                .join("result.md"),
+            "# Result\ndone.\n",
+        );
+
+        reset_lane_git_probe_count();
+        let mut agents = FakeAgents::new_idle(&[("w1:p1", "x-buil-cl")]);
+        let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
+        assert_eq!(report.recorded, 1);
+        assert_eq!(
+            report.reclaimed, 1,
+            "must reclaim the pane in this same pass"
+        );
+        assert_eq!(
+            lane_git_probe_count(),
+            1,
+            "reclaim must reuse reconcile's porcelain, not spawn git again"
+        );
     }
 
     #[test]
@@ -4036,6 +4833,7 @@ mod tests {
                 expired_tasks: Vec::new(),
                 awaiting_gone: Vec::new(),
                 awaiting_partial: Vec::new(),
+                dirty_details: BTreeMap::new(),
             }
         );
         assert_eq!(
@@ -4043,8 +4841,6 @@ mod tests {
             "reclaim must re-probe liveness immediately before closing"
         );
         assert_eq!(agents.closed, vec!["w1:p1".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4071,6 +4867,8 @@ mod tests {
             list_calls: 0,
             closed: Vec::new(),
             fail_next_probes: 0,
+            labels: HashMap::new(),
+            cwds: HashMap::new(),
         };
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report.reclaimed, 0);
@@ -4078,8 +4876,6 @@ mod tests {
             agents.list_calls, 1,
             "not idle/done on the first listing already excludes it; no re-probe"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4132,8 +4928,6 @@ mod tests {
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report.reclaimed, 0, "a different agent now holds the pane");
         assert_eq!(agents.calls, 2);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4165,8 +4959,6 @@ mod tests {
             report.reclaimed, 0,
             "both listings agreeing with each other is not the same as agreeing with the dispatch record"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4192,8 +4984,6 @@ mod tests {
         assert_eq!(report.reclaimed, 1, "dry run still previews the candidate");
         assert!(agents.closed.is_empty(), "a dry run never closes a pane");
         assert_eq!(agents.list_calls, 1, "a preview never re-probes to confirm");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4227,6 +5017,7 @@ mod tests {
                 expired_tasks: Vec::new(),
                 awaiting_gone: Vec::new(),
                 awaiting_partial: Vec::new(),
+                dirty_details: BTreeMap::new(),
             }
         );
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
@@ -4235,8 +5026,6 @@ mod tests {
             2,
             "a failed probe must never let reconcile write anything this pass"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // -- finding 4: `expire_awaiting` (lease expiry) ---------------------
@@ -4266,8 +5055,6 @@ mod tests {
         assert!(
             last.contains("state=abandoned: pane gone, no status file, lease expired after 60m")
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4286,8 +5073,6 @@ mod tests {
         assert_eq!(report.expired, 0);
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert_eq!(log.lines().count(), 1, "a fresh AWAITING task is untouched");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4312,8 +5097,6 @@ mod tests {
             report.expired, 1,
             "the account's own 5-minute override must apply, not the 60-minute fleet default"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4348,8 +5131,6 @@ mod tests {
         );
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert_eq!(log.lines().count(), 1, "nothing must be recorded this pass");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4380,8 +5161,6 @@ mod tests {
             report.expired, 1,
             "80 effective minutes is still past the 60-minute lease"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4420,8 +5199,6 @@ mod tests {
             1,
             "nothing must be recorded while the lane's own status is current"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4447,7 +5224,7 @@ mod tests {
             file_status: None,
             ..tasks[0].clone()
         };
-        let is_live = |_: &str| false;
+        let live_name = |_: &str| None;
         let expiries = expire_awaiting(
             &root,
             std::slice::from_ref(&stale_task),
@@ -4456,7 +5233,7 @@ mod tests {
             now_utc(),
             0,
             true,
-            &is_live,
+            &live_name,
         );
         assert_eq!(
             expiries.len(),
@@ -4475,8 +5252,6 @@ mod tests {
             1,
             "exactly one result line must survive the race, never two"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4492,8 +5267,6 @@ mod tests {
         assert_eq!(report.expired, 1, "a dry run still previews the count");
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert_eq!(log.lines().count(), 1, "a dry run never writes anything");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4519,8 +5292,6 @@ mod tests {
             ),
             "got: {last}"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4546,8 +5317,6 @@ mod tests {
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report.reclaimed, 0);
         assert_eq!(agents.list_calls, 1, "no clean candidate means no re-probe");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4559,8 +5328,6 @@ mod tests {
         let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
         assert_eq!(report, SweepReport::default());
         assert_eq!(agents.list_calls, 1);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4586,8 +5353,6 @@ mod tests {
             .last()
             .unwrap()
             .contains("event=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=reconciled"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4625,8 +5390,6 @@ mod tests {
             .find(|t| t.task_id == "20260101-fixer-aaaaaa")
             .unwrap();
         assert!(!a.recorded, "the unnamed candidate must be left alone");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // -- `close_stranded`/`reclaimable_panes` ----------------------------
@@ -4709,8 +5472,6 @@ mod tests {
         // A second pass sees the outcome it just wrote and leaves it alone.
         let again = close_stranded(&root, true, &mut agents);
         assert!(again.is_empty(), "a recorded task is no longer AWAITING");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4738,8 +5499,6 @@ mod tests {
 
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert!(!log.contains("event=result"), "a dry run must never write");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4762,8 +5521,6 @@ mod tests {
         assert_eq!(closures.len(), 1);
         assert_eq!(closures[0].status, TaskStatus::Failed);
         assert_eq!(closures[0].state, ABANDONED_EMPTY_LANE);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4793,8 +5550,6 @@ mod tests {
         assert_eq!(closures[0].status, TaskStatus::Blocked);
         assert_eq!(closures[0].state, STRANDED_UNCOMMITTED_WORK);
         assert!(closures[0].evidence.contains("uncommitted.txt"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4816,8 +5571,6 @@ mod tests {
         assert_eq!(closures.len(), 1);
         assert_eq!(closures[0].status, TaskStatus::Blocked);
         assert_eq!(closures[0].state, UNKNOWN_NEEDS_HUMAN);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4838,8 +5591,6 @@ mod tests {
         assert_eq!(closures.len(), 1);
         assert_eq!(closures[0].status, TaskStatus::Failed);
         assert_eq!(closures[0].state, NO_BRANCH_EXPECTED);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4865,8 +5616,6 @@ mod tests {
         assert_eq!(closures[0].status, TaskStatus::Failed);
         assert_eq!(closures[0].state, ABANDONED_PARTIAL_RESULT);
         assert!(closures[0].evidence.contains("result.md"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4886,8 +5635,134 @@ mod tests {
             closures.is_empty(),
             "a live-paned task and an already-recorded one are never stranded: {closures:?}"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn close_stranded_records_nothing_when_the_live_listing_fails() {
+        // A failed live probe must never collapse to "no panes are live" —
+        // that would make `is_awaiting` read every pane as gone and close
+        // every AWAITING task sight unseen. `w1:p1` below has no live
+        // agent name on file (reused-pane probe never ran), so the
+        // pre-fix `unwrap_or_default()` would have read it as gone too
+        // and recorded it `no-branch-expected` (a non-writing role).
+        let root = temp_dir("close-stranded-listing-failed");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-ffffff\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-ffffff\tpane=w1:p1\n",
+        );
+
+        let mut agents = FakeAgents::new(&[]).fail_next(1);
+        let closures = close_stranded(&root, true, &mut agents);
+        assert!(
+            closures.is_empty(),
+            "a failed live listing must be a no-op, not a reason to close everything: {closures:?}"
+        );
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            !log.contains("event=result"),
+            "a failed live listing must record nothing"
+        );
+
+        // The very next call, with the probe succeeding, still finds and
+        // closes the same task — the earlier failure didn't eat it.
+        let closures = close_stranded(&root, true, &mut agents);
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].state, NO_BRANCH_EXPECTED);
+        assert!(closures[0].recorded);
+    }
+
+    #[test]
+    fn close_stranded_treats_a_pane_reused_by_a_different_agent_as_stranded() {
+        // Card 20261108-b-152b33: `w1:p1` is this task's own recorded pane
+        // id, dispatched under agent `agent-a`, but the live listing now
+        // shows a different agent, `agent-b`, answering there — the id was
+        // handed to someone else's session after a Herdr restart. Matching
+        // by pane id alone (pre-fix) reads this task as still running
+        // forever; it must instead read as gone, same as
+        // `close_stranded_never_touches_a_running_or_recorded_task`'s own
+        // pane does when the *same* agent still occupies it.
+        let root = temp_dir("close-stranded-reused-pane");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-aaaaaa\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-aaaaaa\tpane=w1:p1\n",
+        );
+
+        let mut reused = FakeAgents::new_idle(&[("w1:p1", "agent-b")]);
+        let closures = close_stranded(&root, true, &mut reused);
+        assert_eq!(
+            closures.len(),
+            1,
+            "a pane now owned by a different agent must read as gone, not still running"
+        );
+        assert_eq!(closures[0].status, TaskStatus::Failed);
+        assert_eq!(closures[0].state, NO_BRANCH_EXPECTED);
+
+        let root2 = temp_dir("close-stranded-same-agent-still-live");
+        write(
+            &root2.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-bbbbbb\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-bbbbbb\tpane=w1:p1\n",
+        );
+        let mut same_agent = FakeAgents::new_idle(&[("w1:p1", "agent-a")]);
+        let closures = close_stranded(&root2, true, &mut same_agent);
+        assert!(
+            closures.is_empty(),
+            "the task's own dispatched agent still occupying the pane must still read as live: \
+             {closures:?}"
+        );
+    }
+
+    #[test]
+    fn close_stranded_leaves_a_live_idle_same_name_task_with_no_status_file_unrecorded() {
+        // Card 20261106-b-2c3d2f Decision 1, the baseline this decision
+        // must not regress: a pane still listed, idle, under the task's
+        // own dispatched name, with no status file, is not stranded.
+        let root = temp_dir("close-stranded-live-idle-same-name");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-gggggg\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-gggggg\tpane=w1:p1\n",
+        );
+
+        let mut agents = FakeAgents::new_idle(&[("w1:p1", "agent-a")]);
+        let closures = close_stranded(&root, true, &mut agents);
+        assert!(
+            closures.is_empty(),
+            "a live idle pane under the task's own agent name must not be recorded: {closures:?}"
+        );
+    }
+
+    #[test]
+    fn close_stranded_leaves_a_live_task_with_no_confirmed_name_unrecorded() {
+        // Card 20261106-b-2c3d2f Decision 1: `w1:p1` is still listed as
+        // live, but the listing carries no name for it — the gap this
+        // decision exists to close. A missing/empty live name is not
+        // confirmation the pane is gone the way a *different* name is
+        // (`close_stranded_treats_a_pane_reused_by_a_different_agent_as_stranded`
+        // above); recording `failed` here would invent a terminal outcome
+        // for an agent that may still be about to write its own status.
+        let root = temp_dir("close-stranded-live-no-name");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-hhhhhh\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-hhhhhh\tpane=w1:p1\n",
+        );
+
+        let mut agents = FakeAgents::new(&["w1:p1"]);
+        let closures = close_stranded(&root, true, &mut agents);
+        assert!(
+            closures.is_empty(),
+            "a pane still listed with no confirmed name must not read as confirmed gone: \
+             {closures:?}"
+        );
     }
 
     #[test]
@@ -4899,13 +5774,12 @@ mod tests {
              2026-01-01T00:01:00+00:00\tevent=result\ttask=20260101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\tpane=w1:p1\n",
         );
 
-        let mut agents = FakeAgents::new(&["w1:p1"]);
+        let mut agents =
+            FakeAgents::new(&["w1:p1"]).with_label("w1:p1", "fixer · 20260101-fixer-aaaaaa");
         let (reclaimable, stale) = reclaimable_panes(&root, &mut agents);
         assert_eq!(reclaimable.len(), 1);
         assert_eq!(reclaimable[0].task_id, "20260101-fixer-aaaaaa");
         assert!(stale.is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4934,13 +5808,27 @@ mod tests {
         assert_eq!(stale[0].task_id, "20260101-fixer-111111");
 
         // The agent matching the task's own recorded dispatch still
-        // reclaims normally.
-        let mut same_agent = FakeAgents::new_idle(&[("w1:p1", "x-fix-cl")]);
+        // reclaims normally, once its pane label also names this task.
+        let mut same_agent = FakeAgents::new_idle(&[("w1:p1", "x-fix-cl")])
+            .with_label("w1:p1", "builder · 20260101-fixer-111111");
         let (reclaimable, stale) = reclaimable_panes(&root, &mut same_agent);
         assert_eq!(reclaimable.len(), 1);
         assert!(stale.is_empty());
 
-        let _ = std::fs::remove_dir_all(&root);
+        // Card 20261106-b-9d70c7's own static race: the same name, in the
+        // same pane, both idle — but the pane's own label now names a
+        // *different* task, the shape a Herdr restart that reissues this
+        // deterministic name into a recycled pane would produce. The
+        // label gate must still refuse it, falling to `stale` exactly
+        // like the differently-named case above.
+        let mut same_name_wrong_label = FakeAgents::new_idle(&[("w1:p1", "x-fix-cl")])
+            .with_label("w1:p1", "builder · 20260101-builder-999999");
+        let (reclaimable, stale) = reclaimable_panes(&root, &mut same_name_wrong_label);
+        assert!(
+            reclaimable.is_empty(),
+            "a pane label naming a different task must never confirm reclaim"
+        );
+        assert_eq!(stale.len(), 1);
     }
 
     #[test]
@@ -4968,8 +5856,42 @@ mod tests {
         let (reclaimable_again, stale_again) = reclaimable_panes(&root, &mut agents);
         assert!(reclaimable_again.is_empty());
         assert!(stale_again.is_empty());
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn reclaimable_panes_reports_nothing_when_the_live_listing_fails() {
+        // A failed live probe must never collapse to "no panes are live" —
+        // that would make `occupant_matches` read this task's pane as gone
+        // and call it `stale` sight unseen, same risk `close_stranded`
+        // guards against. The pre-fix `unwrap_or_default()` would have
+        // read `w1:p1` below as gone and recorded it stale.
+        let root = temp_dir("reclaimable-listing-failed");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-aaaaaa\tbranch=main\trole=fixer\n\
+             2026-01-01T00:01:00+00:00\tevent=result\ttask=20260101-fixer-aaaaaa\tstatus=done\tstate=done\trevisions=0\tpane=w1:p1\n",
+        );
+
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_label("w1:p1", "fixer · 20260101-fixer-aaaaaa")
+            .fail_next(1);
+        let (reclaimable, stale) = reclaimable_panes(&root, &mut agents);
+        assert!(
+            reclaimable.is_empty(),
+            "a failed live listing must never report a pane reclaimable: {reclaimable:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "a failed live listing must never report a pane stale either: {stale:?}"
+        );
+
+        // The very next call, with the probe succeeding, still finds and
+        // reclaims the same pane — the earlier failure didn't eat it or
+        // mark it stale.
+        let (reclaimable, stale) = reclaimable_panes(&root, &mut agents);
+        assert_eq!(reclaimable.len(), 1);
+        assert_eq!(reclaimable[0].task_id, "20260101-fixer-aaaaaa");
+        assert!(stale.is_empty());
     }
 
     fn reclaim_lane_fixture(root: &Path) -> PathBuf {
@@ -5026,13 +5948,15 @@ mod tests {
             &lane.join(".multiverse/tasks/20260101-builder-bbbbbb/status"),
             "done",
         );
-        let (reclaimable, _) = reclaimable_panes(&root, &mut FakeAgents::new(&["w1:p1", "w1:p2"]));
+        let mut agents = FakeAgents::new(&["w1:p1", "w1:p2"])
+            .with_label("w1:p1", "builder · 20260101-builder-aaaaaa")
+            .with_cwd("w1:p1", lane.clone());
+        let (reclaimable, _) = reclaimable_panes(&root, &mut agents);
         assert_eq!(
             reclaimable.len(),
             1,
             "terminal local status releases the guard"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5049,14 +5973,15 @@ mod tests {
             &root.join(".multiverse/tasks/20260101-builder-bbbbbb/status"),
             "failed",
         );
-        let (reclaimable, _) = reclaimable_panes(&root, &mut FakeAgents::new(&["w1:p1"]));
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_label("w1:p1", "builder · 20260101-builder-aaaaaa")
+            .with_cwd("w1:p1", lane.clone());
+        let (reclaimable, _) = reclaimable_panes(&root, &mut agents);
         assert_eq!(
             reclaimable.len(),
             1,
             "rescued terminal status releases the guard"
         );
-        std::fs::remove_dir_all(lane).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn artifact_lane_fixture(root: &Path) -> PathBuf {
@@ -5103,7 +6028,6 @@ mod tests {
         );
         write(&lane.join(".multiverse/.gitignore"), "*\n");
         assert!(lanes_holding_unrescued_output(&root).unwrap().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5117,7 +6041,6 @@ mod tests {
         assert!(lanes_holding_unrescued_output(&root).unwrap().is_empty());
         write(&lane.join(roster), "# uncommitted lane roster\n");
         assert_eq!(lanes_holding_unrescued_output(&root).unwrap().len(), 1);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5133,7 +6056,6 @@ mod tests {
         std::fs::remove_file(lane.join(relative)).unwrap();
         std::os::unix::fs::symlink(root.join("README"), lane.join(relative)).unwrap();
         assert!(lanes_holding_unrescued_output(&root).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     // -- `auto_supersede` / `lane_reuse_index` (card `20261102-b-0d8b17`) --
@@ -5208,7 +6130,7 @@ mod tests {
         );
 
         let mut tasks = sweep_tasks(&root);
-        let results = auto_supersede(&root, &mut tasks, true, &|_| false);
+        let results = auto_supersede(&root, &mut tasks, true, &|_: &str| None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, "20260101-fixer-aaaaaa");
         assert_eq!(results[0].status, TaskStatus::Done);
@@ -5231,8 +6153,6 @@ mod tests {
             .unwrap();
         assert!(task.recorded);
         assert_eq!(task.status, Some(TaskStatus::Done));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5258,7 +6178,7 @@ mod tests {
         );
 
         let mut tasks = sweep_tasks(&root);
-        let results = auto_supersede(&root, &mut tasks, true, &|_| false);
+        let results = auto_supersede(&root, &mut tasks, true, &|_: &str| None);
         // Only the superseded owner is reported — the later occupant
         // holding the lane now is not itself a candidate: its own lane
         // name resolves to the owner's id, not its own, so it is never
@@ -5275,8 +6195,6 @@ mod tests {
         assert!(last.contains("event=result\ttask=20260101-fixer-aaaaaa"));
         assert!(last.contains("status=done"));
         assert!(last.contains("state=superseded-redispatched"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5302,7 +6220,7 @@ mod tests {
         );
 
         let mut tasks = sweep_tasks(&root);
-        let results = auto_supersede(&root, &mut tasks, false, &|_| false);
+        let results = auto_supersede(&root, &mut tasks, false, &|_: &str| None);
         assert_eq!(results.len(), 1);
         assert!(!results[0].recorded, "a dry run must never write");
 
@@ -5313,8 +6231,6 @@ mod tests {
             .find(|t| t.task_id == "20260101-fixer-aaaaaa")
             .unwrap();
         assert!(!task.recorded, "a dry run must never mutate the snapshot");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5340,13 +6256,11 @@ mod tests {
         );
 
         let mut tasks = sweep_tasks(&root);
-        let results = auto_supersede(&root, &mut tasks, true, &|_| false);
+        let results = auto_supersede(&root, &mut tasks, true, &|_: &str| None);
         assert!(
             results.is_empty(),
             "a read-only role is skipped outright, even though its lane was reused"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5388,8 +6302,54 @@ mod tests {
             report.expired, 0,
             "a task `auto_supersede` just claimed must never also be lease-expired in the same pass"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn sweep_project_expires_an_awaiting_task_whose_pane_was_reused_by_a_different_agent() {
+        // Card 20261108-b-152b33: `w1:p1` is this task's own recorded pane
+        // id, dispatched under agent `agent-a`, long past any reasonable
+        // lease. The live listing now shows a different agent, `agent-b`,
+        // answering there. Matching by pane id alone (pre-fix) reads this
+        // task as still running forever, so `expire_awaiting` never gets a
+        // chance to lease-expire it; it must instead read as gone, same as
+        // `close_stranded_treats_a_pane_reused_by_a_different_agent_as_stranded`.
+        let root = temp_dir("sweep-expire-reused-pane");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-aaaaaa\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-aaaaaa\tpane=w1:p1\n",
+        );
+
+        let mut reused = FakeAgents::new_idle(&[("w1:p1", "agent-b")]);
+        let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut reused);
+        assert_eq!(
+            report.expired, 1,
+            "a pane now owned by a different agent must not keep this task AWAITING forever"
+        );
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(log.contains("event=result\ttask=20260101-explorer-aaaaaa\tstatus=failed"));
+
+        let root2 = temp_dir("sweep-expire-same-agent-still-live");
+        write(
+            &root2.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-explorer-bbbbbb\t\
+             branch=\trole=explorer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-explorer-bbbbbb\tpane=w1:p1\n",
+        );
+        let mut same_agent = FakeAgents::new_idle(&[("w1:p1", "agent-a")]);
+        let report = sweep_project(
+            &root2,
+            false,
+            60,
+            &HashMap::new(),
+            now_utc(),
+            &mut same_agent,
+        );
+        assert_eq!(
+            report.expired, 0,
+            "the task's own dispatched agent still occupying the pane must still read as live"
+        );
     }
 
     #[test]
@@ -5417,7 +6377,6 @@ mod tests {
             Some(TaskStatus::Done),
             "the worktree status must win over a leftover main-checkout copy"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5495,9 +6454,6 @@ mod tests {
         );
         assert_eq!(outcome.closed_panes, 0);
         assert!(working.closed.is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&root2);
     }
 
     #[test]
@@ -5548,8 +6504,6 @@ mod tests {
             "a pane id reused by a different live agent must never be closed"
         );
         assert!(reused.closed.is_empty());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5587,6 +6541,5 @@ mod tests {
         assert!(outcome.recorded.is_empty());
         let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
         assert!(!log.contains("state=reconciled"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

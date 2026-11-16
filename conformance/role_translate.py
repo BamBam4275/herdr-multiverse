@@ -100,6 +100,7 @@ def translate_role_argv(argv: list[str]) -> list[str]:
 
 
 def _title(word: str) -> str:
+    """Title-case only the first letter, leaving the rest as-is."""
     return word[:1].upper() + word[1:]
 
 
@@ -155,6 +156,8 @@ _REVIEW_POLICY_NOUN_RES: list[tuple[re.Pattern[str], str]] = [
 
 
 def _preserve_case(old: str, new: str) -> str:
+    """Rewrite `new` to match `old`'s case convention (upper/lower/title),
+    so translating a live prose word keeps the sentence's own casing."""
     if old.isupper():
         return new.upper()
     if old.islower():
@@ -229,6 +232,8 @@ def translate_prose_roles(text: str) -> str:
         return _preserve_case(old, new)
 
     def box_label(match: re.Match[str]) -> str:
+        """Translate a box-footer label and rebalance its dash rails so
+        the card's overall width is unchanged."""
         corner, lead, label, trail = match.groups()
         translated = _PROSE_ROLE_RE.sub(repl, label)
         if translated == label:

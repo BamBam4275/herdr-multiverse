@@ -28,6 +28,13 @@
 //! `--force`: closing their panes would destroy the account of work that
 //! has not reached project state. The read-only artifact check lives in
 //! `mv_state::tasks::lanes_holding_unrescued_output` and fails closed.
+//!
+//! `LiveAgent::is_safe_to_stop`, the `Fleet` trait, `HerdrFleet`, and
+//! `herdr_binary` are `pub(crate)` so `commands::lifecycle`'s `down` can
+//! reuse this exact busy check — every live agent in a project's
+//! workspace, not only its Nexus — before closing a wrapped workspace
+//! (card `20261116-b-f0612d` Lane B fix round), instead of a second,
+//! divergent enumeration of the same workspace/pane/agent records.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -63,12 +70,20 @@ pub(crate) struct LiveAgent {
 }
 
 impl LiveAgent {
-    fn is_safe_to_stop(&self) -> bool {
+    /// The exact busy rule `stop` refuses on, and that `down`
+    /// (`commands::lifecycle::close_if_wrapped`) reuses rather than
+    /// duplicates: idle/done are safe to stop; anything else — including
+    /// a genuinely unknown status — keeps the workspace open.
+    pub(crate) fn is_safe_to_stop(&self) -> bool {
         matches!(self.status.as_str(), "idle" | "done")
     }
 }
 
-trait Fleet {
+/// `pub(crate)` so `commands::lifecycle::close_if_wrapped` can enumerate a
+/// project's live agents the same way `stop` does, rather than
+/// re-implementing the workspace-label/pane-cwd matching here a second
+/// time.
+pub(crate) trait Fleet {
     /// `name`'s open workspace id, when one matches, and every agent
     /// Herdr reports as live inside it. `None` for the workspace id means
     /// no open workspace matched this project at all — distinct from an
@@ -200,9 +215,11 @@ fn record_fields(record: &str) -> BTreeMap<String, String> {
 /// `$HERDR_BIN_PATH` when set and non-blank, else the bare `herdr` token —
 /// identical semantics to `doctor::herdr_binary`/`workers::herdr_binary`,
 /// duplicated locally since those are private to their own files and this
-/// task's write scope does not include editing them to share it.
+/// task's write scope does not include editing them to share it. `pub(crate)`
+/// so `commands::lifecycle` can build the same `HerdrFleet` this file uses
+/// for its own busy check, rather than a second copy of this lookup.
 #[cfg(not(test))]
-fn herdr_binary() -> String {
+pub(crate) fn herdr_binary() -> String {
     match std::env::var("HERDR_BIN_PATH") {
         Ok(value) if !value.trim().is_empty() => value,
         _ => "herdr".to_string(),
@@ -212,7 +229,7 @@ fn herdr_binary() -> String {
 /// Never resolves to a real binary under `cargo test`, for the same reason
 /// `doctor.rs`/`workers.rs` isolate their own test builds this way.
 #[cfg(test)]
-fn herdr_binary() -> String {
+pub(crate) fn herdr_binary() -> String {
     "mv-cli-test-herdr-stub-should-never-exist".to_string()
 }
 
@@ -242,8 +259,8 @@ fn fetch_records(binary: &str, noun: &str, plural: &str) -> Option<Vec<BTreeMap<
 /// hand-rolled JSON reader for the busy check (see the module doc for
 /// why), but the one call that actually destroys something is not worth
 /// a second, divergent implementation.
-struct HerdrFleet {
-    binary: String,
+pub(crate) struct HerdrFleet {
+    pub(crate) binary: String,
 }
 
 impl Fleet for HerdrFleet {
@@ -330,6 +347,10 @@ fn select_projects<'a>(projects: &'a [&'a Project], requested: &[String]) -> Vec
 /// matches the column `stop-refusal-agent-not-settled.json` pins.
 const LABEL_WIDTH: usize = 21;
 
+/// `multiverse stop`'s command handler: resolve the selected projects'
+/// open workspaces via [`HerdrFleet`], refuse any with a busy agent unless
+/// `--force` is given, then close the rest for real
+/// (`mv_engine::fleet_start::close_workspace`).
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;

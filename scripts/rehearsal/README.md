@@ -33,9 +33,9 @@ project, a real `config.toml`, or real Herdr — every script here except
 binary: it exists to prove the Rust binary reaches a *real* `herdr` on
 `PATH` and drives a real pane, for a write-nothing role and a role with its
 own git lane. That is also what makes it unsafe to run from inside a
-dispatched lane's sandbox: a Fixer/Builder/etc. agent's Bash tool permission
+dispatched lane's sandbox: a dispatched agent's Bash tool permission
 layer denies any command that invokes the real `herdr` executable outright
-(confirmed independently from two separate Fixer lanes — see backlog card
+(confirmed independently from two separate Builder lanes — see backlog card
 `20261102-b-c3050e`), so the live-Herdr portion cannot complete end to end
 from inside a lane even when the script itself is correct and its
 `--dry-run`-equivalent setup (config/env shape) has been verified.

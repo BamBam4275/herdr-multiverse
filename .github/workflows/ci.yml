@@ -122,3 +122,33 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/check-private-names.sh
+
+  secrets:
+    name: secrets scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Load pinned gitleaks version
+        run: |
+          set -eu
+          . scripts/release/gitleaks-version.sh
+          echo "GITLEAKS_VERSION=$GITLEAKS_VERSION" >> "$GITHUB_ENV"
+          echo "GITLEAKS_LINUX_X64_SHA256=$GITLEAKS_LINUX_X64_SHA256" >> "$GITHUB_ENV"
+      - name: Install pinned gitleaks
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          curl -sSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          # Verify against the literal sha256 pinned in this repo (not fetched
+          # from the same release as the tarball) and against the release's
+          # own checksums file -- both must agree, so a tampered release that
+          # ships a consistent tarball+checksums pair still fails the first.
+          echo "${GITLEAKS_LINUX_X64_SHA256}  ${asset}" | sha256sum -c -
+          grep " ${asset}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "$asset" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: gitleaks git --redact --config .gitleaks.toml

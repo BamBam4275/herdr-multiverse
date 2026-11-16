@@ -136,6 +136,8 @@ pub struct ChainSelector<'a> {
 }
 
 impl<'a> ChainSelector<'a> {
+    /// Builds a selector over `chain`, ready to seat councillors one at a
+    /// time via [`seat`]; no selection is made until then.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain: &'a [selector::Seat],
@@ -722,6 +724,10 @@ where
                 (stores, herdrs, started)
             }
             held => {
+                // Keep the fleet-lock guard alive for the rest of this
+                // block: `admit`'s recheck and every seat's dispatch start
+                // must happen under the same lock acquisition, never a
+                // fresh one.
                 let _held = held;
                 admit(council)?;
                 let mut kept_stores = Vec::new();
@@ -815,7 +821,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, OnceLock};
+    use std::sync::{Arc, Barrier, Mutex, Weak};
     use std::time::SystemTime;
 
     use mv_herdr::argv::{self, HerdrCommand};
@@ -1545,7 +1551,7 @@ mod tests {
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-    struct Sandbox(PathBuf);
+    struct Sandbox(PathBuf, #[allow(dead_code)] Arc<FakeBinary>);
     impl Sandbox {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
@@ -1554,7 +1560,10 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
-            Self(path)
+            // Holding the `Arc` for as long as this sandbox lives keeps
+            // `fake_binary`'s shared copy alive for exactly as long as any
+            // test that might still exec it (card `20261115-b-c8065f`).
+            Self(path, fake_binary())
         }
     }
     impl Drop for Sandbox {
@@ -1563,58 +1572,79 @@ mod tests {
         }
     }
 
-    fn fake_binary() -> &'static Path {
-        static BINARY: OnceLock<PathBuf> = OnceLock::new();
-        BINARY.get_or_init(|| {
-            // Nested `cargo test --workspace -j N` lets other crates rebuild
-            // `fake-herdr` into the shared `target/` artifact while this
-            // crate is already exec'ing it. Rewriting a binary that another
-            // process is exec'ing returns ETXTBSY; `wait_ready` here has a
-            // zero readiness budget, so that single failed spawn marks the
-            // seat failed and flakes
-            // `a_quorate_council_runs_every_seat_through_the_runner_and_collects_its_answer`.
-            // Ask Cargo for a finished artifact (its lock serializes the
-            // rebuild), then copy it to a process-private path so later
-            // workspace rebuilds cannot touch the file we exec.
-            let output = Command::new(env!("CARGO"))
-                .args([
-                    "build",
-                    "-p",
-                    "mv-herdr",
-                    "--bin",
-                    "fake-herdr",
-                    "--locked",
-                    "--message-format=json",
-                ])
-                .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
-                .output()
-                .expect("build fake-herdr with Cargo");
-            assert!(
-                output.status.success(),
-                "fake-herdr build failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let artifact = String::from_utf8(output.stdout)
-                .unwrap()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .find_map(|message| {
-                    (message["reason"] == "compiler-artifact"
-                        && message["target"]["name"] == "fake-herdr")
-                        .then(|| message["executable"].as_str().map(PathBuf::from))
-                        .flatten()
-                })
-                .expect("Cargo must report the fake-herdr executable");
-            assert!(
-                artifact.is_file(),
-                "fake-herdr must exist; never fall back to real Herdr"
-            );
-            let isolated =
-                std::env::temp_dir().join(format!("mv-council-fake-herdr-{}", std::process::id()));
-            fs::copy(&artifact, &isolated).expect("isolate fake-herdr from target/");
-            fs::set_permissions(&isolated, fs::Permissions::from_mode(0o700)).unwrap();
-            isolated
-        })
+    /// Removed once the last `Arc` referencing it drops, including on
+    /// panic (card `20261115-b-c8065f`: the bare `OnceLock<PathBuf>` this
+    /// replaced lived for the whole process and was never cleaned up,
+    /// leaking `mv-council-fake-herdr-*` into `TMPDIR`).
+    struct FakeBinary(PathBuf);
+    impl std::ops::Deref for FakeBinary {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for FakeBinary {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn fake_binary() -> Arc<FakeBinary> {
+        static CACHE: Mutex<Weak<FakeBinary>> = Mutex::new(Weak::new());
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = cache.upgrade() {
+            return existing;
+        }
+        // Nested `cargo test --workspace -j N` lets other crates rebuild
+        // `fake-herdr` into the shared `target/` artifact while this
+        // crate is already exec'ing it. Rewriting a binary that another
+        // process is exec'ing returns ETXTBSY; `wait_ready` here has a
+        // zero readiness budget, so that single failed spawn marks the
+        // seat failed and flakes
+        // `a_quorate_council_runs_every_seat_through_the_runner_and_collects_its_answer`.
+        // Ask Cargo for a finished artifact (its lock serializes the
+        // rebuild), then copy it to a private path so later workspace
+        // rebuilds cannot touch the file we exec.
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "-p",
+                "mv-herdr",
+                "--bin",
+                "fake-herdr",
+                "--locked",
+                "--message-format=json",
+            ])
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .output()
+            .expect("build fake-herdr with Cargo");
+        assert!(
+            output.status.success(),
+            "fake-herdr build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifact = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|message| {
+                (message["reason"] == "compiler-artifact"
+                    && message["target"]["name"] == "fake-herdr")
+                    .then(|| message["executable"].as_str().map(PathBuf::from))
+                    .flatten()
+            })
+            .expect("Cargo must report the fake-herdr executable");
+        assert!(
+            artifact.is_file(),
+            "fake-herdr must exist; never fall back to real Herdr"
+        );
+        let isolated =
+            std::env::temp_dir().join(format!("mv-council-fake-herdr-{}", std::process::id()));
+        fs::copy(&artifact, &isolated).expect("isolate fake-herdr from target/");
+        fs::set_permissions(&isolated, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = Arc::new(FakeBinary(isolated));
+        *cache = Arc::downgrade(&binary);
+        binary
     }
 
     fn quote(value: &str) -> String {

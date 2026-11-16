@@ -24,6 +24,7 @@ mod halt;
 mod health;
 mod import_python;
 mod inspect;
+mod lifecycle;
 mod new;
 mod notify;
 mod presence;
@@ -36,9 +37,9 @@ mod start;
 mod stop;
 mod sweep;
 mod tasks;
-// `pub(crate)`, not private: `args.rs`'s own blanket-invocation test reaches
-// this module's `herdr_env` lock across the `commands`/`args` module
-// boundary (task `20261105-fixer-e1b6cc`).
+/// `pub(crate)`, not private: `args.rs`'s own blanket-invocation test reaches
+/// this module's `herdr_env` lock across the `commands`/`args` module
+/// boundary (task `20261105-fixer-e1b6cc`).
 pub(crate) mod worktrees;
 
 fn config_override(args: &ArgMatches) -> Option<PathBuf> {
@@ -290,6 +291,11 @@ pub(crate) fn config_available(args: &ArgMatches) -> bool {
 }
 mod workers;
 
+/// Checks the `--yes`/`--dry-run` gate `dispatch` and `council` share
+/// before `run` reaches their handlers; every other command is a no-op
+/// here. Called separately from `run` itself (see `main.rs`'s
+/// `MissingRequiredArgument` handling) so the authorization refusal still
+/// surfaces even when a required positional is missing.
 pub fn authorization(command: &str, args: &ArgMatches) -> Result<(), Failure> {
     let needs_yes = matches!(command, "dispatch" | "council")
         && !args.get_flag("yes")
@@ -340,6 +346,12 @@ fn validate(args: &ArgMatches) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The one routing table from a clap subcommand name to its handler.
+/// Validates shared argument constraints and the `--yes`/`--dry-run` gate
+/// first, then dispatches — every registered command is wired to a real
+/// handler, so reaching the final `unreachable!()` means clap accepted a
+/// name this table does not know, which is a bug in the two staying in
+/// sync, not a runtime condition.
 pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
     let (name, args) = matches.subcommand().expect("clap requires a subcommand");
     validate(args)?;
@@ -350,6 +362,8 @@ pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
         "halt" => halt::run(args),
         "scratch" => scratch::run(args),
         "start" => start::run(args),
+        "down" => lifecycle::run_down(args),
+        "up" => lifecycle::run_up(args),
         "projects" => projects::run(args),
         "stop" => stop::run(args),
         "add" => add::run(args),

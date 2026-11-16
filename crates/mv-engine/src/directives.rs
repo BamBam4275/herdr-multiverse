@@ -9,18 +9,27 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// `digest`'s return value for a project with no directives file.
 pub const NO_DIRECTIVE_DIGEST: &str = "none";
 
+/// Everything that can go wrong reading or writing a project's standing
+/// directives file.
 #[derive(Debug, thiserror::Error)]
 pub enum DirectivesError {
+    /// A write was attempted from inside a Herdr pane; directives may only
+    /// be changed from outside one.
     #[error("standing directives may only be written from outside a Herdr pane")]
     InsidePane,
+    /// `project` failed `valid_project_name`.
     #[error("invalid project name {0:?}")]
     InvalidProject(String),
+    /// The resolved path is a symlink, or resolves outside `root`.
     #[error("refusing symlinked or escaping directives path: {0}")]
     SymlinkRefusal(PathBuf),
+    /// The file's leading `until:` header did not parse.
     #[error("{path}: malformed until header {value:?}")]
     MalformedDirective { path: PathBuf, value: String },
+    /// An underlying filesystem error, with the path it happened on.
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -36,6 +45,7 @@ fn io_error(path: &Path, source: io::Error) -> DirectivesError {
     }
 }
 
+/// A project's standing directive, as read from its on-disk file.
 #[derive(Debug, Clone)]
 pub struct Directive {
     pub project: String,
@@ -46,6 +56,8 @@ pub struct Directive {
 }
 
 impl Directive {
+    /// Whether `until` has passed as of `now`. A directive with no `until`
+    /// never expires.
     pub fn is_expired(&self, now: SystemTime) -> bool {
         self.until.is_some_and(|until| until <= now)
     }
@@ -59,6 +71,8 @@ pub fn directives_root(state_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| state_dir.join("directives"))
 }
 
+/// The on-disk path for `project`'s directive under `root`, after
+/// validating the project name.
 pub fn directives_path(root: &Path, project: &str) -> Result<PathBuf, DirectivesError> {
     // Config owns cross-project case/Unicode collision checks.
     if !valid_project_name(project) {
@@ -93,6 +107,9 @@ fn verify_path(root: &Path, path: &Path) -> Result<(), DirectivesError> {
     Ok(())
 }
 
+/// Read `project`'s directive file, if any, parsing its optional leading
+/// `until:` header. `Ok(None)` means the file does not exist; any other
+/// failure (malformed header, symlink, I/O) is an error.
 pub fn read(root: &Path, project: &str) -> Result<Option<Directive>, DirectivesError> {
     let path = directives_path(root, project)?;
     verify_path(root, &path)?;
@@ -107,6 +124,8 @@ pub fn read(root: &Path, project: &str) -> Result<Option<Directive>, DirectivesE
         .map_err(|e| io_error(&path, e))?;
     let mut text = String::new();
     std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| io_error(&path, e))?;
+    // Only the first line can carry an `until:` header (mirrors `write_checked`'s
+    // own format); any other line starting with it is just body text.
     let (until, body) = match text
         .lines()
         .next()
@@ -134,6 +153,7 @@ pub fn read(root: &Path, project: &str) -> Result<Option<Directive>, DirectivesE
     }))
 }
 
+/// [`read`], filtered to `None` if the directive has already expired as of `now`.
 pub fn active(
     root: &Path,
     project: &str,
@@ -195,6 +215,8 @@ fn write_checked(
     Ok(path)
 }
 
+/// Content digest of `project`'s raw directive file, or [`NO_DIRECTIVE_DIGEST`]
+/// if it doesn't exist — used to detect whether a seed's embedded digest is stale.
 pub fn digest(root: &Path, project: &str) -> Result<String, DirectivesError> {
     let path = directives_path(root, project)?;
     verify_path(root, &path)?;

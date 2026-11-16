@@ -1,0 +1,45 @@
+{
+  "id": "check-seat-cap-excludes-nexus-pane",
+  "description": "Card 20261115-b-234610: `check`'s live open-agent cap check (`commands::check::fetch_live_open_counts`, backed by `mv_engine::seatstate`) must exclude a busy Nexus pane from a worker seat's own cap -- the same exclusion `commands::dispatch`'s `is_nexus_role` already applies to dispatch/council. A seat capped at 1, hosting only one busy Nexus pane (no worker pane at all), has zero worker panes open and must resolve its scout chain quietly, exiting EXIT_OK (0). Before this fix the Nexus pane counted against the cap, the chain read `ChainExhaustedError`/UNRESOLVED, and `check` exited EXIT_NEEDS_CONFIG (3).",
+  "dirs": {
+    "codex-home": {}
+  },
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n",
+        ".multiverse/routing.log": "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-nexus-aaaaaa\tproject=sandbox\trole=nexus\taccount=primary\tpool=codex:test\toutcome=chain-primary\treason=\tagent=sandbox-nex-1-pr\tbranch=main\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[accounts.primary]\nkind = \"codex\"\nshort = \"pr\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:test\"\n\n[roles.scout]\n[roles.scout.models]\ncodex = \"m\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n[projects.sandbox.chains]\nscout = [\"primary\"]\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["accounts", "limit", "primary", "1"],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["check"],
+      "transcript": [
+        {
+          "match_argv": ["agent", "list"],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": [{\"pane_id\": \"w1:p1\", \"agent_status\": \"working\", \"name\": \"sandbox-nex-1-pr\"}]}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0
+      }
+    }
+  ]
+}

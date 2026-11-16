@@ -1,6 +1,6 @@
 {
   "id": "workers-herdr-shape-fidelity",
-  "description": "`multiverse workers` makes one `agent list` call and renders the live, non-orchestrator agents it recognizes as this fleet's own (runner.dispatched_agents: a name of the form <project>-<role-short>-<seat-short>, both short codes resolved against the running config — 'expl'/'sb' here). The reply envelope mirrors the shape of the committed tests/fixtures/herdr/agent-list.json capture (same keys: agent/agent_status/cwd/name/pane_id under result.agents) with sandbox-safe values rather than that fixture's real host paths.",
+  "description": "`multiverse workers` makes one `agent list` call and renders the live, non-orchestrator agents it recognizes as this fleet's own (runner.dispatched_agents: a name of the form <project>-<role-short>-<seat-short>, both short codes resolved against the running config — 'expl'/'sb' here). The reply envelope mirrors the shape of the committed tests/fixtures/herdr/agent-list.json capture (same keys: agent/agent_status/cwd/name/pane_id under result.agents) with sandbox-safe values rather than that fixture's real host paths. It also makes one `pane read <pane> --lines 200` call per live agent with a pane id — card `20261115-b-59e017`'s stalled-pane content probe (crates/mv-cli/src/commands/workers.rs's `fetch_pane_hashes`/`STALL_CONTENT_LINES`) — whose reply content is irrelevant here, only that it is asked for.",
   "dirs": {
     "codex-home": {}
   },
@@ -24,11 +24,18 @@
             "exit": 0,
             "stdout": "{\"result\": {\"agents\": [{\"agent\": \"codex\", \"agent_status\": \"working\", \"cwd\": \"/tmp/lane\", \"name\": \"sandbox-expl-sb\", \"pane_id\": \"w1:p1\"}]}}\n"
           }
+        },
+        {
+          "match_argv": ["pane", "read", "w1:p1", "--lines", "200"],
+          "reply": {
+            "exit": 0,
+            "stdout": "agent output\n"
+          }
         }
       ],
       "expect": {
         "exit": 0,
-        "stdout": "PROJECT          TASK                       ROLE       SEAT             STATUS     AGE\n—                —                          scout      seat-b           working    —\n\nworkers 1/3\nseats: seat-b 0\nprojects: sandbox 0 open, ceiling 3\nnexus sessions 0 (excluded from workers; they do not count against max_concurrent)"
+        "stdout": "PROJECT TASK ROLE  SEAT   STATUS  OUTCOME AGE\n—       —    scout seat-b working —       —\n\nworkers 1/3\nseats: seat-b 0\nprojects: sandbox 0 open, ceiling 3\nnexus sessions 0 (excluded from workers; they do not count against max_concurrent)"
       }
     }
   ]

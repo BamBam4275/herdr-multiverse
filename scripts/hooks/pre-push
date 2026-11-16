@@ -1,0 +1,92 @@
+#!/bin/sh
+# Refuses to push when gitleaks finds a secret in the commits being pushed,
+# or when gitleaks itself is unavailable -- never a silent skip. Also runs
+# scripts/check-private-names.sh against a local deny-list: MV_PRIVATE_NAMES
+# if set, else $HOME/.config/multiverse/private-names.txt when that file
+# exists. If neither is present, prints one skip line and continues. A hit
+# refuses the push with the checker's own output; this hook never prints
+# the list. Installed via scripts/hooks/install.sh (opt-in; see
+# CONTRIBUTING.md's dev setup).
+#
+# Git's pre-push protocol (githooks(5)) feeds one line per updated ref on
+# stdin: "<local ref> <local sha1> <remote ref> <remote sha1>".
+#
+# POSIX sh only.
+set -eu
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+CONFIG="$REPO_ROOT/.gitleaks.toml"
+ZERO=0000000000000000000000000000000000000000
+
+# $1=have $2=want, each "MAJOR.MINOR.PATCH" -- true if have >= want.
+# Pure parameter expansion, no external tools, so this never depends on
+# what else happens to be on PATH.
+version_ge() {
+    have_major=${1%%.*}; have_rest=${1#*.}
+    have_minor=${have_rest%%.*}; have_patch=${have_rest#*.}
+    want_major=${2%%.*}; want_rest=${2#*.}
+    want_minor=${want_rest%%.*}; want_patch=${want_rest#*.}
+    [ "$have_major" -gt "$want_major" ] 2>/dev/null && return 0
+    [ "$have_major" -lt "$want_major" ] 2>/dev/null && return 1
+    [ "$have_minor" -gt "$want_minor" ] 2>/dev/null && return 0
+    [ "$have_minor" -lt "$want_minor" ] 2>/dev/null && return 1
+    [ "$have_patch" -ge "$want_patch" ] 2>/dev/null
+}
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-push: gitleaks is not installed -- refusing to push unscanned commits." >&2
+    echo "pre-push: install the version pinned in scripts/release/gitleaks-version.sh from" >&2
+    echo "pre-push: https://github.com/gitleaks/gitleaks/releases (or via your package" >&2
+    echo "pre-push: manager), then retry. To push once without scanning, use --no-verify." >&2
+    exit 1
+fi
+
+GITLEAKS_VERSION_PIN="$REPO_ROOT/scripts/release/gitleaks-version.sh"
+if [ ! -f "$GITLEAKS_VERSION_PIN" ]; then
+    echo "pre-push: $GITLEAKS_VERSION_PIN is missing -- refusing to push unscanned commits." >&2
+    echo "pre-push: this repo pins its required gitleaks version there; restore the file" >&2
+    echo "pre-push: (or reclone), then retry. To push once without scanning, use --no-verify." >&2
+    exit 1
+fi
+. "$GITLEAKS_VERSION_PIN"
+found_version=$(gitleaks version 2>/dev/null)
+found_version=${found_version#v}
+if ! version_ge "$found_version" "$GITLEAKS_VERSION"; then
+    echo "pre-push: gitleaks is v${found_version:-unknown}, this repo requires >= v$GITLEAKS_VERSION -- refusing to push unscanned commits." >&2
+    echo "pre-push: upgrade (https://github.com/gitleaks/gitleaks/releases or your package" >&2
+    echo "pre-push: manager), then retry. To push once without scanning, use --no-verify." >&2
+    exit 1
+fi
+
+fail=0
+
+if [ -z "${MV_PRIVATE_NAMES:-}" ] && [ -n "${HOME:-}" ] \
+        && [ -f "$HOME/.config/multiverse/private-names.txt" ]; then
+    MV_PRIVATE_NAMES="$HOME/.config/multiverse/private-names.txt"
+    export MV_PRIVATE_NAMES
+fi
+
+if [ -n "${MV_PRIVATE_NAMES:-}" ]; then
+    if ! "$REPO_ROOT/scripts/check-private-names.sh" </dev/null; then
+        fail=1
+    fi
+else
+    echo "pre-push: private-names check skipped" >&2
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$ZERO" ] && continue # deleting a ref: nothing to scan
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        range="$local_sha" # new ref: scan its full ancestry
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    if ! gitleaks git --config "$CONFIG" --redact -v --log-opts="$range"; then
+        echo "pre-push: gitleaks found a potential secret pushing $local_ref ($range) -- push refused." >&2
+        fail=1
+    fi
+done
+
+exit "$fail"

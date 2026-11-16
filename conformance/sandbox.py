@@ -46,6 +46,10 @@ class Sandbox:
         self.paths.add(str(self.root), "<SANDBOX_ROOT>")
 
     def add_project(self, name: str, spec: dict) -> Path:
+        """Create a project directory under this sandbox from `spec`
+        (files, fifos, and — if `spec["git"]` — a git repo with optional
+        lane branches, orphan branches, worktrees and archived lanes),
+        and register it for path normalization."""
         path = self.root / "projects" / name
         path.mkdir(parents=True)
         for relpath, content in (spec.get("files") or {}).items():
@@ -97,6 +101,9 @@ class Sandbox:
         mode: int | None = None,
         files: dict | None = None,
     ) -> Path:
+        """Create an arbitrary named directory under this sandbox (for a
+        fake account config dir, etc.), with optional file contents and
+        permission mode, and register it for path normalization."""
         path = self.root / "dirs" / key
         path.mkdir(parents=True)
         for relpath, content in (files or {}).items():
@@ -124,10 +131,12 @@ class Sandbox:
 
 
 def _run_git(args: list[str], *, cwd: Path) -> None:
+    """Run a git command in `cwd`, raising on a non-zero exit."""
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
 def _run_git_capture(args: list[str], *, cwd: Path) -> str:
+    """Like `_run_git`, but return the command's stdout."""
     result = subprocess.run(
         ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
     )
@@ -169,5 +178,6 @@ def _add_lane_branch(repo: Path, task_id: str, spec: dict) -> None:
 
 
 def make_sandbox(tmp_parent: Path | None = None) -> Sandbox:
+    """Create a fresh `Sandbox` rooted in a new `mkdtemp()` directory."""
     root = Path(tempfile.mkdtemp(prefix="mv-conformance-", dir=tmp_parent)).resolve()
     return Sandbox(root)

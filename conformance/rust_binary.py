@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def build_rust_binary() -> str:
+    """Build `mv-cli` (the `multiverse` binary) and return its path."""
     proc = subprocess.run(
         ["cargo", "build", "-p", "mv-cli", "--locked", "--message-format=json"],
         cwd=REPO_ROOT,

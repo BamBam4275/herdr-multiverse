@@ -21,10 +21,18 @@ TARGETS = {
 
 
 class BootstrapTests(unittest.TestCase):
+    """scripts/bootstrap-plugin.sh regressions: release download + checksum
+    + attestation, the cargo-source fallback, and the existing-binary no-op,
+    all run against a throwaway checkout with every external tool
+    (curl/gh/cargo/gitleaks's peers) stubbed under an isolated PATH."""
+
     # The macOS end-to-end runner supplies archives built by scripts/build.sh.
     release_source = None
 
     def setUp(self):
+        """Build a throwaway plugin checkout (bootstrap-plugin.sh, build.sh,
+        herdr-plugin.toml) with an isolated PATH, HOME, and release fixture
+        directory, so each test runs bootstrap against local state only."""
         self.temp = tempfile.TemporaryDirectory(prefix="bootstrap-test-", dir=REPO / "scripts")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
@@ -82,6 +90,8 @@ class BootstrapTests(unittest.TestCase):
             (self.releases / "SHA256SUMS").write_text(checksum)
 
     def bootstrap(self, caller="install"):
+        """Run bootstrap-plugin.sh against the fixture checkout and return
+        its completed subprocess.run result (caller: "install" or "action")."""
         return subprocess.run(
             [str(self.root / "scripts/bootstrap-plugin.sh"), caller],
             cwd=self.work / "project", env=self.env,
@@ -89,6 +99,7 @@ class BootstrapTests(unittest.TestCase):
         )
 
     def assert_version(self):
+        """Assert the installed bin/multiverse reports this fixture's version."""
         result = subprocess.run(
             [str(self.binary), "--version"], cwd=self.work / "project", env=self.env,
             text=True, capture_output=True, check=False,
@@ -97,6 +108,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), f"multiverse {self.version}")
 
     def remove_release(self):
+        """Delete the local release fixture, forcing bootstrap past step 1
+        (no matching binary) and step 2 (no release archive to download)."""
         shutil.rmtree(self.releases)
 
     def use_default_github_url(self):
@@ -138,6 +151,9 @@ class BootstrapTests(unittest.TestCase):
         curl.chmod(0o755)
 
     def install_gh(self, body, *, help_ok=True):
+        """Install a fake `gh` into the isolated PATH whose `gh attestation
+        verify ...` body is `body`; `help_ok=False` simulates a `gh` too old
+        to recognize `attestation verify --help`."""
         gh = self.tools / "gh"
         if help_ok:
             script = (
@@ -155,6 +171,8 @@ class BootstrapTests(unittest.TestCase):
         gh.chmod(0o755)
 
     def test_verified_release_and_existing_binary(self):
+        """A checksum-verified release archive installs bin/multiverse, and a
+        second run against the now-matching binary is a no-op (step 1)."""
         result = self.bootstrap()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("from release", result.stdout)
@@ -168,6 +186,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("nothing to do", result.stdout)
 
     def test_stale_binary_redownloads_from_release(self):
+        """A version-mismatched existing binary is replaced from the release
+        archive rather than treated as already up to date."""
         # Tag-upgrade path: an old bin/multiverse is already installed and a
         # newer release archive is available (herdr plugin install --ref vNext).
         stale_version = "0.0.0"
@@ -186,6 +206,9 @@ class BootstrapTests(unittest.TestCase):
         self.assertNotEqual(self.binary.read_bytes(), stale)
 
     def test_custom_release_url_skips_gh_attestation(self):
+        """With MULTIVERSE_RELEASE_BASE_URL set, bootstrap must not even
+        invoke `gh attestation verify` -- a present `gh` that would fail is
+        proof attestation was skipped, not bypassed-but-ignored."""
         # Offline mirrors and the local file:// fixture have no GitHub
         # attestation. A present `gh` must not fail the checksum-verified
         # install (bootstrap-plugin.sh skips attestation whenever
@@ -202,6 +225,8 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_default_url_gh_success_installs_release(self):
+        """A successful `gh attestation verify` installs the release binary
+        with no warning."""
         self.use_default_github_url()
         self.install_gh(
             "echo '✓ Verification succeeded!' >&2\n"
@@ -215,6 +240,8 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_default_url_old_gh_warns_and_installs(self):
+        """A `gh` too old to run `attestation verify` warns and still
+        installs the checksum-verified release binary."""
         self.use_default_github_url()
         self.install_gh(
             "echo 'unknown command \"attestation\" for \"gh\"' >&2\n"
@@ -230,6 +257,8 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_default_url_unauthenticated_gh_warns_and_installs(self):
+        """An unauthenticated `gh` warns and still installs the
+        checksum-verified release binary."""
         self.use_default_github_url()
         self.install_gh(
             "echo 'To get started with GitHub CLI, please run:  gh auth login' >&2\n"
@@ -244,6 +273,8 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_default_url_offline_gh_warns_and_installs(self):
+        """A `gh` that can't reach GitHub warns and still installs the
+        checksum-verified release binary."""
         self.use_default_github_url()
         self.install_gh(
             "echo 'failed to fetch attestations for subject: dial tcp: lookup api.github.com: no such host' >&2\n"
@@ -258,6 +289,8 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_default_url_no_attestation_warns_and_installs(self):
+        """A release with no attestation on record warns and still installs
+        the checksum-verified release binary."""
         self.use_default_github_url()
         self.install_gh(
             "echo '✗ No attestations found for subject sha256:deadbeef' >&2\n"
@@ -272,6 +305,9 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_default_url_attestation_mismatch_refuses_release(self):
+        """A `gh` that reports the artifact does not match its attestation
+        refuses the release binary outright, with no cargo on PATH to
+        fall back to."""
         self.use_default_github_url()
         self.install_gh(
             "echo 'Loaded 1 attestation from GitHub API' >&2\n"
@@ -287,6 +323,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.binary.exists())
 
     def test_default_url_attestation_mismatch_falls_back_to_cargo(self):
+        """An attestation mismatch refuses the release binary, then
+        bootstrap falls through to the cargo source build (step 3)."""
         self.use_default_github_url()
         self.install_gh(
             "echo '✗ Verification failed' >&2\n"
@@ -312,6 +350,8 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_corrupt_checksum_refuses_install(self):
+        """A SHA256SUMS entry that doesn't match the downloaded archive
+        refuses the install and leaves no leftover temp directory."""
         (self.releases / "SHA256SUMS").write_text(f"{'0' * 64}  {self.archive_name}\n")
         result = self.bootstrap()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -320,12 +360,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(list((self.work / "tmp").iterdir()), [])
 
     def test_missing_checksum_refuses_install(self):
+        """No SHA256SUMS entry for the archive refuses the install."""
         (self.releases / "SHA256SUMS").unlink()
         result = self.bootstrap()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertFalse(self.binary.exists())
 
     def test_missing_release_builds_from_source(self):
+        """No matching release archive, but cargo is on PATH: bootstrap
+        builds from source (step 3) and installs the result."""
         self.remove_release()
         cargo = self.tools / "cargo"
         cargo.write_text(
@@ -348,6 +391,9 @@ class BootstrapTests(unittest.TestCase):
         self.assert_version()
 
     def test_missing_release_and_cargo_explains_recovery(self):
+        """With neither a matching release archive nor cargo on PATH,
+        bootstrap fails (step 4) with a message naming both recovery paths
+        and the caller-appropriate retry hint."""
         self.remove_release()
         for caller, hint in (("install", "re-run 'herdr plugin install'"), ("action", "retry the action")):
             with self.subTest(caller=caller):

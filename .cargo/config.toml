@@ -22,6 +22,69 @@
 # Herdr must set `HERDR_BIN_PATH` to a fake explicitly first. Production
 # use is unaffected — it runs the already-built `multiverse` binary
 # directly, never through `cargo`, so none of this is ever in effect for it.
+#
+# Card `20261110-b-590e00`: worker panes now export the live
+# `MULTIVERSE_STATE_DIR`/`MULTIVERSE_CONFIG` into every process they spawn
+# (merged `0f90860`) the same way they already exported `HERDR_BIN_PATH`
+# above, so a lane's `cargo test` could otherwise read or write the real
+# fleet's config/state. Unlike `HERDR_BIN_PATH`, this `[env]` table cannot
+# *unset* either var to recover an "absent" reading cargo could fall back
+# from — it can only force a value — so the forced value here is itself
+# the refusal signal: a sentinel no real config path or state directory
+# would ever legitimately be. `mv_config::load::resolve_config_path_from_env`/
+# `config_state_dir_from_env` (`crates/mv-config/src/load.rs`) check for
+# these two literals by exact match and refuse rather than resolve against
+# them — see `FORBIDDEN_LIVE_CONFIG_SENTINEL`/`FORBIDDEN_LIVE_STATE_DIR_SENTINEL`
+# there, which this file's two values below must stay byte-identical to.
+# A test that needs its own isolated directory still works exactly as
+# before: it overrides the var in-process (`std::env::set_var`, the
+# existing `StateDirEnvGuard` pattern in `load.rs`'s own tests) before
+# calling into config loading, which replaces the forced value for the
+# rest of that process same as it always has.
 [env]
 HERDR_BIN_PATH = { value = "", force = true }
 MV_TEST_FORBID_REAL_HERDR = { value = "1", force = true }
+MULTIVERSE_STATE_DIR = { value = "/MV_TEST_FORBID_REAL_STATE_DIR", force = true }
+MULTIVERSE_CONFIG = { value = "/MV_TEST_FORBID_REAL_CONFIG", force = true }
+
+# Card 20261115-b-d9ef30: the operator's `~/.cargo/config.toml` sets
+# `[build] build-dir = "{cargo-cache-home}/shared-build"` — one literal
+# path, not namespaced by workspace. Every worktree of this repo (each
+# lane under `.multiverse/worktrees/`) resolves to the *same* build-dir,
+# so cargo's fingerprint cache for a given crate (keyed by package
+# identity, not by which worktree compiled it) can be satisfied by
+# another lane's object entirely. The dep-info backing that cache entry
+# still lists the *other* lane's absolute source paths; cargo checks
+# those paths' mtimes to decide freshness, never looks at this lane's
+# own (different) sources, and — if the other lane's files haven't
+# moved since — calls it Fresh. Observed in the field: lane
+# `20261115-builder-7abd49`'s `mv-state` linked against lane
+# `44c1ec`'s stale `mv-config` build and was missing a struct the
+# `44c1ec` lane had added; reproduced on demand with two scratch
+# worktrees sharing one build-dir, where a package added only in one
+# worktree compiled cleanly against the other worktree's `mv-state`
+# that called it. `CARGO_TARGET_DIR`/`target-dir` do not help — the
+# home config's override is on `build-dir`, a cache Cargo keeps
+# separate from `target-dir` for intermediate artifacts (see the build
+# cache chapter of the Cargo reference).
+#
+# `{workspace-path-hash}` is a build-dir path template variable Cargo
+# resolves to a hash of this workspace's manifest path — distinct per
+# worktree even though every worktree shares the same `Cargo.toml`
+# *content*, because the path it's checked out at differs. Nesting it
+# under the same `{cargo-cache-home}/shared-build` the operator's config
+# already names keeps artifacts on the same volume/cache root the
+# operator chose; this file only adds the missing namespace segment.
+# `CARGO_BUILD_BUILD_DIR` (if set in a shell) still overrides this, same
+# precedence as any other `[build]` key.
+#
+# Cost: each worktree now populates its own build-dir from nothing on
+# first build instead of reusing a warm shared one — a fresh lane's
+# first `cargo build --workspace --locked` pays a full cold compile
+# (measured ~46s wall-clock for this workspace with a warm registry
+# cache, card `20261115-b-d9ef30`'s builder task) rather than the
+# near-instant reuse a correctly-shared cache would give. That cost
+# buys the one guarantee a shared, unhashed build-dir cannot: a lane's
+# build only ever reflects that lane's own source.
+[build]
+build-dir = "{cargo-cache-home}/shared-build/{workspace-path-hash}"

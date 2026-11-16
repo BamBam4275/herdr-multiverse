@@ -2,6 +2,9 @@
 
 use clap::{Arg, ArgAction, ArgGroup, Command};
 
+/// The current (non-retired) worker role names, in the order help text and
+/// validation messages list them. History readers must still accept the
+/// old on-disk names; this list is only for new config/write surfaces.
 pub const WORKER_ROLES: &[&str] = &[
     "scout",
     "builder",
@@ -30,6 +33,16 @@ fn positional(name: &'static str, required: bool, help: &'static str) -> Arg {
 
 fn many(name: &'static str, help: &'static str) -> Arg {
     positional(name, false, help).num_args(0..)
+}
+
+/// Trailing hidden positional that absorbs surplus tokens after a
+/// single-value item positional, so they reach the friendly
+/// "takes only an item id" refusal instead of clap's own usage error.
+fn overflow() -> Arg {
+    Arg::new("extra")
+        .num_args(0..)
+        .hide(true)
+        .help("Surplus tokens; refused with the item-id guidance")
 }
 
 fn repeat(name: &'static str, label: &'static str, help: &'static str) -> Arg {
@@ -85,6 +98,10 @@ fn group(name: &'static str, about: &'static str) -> Command {
     Command::new(name).about(about).subcommand_required(true)
 }
 
+/// Builds the full clap schema for the `multiverse` binary: every
+/// subcommand, its arguments, and their help text. Structure only — no
+/// business-rule validation belongs here; that happens at the exit
+/// boundary (see `role()`'s comment) or inside the command handlers.
 pub fn command() -> Command {
     Command::new("multiverse")
         .version(env!("CARGO_PKG_VERSION"))
@@ -136,6 +153,31 @@ pub fn command() -> Command {
                 .arg(flag("reseed", "Reseed existing Nexus sessions"))
                 .arg(flag("dashboard", "Open a dashboard watch pane")),
         )
+        .subcommand(
+            Command::new("down").about("Halt dispatch, ask each project's Nexus to wrap, then close its workspace")
+                .arg(value("reason", "TEXT", "Reason recorded on the halt").default_value("operator requested"))
+                .arg(
+                    Arg::new("down-timeout")
+                        .long("timeout")
+                        .value_name("SECONDS")
+                        .help("Seconds to wait for each project to wrap (0 means forever; default 1800)")
+                        .allow_hyphen_values(true),
+                )
+                .arg(dry_run())
+                .arg(many("projects", "Project names (defaults to every configured project, including the hub)")),
+        )
+        .subcommand(
+            Command::new("up").about("Start project Nexus sessions and clear a halt `down` set")
+                .arg(
+                    Arg::new("up-timeout")
+                        .long("timeout")
+                        .value_name("SECONDS")
+                        .help("Seconds to wait for each pending project's bring-up (0 means forever; default 1800)")
+                        .allow_hyphen_values(true),
+                )
+                .arg(dry_run())
+                .arg(many("projects", "Project names (defaults to every configured project, including the hub)")),
+        )
         .subcommand(Command::new("projects").about("List configured projects").arg(flag("names", "Print only project names")))
         .subcommand(
             Command::new("stop").about("Stop project sessions (all configured projects by default)")
@@ -166,13 +208,15 @@ pub fn command() -> Command {
                 .subcommand(Command::new("show").about("Show seat state").arg(positional("seat", true, "Seat name")).arg(json())),
         )
         .subcommand(
-            Command::new("worktrees").about("Inspect, prune, rescue, or restore task worktrees")
+            Command::new("worktrees").about("Inspect, prune, rescue, restore, or merge task worktrees")
                 .arg(positional("path", true, "Project path"))
                 .arg(flag("prune", "Prune eligible worktrees").conflicts_with("rescue"))
                 .arg(flag("rescue", "Rescue worktrees").conflicts_with("prune"))
                 .arg(flag("force", "Override permitted prune guards"))
+                .arg(flag("reap", "With --prune, end a kept lane's own lingering process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; never with --force"))
                 .arg(yes()).arg(dry_run()).arg(flag("deep", "Inspect deeper worktree history"))
-                .arg(value("restore", "TASK_ID", "Restore an archived lane branch")),
+                .arg(value("restore", "TASK_ID", "Restore an archived lane branch"))
+                .arg(value("merge", "TASK_ID", "Scan a lane for secrets, then merge it into this checkout; refuses on a finding or a missing required scanner").conflicts_with("prune").conflicts_with("rescue")),
         )
         .subcommand(
             Command::new("check").about("Report readiness (exit 0 ready, 3 needs configuration)")
@@ -263,6 +307,7 @@ fn tasks() -> Command {
         .arg(value("task", "TASK_ID", "Select one task"))
         .arg(flag("close-stranded", "Close stranded tasks"))
         .arg(flag("reclaimable", "Show reclaimable tasks"))
+        .arg(flag("reap", "With --reclaimable, after a successful close end that lane's own lingering process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; without --yes, prints what would be reaped and kills nothing"))
         .arg(value("supersede", "TASK_ID", "Task to supersede"))
         .arg(
             value(
@@ -453,10 +498,7 @@ fn activity() -> Command {
         .subcommand(
             Command::new("reply")
                 .about("Reply to a message")
-                .arg(
-                    positional("seq", true, "Message sequence")
-                        .value_parser(clap::value_parser!(u64)),
-                )
+                .arg(positional("seq", true, "Message sequence or Project#SEQ"))
                 .arg(positional("message", true, "Reply body"))
                 .arg(value("id", "ID", "Reply ID")),
         )
@@ -467,10 +509,16 @@ fn activity() -> Command {
                 .arg(value("reason", "TEXT", "Reason for closing").required(true)),
         )
         .subcommand(
+            Command::new("show")
+                .about("Print one message in full, read-only")
+                .arg(positional("seq", true, "Message sequence or Project#SEQ")),
+        )
+        .subcommand(
             Command::new("broadcast")
                 .about("Broadcast a message")
                 .arg(positional("message", true, "Message body"))
-                .arg(value("id", "ID", "Message ID")),
+                .arg(value("id", "ID", "Message ID"))
+                .arg(flag("ask", "Request a reply from each recipient")),
         )
         .subcommand(
             Command::new("nudge")
@@ -485,11 +533,7 @@ fn activity() -> Command {
                         .conflicts_with("replay-since")
                         .conflicts_with("replay-last"),
                 )
-                .arg(
-                    flag("as-nexus", "Authorize acknowledging as the Nexus")
-                        .conflicts_with("replay-since")
-                        .conflicts_with("replay-last"),
-                )
+                .arg(flag("as-nexus", "Authorize acknowledging as the Nexus"))
                 .arg(value("limit", "N", "Maximum messages").value_parser(clap::value_parser!(u32)))
                 .arg(
                     value(
@@ -499,8 +543,7 @@ fn activity() -> Command {
                     )
                     .value_parser(clap::value_parser!(u64))
                     .conflicts_with("replay-last")
-                    .conflicts_with("peek")
-                    .conflicts_with("as-nexus"),
+                    .conflicts_with("peek"),
                 )
                 .arg(
                     value(
@@ -510,8 +553,7 @@ fn activity() -> Command {
                     )
                     .value_parser(clap::value_parser!(u32))
                     .conflicts_with("replay-since")
-                    .conflicts_with("peek")
-                    .conflicts_with("as-nexus"),
+                    .conflicts_with("peek"),
                 ),
         )
         .subcommand(
@@ -565,30 +607,35 @@ fn backlog() -> Command {
         .subcommand(
             Command::new("done")
                 .about("Complete a backlog card")
-                .arg(positional("item", true, "Card ID").num_args(1..))
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow())
                 .arg(value("evidence", "TEXT", "Completion evidence")),
         )
         .subcommand(
             Command::new("reopen")
                 .about("Reopen a backlog card")
-                .arg(positional("item", true, "Card ID").num_args(1..)),
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow()),
         )
         .subcommand(
             Command::new("annotate")
                 .about("Annotate a backlog card")
-                .arg(positional("item", true, "Card ID").num_args(1..))
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow())
                 .arg(value("note", "TEXT", "Annotation").required(true)),
         )
         .subcommand(
             Command::new("reprioritize")
                 .about("Change card priority")
-                .arg(positional("item", true, "Card ID").num_args(1..))
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow())
                 .arg(value("priority", "PRIORITY", "New priority").required(true)),
         )
         .subcommand(
             Command::new("show")
                 .about("Show a backlog card")
-                .arg(positional("item", true, "Card ID").num_args(1..)),
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow()),
         )
         .subcommand(
             Command::new("ask")
@@ -616,7 +663,8 @@ fn backlog() -> Command {
         .subcommand(
             Command::new("mark-asked")
                 .about("Mark a card as asked")
-                .arg(positional("item", true, "Card ID").num_args(1..))
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow())
                 .arg(repeat(
                     "option",
                     "TEXT",
@@ -636,7 +684,8 @@ fn backlog() -> Command {
         .subcommand(
             Command::new("answer")
                 .about("Record an answer")
-                .arg(positional("item", true, "Card ID").num_args(1..))
+                .arg(positional("item", true, "Card ID"))
+                .arg(overflow())
                 .arg(value("note", "TEXT", "Answer note").required(true)),
         )
 }
@@ -644,6 +693,59 @@ fn backlog() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+
+    /// Card `20261110-b-e592db`: `["tasks", "--no-reconcile"]` below reaches
+    /// `mv_config::load::config_state_dir_from_env` (via
+    /// `commands::tasks::list`/`probe_blocking_prompt`) with nothing
+    /// overriding `MULTIVERSE_STATE_DIR`, same failure mode as
+    /// `commands::dispatch`'s own `StateDirEnvGuard` (`dispatch.rs` line
+    /// ~4272) exists to close. Wraps [`HerdrEnvGuard`] for the one
+    /// process-wide lock, same shape as that guard.
+    struct StateDirEnvGuard {
+        _herdr: HerdrEnvGuard,
+        _dir: tempfile::TempDir,
+        previous_state_dir: Option<std::ffi::OsString>,
+        previous_plugin_state_dir: Option<std::ffi::OsString>,
+        previous_config: Option<std::ffi::OsString>,
+    }
+
+    impl StateDirEnvGuard {
+        fn new() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let dir = tempfile::tempdir().unwrap();
+            let previous_state_dir = std::env::var_os("MULTIVERSE_STATE_DIR");
+            let previous_plugin_state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+            let previous_config = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var("MULTIVERSE_STATE_DIR", dir.path());
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", dir.path());
+            std::env::remove_var("MULTIVERSE_CONFIG");
+            Self {
+                _herdr: herdr,
+                _dir: dir,
+                previous_state_dir,
+                previous_plugin_state_dir,
+                previous_config,
+            }
+        }
+    }
+
+    impl Drop for StateDirEnvGuard {
+        fn drop(&mut self) {
+            match self.previous_state_dir.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_STATE_DIR", value),
+                None => std::env::remove_var("MULTIVERSE_STATE_DIR"),
+            }
+            match self.previous_plugin_state_dir.take() {
+                Some(value) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", value),
+                None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+            }
+            match self.previous_config.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
 
     // Every command and documented option from spec-cli.md sections 2 and 3.
     // Each row must parse, route to its own stub, and accept global config at
@@ -700,6 +802,17 @@ mod tests {
         &["scratch", "close"],
         &["scratch", "close", "pane"],
         &["start", "one", "two", "--all", "--reseed", "--dashboard"],
+        &[
+            "down",
+            "one",
+            "two",
+            "--reason",
+            "reason",
+            "--timeout",
+            "60",
+            "--dry-run",
+        ],
+        &["up", "one", "two", "--timeout", "60", "--dry-run"],
         &["projects", "--names"],
         &["stop", "one", "two", "--force"],
         &["add", "project", "--name", "name", "--dry-run"],
@@ -849,7 +962,10 @@ mod tests {
             "--not-a-reply",
         ],
         &["activity", "reply", "1", "message", "--id", "id"],
+        &["activity", "reply", "one#1", "message", "--id", "id"],
         &["activity", "close", "1", "--reason", "reason"],
+        &["activity", "show", "1"],
+        &["activity", "show", "one#1"],
         &["activity", "broadcast", "message", "--id", "id"],
         &["activity", "nudge", "one", "two"],
         &["activity", "inbox", "--peek", "--as-nexus", "--limit", "10"],
@@ -978,6 +1094,8 @@ mod tests {
     const IMPLEMENTED: &[&str] = &[
         "halt",
         "start",
+        "down",
+        "up",
         "projects",
         "stop",
         "add",
@@ -1018,7 +1136,14 @@ mod tests {
         // of that same process-wide var, mid-window, was the second
         // caller inflating that count). Held for the whole loop since
         // several of its other invocations reach `mv-herdr` the same way.
-        let _herdr = crate::commands::worktrees::herdr_env::HerdrEnvGuard::unreachable();
+        //
+        // Card `20261110-b-e592db`: the same `["tasks", "--no-reconcile"]`
+        // invocation also reaches `mv_config::load::config_state_dir_from_env`
+        // (via `commands::tasks::list`/`probe_blocking_prompt`) with
+        // nothing overriding `MULTIVERSE_STATE_DIR` — `StateDirEnvGuard`
+        // below wraps the same `HerdrEnvGuard` lock, so one guard now
+        // covers both reads for the whole loop.
+        let _state = StateDirEnvGuard::new();
 
         // A config path under a scratch temp dir, not the literal relative
         // "alternate.toml" previously used here:
@@ -1030,15 +1155,13 @@ mod tests {
         // of the working tree. An earlier version of this change actually
         // wrote a stray state file into a
         // developer's real `~/.config/multiverse` before this existed.
-        let scratch = std::env::temp_dir().join(format!(
-            "mv-cli-args-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&scratch).unwrap();
+        // `tempfile::tempdir()` removes this on drop, including on panic
+        // (card `20261115-b-3e0fde`: the plain `create_dir_all` this
+        // replaced only cleaned up at the test's own trailing
+        // `remove_dir_all`, so a failure partway through the loop below
+        // left it behind in `TMPDIR`).
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch = scratch.path();
         let config_arg = scratch
             .join("alternate.toml")
             .to_string_lossy()
@@ -1117,7 +1240,6 @@ mod tests {
                 }
             }
         }
-        std::fs::remove_dir_all(&scratch).ok();
 
         let expected: std::collections::BTreeSet<_> = command()
             .get_subcommands()
@@ -1132,7 +1254,34 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             expected
         );
-        assert_eq!(expected.len(), 29);
+        assert_eq!(expected.len(), 31);
+    }
+
+    /// Card `20261110-b-d73da7`: council takes the same global `--config
+    /// PATH` every other subcommand does (`command()`'s `.global(true)`
+    /// arg). Dispatch/check/start do not redeclare it locally; neither
+    /// does council. Pins that the council leaf still sees the value —
+    /// the same capture `commands::council::request_from` threads into
+    /// `RealEngine`.
+    #[test]
+    fn council_accepts_the_global_config_flag() {
+        let m = command()
+            .try_get_matches_from([
+                "multiverse",
+                "council",
+                "project",
+                "question",
+                "--dry-run",
+                "--config",
+                "alternate.toml",
+            ])
+            .unwrap();
+        assert_eq!(m.get_one::<String>("config").unwrap(), "alternate.toml");
+        let council = m.subcommand_matches("council").unwrap();
+        assert_eq!(
+            council.get_one::<String>("config").unwrap(),
+            "alternate.toml"
+        );
     }
 
     #[test]
@@ -1248,12 +1397,38 @@ mod tests {
     }
 
     #[test]
-    fn replay_since_conflicts_with_peek_and_as_nexus() {
-        for extra in [["--peek"].as_slice(), ["--as-nexus"].as_slice()] {
-            let mut argv = vec!["multiverse", "activity", "inbox", "--replay-since", "1"];
-            argv.extend_from_slice(extra);
+    fn replay_since_and_replay_last_conflict_with_peek() {
+        for replay in [
+            ["--replay-since", "1"].as_slice(),
+            ["--replay-last", "1"].as_slice(),
+        ] {
+            let mut argv = vec!["multiverse", "activity", "inbox"];
+            argv.extend_from_slice(replay);
+            argv.push("--peek");
             let error = command().try_get_matches_from(argv).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    /// Card `20261115-b-2a0f8f`: `--as-nexus` only authorizes acknowledging
+    /// past a dispatched task id, and a replay never acknowledges — so the
+    /// combination is read-only and harmless, not a conflict. Previously
+    /// `--replay-since`/`--replay-last` each declared `conflicts_with
+    /// ("as-nexus")`, which refused this with "cannot be used with" even
+    /// though `inbox()` (`commands/activity.rs`) returns from its replay
+    /// branch before either flag is ever consulted.
+    #[test]
+    fn replay_since_and_replay_last_allow_as_nexus() {
+        for replay in [
+            ["--replay-since", "1"].as_slice(),
+            ["--replay-last", "1"].as_slice(),
+        ] {
+            let mut argv = vec!["multiverse", "activity", "inbox"];
+            argv.extend_from_slice(replay);
+            argv.push("--as-nexus");
+            command()
+                .try_get_matches_from(argv.clone())
+                .unwrap_or_else(|e| panic!("{argv:?} must be accepted: {e}"));
         }
     }
 
@@ -1415,16 +1590,11 @@ mod tests {
 
     #[test]
     fn backlog_cwd_values_capture_overflow_but_remain_required() {
+        // `add`/`ask` keep a plain multi-value positional: overflow lands in
+        // the same field clap reports.
         for (command, field, options) in [
             ("add", "title", vec![]),
-            ("done", "item", vec![]),
-            ("reopen", "item", vec![]),
-            ("annotate", "item", vec!["--note", "note"]),
-            ("reprioritize", "item", vec!["--priority", "P2"]),
-            ("show", "item", vec![]),
             ("ask", "question", vec!["--recommend", "1"]),
-            ("mark-asked", "item", vec!["--recommend", "1"]),
-            ("answer", "item", vec!["--note", "note"]),
         ] {
             let mut argv = vec!["backlog", command, "sandbox", "actual value"];
             argv.extend(&options);
@@ -1447,6 +1617,66 @@ mod tests {
                 parse_err(&missing).kind(),
                 clap::error::ErrorKind::MissingRequiredArgument
             );
+        }
+
+        // Every other single-item verb takes `item` as a single value, with
+        // overflow captured by the hidden `extra` positional instead, so
+        // clap's own usage never shows `<item>...`.
+        for (command, options) in [
+            ("done", vec![]),
+            ("reopen", vec![]),
+            ("annotate", vec!["--note", "note"]),
+            ("reprioritize", vec!["--priority", "P2"]),
+            ("show", vec![]),
+            ("mark-asked", vec!["--recommend", "1"]),
+            ("answer", vec!["--note", "note"]),
+        ] {
+            let mut argv = vec!["backlog", command, "sandbox", "actual value"];
+            argv.extend(&options);
+            let matches = parse(&argv);
+            let args = matches
+                .subcommand_matches("backlog")
+                .unwrap()
+                .subcommand_matches(command)
+                .unwrap();
+            assert_eq!(args.get_one::<String>("item").unwrap(), "sandbox");
+            assert_eq!(
+                args.get_many::<String>("extra")
+                    .unwrap()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["actual value"]
+            );
+            let mut missing = vec!["backlog", command];
+            missing.extend(options);
+            assert_eq!(
+                parse_err(&missing).kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+    }
+
+    #[test]
+    fn backlog_item_usage_hides_the_overflow_positional() {
+        for sub in [
+            "done",
+            "reopen",
+            "annotate",
+            "reprioritize",
+            "show",
+            "mark-asked",
+            "answer",
+        ] {
+            let error = command()
+                .try_get_matches_from(["multiverse", "backlog", sub, "--help"])
+                .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = error.to_string();
+            assert!(
+                help.contains("<item>") && !help.contains("<item>..."),
+                "{sub}: {help}"
+            );
+            assert!(!help.contains("extra"), "{sub}: {help}");
         }
     }
 

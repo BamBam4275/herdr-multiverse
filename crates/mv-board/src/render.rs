@@ -14,8 +14,8 @@ use crate::card::{
     split_backlog, split_dispatched, BacklogItemSnapshot, Card, DispatchedTaskSnapshot, PlacedCard,
 };
 use crate::columns::{
-    render_columns_merged_with, render_columns_with, sort_backlog, sort_backlog_placed,
-    sort_blocked, sort_blocked_placed, sort_in_progress, sort_in_progress_placed, ColumnLayout,
+    render_columns_merged_with, sort_backlog, sort_backlog_placed, sort_blocked,
+    sort_blocked_placed, sort_in_progress, sort_in_progress_placed, ColumnLayout,
 };
 use crate::layout::sanitize_title;
 
@@ -24,10 +24,14 @@ use crate::status_cards::{
     render_status_cards, LastCycleEntry, MailEntry, OwedReply, SeatsSnapshot,
 };
 
-/// A bright, dark-terminal-readable 4-entry palette. Red/bright-blue and
+/// A bright, dark-terminal-readable 3-entry palette. Red/bright-blue and
 /// the non-bright set are excluded as unreadable (the same rationale
-/// `board.py`'s `_PALETTE` records, from a reported screenshot).
-const PROJECT_PALETTE: [u8; 4] = [92, 93, 95, 97];
+/// `board.py`'s `_PALETTE` records, from a reported screenshot); bright
+/// cyan is reserved for [`AGENT_COLOR`]; bright white is excluded outright
+/// so a project color can never collide with the white/default-bright
+/// text drawn inside the box, nor with a status signal's own color (the
+/// BLOCKED column's bold-red emphasis).
+const PROJECT_PALETTE: [u8; 3] = [92, 93, 95];
 
 /// Every agent renders in the same color — a past per-agent hash was
 /// reverted as unreadable/arbitrary.
@@ -135,12 +139,33 @@ pub fn render(snapshot: &BoardSnapshot, options: &RenderOptions) -> Vec<String> 
     out.push(sanitize_title(&snapshot.project.name));
 
     let status = render_status(&snapshot.fleet_health, options.width);
+    // Convert a whole-terminal row budget into what's left for the
+    // columns: subtract the ACCOUNTS/blank/name lines already in `out`
+    // and the STATUS rows that will still follow, plus a small fixed
+    // margin (shared with `render_by_project`/`render_merged` below).
     let height = options
         .height
         .map(|rows| rows.saturating_sub(out.len() + status.len() + 2));
     out.extend(project_columns(&snapshot.project, options, height));
     out.extend(status);
     out
+}
+
+/// Tag every card with `project`'s own color, leaving the bottom-right
+/// project-short rail blank — that label only earns its keep once cards
+/// from several projects share one column (the merged fleet view's own
+/// [`place_cards`]); a single project's own board already says which
+/// project it is in the heading above the columns.
+fn colorize_cards(cards: Vec<Card>, color: u8) -> Vec<PlacedCard> {
+    cards
+        .into_iter()
+        .map(|card| PlacedCard {
+            card,
+            project_short: None,
+            color: Some(color),
+            agent_color: None,
+        })
+        .collect()
 }
 
 fn project_columns(
@@ -154,10 +179,11 @@ fn project_columns(
     sort_blocked(&mut blocked);
     sort_in_progress(&mut in_progress);
     sort_backlog(&mut backlog);
-    render_columns_with(
-        &blocked,
-        &in_progress,
-        &backlog,
+    let color = project_color(&project.name);
+    render_columns_merged_with(
+        &colorize_cards(blocked, color),
+        &colorize_cards(in_progress, color),
+        &colorize_cards(backlog, color),
         ColumnLayout {
             total_width: options.width,
             limit: options.limit,
@@ -174,6 +200,12 @@ pub fn render_by_project(fleet: &FleetSnapshot, options: &RenderOptions) -> Vec<
     let mut out = render_accounts(&fleet.fleet_health, options.width);
     let status = render_status(&fleet.fleet_health, options.width);
     let count = fleet.projects.len();
+    // `out` only holds the once-printed ACCOUNTS rows here; each loop
+    // iteration below still pushes its own blank line + project name (2
+    // more lines) before its columns, so `2 * count` reserves room for
+    // those not-yet-emitted headers before splitting what's left evenly
+    // across projects (plus the same small fixed margin as `render`/
+    // `render_merged`).
     let height = options
         .height
         .map(|rows| rows.saturating_sub(out.len() + status.len() + 2 * count + 2) / count.max(1));
@@ -230,6 +262,9 @@ pub fn render_merged(fleet: &FleetSnapshot, options: &RenderOptions) -> Vec<Stri
     sort_backlog_placed(&mut backlog);
 
     let status = render_status(&fleet.fleet_health, options.width);
+    // Same height-budget math as `render`'s own `+2` margin; there are no
+    // per-project headers to reserve for here since the merged view skips
+    // them.
     let height = options
         .height
         .map(|rows| rows.saturating_sub(out.len() + status.len() + 2));
@@ -405,6 +440,63 @@ mod tests {
             assert!(cell_width(line) <= 120, "{line:?}");
         }
         assert_eq!(project_color("alpha"), project_color("alpha"));
+    }
+
+    #[test]
+    fn distinct_project_names_in_a_fixture_get_distinct_colors() {
+        let names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let colors: std::collections::HashSet<u8> =
+            names.iter().map(|name| project_color(name)).collect();
+        assert!(
+            colors.len() >= 2,
+            "expected at least two distinct colors among {names:?}, got {colors:?}"
+        );
+    }
+
+    #[test]
+    fn project_palette_never_maps_to_white_or_a_status_signal_color() {
+        const WHITE: u8 = 97;
+        let reserved = [31u8, 91, AGENT_COLOR];
+        for &code in PROJECT_PALETTE.iter() {
+            assert_ne!(code, WHITE, "palette must exclude white");
+            assert!(
+                !reserved.contains(&code),
+                "palette entry {code} collides with a reserved status/agent color"
+            );
+        }
+    }
+
+    #[test]
+    fn single_project_cards_colorize_only_when_color_is_enabled_and_no_color_stays_golden() {
+        let snapshot = BoardSnapshot {
+            project: mixed_board(),
+            fleet_health: FleetHealth::default(),
+        };
+        let plain_options = RenderOptions {
+            width: 80,
+            height: None,
+            limit: 10,
+            color: false,
+            cards_per_row: CardsPerRow::Auto,
+            statuses: StatusFilter::all(),
+        };
+        let plain = render(&snapshot, &plain_options);
+        assert_eq!(
+            plain,
+            SNAPSHOT_80.to_vec(),
+            "NO_COLOR/plain rendering must stay byte-identical to the golden board"
+        );
+        let colored_options = RenderOptions {
+            color: true,
+            ..plain_options
+        };
+        let colored = render(&snapshot, &colored_options);
+        let expected_code = format!("\u{1b}[{}m", project_color("demo"));
+        assert!(
+            colored.iter().any(|line| line.contains(&expected_code)),
+            "{colored:?}"
+        );
+        assert_ne!(colored, plain);
     }
 
     #[test]

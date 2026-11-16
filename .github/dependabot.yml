@@ -12,6 +12,11 @@ updates:
           - "minor"
           - "patch"
     open-pull-requests-limit: 10
+    # MPL-2.0 option-ext not allowed by deny.toml; card 20261115-b-81da00
+    ignore:
+      - dependency-name: "dirs"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: "github-actions"
     directory: "/"

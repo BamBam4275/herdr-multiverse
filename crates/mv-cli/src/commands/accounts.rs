@@ -12,8 +12,12 @@ use mv_state::gauge::{GaugeEntry, GaugeMap};
 use mv_state::nudge_memory;
 use mv_state::tasks::{sweep_tasks, SUPERSEDED_MERGED, SUPERSEDED_REDISPATCHED};
 
+use super::doctor::{project_path, state_dir_from_config};
 use crate::exit::Failure;
 
+/// Everything the `accounts` subcommands need from configured seats, pool
+/// breakers, and usage state. [`LiveConfig`] is the real implementation;
+/// `#[cfg(test)]`'s `Unconfigured` stands in for "no accounts configured".
 pub trait AccountsSource {
     fn list(&self) -> Result<Vec<String>, Failure>;
     fn trip(
@@ -83,7 +87,7 @@ impl LiveConfig {
         }
         Ok(Self {
             config,
-            state_dir: load::config_state_dir_from_env(&path),
+            state_dir: state_dir_from_config(&path),
         })
     }
 
@@ -200,6 +204,18 @@ impl LiveConfig {
     }
 }
 
+/// Every configured project's resolved path — [`seatstate::
+/// nexus_agent_names`]'s own fleet scope, matching `commands::dispatch`'s
+/// `is_nexus_role` exclusion (card `20261115-b-234610`): a project still on
+/// a `<<PLACEHOLDER: ...>>` path contributes no routing log.
+fn project_roots(config: &Config) -> Vec<PathBuf> {
+    config
+        .projects
+        .values()
+        .filter_map(|project| project_path(project).map(Path::to_path_buf))
+        .collect()
+}
+
 impl AccountsSource for LiveConfig {
     fn list(&self) -> Result<Vec<String>, Failure> {
         let mut lines = vec![format!(
@@ -225,13 +241,20 @@ impl AccountsSource for LiveConfig {
         // on `accounts` itself (only on report commands like `tasks`), so
         // `MULTIVERSE_READ_ONLY` is the only gate, same as `usage` below.
         let read_only = std::env::var("MULTIVERSE_READ_ONLY").is_ok_and(|value| value == "1");
+        // Card `20261115-b-234610`: a busy Nexus pane must never inflate a
+        // worker seat's open count here, the same exclusion
+        // `commands::dispatch`'s `is_nexus_role` already applies — resolved
+        // once per listing from the routing log, not per account.
+        let nexus_agents = seatstate::nexus_agent_names(&project_roots(&self.config));
 
         for account in accounts {
             if !read_only {
                 breaker::pool_status_persisting(&self.state_dir, &account.pool);
             }
             let cap = seatstate::get_cap(&self.state_dir, &account.name);
-            let live_open_count = cap.and_then(|_| seatstate::live_open_count(&account.short));
+            let counts =
+                cap.and_then(|_| seatstate::live_seat_open_counts(&account.short, &nexus_agents));
+            let live_open_count = counts.map(|c| c.workers);
             let state = account_state(
                 &self.config,
                 &self.state_dir,
@@ -260,8 +283,22 @@ impl AccountsSource for LiveConfig {
                 }
             }
             if let Some(cap) = cap {
-                match live_open_count {
-                    Some(open) => lines.push(format!("{:<18} ⛁ open: {open}/{cap}", "")),
+                match counts {
+                    // Card `20261115-b-234610`: a seat with its own
+                    // `nexus_slots` shows the worker/Nexus split rather
+                    // than one merged count — `nexus_slots = 0` (the
+                    // default) keeps this line exactly as it always read.
+                    Some(seatstate::SeatOpenCounts { workers, nexus })
+                        if account.nexus_slots > 0 =>
+                    {
+                        lines.push(format!(
+                            "{:<18} ⛁ open: workers {workers}/{cap}, nexus {nexus}/{}",
+                            "", account.nexus_slots
+                        ));
+                    }
+                    Some(seatstate::SeatOpenCounts { workers, .. }) => {
+                        lines.push(format!("{:<18} ⛁ open: {workers}/{cap}", ""))
+                    }
                     None => lines.push(format!("{:<18} ⛁ open: ?/{cap} (Herdr unreachable)", "")),
                 }
             }
@@ -289,8 +326,10 @@ impl AccountsSource for LiveConfig {
                     breaker::pool_status_persisting(&self.state_dir, &sibling.pool);
                 }
                 let sibling_cap = seatstate::get_cap(&self.state_dir, &sibling.name);
-                let sibling_live_open_count =
-                    sibling_cap.and_then(|_| seatstate::live_open_count(&sibling.short));
+                let sibling_live_open_count = sibling_cap.and_then(|_| {
+                    seatstate::live_seat_open_counts(&sibling.short, &nexus_agents)
+                        .map(|c| c.workers)
+                });
                 let sibling_state = account_state(
                     &self.config,
                     &self.state_dir,
@@ -1046,6 +1085,9 @@ fn parse_lend_state(raw: &str) -> Result<bool, Failure> {
     }
 }
 
+/// `commands::run`'s `accounts` match arm: loads the real [`LiveConfig`]
+/// and dispatches the requested subcommand (or the plain listing) through
+/// [`run_with`].
 pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     run_with(args, &LiveConfig::load(args)?)
 }

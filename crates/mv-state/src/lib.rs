@@ -15,6 +15,7 @@ pub mod mail;
 pub mod notify;
 pub mod notify_episodes;
 pub mod nudge_memory;
+pub mod pane_watch_store;
 pub mod paths;
 pub mod scratch;
 pub mod seatstate_store;

@@ -29,17 +29,27 @@ const MISSING: &str = "—";
 /// list so a LIMIT/RATE banner is never dropped for want of a seat.
 const REGISTERED_KINDS: [&str; 3] = ["claude", "codex", "grok"];
 
+/// What a pane's visible text was classified as, in the module doc's own
+/// evaluation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneClass {
+    /// A vendor usage-limit banner.
     Limit,
+    /// A vendor rate-limit banner.
     Rate,
+    /// The model's context window is exhausted.
     Context,
+    /// The pane's connection appears lost (checked only against the last
+    /// event, after input-bar chrome is removed).
     Dead,
+    /// A dialog/menu is blocking the pane, awaiting a response.
     Dialog,
+    /// The pane's text could not be read at all.
     Unreadable,
 }
 
 impl PaneClass {
+    /// The token this class prints as, e.g. in [`PaneProblem::as_line`].
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Limit => "LIMIT",
@@ -63,6 +73,8 @@ pub struct PaneProblem {
 }
 
 impl PaneProblem {
+    /// Render as `"{cls} {pane} {project} {task} {seat}"`, the line this
+    /// problem prints as.
     pub fn as_line(&self) -> String {
         format!(
             "{} {} {} {} {}",
@@ -196,10 +208,14 @@ fn limit_rate_or_context_for_kind(text: &str, kind: &str) -> Option<PaneClass> {
 pub fn classify_visible_text(tail_lines: &[&str], kind: &str) -> Option<PaneClass> {
     let joined = tail_lines.join("\n");
 
+    // Step 1: LIMIT/RATE/CONTEXT take priority over everything else.
     if let Some(class) = limit_rate_or_context(&joined, kind) {
         return Some(class);
     }
 
+    // Step 2: DEAD is judged only against the last real content line (input
+    // bar chrome skipped), and a progress line never counts as stuck even
+    // if its wording happens to overlap the DEAD vocabulary.
     if let Some(last) = tail_lines
         .iter()
         .rev()
@@ -210,6 +226,7 @@ pub fn classify_visible_text(tail_lines: &[&str], kind: &str) -> Option<PaneClas
         }
     }
 
+    // Step 3: DIALOG — a blocking prompt or menu awaiting a response.
     if crate::runner::attention_reason(&joined).is_some()
         || blocking_prompt::classify_prompt(&joined, kind).is_some()
     {

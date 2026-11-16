@@ -111,6 +111,10 @@ pub const STALE_CLAIM_AFTER: Duration = Duration::from_secs(10 * 60);
 
 const HOURLY_WINDOW: Duration = Duration::from_secs(60 * 60);
 
+/// Everything this module's own disk I/O (state file, outbox, locks) can
+/// fail with, folded into one type so callers handle a single error rather
+/// than threading `io::Error` and `serde_json::Error` separately through
+/// every load/save/lock call.
 #[derive(Debug, thiserror::Error)]
 pub enum NotifyError {
     #[error(transparent)]
@@ -365,8 +369,14 @@ pub fn decide_and_record(
 /// 2026-11-03 09:5xZ, card `20261103-b-50a389`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedNotification {
+    /// The project this notification is about — what [`decide_and_record`]'s
+    /// per-project dedup window and hourly cap are scoped by.
     pub project: String,
+    /// The notification title — already [`truncate_title`]'d and redacted
+    /// by the time a record reaches the outbox or a push.
     pub title: String,
+    /// The notification body — already [`truncate_body`]'d and redacted by
+    /// the time a record reaches the outbox or a push.
     pub message: String,
     /// The ntfy priority string this send was made with, e.g. `"default"`
     /// or `"urgent"` (`notify.py`'s own `args.priority`) — distinct from
@@ -379,12 +389,19 @@ pub struct QueuedNotification {
     /// when a caller's dedup key differs from its title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_key: Option<String>,
+    /// When this record was queued (`notify.py`'s own `queued_at`) —
+    /// diagnostic only: nothing in this module reads it back to make a
+    /// decision.
     pub queued_at: String,
     /// The episode this notification belongs to, e.g. `"down"` /
     /// `"recovered"` — used only by [`collapse_down_recovered_pairs`].
     /// Absent for ordinary (non-episodic) queued sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The identity a `"down"` and `"recovered"` pair for the same thing
+    /// share, e.g. a project or host name — what
+    /// [`collapse_down_recovered_pairs`] matches a pair on. `None` for a
+    /// record with no `kind`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// `notify --tag`, replayed at `--flush` (`notify.py`'s outbox `tags`).
@@ -613,7 +630,11 @@ pub fn collapse_down_recovered_pairs(records: Vec<QueuedNotification>) -> Vec<Qu
 /// transport. Only the latter needs the CLI's offline warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendResult {
+    /// The rate-limiter/delivery result for this attempt — see [`Outcome`].
     pub outcome: Outcome,
+    /// `true` only when this attempt queued because the transport could not
+    /// be reached, as opposed to a rate/dedup decision suppressing or
+    /// queuing it — the signal callers gate an offline warning on.
     pub unreachable: bool,
 }
 

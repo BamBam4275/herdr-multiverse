@@ -36,6 +36,10 @@ export MULTIVERSE_CONFIG MULTIVERSE_STATE_DIR
 MULTIVERSE_INVOCATION="'$(printf '%s' "$BIN" | sed "s/'/'\\\\''/g")'"
 # shellcheck disable=SC2090
 export MULTIVERSE_INVOCATION
+# Default every action to read-only; only the two actions that must write
+# unset it (start: opens an interactive workspace/session, not a dispatch,
+# but still writes session state; import-python: writes config/state files
+# into place).
 case "${1:-}" in
     start|import-python) unset MULTIVERSE_READ_ONLY ;;
     *) MULTIVERSE_READ_ONLY=1; export MULTIVERSE_READ_ONLY ;;

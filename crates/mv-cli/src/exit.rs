@@ -3,13 +3,26 @@
 
 use std::fmt;
 
+/// Success.
 pub const OK: u8 = 0;
+/// A failure already reported by its own `Display`, or a generic
+/// operational failure (`Failure::Operation`, `RoleNotImplemented`,
+/// `Interrupted`).
 pub const ERROR: u8 = 1;
+/// The command genuinely cannot tell success from failure from here — used
+/// for `Failure::Reported(UNKNOWN)` paths such as `presence`'s
+/// `"status": "unknown"` report, where there is no answer to give.
 pub const UNKNOWN: u8 = 2;
+/// A question for the human: bad config, account/seat selection, or an
+/// unresolvable lookup. Mirrors the frozen Python oracle's
+/// `EXIT_NEEDS_CONFIG`.
 pub const NEEDS_CONFIG: u8 = 3;
 
 // These families mirror the frozen Python boundary. Some cannot arise until
 // the engine/config handlers are implemented; keep the mapping explicit.
+/// The error boundary between command handlers and the process exit code:
+/// every command returns one of these, and `code()`/`Display` decide what
+/// the process prints and exits with.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum Failure {
@@ -42,6 +55,9 @@ pub enum Failure {
 }
 
 impl Failure {
+    /// Maps this failure to the process exit code callers such as
+    /// `main.rs` and `commands::presence` propagate; see the constants
+    /// above for what each value means to a caller.
     pub fn code(&self) -> u8 {
         match self {
             Self::Config(_)

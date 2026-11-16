@@ -391,7 +391,7 @@ fn prune_workload_expect(history: &History, lanes: usize, refusal: &str) -> Vec<
     assert_eq!(outcomes.len(), lanes);
     for (outcome, lane) in outcomes.iter().zip(&found) {
         assert!(
-            matches!(outcome, PruneOutcome::Kept { task, reason } if task == &lane.task && reason.contains(refusal)),
+            matches!(outcome, PruneOutcome::Kept { task, reason, .. } if task == &lane.task && reason.contains(refusal)),
             "{outcome:?}"
         );
         assert!(lane.path.is_dir());
