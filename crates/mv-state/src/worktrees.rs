@@ -1204,31 +1204,87 @@ pub fn shared_build_root(project_root: &Path) -> Option<PathBuf> {
     resolve_build_dir_prefix(prefix, None)
 }
 
-/// Bounds the read-only scan `find_build_dir` makes under a shared build
-/// root by both wall-clock time and a hard cap on how many candidate
-/// evidence files it will open: a cache with thousands of fingerprint
-/// files must not turn a `--prune` call into a multi-minute stall, and a
-/// deadline alone can still be blown through many times over by a
-/// pathological number of tiny, fast-to-open files before it is next
-/// checked (card `20261115-b-47f043`, second attempt).
+/// Bounds a whole scan over every candidate hash dir under a shared build
+/// root by wall-clock time alone — a whole-run safety net, never what
+/// decides any one hash dir (see `PerDirFileBudget` for that). Scaled by
+/// `for_candidates` to the number of hash dirs the scan must get through:
+/// a normal shared root (about a dozen hash dirs, 0.4-4 GB each) is fully
+/// decided well inside this, since `PerDirFileBudget` already bounds each
+/// dir's own cost to `PerDirFileBudget::FILE_BUDGET` files; this deadline
+/// exists only to bound a pathological case (a huge number of hash dirs,
+/// or a slow filesystem), not a normal one.
+///
+/// Card `20261116-b-891676`: the single budget this replaces also carried
+/// a hard file-count cap shared across the *whole* scan, so two big live
+/// hash dirs sorted first (the main checkout, another live lane) could
+/// exhaust it before three small vanished-lane dirs after them were ever
+/// read — and a dir this scan never finished reading is always kept (see
+/// `OrphanVerdict::cut_short`), never reclaimed. Splitting the file cap
+/// out to `PerDirFileBudget`, reset fresh for every candidate, means one
+/// big dir can only ever exhaust its own cap, never borrow against the
+/// dirs sorted after it.
 struct BuildDirScanBudget {
     deadline: Instant,
-    files_remaining: usize,
 }
 
 impl BuildDirScanBudget {
-    const TIME_BUDGET: Duration = Duration::from_secs(2);
-    const FILE_BUDGET: usize = 4000;
+    /// Per hash dir the scan must get through, on top of the floor below.
+    /// Generous relative to how long reading at most
+    /// `PerDirFileBudget::FILE_BUDGET` (500) small text files actually
+    /// takes, so a normal dozen-dir sweep sits nowhere near this ceiling;
+    /// it only matters once a sweep spans far more hash dirs than a real
+    /// shared build root ever holds.
+    const TIME_PER_HASH_DIR: Duration = Duration::from_millis(500);
+    /// Floor for a small scan (one hash dir, as every per-lane/main-
+    /// checkout lookup is) — the original single-dir budget this replaces.
+    const MIN_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+    fn for_candidates(candidate_count: usize) -> Self {
+        let scaled = Self::TIME_PER_HASH_DIR.saturating_mul(candidate_count.max(1) as u32);
+        Self {
+            deadline: Instant::now() + scaled.max(Self::MIN_TIME_BUDGET),
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
+
+/// Bounds a single hash dir's own evidence scan: at most this many
+/// build-evidence files opened before giving up on deciding *that* dir
+/// alone (see `OrphanVerdict::cut_short`/`dir_names_marker`'s own
+/// not-found-on-exhaustion rule). Reset fresh for every candidate a scan
+/// visits — see `BuildDirScanBudget`'s own doc comment for why this is
+/// the actual fix for card `20261116-b-891676`, not just a companion to
+/// it. 500 is comfortably above a real workspace's own dep-info/
+/// fingerprint count (dozens to a few hundred files for a multi-crate
+/// workspace, almost always naming the workspace itself in the first few
+/// read) and far below the "thousands" a pathological or long-lived hash
+/// dir can accumulate — enough for a live dir to prove itself live (one
+/// matching line ends that dir's scan immediately) without reading
+/// anywhere near its full evidence set, and small enough that a dir with
+/// no usable evidence at all can never consume more than a sliver of a
+/// whole run's time.
+struct PerDirFileBudget {
+    files_remaining: usize,
+}
+
+impl PerDirFileBudget {
+    const FILE_BUDGET: usize = 500;
 
     fn new() -> Self {
         Self {
-            deadline: Instant::now() + Self::TIME_BUDGET,
             files_remaining: Self::FILE_BUDGET,
         }
     }
 
     fn exhausted(&self) -> bool {
-        self.files_remaining == 0 || Instant::now() >= self.deadline
+        self.files_remaining == 0
+    }
+
+    fn charge(&mut self) {
+        self.files_remaining = self.files_remaining.saturating_sub(1);
     }
 }
 
@@ -1248,24 +1304,26 @@ fn is_build_evidence(path: &Path) -> bool {
 /// lines — never one that also names a path under `exclude`, when given,
 /// on that same line (used only so a search for the main checkout's own
 /// hash dir never matches a lane nested under it: see
-/// `find_main_checkout_build_dir`). Bounded by `budget`'s own file count
-/// and deadline; either exhausting first reads as `false`, the same as a
-/// genuine not-found — a scan that ran out of budget must never be read
-/// as "nothing here to protect."
+/// `find_main_checkout_build_dir`). Bounded by the whole-scan `budget`'s
+/// own deadline and by `per_dir`'s own file cap, scoped to this one `dir`
+/// alone (see `PerDirFileBudget`); either exhausting first reads as
+/// `false`, the same as a genuine not-found — a scan that ran out of
+/// budget must never be read as "nothing here to protect."
 fn dir_names_marker(
     dir: &Path,
     marker: &str,
     exclude: Option<&str>,
     budget: &mut BuildDirScanBudget,
+    per_dir: &mut PerDirFileBudget,
 ) -> bool {
-    if budget.exhausted() {
+    if budget.exhausted() || per_dir.exhausted() {
         return false;
     }
     let Ok(entries) = deep_prune_entries(dir) else {
         return false;
     };
     for entry in entries {
-        if budget.exhausted() {
+        if budget.exhausted() || per_dir.exhausted() {
             return false;
         }
         let Ok(file_type) = fs::symlink_metadata(&entry).map(|info| info.file_type()) else {
@@ -1275,7 +1333,7 @@ fn dir_names_marker(
             continue;
         }
         if file_type.is_dir() {
-            if dir_names_marker(&entry, marker, exclude, budget) {
+            if dir_names_marker(&entry, marker, exclude, budget, per_dir) {
                 return true;
             }
             continue;
@@ -1283,7 +1341,7 @@ fn dir_names_marker(
         if !file_type.is_file() || !is_build_evidence(&entry) {
             continue;
         }
-        budget.files_remaining = budget.files_remaining.saturating_sub(1);
+        per_dir.charge();
         let Ok(content) = fs::read_to_string(&entry) else {
             continue;
         };
@@ -1351,18 +1409,26 @@ fn hash_dir_candidates(shared_root: &Path) -> Vec<PathBuf> {
     frontier
 }
 
+/// Sizes its own whole-scan `BuildDirScanBudget` off the full candidate
+/// list up front (`BuildDirScanBudget::for_candidates`), then decides each
+/// one off a fresh `PerDirFileBudget` — so a big hash dir sorted early
+/// (the main checkout, another live lane) can only ever exhaust its own
+/// per-dir cap, never the whole scan's, and the candidates after it are
+/// still reached (card `20261116-b-891676`).
 fn find_build_dir_evidence(
     shared_root: &Path,
     marker: &Path,
     exclude: Option<&str>,
-    budget: &mut BuildDirScanBudget,
 ) -> Option<PathBuf> {
     let marker = format!("{}/", marker.display());
-    for candidate in hash_dir_candidates(shared_root) {
+    let candidates = hash_dir_candidates(shared_root);
+    let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
+    for candidate in candidates {
         if budget.exhausted() {
             return None;
         }
-        if dir_names_marker(&candidate, &marker, exclude, budget) {
+        let mut per_dir = PerDirFileBudget::new();
+        if dir_names_marker(&candidate, &marker, exclude, &mut budget, &mut per_dir) {
             return Some(candidate);
         }
     }
@@ -1382,8 +1448,7 @@ fn find_build_dir_evidence(
 /// calls, which also applies the delete-safety guards this bare
 /// resolution does not.
 pub fn find_build_dir(shared_root: &Path, workspace_root: &Path) -> Option<PathBuf> {
-    let mut budget = BuildDirScanBudget::new();
-    find_build_dir_evidence(shared_root, workspace_root, None, &mut budget)
+    find_build_dir_evidence(shared_root, workspace_root, None)
 }
 
 /// `project_root`'s own build-dir hash, excluding any match that is also
@@ -1394,14 +1459,8 @@ pub fn find_build_dir(shared_root: &Path, workspace_root: &Path) -> Option<PathB
 /// `mv_engine::hostdisk`'s own orphaned-bytes notice, which needs the same
 /// project-vs-lane distinction `prune` itself relies on.
 pub fn find_main_checkout_build_dir(shared_root: &Path, project_root: &Path) -> Option<PathBuf> {
-    let mut budget = BuildDirScanBudget::new();
     let worktrees_prefix = format!("{}/.multiverse/worktrees/", project_root.display());
-    find_build_dir_evidence(
-        shared_root,
-        project_root,
-        Some(&worktrees_prefix),
-        &mut budget,
-    )
+    find_build_dir_evidence(shared_root, project_root, Some(&worktrees_prefix))
 }
 
 /// `find_build_dir`'s own two safety properties, checked explicitly here
@@ -1508,19 +1567,21 @@ struct OrphanVerdict {
 /// `is_cargo_cache_source`) against `names_an_existing_workspace`. Stops
 /// the instant `verdict.saw_live` is set — no further evidence can change a
 /// hash dir this proves still live — and marks `verdict.cut_short` rather
-/// than guessing once `budget` runs out, the same "exhaustion is never
-/// found" rule `dir_names_marker` already follows for its own budget.
+/// than guessing once either the whole-scan `budget`'s deadline or `dir`'s
+/// own `per_dir` file cap runs out, the same "exhaustion is never found"
+/// rule `dir_names_marker` already follows for its own budgets.
 fn scan_orphan_evidence(
     dir: &Path,
     cargo_home: Option<&Path>,
     shared_root: Option<&Path>,
     budget: &mut BuildDirScanBudget,
+    per_dir: &mut PerDirFileBudget,
     verdict: &mut OrphanVerdict,
 ) {
     if verdict.saw_live {
         return;
     }
-    if budget.exhausted() {
+    if budget.exhausted() || per_dir.exhausted() {
         verdict.cut_short = true;
         return;
     }
@@ -1531,7 +1592,7 @@ fn scan_orphan_evidence(
         if verdict.saw_live {
             return;
         }
-        if budget.exhausted() {
+        if budget.exhausted() || per_dir.exhausted() {
             verdict.cut_short = true;
             return;
         }
@@ -1542,13 +1603,13 @@ fn scan_orphan_evidence(
             continue;
         }
         if file_type.is_dir() {
-            scan_orphan_evidence(&entry, cargo_home, shared_root, budget, verdict);
+            scan_orphan_evidence(&entry, cargo_home, shared_root, budget, per_dir, verdict);
             continue;
         }
         if !file_type.is_file() || !is_build_evidence(&entry) {
             continue;
         }
-        budget.files_remaining = budget.files_remaining.saturating_sub(1);
+        per_dir.charge();
         let Ok(content) = fs::read_to_string(&entry) else {
             continue;
         };
@@ -1575,15 +1636,18 @@ fn scan_orphan_evidence(
 /// `20261115-b-673528`). `false` the moment any line names a still-existing
 /// workspace root, there is no readable (non-registry) evidence at all, or
 /// the scan was cut short before finishing — a scan this inconclusive must
-/// never license a delete.
+/// never license a delete. `per_dir` bounds this one dir's own evidence
+/// read, independent of every other candidate `budget`'s whole-scan
+/// deadline also spans (card `20261116-b-891676`).
 fn hash_dir_is_orphaned(
     dir: &Path,
     cargo_home: Option<&Path>,
     shared_root: Option<&Path>,
     budget: &mut BuildDirScanBudget,
+    per_dir: &mut PerDirFileBudget,
 ) -> bool {
     let mut verdict = OrphanVerdict::default();
-    scan_orphan_evidence(dir, cargo_home, shared_root, budget, &mut verdict);
+    scan_orphan_evidence(dir, cargo_home, shared_root, budget, per_dir, &mut verdict);
     verdict.saw_dead && !verdict.saw_live && !verdict.cut_short
 }
 
@@ -2621,11 +2685,20 @@ impl Worktrees {
     /// one: a hash dir here need not belong to any lane this project's own
     /// `lanes()` still lists, so it also reclaims a worktree removed
     /// outside `--prune` entirely, or one this project never tracked at
-    /// all. `[]` when this workspace has no shared build-dir namespacing
-    /// configured (see `shared_build_root`). `dry_run` measures bytes
-    /// without deleting anything, sharing one `BuildDirScanBudget` across
-    /// the whole sweep rather than one per hash dir, the same discipline
-    /// `prune_with_ignored` already applies to its own per-lane scans.
+    /// all. A lane `prune_with_ignored` already removed earlier in this
+    /// same `--prune` invocation counts too: its workspace root is gone
+    /// from disk by the time this sweep's own fresh `fs::exists` check
+    /// runs (see `names_an_existing_workspace`), the same as any other
+    /// vanished workspace, so one real `--prune --yes` call frees the
+    /// build dirs of the lanes it just finished removing rather than
+    /// needing a second run. `[]` when this workspace has no shared
+    /// build-dir namespacing configured (see `shared_build_root`).
+    /// `dry_run` measures bytes without deleting anything, sizing one
+    /// whole-sweep `BuildDirScanBudget` off the full candidate count and
+    /// deciding each candidate off its own fresh `PerDirFileBudget` — see
+    /// both types' own doc comments for why a single shared budget across
+    /// every hash dir (card `20261116-b-891676`) let big dirs sorted first
+    /// starve the small vanished ones after them.
     pub fn prune_orphaned_build_dirs(&self, dry_run: bool) -> Result<Vec<OrphanedBuildDir>> {
         let Some(shared_root) = shared_build_root(&self.project) else {
             return Ok(Vec::new());
@@ -2636,17 +2709,20 @@ impl Worktrees {
             Some(lock(&self.project)?)
         };
         let cargo_home = cargo_cache_home();
-        let mut budget = BuildDirScanBudget::new();
+        let candidates = hash_dir_candidates(&shared_root);
+        let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
         let mut outcomes = Vec::new();
-        for candidate in hash_dir_candidates(&shared_root) {
+        for candidate in candidates {
             if budget.exhausted() {
                 break;
             }
+            let mut per_dir = PerDirFileBudget::new();
             if !hash_dir_is_orphaned(
                 &candidate,
                 cargo_home.as_deref(),
                 Some(&shared_root),
                 &mut budget,
+                &mut per_dir,
             ) {
                 continue;
             }
@@ -6076,19 +6152,183 @@ pub(crate) mod tests {
         fs::remove_dir_all(&live).unwrap();
     }
 
+    /// `count` junk dep-info files under `hash_dir`, each naming no
+    /// absolute path at all — cheap filler that still counts as a
+    /// build-evidence file `is_build_evidence` must open before it can
+    /// tell there is nothing useful on that particular line. Named so a
+    /// lexicographic walk reads every one of them before `marker_name`
+    /// (chosen to sort last, e.g. `"zzz-live.d"`), the same way a real
+    /// cargo build-dir's own fingerprint/dep-info files sort in no order
+    /// that favors whichever one happens to name a still-live workspace.
+    fn write_junk_evidence_files(hash_dir: &Path, count: usize) {
+        let deps = hash_dir.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        for i in 0..count {
+            fs::write(
+                deps.join(format!("junk{i:05}.d")),
+                "no-workspace-path-here\n",
+            )
+            .unwrap();
+        }
+    }
+
+    /// Card `20261116-b-891676`: on the installed release, `--prune --yes`
+    /// removed 5 merged lanes but froze none of their shared-build hash
+    /// dirs in that same run — two big live hash dirs, sorted before the
+    /// small vanished-lane ones, exhausted the single whole-root
+    /// `BuildDirScanBudget` (4000 files total) before the vanished ones
+    /// were ever read, and a dir this scan never finishes reading is
+    /// always kept (`OrphanVerdict::cut_short`), never reclaimed. Rebuilds
+    /// that exact shape: two hash dirs sorted first (`"00"`, `"01"`),
+    /// each with 2200 junk evidence files (4400 total — over the old
+    /// 4000-file cap) in front of one real live-workspace marker that
+    /// sorts last within its own dir, then three small vanished-lane hash
+    /// dirs (`"02"`..`"04"`) sorted after both. One reclaim pass must
+    /// delete all three vanished dirs and keep both candidates sorted
+    /// ahead of them — whether a candidate is kept because it is proven
+    /// live or merely because its own per-dir cap cut the scan short
+    /// before proving anything, either is the same safe "never deleted on
+    /// a guess" outcome `OrphanVerdict::cut_short` already guarantees.
+    #[test]
+    fn prune_orphaned_build_dirs_reclaims_vanished_dirs_sorted_after_two_big_live_dirs() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+
+        let mut live_dirs = Vec::new();
+        for bucket in ["00", "01"] {
+            let live = std::env::temp_dir().join(format!(
+                "mv-live-workspace-{bucket}-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+            write_workspace_marker(&live);
+            let big_hash_dir = hash_dir(&shared_root, bucket, "1");
+            write_junk_evidence_files(&big_hash_dir, 2200);
+            fs::write(
+                big_hash_dir.join("debug/deps/zzz-live.d"),
+                format!("{}/src/lib.rs\n", live.display()),
+            )
+            .unwrap();
+            live_dirs.push((big_hash_dir, live));
+        }
+
+        let mut vanished_dirs = Vec::new();
+        for (bucket, leaf) in [("02", "1"), ("03", "1"), ("04", "1")] {
+            let vanished = std::env::temp_dir().join(format!(
+                "mv-vanished-workspace-{bucket}-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+            write_workspace_marker(&vanished);
+            let hash_dir_path = hash_dir(&shared_root, bucket, leaf);
+            write_build_evidence(&hash_dir_path, &[&vanished]);
+            let size = deep_prune_size(&hash_dir_path);
+            fs::remove_dir_all(&vanished).unwrap();
+            vanished_dirs.push((hash_dir_path, size));
+        }
+
+        let outcomes = store.prune_orphaned_build_dirs(false).unwrap();
+        let reclaimed_paths: std::collections::BTreeSet<_> =
+            outcomes.iter().map(|o| o.path.clone()).collect();
+        for (path, size) in &vanished_dirs {
+            assert!(
+                reclaimed_paths.contains(path),
+                "{} must be reclaimed in the same pass as the two big dirs ahead of it",
+                path.display()
+            );
+            assert!(!path.exists(), "a reclaimed vanished dir must be deleted");
+            assert_eq!(
+                outcomes.iter().find(|o| &o.path == path).unwrap().bytes,
+                *size
+            );
+        }
+        for (path, live) in &live_dirs {
+            assert!(
+                path.exists(),
+                "a big dir sorted ahead of the vanished ones must survive"
+            );
+            fs::remove_dir_all(live).unwrap();
+        }
+    }
+
+    /// Card `20261116-b-891676`'s second half: a lane `--prune --yes`
+    /// removes in a run must have its own shared-build hash dir freed in
+    /// that *same* run, not a later one — the combined `store.prune(...)`
+    /// (removal) then `store.prune_orphaned_build_dirs(...)` (the global
+    /// backstop sweep) call sequence the real CLI makes in one
+    /// invocation. Two big junk-laden hash dirs sort ahead of the lane's
+    /// own, the same shape as
+    /// `prune_orphaned_build_dirs_reclaims_vanished_dirs_sorted_after_two_big_live_dirs`,
+    /// so this also proves the per-dir cap does not regress the ordinary
+    /// per-lane path (`scoped_lane_build_dir`, exercised inside
+    /// `store.prune`) that a removed lane's own build-dir reclaim already
+    /// relies on.
+    #[test]
+    fn prune_frees_a_just_removed_lanes_build_dir_in_the_same_run() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        for bucket in ["00", "01"] {
+            let junk_hash_dir = hash_dir(&shared_root, bucket, "1");
+            write_junk_evidence_files(&junk_hash_dir, 2200);
+        }
+        let lane_hash_dir = hash_dir(&shared_root, "5a", "2");
+        write_build_evidence(&lane_hash_dir, &[&lane.path]);
+
+        let outcomes = store.prune(&mut Observer::idle(), true, false).unwrap();
+        assert!(matches!(&outcomes[0], PruneOutcome::Removed { .. }));
+        assert!(!lane.path.exists(), "the lane itself must be removed");
+
+        let orphaned = store.prune_orphaned_build_dirs(false).unwrap();
+        assert!(
+            !lane_hash_dir.exists(),
+            "the lane's own build-dir must be freed in this same run, either by \
+             `store.prune`'s own per-lane reclaim or by this backstop sweep"
+        );
+        for outcome in &orphaned {
+            assert_ne!(
+                outcome.path, lane_hash_dir,
+                "the lane's build-dir was already freed by `store.prune` itself"
+            );
+        }
+    }
+
     /// Nexus mutated `hash_dir_is_orphaned` to ignore `verdict.cut_short`
     /// entirely (`verdict.saw_dead && !verdict.saw_live`), and every
     /// existing test still passed — none of them ever exhausted the
-    /// budget mid-scan. The shared sweep budget is a real risk on a real,
+    /// budget mid-scan. A per-dir cut-short scan is a real risk on a real,
     /// multi-GB shared root (card `20261115-b-673528`, fix round): a hash
     /// dir whose live evidence sorts after its dead evidence must stay
     /// kept rather than being judged on only the evidence this scan
-    /// reached before running out. Injects a budget with one file of
-    /// headroom directly — `BuildDirScanBudget::new`'s own limits (4000
-    /// files / 2s) are both far too generous to exhaust deterministically
-    /// in a unit test — so the scan reads exactly the dead evidence file
+    /// reached before running out. Injects a `PerDirFileBudget` with one
+    /// file of headroom directly — `PerDirFileBudget::new`'s own limit
+    /// (500) is far too generous to exhaust deterministically in a unit
+    /// test — so the scan reads exactly the dead evidence file
     /// (`a-dead.d` sorts first) before running out, never reaching the
-    /// live one (`b-live.d`) that sorts after it.
+    /// live one (`b-live.d`) that sorts after it. The whole-scan `budget`
+    /// is given generous headroom so only the per-dir cap is in play.
     #[test]
     fn hash_dir_is_orphaned_keeps_a_budget_cut_short_scan_even_with_dead_evidence_seen_first() {
         let dir = std::env::temp_dir().join(format!(
@@ -6124,12 +6364,10 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let mut budget = BuildDirScanBudget {
-            deadline: Instant::now() + Duration::from_secs(5),
-            files_remaining: 1,
-        };
+        let mut budget = BuildDirScanBudget::for_candidates(1);
+        let mut per_dir = PerDirFileBudget { files_remaining: 1 };
         assert!(
-            !hash_dir_is_orphaned(&dir, None, None, &mut budget),
+            !hash_dir_is_orphaned(&dir, None, None, &mut budget, &mut per_dir),
             "a scan cut short before reaching its live evidence must never read as orphaned"
         );
 

@@ -298,9 +298,9 @@ cargo test --workspace --all-features --locked
 python3 conformance/run_all.py
 ```
 
-This tree currently has 2043 passing crate unit/integration tests (sum of
-the `passed` totals from the workspace test results above) and 162 passing
-conformance scenarios. `conformance/diff_fuzz.py` is a seeded
+Both commands above must pass in full: every crate unit/integration test,
+and every committed conformance scenario under `conformance/scenarios/`.
+`conformance/diff_fuzz.py` is a seeded
 Python-versus-Rust fuzzer that runs read probes after each write; four
 `dispatch --dry-run` rendering differences are accepted (role-rename
 agent short-codes and prompt-file names, prompt-file line counts, this

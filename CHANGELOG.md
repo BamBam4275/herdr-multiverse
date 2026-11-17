@@ -9,6 +9,43 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-17
+
+### Fixed
+
+- CLI: `worktrees <path> --prune` now reliably frees a vanished lane's
+  shared-build hash dir in the same run that removes it, instead of
+  needing several follow-up runs (or sometimes none at all). The sweep
+  used to share one whole-root scan budget (2s, 4000 files total) across
+  every hash dir it considered, so two big dirs sorted early — the main
+  checkout, another live lane — could exhaust it before smaller vanished
+  dirs sorted after them were ever read, and a dir the scan never
+  finished reading is always kept, never reclaimed. Each hash dir now
+  gets its own 500-file cap, decided independently; the whole-run budget
+  is wall-clock time only, scaled to the number of hash dirs found, so a
+  normal shared root (about a dozen hash dirs, 0.4-4 GB each) is fully
+  decided in one pass.
+- CLI: `workers`' `workers N/CAP` line now counts the same slots
+  `dispatch` enforces. A finished lane whose pane Herdr still lists no
+  longer inflates `N`, so `workers` and a `dispatch` refusal at the cap
+  report the same number.
+- CLI: a worker whose pane is gone no longer holds a fleet slot until
+  the next reconcile. When `dispatch` is near its cap, it asks Herdr
+  which workers are still live: a task counts only while its agent is
+  working or blocked, or while it is still inside its account's startup
+  grace. If Herdr can't be asked, or answers without a usable `agents`
+  list, every open task still counts, so an unknown never frees a slot.
+- Docs: `docs/parity.md` now documents `worktrees --merge`. The install
+  and parity docs no longer quote test and scenario counts that went
+  stale.
+- Tests: the `dockerreport` reaper tests now drive the Linux
+  `/proc/<pid>/cwd` lookup through an injectable seam, so they pass on
+  Linux CI as well as macOS.
+- Tests: added conformance scenarios for `multiverse new` (the `--yes`
+  gate, a non-empty unregistered target, an already-registered dry run,
+  and a real create and register with a failed start) and for the "no config
+  file found" refusal on every command that reports it.
+
 ## [0.1.8] - 2026-11-16
 
 First release since v0.1.6; v0.1.7 was prepared but never published.
@@ -791,6 +828,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.9]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.9
 [0.1.8]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.8
 [0.1.6]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.6
 [0.1.5]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.5

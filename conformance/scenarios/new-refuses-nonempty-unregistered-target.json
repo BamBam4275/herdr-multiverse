@@ -1,0 +1,32 @@
+{
+  "id": "new-refuses-nonempty-unregistered-target",
+  "description": "`new <name> --path <dir>` refuses when `<dir>` already exists, holds more than just a half-finished `new`'s own `.git`/`.gitignore` leftover (`is_resumable_leftover`, new.rs:66-75), and is not already a registered project — exit 1, before the `--yes`/`--dry-run` branch is even reached (new.rs:126-136: `if target.exists() && !already_registered { ... not empty ... }`). The fixture's `leftover` dir holds a `README.md`, so it is neither empty nor a resumable leftover. Empty transcript asserts no Herdr call is made and no git/mkdir happens.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "dirs": {
+    "leftover": {
+      "files": { "README.md": "already has real content\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["new", "whatever", "--path", "{{DIR:leftover}}"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "<DIR:leftover> is not empty and is not registered as a project\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

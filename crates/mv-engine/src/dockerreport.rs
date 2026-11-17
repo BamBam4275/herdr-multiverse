@@ -945,6 +945,38 @@ pub struct ProcessCwd {
     pub cpu_percent: String,
 }
 
+/// Which host-cwd lookup a snapshot should use. Decided once, from `cfg!`,
+/// at the real entry points ([`process_cwds`], [`reap`]) — but carried as an
+/// explicit parameter through the `_with` functions below so `reap_tests`
+/// can select [`HostOs::Linux`] on any host, driving that branch's fakes
+/// (`linux_cwd`) without ever needing a real `/proc` entry or a Linux box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    Macos,
+    Linux,
+    Other,
+}
+
+impl HostOs {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            HostOs::Macos
+        } else if cfg!(target_os = "linux") {
+            HostOs::Linux
+        } else {
+            HostOs::Other
+        }
+    }
+}
+
+/// Production Linux cwd lookup: the real `/proc/<pid>/cwd` symlink target.
+/// Injectable via [`process_cwds_with`]'s `linux_cwd` seam, the same way
+/// [`host_probe`] is injectable for `ps`/`lsof`, so a test can drive the
+/// Linux branch with a fake instead of a real `/proc` entry.
+fn proc_cwd_link(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
 /// `ps`+`lsof` (macOS) / `/proc/<pid>/cwd` (Linux) snapshot of every host
 /// process and its working directory, through the shared [`host_probe`]
 /// subprocess seam already used for `sweep`'s own closed-lane report.
@@ -953,17 +985,21 @@ pub struct ProcessCwd {
 /// always excluded: a reaper invoked with its cwd inside the very lane it
 /// is pruning must never find itself among the candidates.
 pub fn process_cwds() -> Option<Vec<ProcessCwd>> {
-    process_cwds_with(&mut host_probe)
+    process_cwds_with(&mut host_probe, &mut proc_cwd_link, HostOs::current())
 }
 
-/// Same as [`process_cwds`], with an injectable probe seam so [`reap`]'s
-/// own pid-identity recheck can share this one implementation instead of
-/// duplicating the `ps`/`lsof` parsing. `None` on any probe failure or an
-/// unsupported OS — the probe gives no further detail worth a dedicated
-/// error type here, and every caller already treats this the same way
-/// [`process_cwds`] does: unknown, never "no processes".
+/// Same as [`process_cwds`], with injectable `ps`/`lsof` and `/proc/<pid>/cwd`
+/// seams — the latter via `linux_cwd` — so [`reap`]'s own pid-identity
+/// recheck can share this one implementation instead of duplicating the
+/// parsing, and so a test can pick `os` independently of the host it runs
+/// on. `None` on any probe failure or an unsupported OS — the probe gives
+/// no further detail worth a dedicated error type here, and every caller
+/// already treats this the same way [`process_cwds`] does: unknown, never
+/// "no processes".
 pub fn process_cwds_with(
     probe: &mut impl FnMut(&str, &[&str]) -> Option<String>,
+    linux_cwd: &mut impl FnMut(u32) -> Option<PathBuf>,
+    os: HostOs,
 ) -> Option<Vec<ProcessCwd>> {
     let stdout = probe("ps", &["-axo", "pid=,pcpu=,comm="])?;
     let mut metadata = HashMap::new();
@@ -982,26 +1018,28 @@ pub fn process_cwds_with(
         metadata.insert(pid, (command, cpu.to_string()));
     }
     let mut cwds: HashMap<u32, PathBuf> = HashMap::new();
-    if cfg!(target_os = "macos") {
-        let stdout = probe("lsof", &["-a", "-d", "cwd", "-Fpcn"])?;
-        let mut pid = None;
-        for line in stdout.lines() {
-            if let Some(rest) = line.strip_prefix('p') {
-                pid = rest.parse().ok();
-            } else if let Some(rest) = line.strip_prefix("n/") {
-                if let Some(pid) = pid {
-                    cwds.insert(pid, PathBuf::from(format!("/{rest}")));
+    match os {
+        HostOs::Macos => {
+            let stdout = probe("lsof", &["-a", "-d", "cwd", "-Fpcn"])?;
+            let mut pid = None;
+            for line in stdout.lines() {
+                if let Some(rest) = line.strip_prefix('p') {
+                    pid = rest.parse().ok();
+                } else if let Some(rest) = line.strip_prefix("n/") {
+                    if let Some(pid) = pid {
+                        cwds.insert(pid, PathBuf::from(format!("/{rest}")));
+                    }
                 }
             }
         }
-    } else if cfg!(target_os = "linux") {
-        for pid in metadata.keys().copied() {
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                cwds.insert(pid, cwd);
+        HostOs::Linux => {
+            for pid in metadata.keys().copied() {
+                if let Some(cwd) = linux_cwd(pid) {
+                    cwds.insert(pid, cwd);
+                }
             }
         }
-    } else {
-        return None;
+        HostOs::Other => return None,
     }
     let own_pid = std::process::id();
     let mut rows: Vec<ProcessCwd> = cwds
@@ -1168,17 +1206,28 @@ pub enum ReapOutcome {
 /// subprocess and a real sleep; [`reap_with`] takes injectable seams for a
 /// test that exercises the state machine without a real target process.
 pub fn reap(target: &ProcessCwd, grace: Duration) -> ReapOutcome {
-    reap_with(target, grace, &mut std::thread::sleep, &mut host_probe)
+    reap_with(
+        target,
+        grace,
+        &mut std::thread::sleep,
+        &mut host_probe,
+        &mut proc_cwd_link,
+        HostOs::current(),
+    )
 }
 
-/// Same as [`reap`], with injectable sleep and probe seams so a test can
-/// drive the SIGTERM/grace/SIGKILL state machine against a fake process
-/// without signaling anything real.
+/// Same as [`reap`], with injectable sleep, `ps`/`lsof`, and `/proc/<pid>/cwd`
+/// seams — the last via `linux_cwd`, mirroring [`process_cwds_with`] — plus
+/// an explicit `os`, so a test can drive the SIGTERM/grace/SIGKILL state
+/// machine against a fake process on either platform's cwd lookup without
+/// signaling anything real.
 pub fn reap_with(
     target: &ProcessCwd,
     grace: Duration,
     sleep: &mut impl FnMut(Duration),
     probe: &mut impl FnMut(&str, &[&str]) -> Option<String>,
+    linux_cwd: &mut impl FnMut(u32) -> Option<PathBuf>,
+    os: HostOs,
 ) -> ReapOutcome {
     let pid = target.pid.to_string();
     if probe("kill", &["-TERM", &pid]).is_none() {
@@ -1187,7 +1236,7 @@ pub fn reap_with(
         return ReapOutcome::Reaped;
     }
     sleep(grace);
-    match process_cwds_with(probe)
+    match process_cwds_with(probe, linux_cwd, os)
         .and_then(|processes| processes.into_iter().find(|p| p.pid == target.pid))
     {
         None => ReapOutcome::Reaped,
@@ -1251,16 +1300,28 @@ mod reap_tests {
 
     #[test]
     fn process_cwds_never_includes_this_process_own_pid() {
+        // Card `20261116-b-acc032`: exercised with `os` forced to both
+        // values so this test proves the Linux seam (`linux_cwd`) on any
+        // host, not just whichever platform happens to run it.
         let own = std::process::id();
-        let mut probe = |program: &str, _args: &[&str]| -> Option<String> {
-            match program {
-                "ps" => Some(format!("{own} 0.0 sleep\n4242 0.0 sleep\n")),
-                "lsof" => Some(format!("p{own}\nn/lane\np4242\nn/lane\n")),
-                _ => None,
-            }
-        };
-        let rows = process_cwds_with(&mut probe).unwrap();
-        assert_eq!(rows.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![4242]);
+        for os in [HostOs::Macos, HostOs::Linux] {
+            let mut probe = |program: &str, _args: &[&str]| -> Option<String> {
+                match program {
+                    "ps" => Some(format!("{own} 0.0 sleep\n4242 0.0 sleep\n")),
+                    "lsof" => Some(format!("p{own}\nn/lane\np4242\nn/lane\n")),
+                    _ => None,
+                }
+            };
+            let mut linux_cwd = |pid: u32| -> Option<PathBuf> {
+                (pid == own || pid == 4242).then(|| PathBuf::from("/lane"))
+            };
+            let rows = process_cwds_with(&mut probe, &mut linux_cwd, os).unwrap();
+            assert_eq!(
+                rows.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                vec![4242],
+                "{os:?}"
+            );
+        }
     }
 
     #[test]
@@ -1277,6 +1338,8 @@ mod reap_tests {
                 ));
                 None
             },
+            &mut |_| None,
+            HostOs::current(),
         );
         assert_eq!(outcome, ReapOutcome::Reaped);
         assert_eq!(
@@ -1287,57 +1350,71 @@ mod reap_tests {
 
     #[test]
     fn reap_waits_then_sigkills_a_process_still_alive_after_term() {
-        let target = process(99);
-        let mut slept = Vec::new();
-        let outcome = reap_with(
-            &target,
-            Duration::from_millis(5),
-            &mut |d| slept.push(d),
-            &mut |program, args| match (program, args) {
-                ("kill", ["-TERM", "99"]) => Some(String::new()),
-                ("kill", ["-KILL", "99"]) => Some(String::new()),
-                ("ps", _) => Some("99 1.0 sleep 300\n".into()),
-                ("lsof", _) => Some("p99\nn/lane\n".into()),
-                _ => None,
-            },
-        );
-        assert_eq!(outcome, ReapOutcome::Killed);
-        assert_eq!(slept, vec![Duration::from_millis(5)]);
+        // Forced to both `os` values: see
+        // `process_cwds_never_includes_this_process_own_pid` above.
+        for os in [HostOs::Macos, HostOs::Linux] {
+            let target = process(99);
+            let mut slept = Vec::new();
+            let outcome = reap_with(
+                &target,
+                Duration::from_millis(5),
+                &mut |d| slept.push(d),
+                &mut |program, args| match (program, args) {
+                    ("kill", ["-TERM", "99"]) => Some(String::new()),
+                    ("kill", ["-KILL", "99"]) => Some(String::new()),
+                    ("ps", _) => Some("99 1.0 sleep 300\n".into()),
+                    ("lsof", _) => Some("p99\nn/lane\n".into()),
+                    _ => None,
+                },
+                &mut |pid| (pid == 99).then(|| PathBuf::from("/lane")),
+                os,
+            );
+            assert_eq!(outcome, ReapOutcome::Killed, "{os:?}");
+            assert_eq!(slept, vec![Duration::from_millis(5)], "{os:?}");
+        }
     }
 
     #[test]
     fn reap_leaves_a_pid_alone_once_it_identifies_a_different_process() {
-        let target = process(99);
-        let outcome = reap_with(
-            &target,
-            Duration::from_millis(0),
-            &mut |_| {},
-            &mut |program, args| match (program, args) {
-                ("kill", ["-TERM", "99"]) => Some(String::new()),
-                ("ps", _) => Some("99 1.0 unrelated-daemon\n".into()),
-                ("lsof", _) => Some("p99\nn/elsewhere\n".into()),
-                _ => panic!("must never SIGKILL once identity no longer matches: {args:?}"),
-            },
-        );
-        assert_eq!(outcome, ReapOutcome::IdentityChanged);
+        for os in [HostOs::Macos, HostOs::Linux] {
+            let target = process(99);
+            let outcome = reap_with(
+                &target,
+                Duration::from_millis(0),
+                &mut |_| {},
+                &mut |program, args| match (program, args) {
+                    ("kill", ["-TERM", "99"]) => Some(String::new()),
+                    ("ps", _) => Some("99 1.0 unrelated-daemon\n".into()),
+                    ("lsof", _) => Some("p99\nn/elsewhere\n".into()),
+                    _ => panic!("must never SIGKILL once identity no longer matches: {args:?}"),
+                },
+                &mut |pid| (pid == 99).then(|| PathBuf::from("/elsewhere")),
+                os,
+            );
+            assert_eq!(outcome, ReapOutcome::IdentityChanged, "{os:?}");
+        }
     }
 
     #[test]
     fn reap_reports_still_alive_when_sigkill_itself_fails() {
-        let target = process(99);
-        let outcome = reap_with(
-            &target,
-            Duration::from_millis(0),
-            &mut |_| {},
-            &mut |program, args| match (program, args) {
-                ("kill", ["-TERM", "99"]) => Some(String::new()),
-                ("kill", ["-KILL", "99"]) => None,
-                ("ps", _) => Some("99 1.0 sleep 300\n".into()),
-                ("lsof", _) => Some("p99\nn/lane\n".into()),
-                _ => None,
-            },
-        );
-        assert_eq!(outcome, ReapOutcome::StillAlive);
+        for os in [HostOs::Macos, HostOs::Linux] {
+            let target = process(99);
+            let outcome = reap_with(
+                &target,
+                Duration::from_millis(0),
+                &mut |_| {},
+                &mut |program, args| match (program, args) {
+                    ("kill", ["-TERM", "99"]) => Some(String::new()),
+                    ("kill", ["-KILL", "99"]) => None,
+                    ("ps", _) => Some("99 1.0 sleep 300\n".into()),
+                    ("lsof", _) => Some("p99\nn/lane\n".into()),
+                    _ => None,
+                },
+                &mut |pid| (pid == 99).then(|| PathBuf::from("/lane")),
+                os,
+            );
+            assert_eq!(outcome, ReapOutcome::StillAlive, "{os:?}");
+        }
     }
 
     #[test]

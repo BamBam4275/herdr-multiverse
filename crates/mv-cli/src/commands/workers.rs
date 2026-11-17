@@ -815,6 +815,15 @@ fn render_with_stalled(
             seat_counts = open_seat_counts(config, &history, agents);
             let mut rows = Vec::new();
             let mut orchestrators = 0u32;
+            // A recorded task's pane does not hold a fleet slot even while
+            // Herdr has not reaped it yet — `open_seat_counts` above
+            // already skips a `recorded` task for the same reason
+            // (line ~710), and `commands::dispatch::fleet_open_counts`
+            // skips it fleet-wide. The row still prints (still-open panes
+            // worth a human's look stay visible), but it must not inflate
+            // the `workers N/CAP` line past what dispatch actually
+            // enforces (card `20261116-b-ed6d3c`).
+            let mut cap_count = 0u32;
             for agent in agents {
                 let nexus = config.projects.values().any(|project| {
                     config
@@ -852,6 +861,9 @@ fn render_with_stalled(
                     .max_by_key(|(_, task)| task.dispatch_ordinal);
                 if let Some((project, task)) = joined {
                     let seat = task.account.as_deref().unwrap_or(DASH);
+                    if !task.recorded {
+                        cap_count += 1;
+                    }
                     *project_counts.entry(&project.name).or_default() += 1;
                     let age = task
                         .dispatched_at
@@ -880,6 +892,7 @@ fn render_with_stalled(
                         ),
                     });
                 } else if let Some((_project, recognized)) = recognize(config, &agent.name) {
+                    cap_count += 1;
                     rows.push(WorkerRow {
                         role: recognized.role.config_key().into(),
                         seat: recognized.seat.into(),
@@ -910,9 +923,8 @@ fn render_with_stalled(
                 (&a.project, &a.task, &a.role, &a.seat)
                     .cmp(&(&b.project, &b.task, &b.role, &b.seat))
             });
-            let count = rows.len();
             sections.push(render_table(&rows));
-            (true, Some(count as u32), Some(orchestrators))
+            (true, Some(cap_count), Some(orchestrators))
         }
         None => (false, None, None),
     };
@@ -1470,6 +1482,214 @@ nexus sessions 0 (excluded from workers; they do not count against max_concurren
         let text = render(&config, Some(&agents));
         assert!(text.contains("seats: seat-b 0"), "{text}");
         assert!(text.contains("sandbox 1 open"), "{text}");
+    }
+
+    /// `workers`'s own printed `workers N/CAP` line must stay equal to the
+    /// number [`super::dispatch::fleet_open_counts`] actually feeds
+    /// `check_fleet_capacity` — otherwise an operator can read `workers`
+    /// as "there's room" the instant before dispatch refuses with "N
+    /// agent(s) already running" against a different N (field report on
+    /// 0.1.6: dispatch refused at 17 while `workers` showed 15/17). Card
+    /// `20261116-b-ed6d3c`.
+    ///
+    /// One mixed fleet, across two projects, exercises every shape that
+    /// could make the two drift apart: a busy and an idle Nexus pane (must
+    /// cost neither count a slot — card `20261115-b-65fe80`), two running
+    /// workers, a finished worker whose `event=result` is already recorded
+    /// but whose pane Herdr has not reaped yet (must cost neither count a
+    /// slot — card `20261110-b-fa4365`'s same reasoning applied to the
+    /// live side, not only the status-file side it already covers), a
+    /// task already closed out as stranded (recorded, pane long gone), and
+    /// a live pane `workers` never dispatched at all — the last two must
+    /// cost neither side anything.
+    #[test]
+    fn fleet_cap_count_agrees_with_the_workers_table_count_across_a_mixed_fleet() {
+        let alpha = tempfile::tempdir().unwrap();
+        let bravo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(alpha.path().join(".multiverse")).unwrap();
+        std::fs::create_dir(bravo.path().join(".multiverse")).unwrap();
+
+        // alpha: one running worker, one busy Nexus, one task already
+        // closed out as stranded (`close_stranded`-shaped: recorded, pane
+        // long gone — must cost nothing on either side).
+        std::fs::write(
+            alpha.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-a00001\tproject=alpha\trole=builder\taccount=seat-b\tagent=alpha-buil-sb\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-a00001\tpane=w1:p1\n\
+             2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-nexus-a00002\tproject=alpha\trole=nexus\taccount=nex\tagent=alpha-nexu-nx\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-nexus-a00002\tpane=w1:p2\n\
+             2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-a00003\tproject=alpha\trole=builder\taccount=seat-b\tagent=alpha-buil-sb-2\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-a00003\tpane=w1:p3\n\
+             2020-01-01T00:00:00Z\tevent=result\ttask=20250101-builder-a00003\tstatus=failed\tstate=stranded-uncommitted-work\n",
+        )
+        .unwrap();
+
+        // bravo: one idle Nexus, one worker already recorded done whose
+        // pane Herdr still lists, one running worker.
+        std::fs::write(
+            bravo.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-nexus-b00001\tproject=bravo\trole=nexus\taccount=nex\tagent=bravo-nexu-nx\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-nexus-b00001\tpane=w2:p1\n\
+             2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-b00002\tproject=bravo\trole=builder\taccount=seat-b\tagent=bravo-buil-sb\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-b00002\tpane=w2:p2\n\
+             2020-01-01T00:00:00Z\tevent=result\ttask=20250101-builder-b00002\tstatus=done\tstate=done\n\
+             2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-b00003\tproject=bravo\trole=builder\taccount=seat-b\tagent=bravo-buil-sb-2\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-b00003\tpane=w2:p3\n",
+        )
+        .unwrap();
+
+        let toml = format!(
+            "[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:b\"\n\n\
+             [accounts.nex]\nkind = \"codex\"\nshort = \"nx\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:nex\"\ninteractive = true\n\n\
+             [projects.alpha]\npath = \"{alpha}\"\n\n\
+             [projects.alpha.chains]\nbuilder = [\"seat-b\"]\n\n\
+             [projects.bravo]\npath = \"{bravo}\"\n\n\
+             [projects.bravo.chains]\nbuilder = [\"seat-b\"]\n\n\
+             [roles.builder]\nwrite_scope = \"declared\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n\
+             [roles.builder.models]\ncodex = \"gpt-test\"\n",
+            alpha = alpha.path().display(),
+            bravo = bravo.path().display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+
+        // Herdr's own listing: alpha's stranded task's pane (`w1:p3`) is
+        // gone, matching its own already-recorded closure, and
+        // `random-human-pane` was never dispatched by multiverse at all.
+        let agents = [
+            LiveAgent {
+                name: "alpha-buil-sb".into(),
+                status: "working".into(),
+                pane: "w1:p1".into(),
+                ..Default::default()
+            },
+            LiveAgent {
+                name: "alpha-nexu-nx".into(),
+                status: "working".into(),
+                pane: "w1:p2".into(),
+                ..Default::default()
+            },
+            LiveAgent {
+                name: "bravo-nexu-nx".into(),
+                status: "idle".into(),
+                pane: "w2:p1".into(),
+                ..Default::default()
+            },
+            LiveAgent {
+                name: "bravo-buil-sb".into(),
+                status: "idle".into(),
+                pane: "w2:p2".into(),
+                ..Default::default()
+            },
+            LiveAgent {
+                name: "bravo-buil-sb-2".into(),
+                status: "working".into(),
+                pane: "w2:p3".into(),
+                ..Default::default()
+            },
+            LiveAgent {
+                name: "random-human-pane".into(),
+                status: "working".into(),
+                pane: "w3:p1".into(),
+                cwd: "/home/human/scratch".into(),
+            },
+        ];
+
+        let live_statuses = live_statuses_from(&agents);
+        let (dispatch_open, _) =
+            crate::commands::dispatch::fleet_open_counts(&config, "", Some(&live_statuses));
+
+        let text = render(&config, Some(&agents));
+        let workers_line = text
+            .lines()
+            .find(|line| line.starts_with("workers "))
+            .unwrap_or_else(|| panic!("no 'workers N/CAP' line in: {text}"));
+        let workers_open: u32 = workers_line
+            .strip_prefix("workers ")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse {workers_line:?}"));
+
+        assert_eq!(
+            dispatch_open, workers_open,
+            "dispatch's fleet cap ({dispatch_open}) must equal the workers table's own \
+             count ({workers_open}); mismatched text:\n{text}"
+        );
+    }
+
+    /// `live_statuses_from`'s own helper: [`crate::commands::dispatch::
+    /// fleet_open_counts`] joins a task to Herdr's listing by agent name
+    /// to raw status, the same map [`status_by_name`] builds here — so
+    /// every `fleet_cap_count_*` test feeds it the identical listing
+    /// `render`/[`open_seat_counts`] already see, instead of re-deriving a
+    /// second shape of the same fixture.
+    fn live_statuses_from(agents: &[LiveAgent]) -> HashMap<String, String> {
+        agents
+            .iter()
+            .filter(|agent| !agent.name.is_empty())
+            .map(|agent| (agent.name.clone(), agent.status.clone()))
+            .collect()
+    }
+
+    /// Card `20261116-b-8b5b22`: a non-recorded, still-status-file-less
+    /// task whose pane Herdr's own `agent list` no longer carries at all
+    /// (not merely idle — genuinely absent, long past its account's
+    /// startup grace) must not go on costing
+    /// [`crate::commands::dispatch::fleet_open_counts`] a fleet slot,
+    /// exactly as `workers`'s own `workers N/CAP` line already excludes
+    /// it. Before this card, the two disagreed: `fleet_open_counts` kept
+    /// counting the dead task until a Nexus's reconcile finally closed it
+    /// out, blocking dispatch in the meantime even though `workers` showed
+    /// room.
+    #[test]
+    fn fleet_cap_count_excludes_an_unrecorded_task_whose_pane_is_gone() {
+        let charlie = tempfile::tempdir().unwrap();
+        std::fs::create_dir(charlie.path().join(".multiverse")).unwrap();
+        std::fs::write(
+            charlie.path().join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-c00001\tproject=charlie\trole=builder\taccount=seat-b\tagent=charlie-buil-sb\n\
+             2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-c00001\tpane=w4:p1\n",
+        )
+        .unwrap();
+
+        let toml = format!(
+            "[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:b\"\n\n\
+             [projects.charlie]\npath = \"{charlie}\"\n\n\
+             [projects.charlie.chains]\nbuilder = [\"seat-b\"]\n\n\
+             [roles.builder]\nwrite_scope = \"declared\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n\
+             [roles.builder.models]\ncodex = \"gpt-test\"\n",
+            charlie = charlie.path().display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+
+        // Herdr's live listing is reachable and confirmed empty — the
+        // stranded task's agent (`charlie-buil-sb`) is simply gone, not
+        // merely idle.
+        let agents: [LiveAgent; 0] = [];
+
+        let live_statuses = live_statuses_from(&agents);
+        let (dispatch_open, _) =
+            crate::commands::dispatch::fleet_open_counts(&config, "", Some(&live_statuses));
+        assert_eq!(
+            dispatch_open, 0,
+            "a stranded task's pane is gone from Herdr's own listing; it must not hold a fleet slot"
+        );
+
+        let text = render(&config, Some(&agents));
+        let workers_line = text
+            .lines()
+            .find(|line| line.starts_with("workers "))
+            .unwrap_or_else(|| panic!("no 'workers N/CAP' line in: {text}"));
+        let workers_open: u32 = workers_line
+            .strip_prefix("workers ")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse {workers_line:?}"));
+
+        assert_eq!(
+            dispatch_open, workers_open,
+            "dispatch's fleet cap ({dispatch_open}) must equal the workers table's own \
+             count ({workers_open}); mismatched text:\n{text}"
+        );
     }
 
     #[test]

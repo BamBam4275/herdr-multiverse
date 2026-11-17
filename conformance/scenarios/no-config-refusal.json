@@ -1,0 +1,133 @@
+{
+  "id": "no-config-refusal",
+  "description": "Pins the 'no config file found' refusal (exit 3, NEEDS_CONFIG) across all 10 command paths named in Scout finding 2bc51a#2: projects, inspect, directives show, workers, start, stop, add, check, down, up, new. Each passes --config against a path this sandbox never creates, since the harness always materializes home/config.toml (even empty) and omitting home.config_toml therefore cannot reach this branch — the same reason mv-cli's own a_missing_config_file_needs_config_not_a_bare_error unit test (review_policy.rs) uses a definitely-absent path rather than relying on no file existing at the default location. Neither message form is unified here, only pinned as-is: projects/inspect/directives/workers raise Failure::Config, rendered 'config error: {msg}' on stderr with no trailing doctor-check line; start/stop/add/check/down/up/new print their own two-line 'config error: ...\\nRun `multiverse doctor`...' form to stdout via Failure::Reported. No step's transcript allows any Herdr call, confirming the refusal fires before any fleet probe.",
+  "projects": {
+    "sandbox": {
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["projects", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "",
+        "stderr": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml; run `multiverse doctor`\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "inspect",
+        "--config",
+        "missing-config.toml",
+        "somefile.txt",
+        "--reason",
+        "pin the no-config refusal",
+        "--lines",
+        "1"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "",
+        "stderr": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml; run `multiverse doctor`\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["directives", "show", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "",
+        "stderr": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml; run `multiverse doctor`\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["workers", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "",
+        "stderr": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml; run `multiverse doctor`\n"
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["start", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["stop", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["add", "unused-path", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["check", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["down", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["up", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": ["new", "newproj", "--config", "missing-config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 3,
+        "stdout": "config error: no config file found at <PROJECT:sandbox>/missing-config.toml\nRun `multiverse doctor` for a full readiness check.\n",
+        "stderr": ""
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

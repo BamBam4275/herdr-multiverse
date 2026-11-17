@@ -1,0 +1,27 @@
+{
+  "id": "new-yes-missing-refusal",
+  "description": "`new <name>` without `--yes` (and without `--dry-run`) refuses before touching the filesystem or calling Herdr, exit 1 (`new.rs` run(): `if !yes { return Err(Failure::Operation(\"new requires --yes to execute; use --dry-run to preview\")) }`, new.rs:157-161) — this check runs after the config load and the non-empty/unregistered-target check, so a fresh, never-created target reaches it cleanly. Empty transcript asserts no Herdr call is made.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["new", "freshproj"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "new requires --yes to execute; use --dry-run to preview\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "id": "new-yes-creates-registers-and-reports-start-failure",
+  "description": "`new <name> --path <dir> --yes` against a pre-existing *empty* (so `is_resumable_leftover`-eligible), unregistered target: real creation (`mkdir`, `git init -q -b main`, write `.gitignore`, `git add`+`commit`), real registration (`add::register` appends `[projects.freshproj]`/`[projects.freshproj.chains]` to `config.toml` and prints the `Added to ...:` block, same as a standalone `add`), then a real `start_one_by_path` attempt (new.rs:163-190). The scripted Herdr reply fails the very first call (`workspace list` exit 1) so `start_one_by_path` returns `Err` without ever reaching `pane list`/`agent list` (`FleetState::fetch`'s `call_listing(...)?` short-circuits), exercising new.rs's fallback note: `note: {name} was created and registered, but did not start: {message}` (new.rs:187-189) — distinct from the untested happy-start path, which is already covered by the `start-*` scenario family. `new`'s own exit code stays 0 either way: a start failure is reported as a note, never propagated as the command's own failure (new.rs:185-191 ends with an unconditional `Ok(())`).",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "freshproj": {}
+  },
+  "dirs": {
+    "codex-home": {}
+  },
+  "home": {
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home}}\"\npool = \"codex:a\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[roles.scout]\nwrite_scope = \"none\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n[roles.scout.models]\ncodex = \"gpt-test\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["new", "freshproj", "--path", "{{PROJECT:freshproj}}", "--yes"],
+      "transcript": [
+        {
+          "match_argv": ["workspace", "list"],
+          "reply": { "exit": 1 }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Added to <STATE_DIR>/config.toml:",
+          "[projects.freshproj]",
+          "[projects.freshproj.chains]",
+          "scout = [\"seat-a\"]",
+          "note: freshproj was created and registered, but did not start: could not list workspaces: exit 1"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    {
+      "root": "freshproj",
+      "files": {
+        ".gitignore": { "equals": "/target/\n" },
+        ".git/refs/heads/main": { "regex": "^[0-9a-f]{40}$" }
+      }
+    }
+  ]
+}

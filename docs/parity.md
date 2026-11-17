@@ -827,7 +827,7 @@ No flags besides global `--config` / `--help`.
 
 ### `worktrees`
 
-Rust about: Inspect, prune, rescue, or restore task worktrees
+Rust about: Inspect, prune, rescue, restore, or merge task worktrees
 
 | Positional | Python | Rust |
 |---|---|---|
@@ -838,6 +838,7 @@ Rust about: Inspect, prune, rescue, or restore task worktrees
 | `--deep` | flag | flag |  |
 | `--dry-run` | flag | flag |  |
 | `--force` | flag | flag |  |
+| `--merge` | — | TASK_ID | Rust-only (commit `6984508`). Scan the lane's commits for secrets (gitleaks, and trufflehog when configured and present), then merge it into this checkout with `git merge --no-ff --no-edit`; refuses on a finding or a missing required scanner. |
 | `--prune` | flag | flag |  |
 | `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--prune`, end a kept lane's own lingering host process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; never with `--force`, and `--dry-run` previews "would reap" and signals nothing. |
 | `--rescue` | flag | flag |  |
@@ -867,7 +868,7 @@ Rust about: Rewrite retired role keys to their current names in place
 
 Parser coverage above is clap versus argparse. Runtime parity is checked separately:
 
-- 154 committed JSON scenarios under `conformance/scenarios/` (`python3 conformance/run_all.py`). All 154 currently pass against Rust. Seven of them (`history-*`) pin retired on-disk role names that history readers must still accept.
+- Every committed JSON scenario under `conformance/scenarios/` (`python3 conformance/run_all.py`) must pass against Rust. Seven of them (`history-*`) pin retired on-disk role names that history readers must still accept.
 - `conformance/diff_fuzz.py`, a seeded differential fuzzer. It generates random sequences of state-changing commands that need no live agent (`backlog add` / `done` / `annotate` / `reopen` / `reprioritize`, `accounts trip` / `reset`, `halt on` / `off`, `notify` / `--flush`, `activity send`), replays the same sequence against the frozen Python oracle and this binary, and after each write runs a fixed battery of read probes (`backlog list` / `show`, `tasks`, `workers`, `health`, `board --no-reconcile --read-only --no-color`, `review-policy`, `accounts usage`, `activity inbox --peek`, `halt status`, and `dispatch --dry-run` for Scout, Builder, and Critic). There is no pre-recorded expectation: Python's own behavior for that sequence is the oracle. Requires `MV_CONFORMANCE_PYTHON_REPO` or `--python-repo`; without an oracle the harness prints `skipped` and exits 0.
 
 Four `dispatch --dry-run` rendering differences are accepted and folded before comparison. They are not bugs in this binary:

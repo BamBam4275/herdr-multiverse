@@ -1,0 +1,32 @@
+{
+  "id": "new-dry-run-already-registered-path",
+  "description": "`new <name> --path <dir> --dry-run` prints plan step 4 as `start '<name>' (already registered)` and stops there — no step 5 (`register` + `start`) — when `<dir>` is already the configured path of a project named `<name>` (new.rs:146-147: `if already_registered { println!(\"4. start '{name}' (already registered)\") } else { ... \"4. register...\" / \"5. start...\" }`). The companion `new-dry-run-prints-plan` scenario covers the unregistered branch (steps 4+5); this one is the already-registered branch the Scout finding flagged as untested. Exact `stdout` match (not `_contains`) so a stray step-5 line would fail this. Empty transcript: dry-run returns before any Herdr call.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    },
+    "already": {
+      "git": true,
+      "files": { "README.md": "existing project\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.already]\npath = \"{{PROJECT:already}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["new", "already", "--path", "{{PROJECT:already}}", "--dry-run"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout": "Plan for new project 'already' at <PROJECT:already>:\n1. mkdir -p <PROJECT:already> (if it does not already exist)\n2. git init -q -b main (if not already a repository)\n3. write .gitignore and commit it (if there are no commits yet)\n4. start 'already' (already registered)\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true },
+    { "root": "already", "unchanged": true }
+  ]
+}

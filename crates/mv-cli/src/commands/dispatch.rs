@@ -1250,7 +1250,32 @@ pub(super) fn is_nexus_role(role: &str) -> bool {
 /// its last fleet slot. Only the `fleet_open` sum this feeds to
 /// `check_fleet_capacity`'s `max_concurrent` comparison is narrowed; a
 /// project's own floor gap is unchanged (not part of this card's decision).
-fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(String, u32)>) {
+///
+/// `pub(super)`, like [`is_nexus_role`]/[`open_task_count`] above, so
+/// `commands::workers` can check its own displayed `workers N/CAP` count
+/// against this one — the number dispatch actually enforces — without a
+/// second, drifting re-derivation (card `20261116-b-ed6d3c`).
+///
+/// `live_statuses` is this moment's [`live_agent_statuses`] reading (agent
+/// name to raw `agent_status`), or `None` to keep today's conservative
+/// count — every unrecorded, still-status-file-less worker task holds its
+/// slot, liveness unchecked, no Herdr call made. Callers pass `None` on
+/// their first (cheap, no-Herdr-call) attempt and only retry with a real
+/// [`live_agent_statuses`] reading when that conservative count would
+/// itself refuse the dispatch (card `20261116-b-8b5b22`): a stranded
+/// task — no recorded result, no status file, no live pane — used to cost
+/// a fleet slot forever that way, disagreeing with `workers` (which
+/// already excludes it, via [`is_task_pane_still_open`]'s own join), until
+/// a Nexus's reconcile finally closed it out. A failed listing (`None`
+/// returned from an actual attempt) keeps the same conservative count: an
+/// unknown never frees a slot. Only the `fleet_open` sum is narrowed this
+/// way — a project's own floor gap (`other_floor_gaps`) is unchanged, same
+/// as card `20261115-b-65fe80` left it.
+pub(super) fn fleet_open_counts(
+    config: &Config,
+    current_project: &str,
+    live_statuses: Option<&HashMap<String, String>>,
+) -> (u32, Vec<(String, u32)>) {
     let mut fleet_open = 0u32;
     let mut other_floor_gaps = Vec::new();
     for (name, project) in &config.projects {
@@ -1265,7 +1290,10 @@ fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(Strin
             .iter()
             .filter(|task| !task.recorded && task.file_status.is_none());
         let open = open_tasks.clone().count() as u32;
-        let worker_open = open_tasks.filter(|task| !is_nexus_role(&task.role)).count() as u32;
+        let worker_open = open_tasks
+            .filter(|task| !is_nexus_role(&task.role))
+            .filter(|task| is_task_pane_still_open(config, task, live_statuses))
+            .count() as u32;
         fleet_open += worker_open;
         if name != current_project {
             let gap = project.min_slots.saturating_sub(open);
@@ -1275,6 +1303,85 @@ fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(Strin
         }
     }
     (fleet_open, other_floor_gaps)
+}
+
+/// Whether an unrecorded, still-status-file-less task still holds a live
+/// pane or agent — [`fleet_open_counts`]'s own join, matched to the one
+/// `commands::workers::open_seat_counts` already does: live when Herdr's
+/// listing reports `working`/`blocked` for the task's dispatched agent
+/// name, or when the task is still within its account's post-dispatch
+/// [`grace_open_counts`]-style startup grace (so a pane Herdr has not
+/// caught up on yet is never mistaken for stranded). `live_statuses` of
+/// `None` (the listing itself could not be asked) always reads as still
+/// open — the conservative, pre-card-`20261116-b-8b5b22` posture, so an
+/// unknown never frees a slot. An unresolvable account — the same gate
+/// `open_seat_counts` applies — reads as not open, same as that caller.
+fn is_task_pane_still_open(
+    config: &Config,
+    task: &mv_state::tasks::SweepTask,
+    live_statuses: Option<&HashMap<String, String>>,
+) -> bool {
+    let Some(statuses) = live_statuses else {
+        return true;
+    };
+    let Some(account) = resolve_task_account(task, config) else {
+        return false;
+    };
+    let status = task
+        .agent
+        .as_deref()
+        .and_then(|agent| statuses.get(agent))
+        .map(String::as_str)
+        .unwrap_or("");
+    if is_open_agent_status(status) {
+        return true;
+    }
+    let grace = time::Duration::seconds(account.startup_grace_seconds.unwrap_or(600).into());
+    let now = time::OffsetDateTime::now_utc();
+    match task.started_at {
+        Some(started_at) => now - started_at <= grace,
+        None => task
+            .dispatched_at
+            .is_some_and(|dispatched_at| now - dispatched_at <= grace),
+    }
+}
+
+/// One live `agent list` call, folded to each agent's own raw
+/// `agent_status` — [`fleet_open_counts`]'s sole source of truth for
+/// [`is_task_pane_still_open`]. `None` means Herdr could not be asked at
+/// all (spawn failure or a non-`ok` reply) or its reply had no usable
+/// `agents` listing, the same fail-closed posture [`live_open_counts`]
+/// already takes for the per-seat cap; callers must never read that as
+/// "every pane is gone".
+fn live_agent_statuses() -> Option<HashMap<String, String>> {
+    let mut herdr = runner::ProcessHerdr;
+    let result = herdr
+        .call(&argv::agent_list(), Duration::from_secs(10))
+        .ok()?;
+    if !result.ok() {
+        return None;
+    }
+    checked_agent_statuses(&result)
+}
+
+/// `result`'s agent-status map, or `None` when `result.agents` is missing
+/// or not a JSON array. An exit-0 Herdr reply with a `result` object but no
+/// usable `agents` field (version skew, a partial write, a Herdr-side bug)
+/// is a listing failure, not an empty roster, and must fail closed exactly
+/// like a process or protocol error — folding it to `Some(HashMap::new())`
+/// would read every live, unrecorded task fleet-wide as gone and zero out
+/// [`fleet_open_counts`], the opposite of "an unknown never frees a slot"
+/// (card `20261117-b-d49eb3`). An `agents` array that is present but empty
+/// is a genuine "nobody live" answer and still folds to `Some(empty)`.
+/// [`live_agent_statuses`] alone calls this; [`live_open_counts`]'s own
+/// `agent_status_by_name` call keeps its existing Python-parity fold to an
+/// empty map on a missing `agents` field unchanged.
+fn checked_agent_statuses(result: &CommandResult) -> Option<HashMap<String, String>> {
+    result
+        .payload
+        .as_ref()
+        .and_then(|p| p["result"]["agents"].as_array())?;
+    Some(agent_status_by_name(result))
 }
 
 /// Whether a Herdr `agent_status` counts as "open" for a seat cap —
@@ -2239,8 +2346,8 @@ impl RealEngine {
         // next time around rather than only at the moment this dispatch
         // started waiting.
         let mut capacity_source = || {
-            let (fleet_open, other_floor_gaps) = fleet_open_counts(&config, &project_name);
-            engine_dispatch::FleetCapacityInputs {
+            let (fleet_open, other_floor_gaps) = fleet_open_counts(&config, &project_name, None);
+            let mut inputs = engine_dispatch::FleetCapacityInputs {
                 max_concurrent: config.max_concurrent,
                 fleet_open,
                 project_open: open_task_count(&project_root),
@@ -2248,7 +2355,21 @@ impl RealEngine {
                 project_max_slots: project.max_slots,
                 other_floor_gaps,
                 batch_count: 1,
+            };
+            // Card 20261116-b-8b5b22: the conservative count above already
+            // matches today's behavior and costs no Herdr round trip — pay
+            // for a live `agent list` only when that conservative count
+            // would actually refuse this dispatch, so a stranded task (no
+            // recorded result, no status file, no live pane) does not go
+            // on costing a fleet slot once that refusal is the only thing
+            // standing in the way. A fleet nowhere near its cap never
+            // makes this call at all.
+            if engine_dispatch::check_fleet_capacity(&inputs).is_err() {
+                let live_statuses = live_agent_statuses();
+                inputs.fleet_open =
+                    fleet_open_counts(&config, &project_name, live_statuses.as_ref()).0;
             }
+            inputs
         };
         // Card 20261013-b-531383 / `cli.py:3401-3405`: a dry run never
         // waits on a capped seat regardless of `--wait-for-seat`; a real
@@ -3857,9 +3978,10 @@ impl DispatchStore for RealDispatchStore {
                 &mut agents,
             );
         }
-        let (fleet_open, other_floor_gaps) = fleet_open_counts(&self.config, &self.project_name);
+        let (fleet_open, other_floor_gaps) =
+            fleet_open_counts(&self.config, &self.project_name, None);
         let project = &self.config.projects[&self.project_name];
-        let capacity = engine_dispatch::FleetCapacityInputs {
+        let mut capacity = engine_dispatch::FleetCapacityInputs {
             max_concurrent: self.config.max_concurrent,
             fleet_open,
             project_open: open_task_count(&self.project_root),
@@ -3868,6 +3990,16 @@ impl DispatchStore for RealDispatchStore {
             other_floor_gaps,
             batch_count: 1,
         };
+        // Card 20261116-b-8b5b22: same posture as `plan_dispatch`'s own
+        // `capacity_source` — a live `agent list` round trip is only worth
+        // its cost when the conservative count above would actually
+        // refuse this dispatch, so a stranded task does not go on costing
+        // a fleet slot once that refusal is the only thing in the way.
+        if engine_dispatch::check_fleet_capacity(&capacity).is_err() {
+            let live_statuses = live_agent_statuses();
+            capacity.fleet_open =
+                fleet_open_counts(&self.config, &self.project_name, live_statuses.as_ref()).0;
+        }
         engine_dispatch::check_fleet_capacity(&capacity)
             .map_err(|e| RunnerError::Refused(e.to_string()))?;
 
@@ -6205,11 +6337,11 @@ review_scope = "repo"
         );
         let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
 
-        let (fleet_open, other_floor_gaps) = fleet_open_counts(&config, "here");
+        let (fleet_open, other_floor_gaps) = fleet_open_counts(&config, "here", None);
         assert_eq!(fleet_open, 1);
         assert_eq!(other_floor_gaps, vec![("there".to_string(), 1)]);
 
-        let (_, no_gaps) = fleet_open_counts(&config, "there");
+        let (_, no_gaps) = fleet_open_counts(&config, "there", None);
         assert!(
             no_gaps.is_empty(),
             "the dispatched project's own floor is never listed as an 'other' gap"
@@ -6238,7 +6370,7 @@ review_scope = "repo"
         let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
 
         // One worker pane, one busy Nexus pane: allowed under a cap of 2.
-        let (fleet_open, _) = fleet_open_counts(&config, "here");
+        let (fleet_open, _) = fleet_open_counts(&config, "here", None);
         assert_eq!(
             fleet_open, 1,
             "the busy Nexus pane must not count toward the fleet cap"
@@ -6262,10 +6394,80 @@ review_scope = "repo"
              2020-01-01T00:00:01+00:00\tevent=dispatch\ttask=20250101-builder-cccccc\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n",
         )
         .unwrap();
-        let (fleet_open, _) = fleet_open_counts(&config, "here");
+        let (fleet_open, _) = fleet_open_counts(&config, "here", None);
         assert_eq!(fleet_open, 2);
         inputs.fleet_open = fleet_open;
         assert!(engine_dispatch::check_fleet_capacity(&inputs).is_err());
+    }
+
+    /// Card `20261116-b-8b5b22`: a failed live listing (Herdr unreachable,
+    /// or never asked at all — `live_statuses: None`) must keep today's
+    /// conservative count rather than ever read a dead pane's absence as
+    /// "free". An unrecorded, still-status-file-less task counts toward
+    /// the fleet cap regardless of whether its agent would actually still
+    /// be found live — the whole point being that this is the one case
+    /// `fleet_open_counts` cannot tell "stranded" from "still running" at
+    /// all, so it must fail closed exactly as it always has.
+    #[test]
+    fn fleet_open_counts_counts_an_unrecorded_task_conservatively_when_the_live_listing_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("here");
+        std::fs::create_dir_all(root.join(".multiverse")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-dddddd\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\tagent=here-buil-st\n",
+        )
+        .unwrap();
+        let toml = format!("[projects.here]\npath = \"{}\"\n", root.display());
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+
+        // No live listing at all (Herdr unreachable): the task still
+        // counts, even though its agent is absent from every (nonexistent)
+        // listing, because an unknown must never free a slot.
+        let (fleet_open, _) = fleet_open_counts(&config, "here", None);
+        assert_eq!(
+            fleet_open, 1,
+            "a failed live listing must count an unrecorded task conservatively, not free its slot"
+        );
+    }
+
+    fn ok_result(payload: serde_json::Value) -> CommandResult {
+        CommandResult {
+            argv: Vec::new(),
+            returncode: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            payload: Some(payload),
+            protocol_error: None,
+        }
+    }
+
+    /// Card `20261117-b-d49eb3`: an exit-0 reply with a `result` object but
+    /// no usable `agents` array is a listing failure, not an empty roster —
+    /// [`checked_agent_statuses`] must read it as `None`, the same as the
+    /// unreachable-Herdr case [`fleet_open_counts_counts_an_unrecorded_task_conservatively_when_the_live_listing_fails`]
+    /// above already proves `fleet_open_counts` fails closed on.
+    #[test]
+    fn checked_agent_statuses_fails_closed_on_a_missing_or_non_array_agents_field() {
+        assert!(
+            checked_agent_statuses(&ok_result(serde_json::json!({"result": {}}))).is_none(),
+            "no agents field at all must read as a listing failure"
+        );
+        assert!(
+            checked_agent_statuses(&ok_result(serde_json::json!({"result": {"agents": {}}})))
+                .is_none(),
+            "a non-array agents field must read as a listing failure"
+        );
+    }
+
+    /// An `agents` array that is present but empty is a real "nobody live"
+    /// answer, not a listing failure — it must still fold to `Some(empty)`.
+    #[test]
+    fn checked_agent_statuses_accepts_a_genuinely_empty_agents_array() {
+        assert_eq!(
+            checked_agent_statuses(&ok_result(serde_json::json!({"result": {"agents": []}}))),
+            Some(HashMap::new())
+        );
     }
 
     /// Card `20261105-fixer-9d070c`: before this task, a seat's open count
