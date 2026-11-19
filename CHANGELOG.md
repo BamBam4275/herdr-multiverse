@@ -9,6 +9,29 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-11-19
+
+### Fixed
+
+- `board`: Herdr `agent list`, `workspace list`, `agent read`, and
+  `pane close` now run through the shared Herdr runner, so a transient
+  spawn failure (Linux `ETXTBSY` on a binary still open for writing, as
+  during an upgrade or a concurrent test's fake Herdr) is retried instead
+  of rendering the fleet as "herdr unavailable". These calls also get the
+  runner's 30s default timeout and its scrubbed `HERDR_*` child
+  environment, which they skipped before.
+- `workers` and `doctor`: Herdr `agent list` and the stall watch's
+  `pane read` (`workers`), and the `--version` / `plugin config-dir`
+  probes (`doctor`), now run through the shared Herdr runner like
+  `board`'s calls, so a transient spawn failure (Linux `ETXTBSY` on a
+  binary still open for writing) is retried instead of reading as an
+  unreachable or missing Herdr. These calls also get the runner's 30s
+  default timeout and its scrubbed `HERDR_*` child environment.
+- CLI: `stop`'s own Herdr `<noun> list` calls now go through the same
+  retrying runner as every other Herdr call in the CLI, so a Linux
+  `ETXTBSY` on the Herdr binary is retried instead of being read as
+  "no trustworthy reply".
+
 ## [0.1.13] - 2026-11-19
 
 ### Fixed
@@ -1341,6 +1364,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.14]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.14
 [0.1.13]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.13
 [0.1.12]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.12
 [0.1.11]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.11

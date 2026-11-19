@@ -29,6 +29,7 @@ use mv_config::roles::Role;
 use sha2::{Digest, Sha256};
 
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
+use super::{herdr_command, run_herdr};
 use crate::exit::Failure;
 
 // --- a minimal, read-only JSON reader (object/array/string/number/bool/null) ---
@@ -298,19 +299,18 @@ fn herdr_binary() -> String {
     "mv-cli-test-herdr-stub-should-never-exist".to_string()
 }
 
-/// One `herdr agent list` call. `None` means "could not get a trustworthy
-/// reply" (spawn failure, nonzero exit, non-JSON stdout, or JSON lacking a
-/// `result` object) — every caller renders that as `?`, never as zero.
+/// One `herdr agent list` call, through the shared runner
+/// ([`super::run_herdr`]) so a transient spawn failure is retried rather
+/// than read as an unreachable Herdr. `None` means "could not get a
+/// trustworthy reply" (spawn failure, nonzero exit, non-JSON stdout, or
+/// JSON lacking a `result` object) — every caller renders that as `?`,
+/// never as zero.
 fn fetch_live_agents(binary: &str) -> Option<Vec<LiveAgent>> {
-    let output = std::process::Command::new(binary)
-        .args(["agent", "list"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let output = run_herdr(mv_engine::mv_herdr::argv::agent_list(), binary).ok()?;
+    if output.returncode != 0 {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let value = JsonParser::parse(stdout.trim())?;
+    let value = JsonParser::parse(output.stdout.trim())?;
     let result = value.get("result")?.as_object()?;
     let agents = result
         .iter()
@@ -387,19 +387,14 @@ fn pane_read_args(pane_id: &str) -> Vec<String> {
     args
 }
 
-/// One [`pane_read_args`] call. `None` means Herdr could not be asked
-/// (spawn failure or nonzero exit) — callers must treat that the same as
-/// "no signal this cycle," never as "the pane is empty," so a fetch
-/// hiccup never looks like content that vanished.
+/// One [`pane_read_args`] call, through the shared runner
+/// ([`super::run_herdr`]). `None` means Herdr could not be asked (spawn
+/// failure or nonzero exit) — callers must treat that the same as "no
+/// signal this cycle," never as "the pane is empty," so a fetch hiccup
+/// never looks like content that vanished.
 fn fetch_pane_content(binary: &str, pane_id: &str) -> Option<String> {
-    let output = std::process::Command::new(binary)
-        .args(pane_read_args(pane_id))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    let output = run_herdr(herdr_command(&pane_read_args(pane_id)), binary).ok()?;
+    (output.returncode == 0).then_some(output.stdout)
 }
 
 /// A stable digest of one pane read, so the store never has to hold a
@@ -2209,5 +2204,69 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
             .unwrap();
         let workers = m.subcommand_matches("workers").unwrap();
         assert!(workers.get_flag("json"));
+    }
+
+    /// Writes `body` as a fake Herdr in `dir`, then holds it open for
+    /// writing for 30ms on a background thread — exactly what makes
+    /// Linux's `execve` return `ExecutableFileBusy`, the condition another
+    /// test thread's `fork()` leaves behind by inheriting its write fd (see
+    /// `mv_herdr::run`'s own
+    /// `run_retries_past_a_transient_executable_file_busy_and_still_succeeds`).
+    #[cfg(target_os = "linux")]
+    fn busy_fake_herdr(
+        dir: &Path,
+        body: &str,
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("herdr-fake");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held_open = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held_open);
+        });
+        (path, closer)
+    }
+
+    /// Card `20261119-b-5f7cf6`: `workers`' `agent list` must ride out a
+    /// transient `ExecutableFileBusy` through the shared runner's retry
+    /// rather than render every count as `?`. Linux-only: macOS `exec`
+    /// ignores an open write fd, so this would pass vacuously there.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn agent_list_survives_a_transient_executable_file_busy_on_the_herdr_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake, closer) = busy_fake_herdr(
+            dir.path(),
+            r#"printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"sandbox-scou-sb","agent_status":"working"}]}}'"#,
+        );
+
+        let agents = fetch_live_agents(fake.to_str().unwrap());
+        closer.join().unwrap();
+
+        let agents = agents.expect("agent list must survive ExecutableFileBusy");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "sandbox-scou-sb");
+        assert_eq!(agents[0].status, "working");
+        assert_eq!(agents[0].pane, "w1:p1");
+    }
+
+    /// Same card, for the stall watch's `pane read`: a busy binary must
+    /// not read as "no signal this cycle", and the argv reaching Herdr is
+    /// unchanged by routing it through the runner.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pane_read_survives_a_transient_executable_file_busy_on_the_herdr_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake, closer) = busy_fake_herdr(dir.path(), r#"printf 'argv:%s\n' "$*""#);
+
+        let content = fetch_pane_content(fake.to_str().unwrap(), "w1:p1");
+        closer.join().unwrap();
+
+        assert_eq!(
+            content.as_deref(),
+            Some("argv:pane read w1:p1 --lines 200\n")
+        );
     }
 }

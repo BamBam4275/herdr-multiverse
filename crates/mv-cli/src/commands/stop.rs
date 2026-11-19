@@ -239,15 +239,14 @@ pub(crate) fn herdr_binary() -> String {
 /// missing) — the caller surfaces that as its own refusal rather than
 /// guessing at liveness.
 fn fetch_records(binary: &str, noun: &str, plural: &str) -> Option<Vec<BTreeMap<String, String>>> {
-    let output = std::process::Command::new(binary)
-        .args([noun, "list"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    // Through the shared runner, so a Linux ETXTBSY on the herdr binary
+    // (a fork racing a write, or a binary replaced mid-upgrade) is retried
+    // the way every other herdr call in mv-cli already is.
+    let output = super::run_herdr(super::herdr_command(&[noun, "list"]), binary).ok()?;
+    if output.returncode != 0 {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let body = find_array(&stdout, plural)?;
+    let body = find_array(&output.stdout, plural)?;
     Some(split_records(body).into_iter().map(record_fields).collect())
 }
 

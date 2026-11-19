@@ -2,11 +2,12 @@
 //! `multiverse board` to configured projects (`mv-config`), their tasks
 //! and backlog (`mv-state::{tasks,backlog,index}`), fleet account/seat
 //! health (`mv-engine::{breaker,seatstate,limits}`), and a live Herdr
-//! `agent list`/`workspace list` (shelled out directly, the same
-//! `std::process::Command` + hand-rolled JSON reader pattern
-//! `commands::workers` already uses — `mv-cli` does not depend on
-//! `mv-herdr` or `serde_json`, and widening its `Cargo.toml` is outside
-//! this task's declared write scope).
+//! `agent list`/`workspace list` (run through the shared
+//! `mv_engine::mv_herdr::run::run` runner, so a transient spawn failure —
+//! Linux ETXTBSY on a binary still open for writing, a brief fd/process
+//! shortage — is retried rather than read as an unreachable Herdr; the
+//! reply is read with this file's hand-rolled JSON reader, since `mv-cli`
+//! does not depend on `serde_json`).
 //!
 //! A one-shot board reconciles settled tasks, closes confirmed idle panes,
 //! and expires stranded AWAITING tasks through `mv_state::tasks::reconcile_project`.
@@ -90,6 +91,7 @@ use mv_state::tasks::{AgentPanes, ReconcileRequest, TaskStatus};
 
 use super::board::{BoardDataSource, BoardScope, BoardView};
 use super::doctor::state_dir_from_config;
+use super::run_herdr;
 use crate::exit::Failure;
 
 // --- a minimal, read-only JSON reader, duplicated from
@@ -444,31 +446,28 @@ fn herdr_binary() -> String {
 /// needs that same text to print the matching banner rather than silently
 /// rendering a fleet with every agent missing.
 fn fetch_live_agents(binary: &str) -> Result<Vec<LiveAgent>, String> {
-    let output = std::process::Command::new(binary)
-        .args(["agent", "list"])
-        .output()
-        .map_err(|error| {
-            // Same wording `mv_herdr::error::HerdrError::MissingBinary`
-            // uses for the identical failure — this crate has no
-            // dependency on `mv-herdr` to import that type from (see this
-            // module's doc), so the format string is duplicated rather
-            // than the dependency widened.
-            format!(
-                "herdr binary {binary:?} could not be run: {error}.\n\
-                 Herdr must be installed and on PATH, or HERDR_BIN_PATH set to its path."
-            )
-        })?;
-    if !output.status.success() {
+    // A spawn failure's text is `mv_herdr::error::HerdrError::MissingBinary`'s
+    // own ("herdr binary ... could not be run: ...") — the wording this
+    // function duplicated before it ran through the shared runner.
+    let result =
+        run_herdr(mv_engine::mv_herdr::argv::agent_list(), binary).map_err(|e| e.to_string())?;
+    if result.returncode != 0 {
         return Err(format!(
             "herdr agent list exited {}",
-            output
-                .status
-                .code()
-                .map_or_else(|| "?".to_string(), |code| code.to_string())
+            exit_code_text(result.returncode)
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_live_agents(stdout.trim())
+    parse_live_agents(result.stdout.trim())
+}
+
+/// The runner reports a signal-killed child as `-1`; this file has always
+/// rendered that as `?`.
+fn exit_code_text(returncode: i32) -> String {
+    if returncode < 0 {
+        "?".to_string()
+    } else {
+        returncode.to_string()
+    }
 }
 
 fn parse_live_agents(stdout: &str) -> Result<Vec<LiveAgent>, String> {
@@ -545,10 +544,8 @@ impl AgentPanes for BoardAgents<'_> {
     }
 
     fn close(&mut self, pane: &str) -> bool {
-        std::process::Command::new(self.binary)
-            .args(["pane", "close", pane])
-            .output()
-            .is_ok_and(|output| output.status.success())
+        run_herdr(mv_engine::mv_herdr::argv::pane_close(pane), self.binary)
+            .is_ok_and(|result| result.ok())
     }
 }
 
@@ -718,27 +715,25 @@ impl LiveSource {
         let Resolved::Projects(mut projects, header) = resolved else {
             return Ok(resolved);
         };
-        let output = match std::process::Command::new(binary)
-            .args(["workspace", "list"])
-            .output()
-        {
+        let output = match run_herdr(mv_engine::mv_herdr::argv::workspace_list(), binary) {
             Ok(output) => output,
             Err(error) => {
+                // A spawn failure keeps naming the bare OS error, as it did
+                // before this ran through the shared runner.
+                let reason = std::error::Error::source(&error)
+                    .map_or_else(|| error.to_string(), ToString::to_string);
                 return Ok(Resolved::Message(vec![format!(
-                    "herdr unavailable — showing recorded state unchanged ({error})"
-                )]))
+                    "herdr unavailable — showing recorded state unchanged ({reason})"
+                )]));
             }
         };
-        if !output.status.success() {
+        if output.returncode != 0 {
             return Err(Failure::Operation(format!(
                 "could not reach Herdr to check active workspaces: exit {}",
-                output
-                    .status
-                    .code()
-                    .map_or_else(|| "?".into(), |code| code.to_string())
+                exit_code_text(output.returncode)
             )));
         }
-        let labels = JsonParser::parse(String::from_utf8_lossy(&output.stdout).trim())
+        let labels = JsonParser::parse(output.stdout.trim())
             .as_ref()
             .and_then(workspace_labels)
             .unwrap_or_default();
@@ -2485,14 +2480,12 @@ fn dirty_lane_detail(
 }
 
 fn read_pane_visible(binary: &str, pane: &str) -> Option<String> {
-    let output = std::process::Command::new(binary)
-        .args(["agent", "read", pane, "--source", "visible"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    let output = run_herdr(
+        mv_engine::mv_herdr::argv::agent_read(pane, Some("visible"), None),
+        binary,
+    )
+    .ok()?;
+    (output.returncode == 0).then_some(output.stdout)
 }
 
 fn probe_task_prompt(
@@ -4636,6 +4629,60 @@ esac"#,
             "{:?}",
             snapshot.fleet_health.last_cycle[0]
         );
+    }
+
+    /// Card `20261119-b-c1bb46`: the Linux CI flake of the test above.
+    /// Holding the fake Herdr open for writing is exactly what makes
+    /// Linux's `execve` return `ExecutableFileBusy` — the same condition
+    /// another test thread's `fork()` leaves behind by inheriting its
+    /// write fd (see `mv_herdr::run`'s own
+    /// `run_retries_past_a_transient_executable_file_busy_and_still_succeeds`).
+    /// The board's `agent list` must ride that out through the shared
+    /// runner's retry rather than render the fleet as unreachable.
+    /// Linux-only: macOS `exec` ignores an open write fd, so this would
+    /// pass vacuously there.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn agent_list_survives_a_transient_executable_file_busy_on_the_herdr_binary() {
+        let root = temp_project("board-etxtbsy");
+        let config = mv_config::load::load_config_str(
+            &format!(
+                "[accounts.seat]\nkind = 'codex'\nconfig_dir_var = 'CODEX_HOME'\nconfig_dir = {:?}\nshort = 'cx'\ninteractive = true\n[projects.demo]\npath = {:?}\n",
+                root.join("vendor").to_str().unwrap(),
+                root.to_str().unwrap()
+            ),
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        let source = live_source(config, &root.join("state"));
+        let fake = fake_board_herdr(
+            &root,
+            r#"case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"demo-orch-cx","agent_status":"blocked"}]}}' ;;
+*) exit 1 ;;
+esac"#,
+        );
+        let held_open = std::fs::OpenOptions::new().write(true).open(&fake).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held_open);
+        });
+
+        let snapshot = source.snapshot_with(&BoardScope::All, fake.to_str().unwrap());
+        closer.join().unwrap();
+
+        let (header, view) = snapshot.unwrap();
+        assert_eq!(header.as_deref(), Some("fleet: all 1 project"));
+        let BoardView::Project(snapshot) = view else {
+            panic!("one project")
+        };
+        assert_eq!(
+            snapshot.fleet_health.last_cycle.len(),
+            1,
+            "{:?}",
+            snapshot.fleet_health
+        );
+        assert!(snapshot.fleet_health.last_cycle[0].parked);
     }
 
     #[test]

@@ -339,6 +339,36 @@ pub(crate) fn current_project(args: &ArgMatches) -> Result<(String, PathBuf), Fa
 pub(crate) fn config_available(args: &ArgMatches) -> bool {
     load_config(args).is_ok()
 }
+
+/// Run one Herdr command against `binary` (`argv[0]` overridden, the same
+/// way `mv_state::worktrees::agent_list_snapshot` pins its own binary)
+/// through `mv_herdr::run::run`. Cards `20261119-b-c1bb46` (board) and
+/// `20261119-b-5f7cf6` (workers, doctor): a raw `std::process::Command`
+/// spawn skipped that runner's bounded retry on `ExecutableFileBusy`, so
+/// a Linux `execve` that raced another process's write fd on the binary —
+/// a concurrent test thread's fake Herdr, or a real install replaced
+/// mid-upgrade — read as an unreachable Herdr on the first attempt.
+pub(crate) fn run_herdr(
+    mut command: mv_engine::mv_herdr::argv::HerdrCommand,
+    binary: &str,
+) -> Result<mv_engine::mv_herdr::envelope::CommandResult, mv_engine::mv_herdr::error::HerdrError> {
+    binary.clone_into(&mut command.argv[0]);
+    mv_engine::mv_herdr::run::run(&command, None)
+}
+
+/// A Herdr command with no dedicated `mv_herdr::argv` builder: `args`
+/// after a placeholder `argv[0]` that [`run_herdr`] replaces. `is_herdr`
+/// is set so the runner still applies its bounded default timeout, as it
+/// does for every builder-made command.
+pub(crate) fn herdr_command<S: AsRef<str>>(args: &[S]) -> mv_engine::mv_herdr::argv::HerdrCommand {
+    let mut argv = vec![String::new()];
+    argv.extend(args.iter().map(|arg| arg.as_ref().to_string()));
+    mv_engine::mv_herdr::argv::HerdrCommand {
+        argv,
+        is_herdr: true,
+        ..Default::default()
+    }
+}
 mod workers;
 
 /// Checks the `--yes`/`--dry-run` gate `dispatch` and `council` share

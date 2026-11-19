@@ -1,9 +1,11 @@
 //! `multiverse doctor`: installation-prerequisite checklist (exit 0 pass,
-//! 1 fail). Shells directly to `git`, `$SHELL`, and the `herdr` binary
-//! itself — per architecture.md's crate table, doctor "call\[s\] raw
-//! `git`/`$SHELL`/`herdr --version` directly" and "should stay a thin
-//! process-probing module, not folded into `herdr_client`" — so this file
-//! never reaches for the `mv-herdr` crate.
+//! 1 fail). Shells directly to `git` and `$SHELL`, and probes the `herdr`
+//! binary itself (`--version`, `plugin config-dir`) — a thin
+//! process-probing module, not folded into `herdr_client`. The Herdr
+//! probes run through the shared `mv_herdr::run::run` runner
+//! ([`super::run_herdr`], card `20261119-b-5f7cf6`) so a transient spawn
+//! failure (Linux ETXTBSY on a binary still open for writing) is retried
+//! rather than reported as a missing Herdr.
 //!
 //! Config loading goes through the real `mv_config::load` (merged in from
 //! `main` partway through this task, after an earlier version of this file
@@ -119,9 +121,7 @@ fn panic_unless_resolved_under_test_sandbox(state_dir: &Path) {
 /// set and non-blank, else the bare `herdr` token. Duplicates
 /// `mv_herdr::argv::herdr_binary`'s exact semantics — `mv-cli` does not
 /// depend on `mv-herdr` (see the crate DAG in architecture.md §1: Herdr
-/// access is routed through `mv-engine`, never straight from `mv-cli`),
-/// and doctor's own probes are the one documented exception that talks to
-/// the `herdr` binary directly rather than through that layer.
+/// access is routed through `mv-engine`, never straight from `mv-cli`).
 ///
 /// Test builds never resolve to a real binary, full stop — a `cargo test`
 /// run must never shell out to this machine's actual `herdr` install (see
@@ -144,15 +144,12 @@ fn herdr_binary() -> String {
     "mv-cli-test-herdr-stub-should-never-exist".to_string()
 }
 
+/// One Herdr probe through the shared runner. `None` means it could not
+/// be run at all (spawn failure after the runner's retries, or its
+/// timeout); a signal-killed child reports `-1`, as it always has here.
 fn run_herdr(binary: &str, args: &[&str]) -> Option<(i32, String)> {
-    let output = std::process::Command::new(binary)
-        .args(args)
-        .output()
-        .ok()?;
-    Some((
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-    ))
+    let output = super::run_herdr(super::herdr_command(args), binary).ok()?;
+    Some((output.returncode, output.stdout))
 }
 
 fn parse_herdr_version(stdout: &str) -> Option<(u32, u32, u32)> {
@@ -608,5 +605,30 @@ mod tests {
         let config = mv_config::load::load_config_str(content, Path::new("config.toml")).unwrap();
         let project = &config.projects["example"];
         assert_eq!(project_path(project), Some(Path::new("/tmp")));
+    }
+
+    /// Card `20261119-b-5f7cf6`: doctor's Herdr probes run through the
+    /// shared runner, so a binary briefly held open for writing — exactly
+    /// what makes Linux's `execve` return `ExecutableFileBusy` — is
+    /// retried rather than reported as a missing Herdr. Linux-only: macOS
+    /// `exec` ignores an open write fd, so this would pass vacuously there.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn herdr_probe_survives_a_transient_executable_file_busy_on_the_herdr_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("herdr-fake");
+        std::fs::write(&fake, "#!/bin/sh\nprintf 'herdr 0.9.5\\n'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held_open = std::fs::OpenOptions::new().write(true).open(&fake).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held_open);
+        });
+
+        let probe = run_herdr(fake.to_str().unwrap(), &["--version"]);
+        closer.join().unwrap();
+
+        assert_eq!(probe, Some((0, "herdr 0.9.5\n".to_string())));
     }
 }
