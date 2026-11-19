@@ -590,4 +590,53 @@ mod tests {
         assert_eq!(fields.get("pane_id").map(String::as_str), Some("w1:p1"));
         assert_eq!(fields.len(), 1);
     }
+
+    /// Writes `body` as a fake Herdr in `dir`, then holds it open for
+    /// writing for 30ms on a background thread — exactly what makes
+    /// Linux's `execve` return `ExecutableFileBusy` (the same helper as
+    /// `workers.rs`'s `busy_fake_herdr`).
+    #[cfg(target_os = "linux")]
+    fn busy_fake_herdr(
+        dir: &Path,
+        body: &str,
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("herdr-fake");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held_open = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held_open);
+        });
+        (path, closer)
+    }
+
+    /// Card `20261119-b-f540ec`: `stop`'s `workspace list` must ride out a
+    /// transient `ExecutableFileBusy` through the shared runner's retry
+    /// rather than refuse with "could not reach Herdr". The fake also
+    /// checks the argv, so routing through the runner left it unchanged.
+    /// Linux-only: macOS `exec` ignores an open write fd, so this would
+    /// pass vacuously there (it compiles out).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_list_survives_a_transient_executable_file_busy_on_the_herdr_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake, closer) = busy_fake_herdr(
+            dir.path(),
+            r#"[ "$*" = "workspace list" ] || exit 7
+printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","label":"alpha"}]}}'"#,
+        );
+
+        let records = fetch_records(fake.to_str().unwrap(), "workspace", "workspaces");
+        closer.join().unwrap();
+
+        let records = records.expect("workspace list must survive ExecutableFileBusy");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("workspace_id").map(String::as_str),
+            Some("w1")
+        );
+        assert_eq!(records[0].get("label").map(String::as_str), Some("alpha"));
+    }
 }

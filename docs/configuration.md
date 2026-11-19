@@ -208,6 +208,37 @@ which accounts a role's chain draws from, per project.
 | `HERDR_BIN_PATH` | Override the `herdr` binary Multiverse shells out to | `mv-herdr`; tests and conformance against `fake-herdr` |
 | `MV_FAKE_HERDR_STATE` | Disposable JSON path for `fake-herdr` mutations | `fake-herdr` |
 
+## Shared cargo build-dir
+
+This repository's `.cargo/config.toml` sets
+`[build] build-dir = "{cargo-cache-home}/shared-build/{workspace-path-hash}"`.
+Cargo expands `{workspace-path-hash}` from the workspace's manifest path,
+so each lane worktree builds into its own hash dir under one shared root
+instead of reusing another lane's artifacts. `CARGO_BUILD_BUILD_DIR`
+overrides it with the same precedence as any other `[build]` key.
+
+`worktrees --prune` (Rust-only) reclaims these hash dirs, but only when the
+active template contains `{workspace-path-hash}`; without it nothing under
+the root counts as a per-lane cache.
+
+- **Per lane:** a finished lane's hash dir is computed from its own path,
+  then freed only when that dir's dep-info names the lane. The shared root
+  and the main checkout's own hash dir are never freed. A lane in the
+  routing log whose worktree is gone has its computed hash dir freed only
+  when the dir's evidence names nothing outside that lane.
+- **Orphan sweep:** any other hash dir under the shared root is freed only
+  when every workspace its evidence names is gone. It is kept if it names
+  any live workspace or was not read in full.
+- **Authorization:** caches are freed only with `--yes` (or `--force`).
+  Plain `--prune` and `--dry-run` only report `would free`.
+- **Output:** `freed`/`would free build-dir (N bytes)` under a lane, or
+  `kept build-dir — <reason>` / `build-dir unresolved — <reason>`. The sweep
+  prints `cargo shared-build <dir>` followed by the same freed / would-free
+  line.
+
+The full rules are in the `--prune` row of
+[`docs/parity.md`](parity.md#worktrees).
+
 ## Redaction
 
 Config and state files may contain account identifiers or paths that

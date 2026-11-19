@@ -893,6 +893,10 @@ pub struct OrphanedBuildDir {
     pub path: PathBuf,
     /// Bytes `deep_prune_size` measured under `path` before removal.
     pub bytes: u64,
+    /// Why `path` is still on disk despite being proven orphaned — its
+    /// removal failed (card `20261119-b-a9f95f`). `None` when it was
+    /// freed, or under `dry_run`, would be.
+    pub kept: Option<String>,
 }
 
 /// The entry point for every lane-lifecycle operation this module offers
@@ -1285,10 +1289,31 @@ impl BuildDirScanBudget {
     /// checkout lookup is) — the original single-dir budget this replaces.
     const MIN_TIME_BUDGET: Duration = Duration::from_secs(2);
 
+    /// Per computed hash dir a complete read (see `for_complete_reads`)
+    /// must get through. Reading a real lane's full dep-info set (866 `.d`
+    /// files after this repo's whole check suite) takes a fraction of a
+    /// second; this leaves room for a host under load 20-30 and a slow
+    /// filesystem, and still bounds a pathological dir.
+    const COMPLETE_READ_TIME_PER_DIR: Duration = Duration::from_secs(30);
+
     fn for_candidates(candidate_count: usize) -> Self {
         let scaled = Self::TIME_PER_HASH_DIR.saturating_mul(candidate_count.max(1) as u32);
         Self {
             deadline: Instant::now() + scaled.max(Self::MIN_TIME_BUDGET),
+        }
+    }
+
+    /// The deadline for reading `dir_count` computed hash dirs (see
+    /// `computed_hash_dir`) in full — paired with
+    /// `PerDirFileBudget::unbounded`, never with the per-dir file cap (card
+    /// `20261119-b-a9f95f`). Each of those is one known dir, not a sweep
+    /// over every dir under the shared root, so it gets a complete read:
+    /// `COMPLETE_READ_TIME_PER_DIR` (30 s) per dir, shared across all of
+    /// them.
+    fn for_complete_reads(dir_count: usize) -> Self {
+        Self {
+            deadline: Instant::now()
+                + Self::COMPLETE_READ_TIME_PER_DIR.saturating_mul(dir_count.max(1) as u32),
         }
     }
 
@@ -1325,6 +1350,18 @@ impl PerDirFileBudget {
     fn new() -> Self {
         Self {
             files_remaining: Self::FILE_BUDGET,
+        }
+    }
+
+    /// No file cap at all, for a computed hash dir's complete read (see
+    /// `BuildDirScanBudget::for_complete_reads`): a lane that ran this
+    /// repo's full check suite left 866 `.d` files outside `.fingerprint/`
+    /// in its one hash dir, so `FILE_BUDGET` cut that read short and kept
+    /// the dir forever (card `20261119-b-a9f95f`). Only the deadline
+    /// bounds it.
+    fn unbounded() -> Self {
+        Self {
+            files_remaining: usize::MAX,
         }
     }
 
@@ -1443,9 +1480,11 @@ fn workspace_evidence(
 /// embeds it — must never read as this lane's own build-dir. Bounded by
 /// the whole-scan `budget`'s own deadline and by `per_dir`'s own file
 /// cap, scoped to this one `dir` alone (see `PerDirFileBudget`); either
-/// exhausting first reads as `false`, the same as a genuine not-found — a
-/// scan that ran out of budget must never be read as "nothing here to
-/// protect."
+/// exhausting first reads as `MarkerScan::CutShort`, never as `Found` —
+/// a scan that ran out of budget must never be read as "nothing here to
+/// protect" — and never as `NotFound` either: a scan that ran out of
+/// budget must never be reported as "does not name this lane" (card
+/// `20261119-b-a9f95f`).
 fn dir_names_marker(
     dir: &Path,
     marker: &Path,
@@ -1454,16 +1493,16 @@ fn dir_names_marker(
     shared_root: &Path,
     budget: &mut BuildDirScanBudget,
     per_dir: &mut PerDirFileBudget,
-) -> bool {
+) -> MarkerScan {
     if budget.exhausted() || per_dir.exhausted() {
-        return false;
+        return MarkerScan::CutShort;
     }
     let Ok(entries) = deep_prune_entries(dir) else {
-        return false;
+        return MarkerScan::NotFound;
     };
     for entry in entries {
         if budget.exhausted() || per_dir.exhausted() {
-            return false;
+            return MarkerScan::CutShort;
         }
         let Ok(file_type) = fs::symlink_metadata(&entry).map(|info| info.file_type()) else {
             continue;
@@ -1472,7 +1511,7 @@ fn dir_names_marker(
             continue;
         }
         if file_type.is_dir() {
-            if dir_names_marker(
+            match dir_names_marker(
                 &entry,
                 marker,
                 exclude,
@@ -1481,9 +1520,9 @@ fn dir_names_marker(
                 budget,
                 per_dir,
             ) {
-                return true;
+                MarkerScan::NotFound => continue,
+                found_or_cut_short => return found_or_cut_short,
             }
-            continue;
         }
         if !file_type.is_file() || !is_build_evidence(&entry) {
             continue;
@@ -1497,10 +1536,21 @@ fn dir_names_marker(
             path.starts_with(marker) && !exclude.is_some_and(|excl| path.starts_with(excl))
         });
         if matched {
-            return true;
+            return MarkerScan::Found;
         }
     }
-    false
+    MarkerScan::NotFound
+}
+
+/// What one `dir_names_marker` walk of a single hash dir concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerScan {
+    /// Some evidence file names the marker.
+    Found,
+    /// Every evidence file was read and none names the marker.
+    NotFound,
+    /// A budget ran out first, so an unread file may still name it.
+    CutShort,
 }
 
 /// cargo's own two-component shape for a `{workspace-path-hash}`
@@ -1619,7 +1669,11 @@ fn computed_hash_dir(shared_root: &Path, workspace_root: &Path) -> PathBuf {
 /// workspace nor any other vanished one (card `20261119-b-4ec912`).
 /// Relative sources do not count against it: the hash itself already
 /// names the one workspace those belong to. Read through
-/// `scan_orphan_evidence`, so a scan cut short is never a proof.
+/// `scan_orphan_evidence`, so a scan cut short is never a proof — and
+/// read without the per-dir file cap (`PerDirFileBudget::unbounded`), so
+/// a lane that left more `.d` files than `PerDirFileBudget::FILE_BUDGET`
+/// is still read in full before `budget`'s deadline (card
+/// `20261119-b-a9f95f`).
 fn hash_dir_names_only_lane(
     dir: &Path,
     lane_path: &Path,
@@ -1628,7 +1682,7 @@ fn hash_dir_names_only_lane(
     budget: &mut BuildDirScanBudget,
 ) -> bool {
     let mut verdict = OrphanVerdict::default();
-    let mut per_dir = PerDirFileBudget::new();
+    let mut per_dir = PerDirFileBudget::unbounded();
     scan_orphan_evidence(
         dir,
         cargo_home,
@@ -1683,7 +1737,7 @@ fn find_build_dir_evidence_within(
             };
         }
         let mut per_dir = PerDirFileBudget::new();
-        if dir_names_marker(
+        match dir_names_marker(
             &candidate,
             marker,
             exclude,
@@ -1692,10 +1746,9 @@ fn find_build_dir_evidence_within(
             &mut budget,
             &mut per_dir,
         ) {
-            return BuildDirLookup::Found(candidate);
-        }
-        if budget.exhausted() || per_dir.exhausted() {
-            unread += 1;
+            MarkerScan::Found => return BuildDirLookup::Found(candidate),
+            MarkerScan::CutShort => unread += 1,
+            MarkerScan::NotFound => {}
         }
     }
     if unread > 0 {
@@ -1793,12 +1846,16 @@ fn guard_build_dir_candidate(
 ///
 /// Card `20261119-b-4ec912`: the lane's own `computed_hash_dir` is the
 /// first candidate, proven by its own dep-info naming the lane — one dir,
-/// read under its own fresh budgets, so a shared root too big or a host
-/// too loaded for the full scan below no longer leaves the lane's
+/// read in full under its own fresh budgets (no file cap — see
+/// `BuildDirScanBudget::for_complete_reads`), so a shared root too big or
+/// a host too loaded for the full scan below no longer leaves the lane's
 /// build-dir behind. The scan runs only when that computed dir does not
 /// exist (a lane built under another `build-dir`, or reached through
 /// another spelling of its path); one that exists but cannot be proven is
-/// kept, never traded for some other dir the scan might match.
+/// kept, never traded for some other dir the scan might match. A read of
+/// it that ran out of time first says so and resolves no dir (card
+/// `20261119-b-a9f95f`), so this run's sweep is not told to skip a dir
+/// nobody read in full.
 fn scoped_lane_build_dir(
     shared_root: &Path,
     main_checkout_dir: Option<&Path>,
@@ -1809,16 +1866,20 @@ fn scoped_lane_build_dir(
         main_checkout_dir,
         lane_path,
         BuildDirScanBudget::for_candidates,
+        BuildDirScanBudget::for_complete_reads,
     )
 }
 
 /// `scoped_lane_build_dir` with the fallback scan's whole-scan budget
-/// sized by `scan_budget` (see `find_build_dir_evidence_within`).
+/// sized by `scan_budget` (see `find_build_dir_evidence_within`) and the
+/// computed dir's complete read bounded by `complete_read`, so a test can
+/// starve either one.
 fn scoped_lane_build_dir_within(
     shared_root: &Path,
     main_checkout_dir: Option<&Path>,
     lane_path: &Path,
     scan_budget: fn(usize) -> BuildDirScanBudget,
+    complete_read: fn(usize) -> BuildDirScanBudget,
 ) -> std::result::Result<PathBuf, BuildDirReclaim> {
     let computed = computed_hash_dir(shared_root, lane_path);
     let lookup = match fs::symlink_metadata(&computed) {
@@ -1827,22 +1888,33 @@ fn scoped_lane_build_dir_within(
         }
         Ok(info) if info.is_dir() => {
             let cargo_home = cargo_cache_home();
-            if !dir_names_marker(
+            match dir_names_marker(
                 &computed,
                 lane_path,
                 None,
                 cargo_home.as_deref(),
                 shared_root,
-                &mut BuildDirScanBudget::for_candidates(1),
-                &mut PerDirFileBudget::new(),
+                &mut complete_read(1),
+                &mut PerDirFileBudget::unbounded(),
             ) {
-                return Err(BuildDirReclaim::kept(
-                    "its computed shared-build hash dir does not name this lane in its dep-info"
-                        .into(),
-                    Some(computed),
-                ));
+                MarkerScan::Found => BuildDirLookup::Found(computed),
+                MarkerScan::NotFound => {
+                    return Err(BuildDirReclaim::kept(
+                        "its computed shared-build hash dir does not name this lane in its \
+                         dep-info"
+                            .into(),
+                        Some(computed),
+                    ))
+                }
+                MarkerScan::CutShort => {
+                    return Err(BuildDirReclaim::kept(
+                        "scan budget ran out before its computed shared-build hash dir was \
+                         read in full"
+                            .into(),
+                        None,
+                    ))
+                }
             }
-            BuildDirLookup::Found(computed)
         }
         _ => {
             return Err(BuildDirReclaim::kept(
@@ -2149,6 +2221,35 @@ fn hash_dir_is_orphaned(
         && !verdict.saw_live
         && !verdict.cut_short
         && !workspace_root_may_survive(&verdict)
+}
+
+/// Measures `dir`, a hash dir the orphan sweep already proved orphaned,
+/// and, unless `dry_run`, deletes it — confined to `shared_root` (see
+/// `deep_prune_remove`). `None` when it measured empty. A failed delete
+/// is reported as kept with its reason, never as freed bytes that are
+/// still on disk (card `20261119-b-a9f95f`) — the same rule
+/// `BuildDirReclaim::free` follows for a lane's own build-dir.
+fn free_orphaned_build_dir(
+    shared_root: &Path,
+    dir: PathBuf,
+    dry_run: bool,
+) -> Option<OrphanedBuildDir> {
+    let bytes = deep_prune_size(&dir);
+    if bytes == 0 {
+        return None;
+    }
+    let kept = if dry_run {
+        None
+    } else {
+        deep_prune_remove(&dir, shared_root)
+            .err()
+            .map(|error| format!("removing its hash dir failed: {error}"))
+    };
+    Some(OrphanedBuildDir {
+        path: dir,
+        bytes,
+        kept,
+    })
 }
 
 impl Worktrees {
@@ -3463,14 +3564,9 @@ impl Worktrees {
         let mut handled = skip.to_vec();
         for dir in self.vanished_lane_build_dirs(&shared_root, cargo_home.as_deref(), skip) {
             handled.push(dir.clone());
-            let bytes = deep_prune_size(&dir);
-            if bytes == 0 {
-                continue;
+            if let Some(outcome) = free_orphaned_build_dir(&shared_root, dir, dry_run) {
+                outcomes.push(outcome);
             }
-            if !dry_run {
-                let _ = deep_prune_remove(&dir, &shared_root);
-            }
-            outcomes.push(OrphanedBuildDir { path: dir, bytes });
         }
         let mut candidates = hash_dir_candidates(&shared_root);
         candidates.retain(|candidate| !handled.contains(candidate));
@@ -3489,17 +3585,9 @@ impl Worktrees {
             ) {
                 continue;
             }
-            let bytes = deep_prune_size(&candidate);
-            if bytes == 0 {
-                continue;
+            if let Some(outcome) = free_orphaned_build_dir(&shared_root, candidate, dry_run) {
+                outcomes.push(outcome);
             }
-            if !dry_run {
-                let _ = deep_prune_remove(&candidate, &shared_root);
-            }
-            outcomes.push(OrphanedBuildDir {
-                path: candidate,
-                bytes,
-            });
         }
         Ok(outcomes)
     }
@@ -3545,7 +3633,7 @@ impl Worktrees {
                 candidates.push((lane_path, dir));
             }
         }
-        let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
+        let mut budget = BuildDirScanBudget::for_complete_reads(candidates.len());
         candidates
             .into_iter()
             .filter(|(lane_path, dir)| {
@@ -6904,6 +6992,7 @@ pub(crate) mod tests {
             vec![OrphanedBuildDir {
                 path: orphan_hash_dir.clone(),
                 bytes: size,
+                kept: None,
             }]
         );
         assert!(
@@ -6917,6 +7006,7 @@ pub(crate) mod tests {
             vec![OrphanedBuildDir {
                 path: orphan_hash_dir.clone(),
                 bytes: size,
+                kept: None,
             }]
         );
         assert!(
@@ -7069,6 +7159,7 @@ pub(crate) mod tests {
             vec![OrphanedBuildDir {
                 path: hash_dir_path.clone(),
                 bytes: size,
+                kept: None,
             }]
         );
         assert!(
@@ -7118,6 +7209,7 @@ pub(crate) mod tests {
             vec![OrphanedBuildDir {
                 path: lane_hash_dir.clone(),
                 bytes: lane_size,
+                kept: None,
             }]
         );
         assert!(
@@ -7538,6 +7630,7 @@ pub(crate) mod tests {
             vec![OrphanedBuildDir {
                 path: hash_dir_path.clone(),
                 bytes: size,
+                kept: None,
             }]
         );
         assert!(!hash_dir_path.exists());
@@ -7795,9 +7888,21 @@ pub(crate) mod tests {
         };
 
         let scan = find_build_dir_evidence_within(&shared_root, &lane, None, spent);
-        let resolved = scoped_lane_build_dir_within(&shared_root, None, &lane, spent);
+        let resolved = scoped_lane_build_dir_within(
+            &shared_root,
+            None,
+            &lane,
+            spent,
+            BuildDirScanBudget::for_complete_reads,
+        );
         write_build_evidence(&computed, &[&root.join("other")]);
-        let unproven = scoped_lane_build_dir_within(&shared_root, None, &lane, spent);
+        let unproven = scoped_lane_build_dir_within(
+            &shared_root,
+            None,
+            &lane,
+            spent,
+            BuildDirScanBudget::for_complete_reads,
+        );
         fs::remove_dir_all(&root).unwrap();
 
         assert!(matches!(scan, BuildDirLookup::Inconclusive { .. }));
@@ -7889,6 +7994,7 @@ pub(crate) mod tests {
         let expected = vec![OrphanedBuildDir {
             path: lane_hash_dir.clone(),
             bytes: size,
+            kept: None,
         }];
         assert_eq!(store.prune_orphaned_build_dirs(true).unwrap(), expected);
         assert!(lane_hash_dir.exists(), "a preview never deletes");
@@ -7948,6 +8054,231 @@ pub(crate) mod tests {
         assert_eq!(freed.len(), 1, "{freed:?}");
         assert_eq!(freed[0].path, lane_hash_dir);
         assert!(!lane_hash_dir.exists());
+    }
+
+    /// Card `20261119-b-a9f95f`, item 1: a lane's computed hash dir whose
+    /// read runs out of budget before reaching the dep-info that names the
+    /// lane used to be reported as "does not name this lane", and its
+    /// `Some(computed)` path put it on the same run's sweep skip list. A
+    /// cut-short read now says the scan ran out and resolves no dir.
+    #[test]
+    fn scoped_lane_build_dir_reports_a_cut_short_computed_read_as_the_scan_running_out() {
+        let cargo_home = CargoHomeEnvGuard::new();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "mv-computed-cut-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+        let lane = root.join("lane");
+        let shared_root = root.join("shared-build");
+        let computed = computed_hash_dir(&shared_root, &lane);
+        write_real_build_dir_layout(&computed, &lane, &cargo_home.dir);
+        let spent: fn(usize) -> BuildDirScanBudget = |_| BuildDirScanBudget {
+            deadline: Instant::now(),
+        };
+
+        let cut_short = scoped_lane_build_dir_within(&shared_root, None, &lane, spent, spent);
+        let complete = scoped_lane_build_dir_within(
+            &shared_root,
+            None,
+            &lane,
+            spent,
+            BuildDirScanBudget::for_complete_reads,
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        match cut_short {
+            Err(BuildDirReclaim {
+                freed: None,
+                kept: Some(reason),
+                path,
+            }) => {
+                assert!(reason.contains("scan budget ran out"), "{reason}");
+                assert!(!reason.contains("does not name"), "{reason}");
+                assert_eq!(path, None, "an unread dir must not join the skip list");
+            }
+            other => panic!("expected a kept, unresolved build-dir, got {other:?}"),
+        }
+        assert_eq!(complete.ok(), Some(computed));
+    }
+
+    /// Card `20261119-b-a9f95f`, item 2: a lane that ran this repo's full
+    /// check suite left 866 `.d` files outside `.fingerprint/` in its hash
+    /// dir — more than `PerDirFileBudget::FILE_BUDGET`. Its computed dir is
+    /// one known dir, so it is read in full: the dep-info naming the lane
+    /// is found even sorted after 1000 other `.d` files.
+    #[test]
+    fn scoped_lane_build_dir_reads_a_computed_hash_dir_past_the_per_dir_file_cap() {
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "mv-computed-big-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+        let lane = root.join("lane");
+        write_workspace_marker(&lane);
+        let shared_root = root.join("shared-build");
+        let computed = computed_hash_dir(&shared_root, &lane);
+        write_junk_evidence_files(&computed, PerDirFileBudget::FILE_BUDGET * 2);
+        fs::write(
+            computed.join("debug/deps/zzz.d"),
+            format!("{}/src/lib.rs\n", lane.display()),
+        )
+        .unwrap();
+
+        let resolved = scoped_lane_build_dir(&shared_root, None, &lane);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(resolved.ok(), Some(computed));
+    }
+
+    /// Card `20261119-b-a9f95f`, item 2: a vanished lane's computed hash
+    /// dir holding more `.d` files than `PerDirFileBudget::FILE_BUDGET`,
+    /// every one naming only that lane, used to be cut short and kept by
+    /// the vanished-lane sweep — and the generic sweep keeps it too, since
+    /// its relative sources resolve under the main checkout. It is now
+    /// read in full and freed.
+    #[test]
+    fn prune_orphaned_build_dirs_frees_a_vanished_lanes_computed_dir_past_the_file_cap() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        commit_nested_workspace(&repo);
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let outcomes = store.prune(&mut Observer::idle(), true, false).unwrap();
+        assert!(matches!(&outcomes[0], PruneOutcome::Removed { .. }));
+        assert!(!lane.path.exists());
+
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let lane_hash_dir = computed_hash_dir(&shared_root, &lane.path);
+        let deps = lane_hash_dir.join("debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let prompt = lane.path.join("prompts/role-builder.md");
+        for i in 0..1100 {
+            fs::write(
+                deps.join(format!("unit{i:04}.d")),
+                format!(
+                    "{out}: crates/mv-core/src/lib.rs {prompt}\n",
+                    out = deps.join(format!("libunit{i:04}.rmeta")).display(),
+                    prompt = prompt.display()
+                ),
+            )
+            .unwrap();
+        }
+        let size = deep_prune_size(&lane_hash_dir);
+
+        let freed = store.prune_orphaned_build_dirs(false).unwrap();
+
+        assert_eq!(
+            freed,
+            vec![OrphanedBuildDir {
+                path: lane_hash_dir.clone(),
+                bytes: size,
+                kept: None,
+            }]
+        );
+        assert!(!lane_hash_dir.exists(), "a dir read in full must be freed");
+    }
+
+    /// Restores `0o755` on each dir on drop, so a test that made one
+    /// read-only still leaves nothing behind in `TMPDIR` when it fails.
+    struct ReadOnlyDirs(Vec<PathBuf>);
+    impl ReadOnlyDirs {
+        fn new(dirs: Vec<PathBuf>) -> Self {
+            for dir in &dirs {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            Self(dirs)
+        }
+    }
+    impl Drop for ReadOnlyDirs {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    /// Card `20261119-b-a9f95f`, item 4: both orphan-sweep loops — the
+    /// vanished-lane one and the generic one — ignored a failed
+    /// `deep_prune_remove` and reported the dir's bytes as freed while it
+    /// was still on disk. A read-only subdir now makes each one report the
+    /// dir kept, with the reason.
+    #[test]
+    fn prune_orphaned_build_dirs_reports_a_failed_delete_as_kept_in_both_loops() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let outcomes = store.prune(&mut Observer::idle(), true, false).unwrap();
+        assert!(matches!(&outcomes[0], PruneOutcome::Removed { .. }));
+        assert!(!lane.path.exists());
+
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let lane_hash_dir = computed_hash_dir(&shared_root, &lane.path);
+        write_build_evidence(&lane_hash_dir, &[&lane.path]);
+        let vanished = std::env::temp_dir().join(format!(
+            "mv-vanished-workspace-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let orphan_hash_dir = hash_dir(&shared_root, "2a", "9");
+        write_build_evidence(&orphan_hash_dir, &[&vanished]);
+        let lane_size = deep_prune_size(&lane_hash_dir);
+        let orphan_size = deep_prune_size(&orphan_hash_dir);
+        let _read_only = ReadOnlyDirs::new(vec![
+            lane_hash_dir.join("debug/deps"),
+            orphan_hash_dir.join("debug/deps"),
+        ]);
+
+        let swept = store.prune_orphaned_build_dirs(false).unwrap();
+
+        let summary: Vec<_> = swept
+            .iter()
+            .map(|outcome| (outcome.path.clone(), outcome.bytes))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (lane_hash_dir.clone(), lane_size),
+                (orphan_hash_dir.clone(), orphan_size)
+            ]
+        );
+        for outcome in &swept {
+            let reason = outcome.kept.as_deref().unwrap_or_default();
+            assert!(
+                reason.starts_with("removing its hash dir failed: "),
+                "{outcome:?}"
+            );
+        }
+        assert!(lane_hash_dir.join("debug/deps/fixture.d").exists());
+        assert!(orphan_hash_dir.join("debug/deps/fixture.d").exists());
     }
 
     /// `dep_info_paths` reads rustc's own dep-info shape: rule targets and

@@ -9,6 +9,37 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-11-19
+
+### Added
+
+- Docs: `docs/parity.md`'s `worktrees --prune` row and a new "Shared cargo
+  build-dir" section in `docs/configuration.md` describe the Rust-only
+  shared-build reclaim: the `{workspace-path-hash}` build-dir template,
+  per-lane reclaim by computed hash, the orphan sweep's keep rule, the
+  `--yes` requirement and its output lines. `stop` gained a Linux-only test
+  that its `workspace list` call survives a transient `ETXTBSY` on the
+  Herdr binary.
+
+### Fixed
+
+- `sweep` disk notice: the Critical "cargo shared-build orphaned" line now
+  counts only the hash dirs that project's own `worktrees --prune --yes`
+  would free, read from prune's own dry-run sweep. It no longer counts
+  another configured project's live builds (the shared-build root is
+  global), nor a current lane whose build-dir a bounded scan could not
+  resolve, and a dir two projects would both free is counted once. The
+  line's format is unchanged.
+- `worktrees --prune`: a lane's computed shared-build hash dir is now read
+  in full (no 500-file cap; a 30 s deadline per dir) by both the per-lane
+  lookup and the vanished-lane sweep, so a lane that ran the full check
+  suite (866 `.d` files) is found and freed instead of kept forever. A read
+  of that dir that still runs out of time prints `build-dir unresolved —
+  scan budget ran out …` instead of the false "does not name this lane",
+  and no longer makes the same run's sweep skip the dir. The orphan sweep
+  prints `kept build-dir — removing its hash dir failed: …` for a dir it
+  could not delete, instead of reporting those bytes as freed.
+
 ## [0.1.15] - 2026-11-19
 
 ### Fixed
@@ -1378,6 +1409,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.16]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.16
 [0.1.15]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.15
 [0.1.14]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.14
 [0.1.13]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.13

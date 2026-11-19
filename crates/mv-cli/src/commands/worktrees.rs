@@ -433,6 +433,12 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
         .map_err(fail)?;
     for build_dir in &orphaned_build_dirs {
         println!("  cargo shared-build {}", build_dir.path.display());
+        // Card `20261119-b-a9f95f`: a delete that failed leaves the dir on
+        // disk, so it is never reported as freed.
+        if let Some(reason) = &build_dir.kept {
+            println!("    kept build-dir — {reason}");
+            continue;
+        }
         let verb = if preview_caches {
             "would free"
         } else {

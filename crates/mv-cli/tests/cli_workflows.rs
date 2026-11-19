@@ -2113,6 +2113,131 @@ fn worktrees_prune_reports_a_removed_lanes_build_dir_once_per_run() {
     assert!(!build_dir.exists(), "--prune --yes must delete it");
 }
 
+/// `worktrees --prune` for `sandbox`'s project with `CARGO_HOME` pinned
+/// inside it; returns stdout after asserting exit 0.
+fn prune_with_cargo_home(sandbox: &Sandbox, extra: &[&str]) -> String {
+    let output = sandbox
+        .command(env!("CARGO_BIN_EXE_multiverse"))
+        .env("CARGO_HOME", sandbox.root.join("cargo-home"))
+        .args(["worktrees", sandbox.project.to_str().unwrap(), "--prune"])
+        .args(extra)
+        .output()
+        .expect("run built multiverse binary");
+    assert_code(&output, 0);
+    stdout(&output)
+}
+
+/// Card `20261119-b-a9f95f`, item 5: a lane whose build-dir no hash dir
+/// names prints `build-dir unresolved —`, never `kept build-dir —`, and
+/// neither line names the shared root (card `20261119-b-087c6c`).
+#[test]
+fn worktrees_prune_says_a_lanes_build_dir_is_unresolved_without_naming_the_shared_root() {
+    let sandbox = Sandbox::new();
+    let build_dir = lane_with_build_dir(&sandbox);
+    fs::remove_dir_all(&build_dir).unwrap();
+    let shared_root = sandbox.root.join("cargo-home/shared-build");
+
+    let out = prune_with_cargo_home(&sandbox, &[]);
+
+    assert!(out.contains("    removed"), "{out}");
+    assert!(
+        out.contains(
+            "    build-dir unresolved — no shared-build hash dir names this lane in its dep-info"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("kept build-dir"), "{out}");
+    assert!(!out.contains(&shared_root.display().to_string()), "{out}");
+}
+
+/// Card `20261119-b-a9f95f`, item 5: a lane whose build-dir resolves to a
+/// hash dir it may not delete — here the main checkout's own, since its
+/// dep-info names both — prints `kept build-dir —`, never `build-dir
+/// unresolved —`, without naming the shared root, and keeps the dir.
+#[test]
+fn worktrees_prune_says_it_kept_a_lanes_resolved_build_dir_without_naming_the_shared_root() {
+    let sandbox = Sandbox::new();
+    let build_dir = lane_with_build_dir(&sandbox);
+    let project = fs::canonicalize(&sandbox.project).unwrap();
+    fs::write(
+        build_dir.join("debug/deps/main.d"),
+        format!(
+            "{}/src/lib.rs\n",
+            project.display().to_string().replace(' ', "\\ ")
+        ),
+    )
+    .unwrap();
+    let shared_root = sandbox.root.join("cargo-home/shared-build");
+
+    let out = prune_with_cargo_home(&sandbox, &["--yes"]);
+
+    assert!(out.contains("    removed"), "{out}");
+    assert!(
+        out.contains(
+            "    kept build-dir — its hash dir is the shared root itself or the main \
+             checkout's own build-dir"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("build-dir unresolved"), "{out}");
+    assert!(!out.contains(&shared_root.display().to_string()), "{out}");
+    assert!(build_dir.exists(), "a kept build-dir stays on disk");
+}
+
+/// Restores `0o755` on a dir on drop, so a test that made it read-only
+/// still lets `Sandbox` remove everything when it fails.
+struct ReadOnlyDir(PathBuf);
+impl ReadOnlyDir {
+    fn new(dir: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        Self(dir)
+    }
+}
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Card `20261119-b-a9f95f`, item 4: an orphaned shared-build hash dir
+/// that `--prune --yes` fails to delete is printed as kept with the
+/// reason, never as freed bytes that are still on disk.
+#[test]
+fn worktrees_prune_reports_an_orphaned_build_dir_it_failed_to_delete_as_kept() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.project.join(".cargo")).unwrap();
+    fs::write(
+        sandbox.project.join(".cargo/config.toml"),
+        "[build]\nbuild-dir = \"{cargo-cache-home}/shared-build/{workspace-path-hash}\"\n",
+    )
+    .unwrap();
+    let vanished = sandbox.root.join("vanished-workspace");
+    let orphan = sandbox
+        .root
+        .join("cargo-home/shared-build/2a/00000000000009");
+    fs::create_dir_all(orphan.join("debug/deps")).unwrap();
+    fs::write(
+        orphan.join("debug/deps/fixture.d"),
+        format!(
+            "{}/src/lib.rs\n",
+            vanished.display().to_string().replace(' ', "\\ ")
+        ),
+    )
+    .unwrap();
+    let _read_only = ReadOnlyDir::new(orphan.join("debug/deps"));
+
+    let out = prune_with_cargo_home(&sandbox, &["--yes"]);
+
+    assert!(
+        out.contains("    kept build-dir — removing its hash dir failed: "),
+        "{out}"
+    );
+    assert!(!out.contains("freed build-dir"), "{out}");
+    assert!(orphan.join("debug/deps/fixture.d").exists());
+}
+
 /// Card `20261119-b-73759c`'s `--deep` half: a redundant
 /// `.multiverse/worktree-state/` quarantine copy is only previewed
 /// ("would remove") by `--prune --deep` without `--yes`.

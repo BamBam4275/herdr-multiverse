@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use mv_config::load::Config;
-use mv_state::worktrees::{find_build_dir, find_main_checkout_build_dir, shared_build_root};
+use mv_state::worktrees::{shared_build_root, Worktrees};
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
@@ -232,9 +232,7 @@ pub fn report_with(
         report
             .lines
             .extend(worktree_target_lines(config, worktree_scan_deadline));
-        report
-            .lines
-            .extend(orphaned_build_dir_lines(config, worktree_scan_deadline));
+        report.lines.extend(orphaned_build_dir_lines(config));
     }
     if apply && report.level.is_some_and(|level| level != Level::Ok) {
         if let Some(hub) = config
@@ -335,25 +333,30 @@ fn worktree_target_lines(config: &Config, deadline: Instant) -> Vec<String> {
     lines
 }
 
-/// One line per project with cargo build-dir bytes, under its configured
-/// shared-build root, that no longer belong to any build-dir this scan can
-/// still find evidence of for that project's own checkout or any of its
-/// current lanes (card `20261115-b-47f043`) — most often a lane `--prune`
-/// already removed before this cleanup landed, or one whose build-dir this
-/// run simply could not resolve in time. Read-only, like every probe in
-/// this module — `find_build_dir`'s own scan never shells out to `cargo`
-/// or `rustup` either. A project with no configured per-workspace
-/// build-dir namespacing, or nothing orphaned, adds no line. Shares
-/// `worktree_target_lines`'s own scan deadline rather than adding a second
-/// budget on top of it.
-fn orphaned_build_dir_lines(config: &Config, deadline: Instant) -> Vec<String> {
+/// One line per project naming the cargo build-dir bytes, under its
+/// configured shared-build root, that its own `multiverse worktrees <root>
+/// --prune --yes` would free (cards `20261115-b-47f043`,
+/// `20261119-b-7c0609`): exactly the hash dirs mv-state's own dry-run
+/// sweep ([`Worktrees::prune_orphaned_build_dirs`]) proves orphaned —
+/// its vanished-lane and generic judgments, never a separate rule here —
+/// sized as that sweep sizes them. The shared root is global
+/// (`{cargo-cache-home}/shared-build`), so another configured project's
+/// live builds, or any non-Multiverse workspace's, are never "orphaned"
+/// merely for not being this project's; and a lane's own build-dir counts
+/// as live from its own evidence, never from whether a scan found it
+/// before a deadline. A hash dir an earlier project's line already
+/// counted is not counted again, so the lines never sum past what the
+/// host would actually get back. Read-only, like every probe in this
+/// module: dry-run takes no lock and deletes nothing, and the sweep's own
+/// scan budget bounds it rather than `worktree_target_lines`' deadline. A
+/// project that is not a git root, has no configured per-workspace
+/// build-dir namespacing, or has nothing prune would free adds no line.
+fn orphaned_build_dir_lines(config: &Config) -> Vec<String> {
     let mut projects: Vec<_> = config.projects.values().collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut counted = BTreeSet::new();
     let mut lines = Vec::new();
     for project in projects {
-        if Instant::now() >= deadline {
-            break;
-        }
         let Some(root) = project.path.value().filter(|root| !root.is_empty()) else {
             continue;
         };
@@ -361,26 +364,16 @@ fn orphaned_build_dir_lines(config: &Config, deadline: Instant) -> Vec<String> {
         let Some(shared_root) = shared_build_root(root) else {
             continue;
         };
-        let mut live = BTreeSet::new();
-        if let Some(main_dir) = find_main_checkout_build_dir(&shared_root, root) {
-            live.insert(main_dir);
-        }
-        let worktrees_dir = root.join(".multiverse").join("worktrees");
-        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
-            for entry in entries.flatten() {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                if let Some(dir) = find_build_dir(&shared_root, &entry.path()) {
-                    live.insert(dir);
-                }
-            }
-        }
-        let mut total = 0u64;
-        collect_orphan_bytes(&shared_root, &live, deadline, &mut total);
+        let Ok(orphans) =
+            Worktrees::new(root).and_then(|worktrees| worktrees.prune_orphaned_build_dirs(true))
+        else {
+            continue;
+        };
+        let total: u64 = orphans
+            .into_iter()
+            .filter(|orphan| counted.insert(orphan.path.clone()))
+            .map(|orphan| orphan.bytes)
+            .sum();
         if total > 0 {
             lines.push(format!(
                 "disk: {} cargo shared-build orphaned {} under {}",
@@ -391,32 +384,6 @@ fn orphaned_build_dir_lines(config: &Config, deadline: Instant) -> Vec<String> {
         }
     }
     lines
-}
-
-/// Recurses into `dir` only while it is a real ancestor of some still-live
-/// build-dir; any other directory under the shared root is, by
-/// construction, disjoint from every build-dir this scan could find, so
-/// its whole subtree counts as orphaned in one `dir_size` call rather than
-/// being walked further.
-fn collect_orphan_bytes(dir: &Path, live: &BTreeSet<PathBuf>, deadline: Instant, total: &mut u64) {
-    if Instant::now() >= deadline || live.contains(dir) {
-        return;
-    }
-    if !live.iter().any(|path| path.starts_with(dir)) {
-        *total += dir_size(dir, deadline);
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            collect_orphan_bytes(&entry.path(), live, deadline, total);
-        }
-    }
 }
 
 /// Sums file bytes under `path`, skipping symlinks (both `path` itself and
@@ -1395,20 +1362,77 @@ mod tests {
         shared_root.join(bucket).join(format!("{leaf:0>14}"))
     }
 
-    /// Card `20261115-b-47f043`: a build-dir hash this scan cannot find
-    /// evidence of for the project's own checkout or any of its current
-    /// lanes must still be named and sized, never silently left out of the
-    /// Critical notice the way `.multiverse/worktrees/*/target` once was —
-    /// found read-only, with no `cargo`/`rustup` subprocess.
+    /// `git init`s `dir`: `orphaned_build_dir_lines` sizes each project
+    /// through `Worktrees::new`, which refuses anything not a git root —
+    /// the same refusal `multiverse worktrees <root> --prune` itself hits.
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A workspace root whose `src/lib.rs` exists on disk, so build
+    /// evidence naming it reads as live to prune's own orphan judgment.
+    fn live_workspace(root: &Path) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"").unwrap();
+    }
+
+    /// A hash dir holding `filler` bytes of build output besides its
+    /// evidence, so a line that wrongly counts it shows in the size.
+    fn fill(hash_dir: &Path, filler: usize) {
+        std::fs::write(hash_dir.join("filler.bin"), vec![0u8; filler]).unwrap();
+    }
+
+    /// Every entry's own length under `path`, directories included — how
+    /// prune itself measures the bytes it reports freeing.
+    fn apparent_size(path: &Path) -> u64 {
+        let info = std::fs::symlink_metadata(path).unwrap();
+        let mut size = info.len();
+        if info.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                size += apparent_size(&entry.unwrap().path());
+            }
+        }
+        size
+    }
+
+    /// The orphaned line `orphaned_build_dir_lines` should print for
+    /// `project` when prune would free exactly `orphans`, sized off the
+    /// fixture's own bytes on disk the way prune sizes them.
+    fn expected_orphan_line(project: &str, shared_root: &Path, orphans: &[&Path]) -> String {
+        let bytes = orphans.iter().map(|dir| apparent_size(dir)).sum();
+        format!(
+            "disk: {project} cargo shared-build orphaned {} under {}",
+            human_size(bytes),
+            shared_root.display()
+        )
+    }
+
+    /// Card `20261115-b-47f043`: a build-dir hash dir whose evidence names
+    /// only a vanished workspace must be named and sized in the Critical
+    /// notice — found read-only, with no `cargo`/`rustup` subprocess —
+    /// while the main checkout's and a current lane's own dirs are not
+    /// counted and stay on disk.
     #[test]
     fn critical_report_names_orphaned_cargo_build_dir_bytes_under_the_shared_root() {
         let dir = tempfile::tempdir().unwrap();
         let config = config(dir.path());
         let demo = dir.path().join("demo");
+        init_repo(&demo);
+        live_workspace(&demo);
         let template = "{cargo-cache-home}/shared-build/{workspace-path-hash}";
         write_build_dir_template(&demo, template);
         let lane_a = demo.join(".multiverse/worktrees/lane-a");
-        std::fs::create_dir_all(&lane_a).unwrap();
+        live_workspace(&lane_a);
 
         let cargo_home = tempfile::tempdir().unwrap();
         let _cargo_home = CargoHomeEnvGuard::set(cargo_home.path());
@@ -1422,21 +1446,14 @@ mod tests {
         std::fs::write(project_hash_dir.join("marker"), b"keep me").unwrap();
         std::fs::write(lane_hash_dir.join("marker"), b"keep me").unwrap();
 
-        let orphan = shared_root.join("orphan-leaf");
-        std::fs::create_dir_all(&orphan).unwrap();
-        std::fs::write(orphan.join("stale.bin"), vec![0u8; 4096]).unwrap();
+        let orphan = hash_dir(&shared_root, "c3", "3");
+        write_build_evidence(&orphan, &[&dir.path().join("gone")]);
+        fill(&orphan, 4096);
 
-        let lines = orphaned_build_dir_lines(&config, Instant::now() + Duration::from_secs(2));
-        let line = lines
-            .iter()
-            .find(|line| line.contains("cargo shared-build orphaned"))
-            .unwrap_or_else(|| panic!("missing orphaned build-dir line in {lines:?}"));
+        let lines = orphaned_build_dir_lines(&config);
         assert_eq!(
-            line,
-            &format!(
-                "disk: demo cargo shared-build orphaned 4.0K under {}",
-                shared_root.display()
-            )
+            lines,
+            vec![expected_orphan_line("demo", &shared_root, &[&orphan])]
         );
         assert!(
             project_hash_dir.join("marker").exists(),
@@ -1445,6 +1462,99 @@ mod tests {
         assert!(
             lane_hash_dir.join("marker").exists(),
             "a still-existing lane's build-dir must still exist on disk"
+        );
+        assert!(orphan.exists(), "a read-only probe must never reclaim");
+    }
+
+    /// Card `20261119-b-7c0609` (Scout 3a23e5 item 3): the shared root is
+    /// global, so two configured projects build into the same one. Neither
+    /// project's line may count the other's live build-dir as orphaned,
+    /// and a dir both would free is counted on one line only.
+    #[test]
+    fn orphaned_build_dir_lines_never_count_another_projects_live_build_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let hub = dir.path().join("hub");
+        let demo = dir.path().join("demo");
+        let template = "{cargo-cache-home}/shared-build/{workspace-path-hash}";
+        for project in [&hub, &demo] {
+            init_repo(project);
+            live_workspace(project);
+            write_build_dir_template(project, template);
+        }
+
+        let cargo_home = tempfile::tempdir().unwrap();
+        let _cargo_home = CargoHomeEnvGuard::set(cargo_home.path());
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let shared_root = shared_build_root(&demo).expect("shared root resolves");
+        assert_eq!(shared_build_root(&hub).as_ref(), Some(&shared_root));
+        let hub_hash_dir = hash_dir(&shared_root, "5a", "1");
+        write_build_evidence(&hub_hash_dir, &[&hub]);
+        fill(&hub_hash_dir, 8192);
+        let demo_hash_dir = hash_dir(&shared_root, "8b", "2");
+        write_build_evidence(&demo_hash_dir, &[&demo]);
+        fill(&demo_hash_dir, 16384);
+        let orphan = hash_dir(&shared_root, "c3", "3");
+        write_build_evidence(&orphan, &[&dir.path().join("gone")]);
+        fill(&orphan, 4096);
+
+        let lines = orphaned_build_dir_lines(&config);
+        assert_eq!(
+            lines,
+            vec![expected_orphan_line("demo", &shared_root, &[&orphan])],
+            "neither project may count the other's live build-dir"
+        );
+    }
+
+    /// Card `20261119-b-7c0609` (Scout 3a23e5 item 3): a current lane's
+    /// build-dir counts as live even when a bounded scan runs out before
+    /// reaching the evidence that names it — here `find_build_dir`'s own
+    /// per-dir file cap, which once left the lane unresolved and so
+    /// counted as orphaned. Prune never frees a dir its scan was cut short
+    /// on, so this notice must not count it either.
+    #[test]
+    fn orphaned_build_dir_lines_count_a_lane_live_when_its_scan_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        let demo = dir.path().join("demo");
+        init_repo(&demo);
+        live_workspace(&demo);
+        let template = "{cargo-cache-home}/shared-build/{workspace-path-hash}";
+        write_build_dir_template(&demo, template);
+        let lane_a = demo.join(".multiverse/worktrees/lane-a");
+        live_workspace(&lane_a);
+
+        let cargo_home = tempfile::tempdir().unwrap();
+        let _cargo_home = CargoHomeEnvGuard::set(cargo_home.path());
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let shared_root = shared_build_root(&demo).expect("shared root resolves");
+        let project_hash_dir = hash_dir(&shared_root, "5a", "1");
+        write_build_evidence(&project_hash_dir, &[&demo]);
+        let lane_hash_dir = hash_dir(&shared_root, "8b", "2");
+        let deps = lane_hash_dir.join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        // More relative-only dep-info than any one dir's file cap (500),
+        // sorted ahead of the one file that names the lane absolutely.
+        for index in 0..600 {
+            std::fs::write(deps.join(format!("a{index:03}.d")), "src/lib.rs\n").unwrap();
+        }
+        std::fs::write(
+            deps.join("zz.d"),
+            format!("{}/src/lib.rs\n", lane_a.display()),
+        )
+        .unwrap();
+        fill(&lane_hash_dir, 16384);
+        let orphan = hash_dir(&shared_root, "c3", "3");
+        write_build_evidence(&orphan, &[&dir.path().join("gone")]);
+        fill(&orphan, 4096);
+
+        let lines = orphaned_build_dir_lines(&config);
+        assert_eq!(
+            lines,
+            vec![expected_orphan_line("demo", &shared_root, &[&orphan])],
+            "a lane's build-dir must count live even when its scan runs out"
         );
     }
 
