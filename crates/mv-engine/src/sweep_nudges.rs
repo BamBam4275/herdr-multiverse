@@ -21,9 +21,24 @@
 //! claims each candidate's one-time slot in [`mv_state::nudge_memory`]
 //! before sending; a task whose slot is already claimed is skipped
 //! outright, never retried — "never sent twice" holds even across two
-//! sweeps started moments apart. A send that fails still keeps the claim:
-//! the one nudge/resume/cap this task gets is spent either way, the same
-//! trade Python's own `_claim_finish_nudge` docstring explains.
+//! sweeps started moments apart. For the finish nudge, a send that fails
+//! still keeps the claim: the one nudge this task gets is spent either
+//! way, the same trade Python's own `_claim_finish_nudge` docstring
+//! explains. [`resume_stuck_lanes`] and [`cap_long_running_lanes`] both
+//! release their own claim on a failed send instead (card
+//! `20261117-b-437eeb`/Scout `20261117-scout-342332` rank 6) — up to
+//! `MAX_STUCK_RESUME_SEND_ATTEMPTS`/`MAX_RUNTIME_CAP_SEND_ATTEMPTS`
+//! consecutive failures apiece (critic `3c0098` finding 4, task
+//! `20261118-builder-6b9075`): past that bound, a send outage stops
+//! retrying and the claim is left armed/spent instead, so the existing
+//! escalate-to-`failed` safety net on each — which can only recognize
+//! "this exact pane/text already got its resume/cap" once a send actually
+//! went out, or (for cap) once the claim exists at all — gets a chance to
+//! fire instead of retrying forever. [`resume_stuck_lanes`]'s own arming
+//! (critic `3c0098` finding 3) now happens on every successful send, not
+//! only a still-`Working` one — see
+//! [`mv_state::nudge_memory::release_stuck_resume_claim`] and
+//! [`mv_state::nudge_memory::record_stuck_resume_send_failure`].
 //!
 //! Reuses, rather than re-deriving: `crate::runner::visible` (newly
 //! `pub(crate)`, card `20261102-b-b4ede0`) for the identical dialog-or-
@@ -78,11 +93,70 @@
 //!   pane text. The project-local evidence path is linked from the
 //!   outcome's existing `state=` text; a failed evidence write still
 //!   records the failed outcome without a link. Dry runs write neither.
-//! - `sleep_minutes` (the host-sleep subtraction `find_stuck_signal`/
-//!   `cap_long_running_lanes` both take) is not threaded through from
-//!   `commands::sweep`, which has no `hostsleep.report()` call of its own
-//!   yet; every elapsed-time comparison below behaves as every Python
-//!   caller with no sleep total already does (`sleep_minutes=0`).
+//! - `cap_long_running_lanes`'s one-shot runtime-cap prompt now gets the
+//!   same escalation follow-up (Scout `20261117-scout-342332` rank 6, task
+//!   `20261117-builder-66c21a`, reworked by task `20261117-builder-f4e16e`):
+//!   a lane still running `STUCK_AFTER_MINUTES` past its own
+//!   `max_runtime_minutes` cap, with the cap prompt already claimed,
+//!   records `failed` through the same
+//!   [`mv_state::tasks::record_stranded_closure`]/[`crate::breaker::
+//!   write_evidence`] pair `resume_stuck_lanes`'s escalation uses, rather
+//!   than leaving the lane with one spent, unconsumed prompt and zero
+//!   further automated signal forever. Time past the cap plus grace is
+//!   never enough by itself, though (the rework): real configs set caps as
+//!   low as 40 minutes, and healthy agents routinely run longer, so a lane
+//!   still `Working` escalates only once the pane also shows the same
+//!   connection-loss banner `resume_stuck_lanes`'s own `find_stuck_signal`
+//!   requires in that state; one no longer `Working` at all (idle/done,
+//!   no terminal status file) needs no further text match. And breaker
+//!   evidence is now written, and linked into the recorded `state=` text,
+//!   only when that same pane text also classifies as a vendor/account
+//!   error per [`crate::limits::classify`] (the same classifier
+//!   `commands::tasks`'s own limit-detection already reuses) — never for a
+//!   plain timeout, which proves nothing about the account and must not
+//!   feed its breaker. And, mirroring card `20261117-b-437eeb` above: a
+//!   cap-prompt send that never actually goes out now releases
+//!   [`mv_state::nudge_memory::release_runtime_cap_claim`] instead of
+//!   spending the one-shot claim on nothing, so a later pass can claim and
+//!   retry it.
+//! - `sleep_intervals` (Scout `20261117-scout-342332` rank 1, task
+//!   `20261117-builder-c53953`; re-threaded per-task, card
+//!   `20261118-b-3d717d`) is `commands::sweep`'s own durable,
+//!   multi-pass [`crate::hostsleep::known_intervals`] record, threaded
+//!   through unsummarized from `commands::sweep` down to `elapsed_since`
+//!   itself. Every `elapsed_since` comparison below (startup grace, stuck
+//!   detection, the runtime cap) discounts only the slice of it that
+//!   overlaps *that task's own* `started_at`/`dispatched_at`-to-`now`
+//!   window (via [`crate::hostsleep::sleep_minutes_overlapping`]), floored
+//!   at zero, so a lane the host slept through is never resumed, capped, or
+//!   escalated to `failed` because of the sleep gap alone. Originally this
+//!   was simply this pass's own newly reported sleep (`hostsleep::
+//!   report()`'s own `SleepReport::lines`), which undercounted the moment
+//!   the hostsleep watermark advanced past an interval a still-running
+//!   task's own window still covered (critic `3c0098` finding 1, task
+//!   `20261118-builder-6b9075`: a lane asleep through most of an 8-hour
+//!   gap was fine on the pass that discovered the sleep, then capped on
+//!   the very next pass, whose own `report()` call found nothing new). That
+//!   fix then computed one flat number per pass from the *oldest* live
+//!   candidate's own window and applied it to every task in the pass
+//!   (card `20261118-b-3d717d`'s own finding): a task dispatched after the
+//!   sleep had already ended could still be over-discounted by the whole
+//!   gap, delaying a legitimate stuck/cap detection for it by however long
+//!   the older lane's own sleep lasted. Passing the raw intervals all the
+//!   way down and letting `elapsed_since` compute its own task-scoped
+//!   overlap removes that cross-task leakage entirely. A caller with no
+//!   sleep record of its own (`board_data`'s own read-only [`stuck_notes`]
+//!   call) passes `&[]`, the same "nothing to discount" default
+//!   [`crate::hostsleep::sleep_minutes_overlapping`] already returns `0`
+//!   for.
+//! - [`run`] drops every task id [`resume_stuck_lanes`] returned anything
+//!   about this pass — previewed, sent, or escalated — from
+//!   [`cap_long_running_lanes`]'s own input (critic `3c0098` finding 2,
+//!   task `20261118-builder-6b9075`): the two otherwise read the same
+//!   pre-pass snapshot and do not see each other's claims or writes, so a
+//!   lane resume just claimed could still look cap-eligible to a cap call
+//!   that never re-reads anything. The skipped lane stays eligible for cap
+//!   on a later pass, once resume no longer has anything to say about it.
 //!
 //! Python has no analogue for `submit_unsubmitted_composers` (card
 //! `20261114-b-4d8baf`, design `20261115-seer-c2c967`): a lane idle with
@@ -110,7 +184,7 @@
 //! identical gap (`herdr.agent_prompt(task.pane, ...)` with no re-check),
 //! so there is no Python targeting to match here (card `20261103-b-695405`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
@@ -136,6 +210,23 @@ pub const RUNTIME_CAP_PROMPT: &str = "wrap up now: write result.md with what you
 const STUCK_AFTER_MINUTES: i64 = 30;
 
 const SEND_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+
+/// Finding 4 (critic `3c0098`): how many consecutive failed sends
+/// [`resume_stuck_lanes`] retries (claim released, reclaimed next pass)
+/// before giving up on retrying and arming the escalation safety net
+/// instead (see [`mv_state::nudge_memory::record_stuck_resume_send_failure`]).
+/// The "backoff" this bound buys is total, not timed: once spent, the
+/// claim is never released again, so no further send is ever attempted
+/// for this task's one-shot slot — only the existing escalate-to-`failed`
+/// path (which needs no send at all) can still act on it.
+const MAX_STUCK_RESUME_SEND_ATTEMPTS: u32 = 3;
+
+/// Mirrors [`MAX_STUCK_RESUME_SEND_ATTEMPTS`] for [`cap_long_running_lanes`]:
+/// how many consecutive failed sends it retries before leaving the claim
+/// spent so the existing cap-escalation leg (gated on [`mv_state::
+/// nudge_memory::runtime_cap_already_sent`] alone, no pane/fingerprint of
+/// its own to arm) can fire on a later pass instead of retrying forever.
+const MAX_RUNTIME_CAP_SEND_ATTEMPTS: u32 = 3;
 
 /// Python's `_STUCK_PANE_RE`: the broader vocabulary, matched against a
 /// pane Herdr does not report `Working`.
@@ -219,12 +310,18 @@ pub struct StuckResume {
     pub failed: bool,
 }
 
-/// One task's outcome from [`cap_long_running_lanes`].
+/// One task's outcome from [`cap_long_running_lanes`]. `failed` (Scout
+/// `20261117-scout-342332` rank 6) is `true` only for the escalation leg,
+/// mirroring [`StuckResume::failed`]: a lane still running
+/// `STUCK_AFTER_MINUTES` past its own runtime cap after the one-shot cap
+/// prompt was already sent, recorded `failed` instead of prompted again,
+/// `sent` staying `false` on that outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCap {
     pub task_id: String,
     pub pane: String,
     pub sent: bool,
+    pub failed: bool,
 }
 
 /// One task's outcome from `submit_unsubmitted_composers`: `sent` is
@@ -259,11 +356,34 @@ pub struct NudgeOutcome {
 /// The "RUNNING or STALLED" proxy every function below starts from: not
 /// yet recorded in the routing log, no status file written yet (a written
 /// terminal status means `reconcile`'s own territory, not a live nudge),
-/// and a recorded pane/agent to address. See the module doc comment for
-/// why this, not a ported `TaskState::STALLED`, stands in for Python's
+/// no garbled/unrecognized status token written either (`tasks`'s own
+/// `garbled` classification and `--close-stranded`'s doc comment both
+/// treat that as "a human must look", never as a live task to nudge,
+/// probe, resume or cap — Scout `20261118-scout-075fc0` item 1), and a
+/// recorded pane/agent to address. See the module doc comment for why
+/// this, not a ported `TaskState::STALLED`, stands in for Python's
 /// `task.state in (RUNNING, STALLED)`.
 fn base_running_candidate(task: &SweepTask) -> bool {
-    !task.recorded && task.file_status.is_none() && task.pane.is_some() && task.agent.is_some()
+    !task.recorded
+        && task.file_status.is_none()
+        && task.unrecognized_status.is_none()
+        && task.pane.is_some()
+        && task.agent.is_some()
+}
+
+/// Every task id in `tasks` with a recorded terminal outcome — `tasks` is
+/// this project's whole routing-log history (`mv_state::tasks::sweep_
+/// tasks`'s own unfiltered return, minus at most a few composer-held ids
+/// this pass set aside, which are never themselves recorded), so this one
+/// pass over it is the entire "recorded set" [`mv_state::nudge_memory`]'s
+/// claim-pruning needs — read here once per nudge/resume/cap pass, never
+/// re-derived per claim entry.
+fn recorded_task_ids(tasks: &[SweepTask]) -> BTreeSet<&str> {
+    tasks
+        .iter()
+        .filter(|task| task.recorded)
+        .map(|task| task.task_id.as_str())
+        .collect()
 }
 
 fn pane_status(live: &[LiveAgentStatus], pane: &str) -> Option<AgentState> {
@@ -295,21 +415,48 @@ fn pane_still_hosts_task_agent(agents: &mut impl AgentPanes, task: &SweepTask, p
         .is_some_and(|agent| agent.name.as_deref() == task.agent.as_deref())
 }
 
-fn elapsed_since(task: &SweepTask, now: OffsetDateTime) -> Option<time::Duration> {
+/// `sleep_intervals` (Scout `20261117-scout-342332` rank 1, re-threaded
+/// per-task by card `20261118-b-3d717d`) is every host-sleep interval this
+/// sweep still has a durable record of — [`crate::hostsleep::known_intervals`]'s
+/// own return. Only the slice of it that overlaps `[last_seen, now]` is
+/// subtracted from the raw wall-clock gap before any stuck/cap/grace
+/// comparison sees it, floored at zero the same way [`mv_state::tasks::
+/// expire_awaiting`] already floors its own lease-vs-sleep subtraction: a
+/// host that slept through most of the gap between `last_seen` and `now`
+/// must never, by itself, make a healthy lane look stuck, capped, or still
+/// inside its startup grace when it is not. Computing the overlap per task
+/// here, rather than once per pass against the oldest candidate's own
+/// window, is the fix for card `20261118-b-3d717d`: a flat number computed
+/// from one lane's window and threaded into every other lane's own
+/// `elapsed_since` call over-discounted a younger lane dispatched after a
+/// sleep had already ended.
+fn elapsed_since(
+    task: &SweepTask,
+    now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
+) -> Option<time::Duration> {
     let last_seen = task.started_at.or(task.dispatched_at)?;
-    Some(now - last_seen)
+    let elapsed = now - last_seen;
+    let sleep_minutes =
+        crate::hostsleep::sleep_minutes_overlapping(sleep_intervals, last_seen, now);
+    Some((elapsed - time::Duration::minutes(sleep_minutes)).max(time::Duration::ZERO))
 }
 
 /// Python's `_startup_grace_active`: whether a just-started task still
 /// gets its account's configured missing-pane/not-yet-working grace.
-fn startup_grace_active(task: &SweepTask, account: &Account, now: OffsetDateTime) -> bool {
+fn startup_grace_active(
+    task: &SweepTask,
+    account: &Account,
+    now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
+) -> bool {
     let Some(grace) = account.startup_grace_seconds else {
         return false;
     };
     if grace == 0 {
         return false;
     }
-    let Some(elapsed) = elapsed_since(task, now) else {
+    let Some(elapsed) = elapsed_since(task, now, sleep_intervals) else {
         return false;
     };
     elapsed < time::Duration::seconds(i64::from(grace))
@@ -366,6 +513,7 @@ fn finish_nudge_base_eligible(
     config: &Config,
     project_root: &Path,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
 ) -> bool {
     if !base_running_candidate(task) {
         return false;
@@ -376,7 +524,7 @@ fn finish_nudge_base_eligible(
     if account.vendor != "local" && account.kind != "codex" && account.kind != "claude" {
         return false;
     }
-    if startup_grace_active(task, account, now) {
+    if startup_grace_active(task, account, now, sleep_intervals) {
         return false;
     }
     if mv_state::tasks::has_usable_result(project_root, &task.task_id) {
@@ -395,19 +543,22 @@ pub fn nudge_idle_lanes_to_finish(
     config: &Config,
     apply: bool,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     agents: &mut impl AgentPanes,
     herdr: &mut impl Herdr,
 ) -> Vec<FinishNudge> {
+    let recorded = recorded_task_ids(tasks);
     let mut results = Vec::new();
     for task in tasks {
-        if !finish_nudge_base_eligible(task, config, project_root, now) {
+        if !finish_nudge_base_eligible(task, config, project_root, now, sleep_intervals) {
             continue;
         }
         let pane = task.pane.as_deref().expect("base_eligible checked pane");
         if !pane_status(live, pane).is_some_and(AgentState::is_ready_for_input) {
             continue;
         }
-        if mv_state::nudge_memory::finish_nudge_already_sent(project_root, &task.task_id) {
+        if mv_state::nudge_memory::finish_nudge_already_sent(project_root, &task.task_id, &recorded)
+        {
             continue;
         }
         let Some(account) = account_for(task, config) else {
@@ -430,7 +581,8 @@ pub fn nudge_idle_lanes_to_finish(
             });
             continue;
         }
-        if !mv_state::nudge_memory::claim_finish_nudge(project_root, &task.task_id, now) {
+        if !mv_state::nudge_memory::claim_finish_nudge(project_root, &task.task_id, &recorded, now)
+        {
             continue;
         }
         let sent = pane_still_hosts_task_agent(agents, task, pane)
@@ -453,15 +605,16 @@ fn find_stuck_signal(
     account: &Account,
     live: &[LiveAgentStatus],
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     herdr: &mut impl Herdr,
 ) -> bool {
     if !base_running_candidate(task) {
         return false;
     }
-    if startup_grace_active(task, account, now) {
+    if startup_grace_active(task, account, now, sleep_intervals) {
         return false;
     }
-    let Some(elapsed) = elapsed_since(task, now) else {
+    let Some(elapsed) = elapsed_since(task, now, sleep_intervals) else {
         return false;
     };
     if elapsed <= time::Duration::minutes(STUCK_AFTER_MINUTES) {
@@ -500,6 +653,7 @@ pub fn stuck_notes(
     live: &[LiveAgentStatus],
     config: &Config,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     herdr: &mut impl Herdr,
 ) -> Vec<String> {
     let mut tasks: Vec<&SweepTask> = tasks.iter().collect();
@@ -509,7 +663,15 @@ pub fn stuck_notes(
         let Some(account) = account_for(task, config) else {
             continue;
         };
-        if find_stuck_signal(project_root, task, account, live, now, herdr) {
+        if find_stuck_signal(
+            project_root,
+            task,
+            account,
+            live,
+            now,
+            sleep_intervals,
+            herdr,
+        ) {
             notes.push(format!(
                 "stuck: {} ({})",
                 task.task_id,
@@ -535,28 +697,37 @@ pub fn resume_stuck_lanes(
     config: &Config,
     apply: bool,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     agents: &mut impl AgentPanes,
     herdr: &mut impl Herdr,
 ) -> Vec<StuckResume> {
+    let recorded = recorded_task_ids(tasks);
     let mut results = Vec::new();
     for task in tasks {
         let Some(account) = account_for(task, config) else {
             continue;
         };
-        if !find_stuck_signal(project_root, task, account, live, now, herdr) {
+        if !find_stuck_signal(
+            project_root,
+            task,
+            account,
+            live,
+            now,
+            sleep_intervals,
+            herdr,
+        ) {
             continue;
         }
         let pane = task
             .pane
             .as_deref()
             .expect("find_stuck_signal confirmed a pane");
-        let working = pane_status(live, pane) == Some(AgentState::Working);
         let Some(text) = safe_pane_text(herdr, task, pane, &account.kind) else {
             continue;
         };
 
         if let Some(previous) =
-            mv_state::nudge_memory::stuck_resume_claim(project_root, &task.task_id)
+            mv_state::nudge_memory::stuck_resume_claim(project_root, &task.task_id, &recorded)
         {
             let Some(signal) = connection_loss_re().find(&text) else {
                 continue;
@@ -610,18 +781,63 @@ pub fn resume_stuck_lanes(
             });
             continue;
         }
-        if !mv_state::nudge_memory::claim_stuck_resume(project_root, &task.task_id, now) {
+        if !mv_state::nudge_memory::claim_stuck_resume(project_root, &task.task_id, &recorded, now)
+        {
             continue;
         }
         let sent = pane_still_hosts_task_agent(agents, task, pane)
             && send(herdr, pane, STUCK_RESUME_PROMPT);
-        if sent && working {
+        if sent {
+            // Finding 3 (critic `3c0098`): arm the escalation safety net on
+            // every successful send, not only one into a still-`Working`
+            // pane. An idle/done pane matching `stuck_pane_re` is the usual
+            // post-drop shape, and a claim left at `pane: None` can never
+            // satisfy the escalation branch's own pane/fingerprint match
+            // above, so a truly frozen idle lane got one resume and then
+            // nothing, forever.
             mv_state::nudge_memory::remember_stuck_resume_signal(
                 project_root,
                 &task.task_id,
                 pane,
                 &text,
+                &recorded,
             );
+        } else {
+            // Finding 4 (critic `3c0098`): during a send outage this
+            // claim/fail/release cycle would otherwise repeat every pass
+            // forever, and the escalation branch above never arms (it
+            // needs a confirmed `pane`/`fingerprint`, which only a
+            // successful send ever sets). Release for a fresh retry up to
+            // `MAX_STUCK_RESUME_SEND_ATTEMPTS` consecutive failures; once
+            // that bound is spent, arm the escalation on the text this
+            // attempt tried to send instead of releasing again, so a
+            // persisting outage's own banner is watched for rather than
+            // retried without end. Short of that bound, this claim must
+            // still survive a failed send the way `nudge_idle_lanes_to_
+            // finish`'s one-shot claim does not (module doc comment): it
+            // is also the escalate-to-`failed` safety net's only way to
+            // recognize "this exact pane/text already got its resume,"
+            // which a claim stuck at `pane: None` can never satisfy again
+            // (card `20261117-b-437eeb`).
+            let attempts = mv_state::nudge_memory::record_stuck_resume_send_failure(
+                project_root,
+                &task.task_id,
+            );
+            if attempts < MAX_STUCK_RESUME_SEND_ATTEMPTS {
+                mv_state::nudge_memory::release_stuck_resume_claim(
+                    project_root,
+                    &task.task_id,
+                    &recorded,
+                );
+            } else {
+                mv_state::nudge_memory::remember_stuck_resume_signal(
+                    project_root,
+                    &task.task_id,
+                    pane,
+                    &text,
+                    &recorded,
+                );
+            }
         }
         results.push(StuckResume {
             task_id: task.task_id.clone(),
@@ -634,8 +850,18 @@ pub fn resume_stuck_lanes(
 }
 
 /// Send [`RUNTIME_CAP_PROMPT`] to every RUNNING/STALLED task whose
-/// account's `max_runtime_minutes` it has exceeded. See the module doc
-/// comment for the claim-then-act/`apply` contract.
+/// account's `max_runtime_minutes` it has exceeded — or, for one already
+/// sent its one cap prompt, still running `STUCK_AFTER_MINUTES` past that
+/// cap, AND corroborated per the module doc comment's rework note,
+/// escalate to a recorded `failed` outcome instead of leaving it with no
+/// further automated signal (Scout `20261117-scout-342332` rank 6, reworked
+/// task `20261117-builder-f4e16e`; see the module doc comment for the
+/// claim-then-act/`apply` contract and what this escalation mirrors from
+/// [`resume_stuck_lanes`]'s own). Time past the cap plus grace, alone, is
+/// never enough: a healthy lane still `Working` with ordinary pane text
+/// gets no further action beyond the one cap prompt already sent — real
+/// configs set caps as low as 40 minutes, and healthy agents routinely run
+/// longer than that.
 #[allow(clippy::too_many_arguments)]
 pub fn cap_long_running_lanes(
     project_root: &Path,
@@ -644,9 +870,11 @@ pub fn cap_long_running_lanes(
     config: &Config,
     apply: bool,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     agents: &mut impl AgentPanes,
     herdr: &mut impl Herdr,
 ) -> Vec<RuntimeCap> {
+    let recorded = recorded_task_ids(tasks);
     let mut results = Vec::new();
     for task in tasks {
         if !base_running_candidate(task) {
@@ -665,16 +893,79 @@ pub fn cap_long_running_lanes(
         let Some(cap_minutes) = account.max_runtime_minutes else {
             continue;
         };
-        let Some(elapsed) = elapsed_since(task, now) else {
+        let Some(elapsed) = elapsed_since(task, now, sleep_intervals) else {
             continue;
         };
         if elapsed < time::Duration::minutes(i64::from(cap_minutes)) {
             continue;
         }
-        if startup_grace_active(task, account, now) {
+        if startup_grace_active(task, account, now, sleep_intervals) {
             continue;
         }
-        if mv_state::nudge_memory::runtime_cap_already_sent(project_root, &task.task_id) {
+        if mv_state::nudge_memory::runtime_cap_already_sent(project_root, &task.task_id, &recorded)
+        {
+            if !apply
+                || elapsed < time::Duration::minutes(i64::from(cap_minutes) + STUCK_AFTER_MINUTES)
+            {
+                continue;
+            }
+            let Some(text) = safe_pane_text(herdr, task, pane, &account.kind) else {
+                continue;
+            };
+            let working = pane_status(live, pane) == Some(AgentState::Working);
+            // A healthy lane still `Working` past its cap gets no further
+            // action beyond the one cap prompt already sent: time alone is
+            // not a corroborating signal (real configs set caps as low as
+            // 40 minutes, and healthy agents routinely run longer). This
+            // escalation fires only once a second, independent signal also
+            // holds: the agent is no longer `Working` at all (idle/done,
+            // with no terminal status file — already guaranteed by
+            // `base_running_candidate` above, so "idle" here means exactly
+            // "not actually running anymore"), or, while still `Working`,
+            // the pane shows the same connection-loss banner
+            // `resume_stuck_lanes`'s own `find_stuck_signal` requires in
+            // that state.
+            if working && !connection_loss_re().is_match(&text) {
+                continue;
+            }
+            let mut state = format!(
+                "runtime cap exceeded: {} {} minutes after the cap prompt ({}m cap)",
+                if working {
+                    "connection lost, persisted"
+                } else {
+                    "agent idle with no result"
+                },
+                elapsed.whole_minutes(),
+                cap_minutes,
+            );
+            // Evidence (and the breaker lookup it feeds) is written only
+            // when the pane text itself proves a vendor/account error the
+            // breaker already classifies — never for a plain timeout, which
+            // proves nothing about the account and must not trip its pool.
+            if let Some(verdict) = crate::limits::classify(&text, &account.kind, Some(now)) {
+                if let Some(path) =
+                    crate::breaker::write_evidence(project_root, &account.pool, now, &text)
+                {
+                    state.push_str(&format!(
+                        " (evidence: {}, rule: {})",
+                        path.display(),
+                        verdict.rule
+                    ));
+                }
+            }
+            let failed = mv_state::tasks::record_stranded_closure(
+                project_root,
+                &task.task_id,
+                TaskStatus::Failed,
+                &state,
+                Some(pane),
+            );
+            results.push(RuntimeCap {
+                task_id: task.task_id.clone(),
+                pane: pane.to_string(),
+                sent: false,
+                failed,
+            });
             continue;
         }
         if safe_pane_text(herdr, task, pane, &account.kind).is_none() {
@@ -685,18 +976,44 @@ pub fn cap_long_running_lanes(
                 task_id: task.task_id.clone(),
                 pane: pane.to_string(),
                 sent: false,
+                failed: false,
             });
             continue;
         }
-        if !mv_state::nudge_memory::claim_runtime_cap(project_root, &task.task_id, now) {
+        if !mv_state::nudge_memory::claim_runtime_cap(project_root, &task.task_id, &recorded, now) {
             continue;
         }
         let sent = pane_still_hosts_task_agent(agents, task, pane)
             && send(herdr, pane, RUNTIME_CAP_PROMPT);
+        if !sent {
+            // Mirrors `resume_stuck_lanes`'s own `release_stuck_resume_claim`
+            // (card `20261117-b-437eeb`): a claim reserved but never
+            // actually sent must not be left permanently spent, or this
+            // task gets neither a retried cap prompt nor the escalation
+            // above ever again. Finding 4 (critic `3c0098`) bounds that
+            // retry: past `MAX_RUNTIME_CAP_SEND_ATTEMPTS` consecutive
+            // failures, stop releasing and leave the claim spent instead —
+            // unlike resume's own claim, the cap escalation leg above
+            // needs no pane/fingerprint of its own to arm, only
+            // `runtime_cap_already_sent`, so a claim left spent is already
+            // everything that escalation needs to fire on a later pass.
+            let attempts = mv_state::nudge_memory::record_runtime_cap_send_failure(
+                project_root,
+                &task.task_id,
+            );
+            if attempts < MAX_RUNTIME_CAP_SEND_ATTEMPTS {
+                mv_state::nudge_memory::release_runtime_cap_claim(
+                    project_root,
+                    &task.task_id,
+                    &recorded,
+                );
+            }
+        }
         results.push(RuntimeCap {
             task_id: task.task_id.clone(),
             pane: pane.to_string(),
             sent,
+            failed: false,
         });
     }
     results
@@ -863,12 +1180,13 @@ fn submit_unsubmitted_composers(
     config: &Config,
     apply: bool,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     agents: &mut impl AgentPanes,
     herdr: &mut impl Herdr,
 ) -> ComposerCheck {
     let mut check = ComposerCheck::default();
     for task in tasks {
-        if !finish_nudge_base_eligible(task, config, project_root, now) {
+        if !finish_nudge_base_eligible(task, config, project_root, now, sleep_intervals) {
             continue;
         }
         let pane = task.pane.as_deref().expect("base_eligible checked pane");
@@ -933,12 +1251,14 @@ fn submit_unsubmitted_composers(
 /// (`base_running_candidate`); a failed listing (`None`) is read the
 /// same way, "nothing live enough to act on," so a Herdr outage never
 /// looks like zero candidates found by exhaustive search.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     project_root: &Path,
     tasks: &[SweepTask],
     config: &Config,
     apply: bool,
     now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
     agents: &mut impl AgentPanes,
     herdr: &mut impl Herdr,
 ) -> NudgeOutcome {
@@ -955,6 +1275,7 @@ pub fn run(
         config,
         apply,
         now,
+        sleep_intervals,
         agents,
         herdr,
     );
@@ -963,40 +1284,71 @@ pub fn run(
         .filter(|task| !composer_check.held.contains(&task.task_id))
         .cloned()
         .collect();
+    let stuck = stuck_notes(
+        project_root,
+        tasks,
+        &live,
+        config,
+        now,
+        sleep_intervals,
+        herdr,
+    );
+    let finish = nudge_idle_lanes_to_finish(
+        project_root,
+        &remaining,
+        &live,
+        config,
+        apply,
+        now,
+        sleep_intervals,
+        agents,
+        herdr,
+    );
+    let resume = resume_stuck_lanes(
+        project_root,
+        &remaining,
+        &live,
+        config,
+        apply,
+        now,
+        sleep_intervals,
+        agents,
+        herdr,
+    );
+    // Finding 2 (critic `3c0098`): at most one canned prompt per lane per
+    // pass. `resume` and `cap` both read the same pre-pass `remaining`
+    // snapshot and neither sees the other's claims or writes, so a lane
+    // `resume_stuck_lanes` just sent a resume to (or escalated to
+    // `failed`) could still look cap-eligible to a `cap_long_running_lanes`
+    // call that never re-reads anything. Drop every task id `resume`
+    // touched at all this pass — previewed, sent, or escalated — from
+    // cap's own input; the skipped one stays eligible next pass, once
+    // resume no longer has anything to say about it (its stuck signal no
+    // longer confirms, or its claim already resolved).
+    let resumed_ids: HashSet<&str> = resume.iter().map(|r| r.task_id.as_str()).collect();
+    let cap_candidates: Vec<SweepTask> = remaining
+        .iter()
+        .filter(|task| !resumed_ids.contains(task.task_id.as_str()))
+        .cloned()
+        .collect();
+    let cap = cap_long_running_lanes(
+        project_root,
+        &cap_candidates,
+        &live,
+        config,
+        apply,
+        now,
+        sleep_intervals,
+        agents,
+        herdr,
+    );
     NudgeOutcome {
-        stuck: stuck_notes(project_root, tasks, &live, config, now, herdr),
-        finish: nudge_idle_lanes_to_finish(
-            project_root,
-            &remaining,
-            &live,
-            config,
-            apply,
-            now,
-            agents,
-            herdr,
-        ),
-        resume: resume_stuck_lanes(
-            project_root,
-            &remaining,
-            &live,
-            config,
-            apply,
-            now,
-            agents,
-            herdr,
-        ),
+        stuck,
+        finish,
+        resume,
         composer: composer_check.holds,
         unsubmitted_composer: composer_check.unsubmitted,
-        cap: cap_long_running_lanes(
-            project_root,
-            &remaining,
-            &live,
-            config,
-            apply,
-            now,
-            agents,
-            herdr,
-        ),
+        cap,
     }
 }
 
@@ -1069,6 +1421,7 @@ mod tests {
             role: "fixer".to_string(),
             pane: Some(pane.to_string()),
             file_status: None,
+            unrecognized_status: None,
             recorded: false,
             agent: Some(format!("{task_id}-agent")),
             account: Some(account.to_string()),
@@ -1235,6 +1588,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut PanicAgents,
             &mut PanicHerdr,
         );
@@ -1264,6 +1618,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1271,7 +1626,9 @@ mod tests {
         assert!(results[0].sent);
         assert_eq!(herdr.prompts, vec![FINISH_NUDGE_PROMPT.to_string()]);
         assert!(mv_state::nudge_memory::finish_nudge_already_sent(
-            &root, "t1"
+            &root,
+            "t1",
+            &BTreeSet::new()
         ));
 
         // A second pass must not claim (or send) again.
@@ -1282,6 +1639,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1323,6 +1681,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut recycled,
             &mut herdr,
         );
@@ -1355,6 +1714,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1383,13 +1743,16 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
         assert!(results.is_empty());
         assert!(herdr.prompts.is_empty());
         assert!(!mv_state::nudge_memory::finish_nudge_already_sent(
-            &root, "t1"
+            &root,
+            "t1",
+            &BTreeSet::new()
         ));
     }
 
@@ -1418,13 +1781,16 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
         assert!(results.is_empty());
         assert!(herdr.prompts.is_empty());
         assert!(!mv_state::nudge_memory::finish_nudge_already_sent(
-            &root, "t1"
+            &root,
+            "t1",
+            &BTreeSet::new()
         ));
     }
 
@@ -1449,6 +1815,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1477,6 +1844,7 @@ mod tests {
             &config,
             false,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1484,7 +1852,9 @@ mod tests {
         assert!(!results[0].sent);
         assert!(herdr.prompts.is_empty());
         assert!(!mv_state::nudge_memory::finish_nudge_already_sent(
-            &root, "t1"
+            &root,
+            "t1",
+            &BTreeSet::new()
         ));
     }
 
@@ -1504,6 +1874,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live },
             &mut FakeHerdr {
                 pane_text: "ready",
@@ -1537,6 +1908,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1569,6 +1941,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1599,6 +1972,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1626,6 +2000,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut FakeHerdr {
                 pane_text: "ready",
@@ -1657,6 +2032,7 @@ mod tests {
             &config,
             true,
             now,
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1670,12 +2046,452 @@ mod tests {
             &config,
             true,
             now + time::Duration::minutes(5),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
         assert_eq!(second.len(), 1);
         assert!(second[0].sent);
         assert!(!second[0].failed);
+        assert_eq!(herdr.prompts, vec![STUCK_RESUME_PROMPT.to_string()]);
+    }
+
+    /// Scout `20261117-scout-342332` rank 1: `t1`'s raw wall-clock gap
+    /// (45 minutes) alone is past [`STUCK_AFTER_MINUTES`] (30), the same
+    /// shape as the fresh-connection-drop test above — but 40 of those 45
+    /// minutes were host sleep. With that discounted, the effective gap is
+    /// only 5 minutes, so even the identical connection-loss banner on a
+    /// second pass must never confirm this lane stuck, and the one-shot
+    /// resume must never fire. Revert [`elapsed_since`]'s sleep-minutes
+    /// subtraction and this fails the same way the pre-fix code did: the
+    /// second pass sends [`STUCK_RESUME_PROMPT`].
+    #[test]
+    fn a_lane_asleep_through_most_of_the_gap_is_never_marked_stuck() {
+        let root = temp_project();
+        let config = config_with_codex_account("");
+        let t = task("t1", "codex-main", "w1:p1", 45);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let now = mv_core::time::now_utc();
+        // The last 40 of `t`'s own 45-minute window were host sleep.
+        let sleep_intervals = vec![crate::hostsleep::SleepInterval {
+            start: Some(now - time::Duration::minutes(40)),
+            end: now,
+            lower_bound: false,
+            power: "AC".to_string(),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "Connection lost, reconnecting...",
+            prompts: Vec::new(),
+        };
+        let first = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &sleep_intervals,
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(first.is_empty());
+        assert!(herdr.prompts.is_empty());
+
+        let second = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(5),
+            &sleep_intervals,
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(
+            second.is_empty(),
+            "a lane the host slept through must never be confirmed stuck"
+        );
+        assert!(herdr.prompts.is_empty(), "no resume prompt was ever sent");
+    }
+
+    /// Card `20261118-b-3d717d`: in the same pass, lane A was dispatched
+    /// before an 8-hour host sleep and lane B was dispatched 2 hours after
+    /// it ended. The fix this test is for computed one flat discount from
+    /// the OLDEST live candidate's own window (A's 8 hours) and applied it
+    /// to every task in the pass, so B's own 35-minute raw gap was wrongly
+    /// discounted by A's whole 8 hours too — flooring B's elapsed to zero
+    /// at [`elapsed_since`] and leaving a frozen B unresumed for hours.
+    /// Per-task overlap must discount A by its own 8 hours and B by none,
+    /// so B still crosses [`STUCK_AFTER_MINUTES`] and gets resumed on
+    /// schedule regardless of what A's own window looked like. Revert this
+    /// by computing one `sleep_minutes_overlapping` total from whichever
+    /// task in `tasks` started earliest and threading that flat number into
+    /// every `elapsed_since` call instead (the shape this task's own
+    /// `result.md` traces back to card `20261118-b-3d717d`'s finding), and
+    /// `second` below comes back without `"lane-b"` in it.
+    #[test]
+    fn a_younger_lane_in_the_same_pass_is_not_over_discounted_by_an_older_lanes_sleep_card_3d717d()
+    {
+        let root = temp_project();
+        let config = config_with_codex_account("");
+        let sleep_start = mv_core::time::now_utc();
+        let sleep_end = sleep_start + time::Duration::hours(8);
+
+        let lane_a = SweepTask {
+            started_at: Some(sleep_start - time::Duration::hours(1)),
+            dispatched_at: Some(sleep_start - time::Duration::hours(1)),
+            ..task("lane-a", "codex-main", "w1:p1", 0)
+        };
+        let lane_b = SweepTask {
+            started_at: Some(sleep_end + time::Duration::hours(2)),
+            dispatched_at: Some(sleep_end + time::Duration::hours(2)),
+            ..task("lane-b", "codex-main", "w2:p2", 0)
+        };
+        let tasks = vec![lane_a, lane_b];
+        let sleep_intervals = vec![crate::hostsleep::SleepInterval {
+            start: Some(sleep_start),
+            end: sleep_end,
+            lower_bound: false,
+            power: "AC".to_string(),
+        }];
+        let live = vec![
+            LiveAgentStatus {
+                pane_id: "w1:p1".to_string(),
+                name: Some("lane-a-agent".to_string()),
+                status: Some(AgentState::Idle),
+            },
+            LiveAgentStatus {
+                pane_id: "w2:p2".to_string(),
+                name: Some("lane-b-agent".to_string()),
+                status: Some(AgentState::Idle),
+            },
+        ];
+        let mut herdr = FakeHerdr {
+            pane_text: "Connection lost, reconnecting...",
+            prompts: Vec::new(),
+        };
+        // 35 minutes past lane B's own dispatch: past `STUCK_AFTER_MINUTES`
+        // (30) on B's own un-discounted window; A's own window is past it
+        // too even after its full 8-hour discount (raw ~9h35m - 8h).
+        let pass_now = sleep_end + time::Duration::hours(2) + time::Duration::minutes(35);
+
+        let first = resume_stuck_lanes(
+            &root,
+            &tasks,
+            &live,
+            &config,
+            true,
+            pass_now,
+            &sleep_intervals,
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(first.is_empty(), "a single read never confirms stuck");
+
+        let second = resume_stuck_lanes(
+            &root,
+            &tasks,
+            &live,
+            &config,
+            true,
+            pass_now + time::Duration::minutes(5),
+            &sleep_intervals,
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        let resumed: Vec<&str> = second.iter().map(|r| r.task_id.as_str()).collect();
+        assert!(
+            resumed.contains(&"lane-b"),
+            "lane B, started after the sleep ended, must be resumed on its own schedule: {resumed:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .find(|r| r.task_id == "lane-b")
+                .expect("lane-b present")
+                .sent,
+            "lane B's resume prompt must actually be sent"
+        );
+    }
+
+    /// Card `20261118-b-3d717d`: a lane whose own window spans two separate
+    /// host sleeps must be discounted by both, not only the one
+    /// [`sleep_minutes_overlapping`] would find if only a single interval
+    /// were ever passed through.
+    #[test]
+    fn a_lane_spanning_two_sleeps_is_discounted_by_both_card_3d717d() {
+        let base = mv_core::time::now_utc();
+        let sleep_one = crate::hostsleep::SleepInterval {
+            start: Some(base),
+            end: base + time::Duration::hours(2),
+            lower_bound: false,
+            power: "AC".to_string(),
+        };
+        let sleep_two = crate::hostsleep::SleepInterval {
+            start: Some(base + time::Duration::hours(4)),
+            end: base + time::Duration::hours(5),
+            lower_bound: false,
+            power: "AC".to_string(),
+        };
+        let lane = SweepTask {
+            started_at: Some(base - time::Duration::hours(1)),
+            dispatched_at: Some(base - time::Duration::hours(1)),
+            ..task("lane-spans-two-sleeps", "codex-main", "w1:p1", 0)
+        };
+        // Raw gap from `lane`'s own start to `now`: 1h before the first
+        // sleep, plus 2h (sleep one) + 2h (awake in between) + 1h (sleep
+        // two) + 1h (awake after) = 7 hours. The two sleeps total 3 hours
+        // (2h + 1h), so the discounted gap must be 4 hours.
+        let now = base + time::Duration::hours(6);
+        let elapsed =
+            elapsed_since(&lane, now, &[sleep_one, sleep_two]).expect("lane has a started_at");
+        assert_eq!(elapsed, time::Duration::hours(4));
+    }
+
+    /// Critic `3c0098` finding 3: an idle/done pane's resume send must arm
+    /// the escalation safety net exactly as a still-`Working` pane's
+    /// already does. Revert [`remember_stuck_resume_signal`]'s own call
+    /// back to its old `if working` gate and this fails: the third pass
+    /// finds no armed claim to escalate (`previous.pane` stuck at `None`
+    /// can never match `Some(pane)`), so it is skipped outright instead of
+    /// recording `failed`.
+    #[test]
+    fn an_idle_resume_send_arms_escalation_critic_3c0098_finding_3() {
+        let root = temp_project();
+        let config = config_with_codex_account("");
+        let t = task("t1", "codex-main", "w1:p1", 45);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "Connection lost, reconnecting...",
+            prompts: Vec::new(),
+        };
+        let first = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(first.is_empty(), "a single read never confirms stuck");
+
+        let second = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(5),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(second.len(), 1);
+        assert!(second[0].sent, "the idle lane's one resume must still send");
+        assert_eq!(herdr.prompts, vec![STUCK_RESUME_PROMPT.to_string()]);
+
+        let third = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(10),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(third.len(), 1);
+        assert!(
+            third[0].failed,
+            "a still-frozen idle lane must escalate once its resume already armed"
+        );
+        assert!(!third[0].sent);
+        // No second prompt was ever sent — escalation needs no send of its
+        // own.
+        assert_eq!(herdr.prompts, vec![STUCK_RESUME_PROMPT.to_string()]);
+    }
+
+    /// Critic `3c0098` finding 4: a send that keeps failing (a Herdr
+    /// listing/send outage, simulated here the same way the existing
+    /// "never send into the recycled pane" test does — an `agents` re-check
+    /// that never matches the task's own agent) must stop retrying once
+    /// [`MAX_STUCK_RESUME_SEND_ATTEMPTS`] is spent, and that exhaustion
+    /// must let the existing escalate-to-`failed` path run instead of
+    /// leaving the lane with no further signal forever. Revert the bound
+    /// (always release on failure, the pre-fix behavior) and this fails:
+    /// the claim keeps releasing every pass, so the final pass finds no
+    /// armed claim and sends a fresh resume instead of escalating.
+    #[test]
+    fn a_send_outage_stops_retrying_and_lets_escalation_run_critic_3c0098_finding_4() {
+        let root = temp_project();
+        let config = config_with_codex_account("");
+        let t = task("t1", "codex-main", "w1:p1", 45);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "Connection lost, reconnecting...",
+            prompts: Vec::new(),
+        };
+        let mut recycled = FakeAgents {
+            live: vec![LiveAgentStatus {
+                pane_id: "w1:p1".to_string(),
+                name: Some("other-agent".to_string()),
+                status: Some(AgentState::Idle),
+            }],
+        };
+
+        let first = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(first.is_empty(), "a single read never confirms stuck");
+
+        // Three confirmed-stuck passes in a row, each failing to send
+        // because the pane keeps getting recycled out from under it.
+        for minute in [5, 10, 15] {
+            let pass = resume_stuck_lanes(
+                &root,
+                std::slice::from_ref(&t),
+                &live,
+                &config,
+                true,
+                now + time::Duration::minutes(minute),
+                &[],
+                &mut recycled,
+                &mut herdr,
+            );
+            assert_eq!(pass.len(), 1);
+            assert!(
+                !pass[0].sent,
+                "the recycled pane must never receive the send"
+            );
+        }
+        assert!(
+            herdr.prompts.is_empty(),
+            "no resume prompt ever reached the recycled pane"
+        );
+
+        // The bound is now spent: the claim must stay armed (a recorded
+        // `pane`) rather than releasing a fourth time.
+        let claim = mv_state::nudge_memory::stuck_resume_claim(&root, "t1", &BTreeSet::new());
+        assert!(
+            claim.is_some_and(|c| c.pane.is_some()),
+            "once the retry bound is spent the claim must arm escalation \
+             instead of releasing again"
+        );
+
+        // A later pass, with the task's own agent back in its pane, must
+        // escalate on the still-persisting banner rather than attempt yet
+        // another send.
+        let escalated = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(20),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(escalated.len(), 1);
+        assert!(
+            escalated[0].failed,
+            "the exhausted retry bound must let escalation run"
+        );
+        assert!(!escalated[0].sent);
+        assert!(
+            herdr.prompts.is_empty(),
+            "the exhausted retry bound must never attempt another send"
+        );
+    }
+
+    /// Critic `3c0098` finding 2: `resume_stuck_lanes` and
+    /// `cap_long_running_lanes` share one `run` pass and do not see each
+    /// other's claims. Revert [`run`]'s own `cap_candidates` filter and
+    /// this fails: the second pass's `herdr.prompts` gains a second entry
+    /// (`RUNTIME_CAP_PROMPT`), sent into the same pane the resume prompt
+    /// just reached.
+    #[test]
+    fn at_most_one_prompt_per_lane_per_pass_critic_3c0098_finding_2() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 40");
+        let t = task("t1", "codex-main", "w1:p1", 31);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "Connection lost, reconnecting...",
+            prompts: Vec::new(),
+        };
+        let first = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(
+            first.resume.is_empty(),
+            "a single read never confirms stuck"
+        );
+        assert!(
+            first.cap.is_empty(),
+            "elapsed is still under the 40-minute cap"
+        );
+        assert!(herdr.prompts.is_empty());
+
+        let second = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            now + time::Duration::minutes(9),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(
+            second.resume.len(),
+            1,
+            "the now-confirmed stuck signal must claim its resume"
+        );
+        assert!(second.resume[0].sent);
+        assert!(
+            second.cap.is_empty(),
+            "cap must not also act on a lane resume already claimed this same pass"
+        );
         assert_eq!(herdr.prompts, vec![STUCK_RESUME_PROMPT.to_string()]);
     }
 
@@ -1700,6 +2516,7 @@ mod tests {
             &config,
             true,
             now,
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1712,6 +2529,7 @@ mod tests {
             &config,
             true,
             now + time::Duration::minutes(5),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1725,6 +2543,7 @@ mod tests {
             &config,
             true,
             now + time::Duration::minutes(10),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1733,10 +2552,17 @@ mod tests {
             ["stuck: t1 (codex-main)"],
             "the visibility line is independent of the spent resume claim"
         );
+        // Critic `3c0098` finding 3: an idle pane's successful resume now
+        // arms escalation the same as a `Working` pane's already did, so a
+        // persisting banner on this third pass escalates to `failed`
+        // rather than going quiet forever — not a second resume prompt,
+        // never a second canned text.
+        assert_eq!(third.resume.len(), 1);
         assert!(
-            third.resume.is_empty(),
+            !third.resume[0].sent,
             "the one-shot resume must not fire again"
         );
+        assert!(third.resume[0].failed);
         assert_eq!(herdr.prompts.len(), 1);
     }
 
@@ -1767,6 +2593,7 @@ mod tests {
             &config,
             true,
             now,
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1786,6 +2613,7 @@ mod tests {
             &config,
             true,
             now + time::Duration::minutes(5),
+            &[],
             &mut recycled,
             &mut herdr,
         );
@@ -1796,6 +2624,31 @@ mod tests {
             herdr.prompts.is_empty(),
             "the resume prompt must never reach other-agent's pane"
         );
+
+        // Card `20261117-b-437eeb`: the second pass's send never went out
+        // (the pane was recycled), so the one-shot claim it reserved must
+        // not be left spent. Once the task's own agent is back in the
+        // pane, a later pass must still be able to claim and send the
+        // resume — not find a `pane: None` claim it can never match.
+        let third = resume_stuck_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(10),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(
+            third.len(),
+            1,
+            "a failed send must leave the claim retryable"
+        );
+        assert!(third[0].sent, "the retried resume must actually send");
+        assert!(!third[0].failed);
+        assert_eq!(herdr.prompts, vec![STUCK_RESUME_PROMPT.to_string()]);
     }
 
     #[test]
@@ -1827,6 +2680,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1866,6 +2720,7 @@ mod tests {
             &config,
             true,
             now,
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1878,6 +2733,7 @@ mod tests {
             &config,
             true,
             now + time::Duration::minutes(5),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1893,6 +2749,7 @@ mod tests {
             &config,
             false,
             now + time::Duration::minutes(10),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1911,6 +2768,7 @@ mod tests {
             &config,
             true,
             now + time::Duration::minutes(10),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -1973,6 +2831,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut FakeHerdr {
                 pane_text: "still going",
@@ -2003,12 +2862,60 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
         assert_eq!(results.len(), 1);
         assert!(results[0].sent);
         assert_eq!(herdr.prompts, vec![RUNTIME_CAP_PROMPT.to_string()]);
+    }
+
+    /// Scout `20261117-scout-342332` rank 1: `t1`'s raw wall-clock gap (90
+    /// minutes) alone is past its 60-minute cap, the same shape as the test
+    /// above — but 50 of those 90 minutes were host sleep. With that
+    /// discounted, the effective gap is only 40 minutes, under the cap, so
+    /// the runtime-cap prompt must never fire. Revert [`elapsed_since`]'s
+    /// sleep-minutes subtraction and this fails the same way the pre-fix
+    /// code did: `t1` gets capped anyway.
+    #[test]
+    fn a_lane_asleep_through_most_of_the_cap_gap_is_never_capped() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60");
+        let t = task("t1", "codex-main", "w1:p1", 90);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "still going",
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        // The last 50 of `t`'s own 90-minute window were host sleep.
+        let sleep_intervals = vec![crate::hostsleep::SleepInterval {
+            start: Some(now - time::Duration::minutes(50)),
+            end: now,
+            lower_bound: false,
+            power: "AC".to_string(),
+        }];
+        let results = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &sleep_intervals,
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(
+            results.is_empty(),
+            "a lane the host slept through must never be capped"
+        );
+        assert!(herdr.prompts.is_empty());
     }
 
     /// Card `20261103-b-695405`: `t1` is well past its runtime cap in the
@@ -2044,6 +2951,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut recycled,
             &mut herdr,
         );
@@ -2053,6 +2961,440 @@ mod tests {
             herdr.prompts.is_empty(),
             "the runtime cap prompt must never reach other-agent's pane"
         );
+    }
+
+    /// Task `20261117-builder-f4e16e` (rework of Scout
+    /// `20261117-scout-342332` rank 6, task `20261117-builder-66c21a`): a
+    /// lane still `Working`, past its cap plus the `STUCK_AFTER_MINUTES`
+    /// grace, with the one cap prompt already sent, gets no further
+    /// automated action when the pane shows nothing but ordinary text —
+    /// time alone is never a corroborating signal (real configs set caps
+    /// as low as 40 minutes, and healthy agents routinely run longer than
+    /// that). Revert check: drop the `working && !connection_loss_re()...`
+    /// gate in `cap_long_running_lanes` and this test fails — the
+    /// escalation branch would again record this healthy lane `failed` on
+    /// a plain timeout.
+    #[test]
+    fn a_working_lane_past_the_cap_plus_grace_with_plain_text_is_never_escalated() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60\npool = \"shared/pool\"");
+        let t = task("t1", "codex-main", "w1:p1", 60);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "still going",
+            prompts: Vec::new(),
+        };
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(first[0].sent);
+        assert!(!first[0].failed);
+
+        // STUCK_AFTER_MINUTES (30) later than the cap was already crossed:
+        // still `Working`, still showing the same plain pane text, one
+        // spent claim — no corroborating signal, so no further action at
+        // all beyond the one cap prompt already sent.
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(31),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(
+            second.is_empty(),
+            "a healthy, still-Working lane must never be escalated on time alone"
+        );
+        // Only ever the one cap prompt — never a second send, never an
+        // escalation.
+        assert_eq!(herdr.prompts, vec![RUNTIME_CAP_PROMPT.to_string()]);
+        assert!(!root.join(".multiverse/routing.log").exists());
+        assert!(!root.join(".multiverse/evidence").exists());
+    }
+
+    /// Brief test (2): an agent Herdr reports idle/done (not `Working`),
+    /// still with no terminal status file, past the cap plus grace, is its
+    /// own corroborating signal — no pane-text match required. The pane
+    /// text here is ordinary, so no breaker evidence is written: this
+    /// escalation proves the lane stopped making progress, not that the
+    /// account is impaired.
+    #[test]
+    fn an_idle_lane_past_the_cap_plus_grace_escalates_without_breaker_evidence() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60\npool = \"shared/pool\"");
+        let t = task("t1", "codex-main", "w1:p1", 60);
+        let working_live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let idle_live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Done),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "still going",
+            prompts: Vec::new(),
+        };
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &working_live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents {
+                live: working_live.clone(),
+            },
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(first[0].sent);
+
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &idle_live,
+            &config,
+            true,
+            now + time::Duration::minutes(31),
+            &[],
+            &mut FakeAgents {
+                live: idle_live.clone(),
+            },
+            &mut herdr,
+        );
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].sent, "the escalation never resends the prompt");
+        assert!(second[0].failed);
+        assert_eq!(herdr.prompts, vec![RUNTIME_CAP_PROMPT.to_string()]);
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(log.contains("event=result\ttask=t1\tstatus=failed"));
+        assert!(log.contains("runtime cap exceeded"));
+        assert!(
+            !root.join(".multiverse/evidence").exists(),
+            "a plain idle pane classifies as no vendor error, so no evidence is written"
+        );
+    }
+
+    /// Brief test (3), first half: a lane still `Working` past the cap plus
+    /// grace, whose pane shows the same connection-loss vocabulary
+    /// `resume_stuck_lanes`'s own `find_stuck_signal` requires in that
+    /// state, escalates — but writes no breaker evidence, because this
+    /// particular banner is not one [`crate::limits::classify`] recognises
+    /// as a vendor/account error.
+    #[test]
+    fn a_working_lane_with_an_unclassified_connection_loss_banner_escalates_without_evidence() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60\npool = \"shared/pool\"");
+        let t = task("t1", "codex-main", "w1:p1", 60);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "reconnecting to session...",
+            prompts: Vec::new(),
+        };
+        assert!(crate::limits::classify(herdr.pane_text, "codex", Some(now)).is_none());
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(first[0].sent);
+
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(31),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].sent);
+        assert!(second[0].failed);
+        assert!(!root.join(".multiverse/evidence").exists());
+    }
+
+    /// Brief test (3), second half: the same still-`Working`, connection-
+    /// loss-banner shape, but this time the banner text is also one
+    /// [`crate::limits::classify`] recognises as a vendor/account error —
+    /// breaker evidence is now written, and the recorded `state=` text
+    /// links it.
+    #[test]
+    fn a_working_lane_with_a_classified_vendor_error_banner_escalates_with_evidence() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60\npool = \"shared/pool\"");
+        let t = task("t1", "codex-main", "w1:p1", 60);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            // Matches `connection_loss_re` ("network error") — the
+            // corroborating signal — and also `codex`'s own
+            // `codex_retry_limit_exceeded` classifier, so this is the one
+            // case where both the escalation and the evidence write fire.
+            pane_text: "network error: exceeded retry limit, last status: 429 Too Many Requests",
+            prompts: Vec::new(),
+        };
+        let verdict = crate::limits::classify(herdr.pane_text, "codex", Some(now)).unwrap();
+        assert_eq!(verdict.rule, "codex_retry_limit_exceeded");
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(first[0].sent);
+
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(31),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].sent);
+        assert!(second[0].failed);
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(log.contains("event=result\ttask=t1\tstatus=failed"));
+        assert!(log.contains("rule: codex_retry_limit_exceeded"));
+        let evidence_dir = root.join(".multiverse/evidence");
+        assert!(evidence_dir.is_dir());
+        assert_eq!(std::fs::read_dir(&evidence_dir).unwrap().count(), 1);
+    }
+
+    /// A task that finished (its `status` file landed, or `sweep_project`
+    /// already recorded it) between the cap prompt and the next sweep pass
+    /// is no longer a [`base_running_candidate`] at all, so the escalation
+    /// never fires for it even though its claim is still on disk.
+    #[test]
+    fn a_lane_that_finished_after_its_cap_prompt_is_never_escalated() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60");
+        let t = task("t1", "codex-main", "w1:p1", 60);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "still going",
+            prompts: Vec::new(),
+        };
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(first[0].sent);
+
+        let finished = SweepTask {
+            recorded: true,
+            ..t.clone()
+        };
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&finished),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(31),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(second.is_empty(), "a finished lane is never escalated");
+        assert!(!root.join(".multiverse/routing.log").exists());
+    }
+
+    /// Card `20261117-b-66c21a` (this task, mirroring `20261117-b-437eeb`):
+    /// a cap-prompt send that never actually went out (the pane's agent
+    /// was no longer there to receive it) must not spend the one-shot
+    /// claim — a later pass, once the agent is back, can still claim and
+    /// send it.
+    #[test]
+    fn a_failed_cap_send_leaves_the_claim_retryable() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60");
+        let t = task("t1", "codex-main", "w1:p1", 90);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: "still going",
+            prompts: Vec::new(),
+        };
+        let mut recycled = FakeAgents {
+            live: vec![LiveAgentStatus {
+                pane_id: "w1:p1".to_string(),
+                name: Some("other-agent".to_string()),
+                status: Some(AgentState::Working),
+            }],
+        };
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &[],
+            &mut recycled,
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].sent, "never send into the recycled pane");
+        assert!(
+            !mv_state::nudge_memory::runtime_cap_already_sent(&root, "t1", &BTreeSet::new()),
+            "a failed send must leave the claim retryable"
+        );
+
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(second.len(), 1);
+        assert!(second[0].sent, "the retried cap prompt must actually send");
+        assert_eq!(herdr.prompts, vec![RUNTIME_CAP_PROMPT.to_string()]);
+    }
+
+    /// Scout `20261117-scout-342332` rank 1's own sleep discount applies to
+    /// the escalation grace too: `t1`'s raw wall-clock gap since it started
+    /// (121 minutes) is well past the 90-minute cap-plus-grace threshold,
+    /// but 40 of those minutes were host sleep. With that discounted, the
+    /// effective gap (81 minutes) stays under the threshold, so the lane
+    /// must not be recorded `failed` just because the host was briefly
+    /// asleep.
+    #[test]
+    fn a_lane_asleep_through_the_escalation_grace_is_never_escalated() {
+        let root = temp_project();
+        let config = config_with_codex_account("max_runtime_minutes = 60");
+        let t = task("t1", "codex-main", "w1:p1", 60);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text: "still going",
+            prompts: Vec::new(),
+        };
+
+        let first = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now,
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(first[0].sent);
+
+        // Raw gap since start is 121 minutes (past the 90-minute
+        // cap-plus-grace threshold), but 40 of those were host sleep: the
+        // effective gap (81) stays under it.
+        let sleep_intervals = vec![crate::hostsleep::SleepInterval {
+            start: Some(now),
+            end: now + time::Duration::minutes(40),
+            lower_bound: false,
+            power: "AC".to_string(),
+        }];
+        let second = cap_long_running_lanes(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            now + time::Duration::minutes(61),
+            &sleep_intervals,
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert!(
+            second.is_empty(),
+            "a lane the host slept through must never be escalated"
+        );
+        assert!(!root.join(".multiverse/routing.log").exists());
     }
 
     #[test]
@@ -2070,6 +3412,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: Vec::new() },
             &mut FakeHerdr {
                 pane_text: "",
@@ -2079,6 +3422,39 @@ mod tests {
         assert!(outcome.finish.is_empty());
         assert!(outcome.resume.is_empty());
         assert!(outcome.cap.is_empty());
+    }
+
+    #[test]
+    fn a_task_with_an_unrecognized_status_token_is_never_a_candidate() {
+        let root = temp_project();
+        let config = config_with_codex_account("");
+        let t = SweepTask {
+            unrecognized_status: Some("donedone".to_string()),
+            ..task("t1", "codex-main", "w1:p1", 90)
+        };
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: t.agent.clone(),
+            status: Some(AgentState::Idle),
+        }];
+        assert!(!base_running_candidate(&t));
+        let outcome = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut FakeHerdr {
+                pane_text: "",
+                prompts: Vec::new(),
+            },
+        );
+        assert!(outcome.finish.is_empty());
+        assert!(outcome.resume.is_empty());
+        assert!(outcome.cap.is_empty());
+        assert!(outcome.stuck.is_empty());
     }
 
     // --- `submit_unsubmitted_composers` (card `20261114-b-4d8baf`, design
@@ -2130,6 +3506,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live: live.clone() },
             &mut herdr,
         );
@@ -2150,6 +3527,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc() + time::Duration::minutes(1),
+            &[],
             &mut FakeAgents { live },
             &mut herdr,
         );
@@ -2178,6 +3556,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live },
             &mut herdr,
         );
@@ -2208,6 +3587,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live },
             &mut herdr,
         );
@@ -2262,6 +3642,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live },
             &mut herdr,
         );
@@ -2294,6 +3675,7 @@ mod tests {
             &config,
             false,
             mv_core::time::now_utc(),
+            &[],
             &mut FakeAgents { live },
             &mut herdr,
         );
@@ -2340,6 +3722,7 @@ mod tests {
             &config,
             true,
             mv_core::time::now_utc(),
+            &[],
             &mut recycled,
             &mut herdr,
         );

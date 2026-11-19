@@ -23,6 +23,13 @@ use serde_json::Value;
 /// slower operation.
 pub const DEFAULT_TIMEOUT_SECONDS: f64 = 30.0;
 
+/// Timeout for a cheap, listing-shaped Herdr call (`agent list` and
+/// friends), which normally answers in milliseconds and should not make a
+/// caller wait out the full [`DEFAULT_TIMEOUT_SECONDS`] against a hung
+/// socket. Matches the 10s bound `dispatch.rs`'s `live_agent_statuses`
+/// already uses for the same call.
+pub const LISTING_TIMEOUT_SECONDS: f64 = 10.0;
+
 /// Pane/agent reads are diagnostics and prompt-state probes, not a way
 /// to stream an unbounded terminal transcript. Keep only the newest
 /// portion, where Herdr's status prompts and the current composer live.
@@ -57,10 +64,22 @@ pub struct HerdrCommand {
     /// `agent prompt`, and text-format reads legitimately print plain
     /// text.
     pub expects_json: bool,
+    /// Set once, at construction, by every builder in this module — never
+    /// re-derived from `argv[0]` later. A caller that overrides `argv[0]`
+    /// after building (`mv-state::worktrees::agent_list_snapshot` pins an
+    /// explicit Herdr binary this way) must not thereby lose the bounded
+    /// default timeout `run()` gives every Herdr call: re-deriving this
+    /// flag by comparing `argv[0]` against the *current* `herdr_binary()`
+    /// made exactly that mismatch possible.
+    pub is_herdr: bool,
 }
 
 impl HerdrCommand {
-    /// Build a command with no purpose, stdin, or JSON expectation set.
+    /// Build a command with no purpose, stdin, or JSON expectation set,
+    /// and `is_herdr` left `false` — this is the constructor a caller
+    /// running a non-Herdr subprocess (`du`, `pmset`, `lsof`, ...) through
+    /// the shared runner uses, not one of this module's `herdr_binary()`
+    /// builders.
     pub fn new(argv: Vec<String>) -> Self {
         Self {
             argv,
@@ -109,6 +128,7 @@ fn command(argv: Vec<String>, purpose: impl Into<String>) -> HerdrCommand {
         purpose: purpose.into(),
         stdin: None,
         expects_json: false,
+        is_herdr: true,
     }
 }
 
@@ -219,8 +239,24 @@ const CODEX_DISABLE_UPDATE_ON_STARTUP: [&str; 2] = ["-c", "check_for_update_on_s
 /// disagree about what the agent actually started with. An unknown
 /// `kind` gets `--model` alone rather than a guessed effort flag: a
 /// wrong flag is a startup failure, a missing one is merely a default.
-pub fn native_args(model: &str, kind: &str, effort: Option<&str>) -> Vec<String> {
+///
+/// `worktree` pins a Codex lane's working root with `-C`/`--cd` — the
+/// only documented lever Codex exposes for where it considers itself
+/// rooted. Codex has no flag that restricts what it can *read* (`-s`/
+/// `--sandbox` and `--add-dir` only govern writes/exec), so this stops
+/// deliberate re-rooting rather than enforcing a read boundary; every
+/// other `kind` ignores the argument.
+pub fn native_args(
+    model: &str,
+    kind: &str,
+    effort: Option<&str>,
+    worktree: impl AsRef<Path>,
+) -> Vec<String> {
     let mut args = vec!["--model".to_string(), model.to_string()];
+    if kind == "codex" {
+        args.push("-C".to_string());
+        args.push(path_str(worktree));
+    }
     if let Some(level) = effort {
         if let Some(extra) = effort_args(kind, level) {
             args.extend(extra);
@@ -763,6 +799,16 @@ mod tests {
     use super::test_support::HerdrBinPathGuard;
     use super::*;
 
+    // --- timeouts -----------------------------------------------------
+
+    /// Matches the 10s bound `dispatch.rs`'s `live_agent_statuses` already
+    /// uses for the same `agent list` call — a cheap listing call must
+    /// not wait out the full 30s [`DEFAULT_TIMEOUT_SECONDS`].
+    #[test]
+    fn listing_timeout_matches_the_dispatch_rs_precedent() {
+        assert_eq!(LISTING_TIMEOUT_SECONDS, 10.0);
+    }
+
     // --- HERDR_BIN_PATH resolution ----------------------------------
 
     #[test]
@@ -939,10 +985,12 @@ mod tests {
     #[test]
     fn codex_native_args_disable_update_on_startup() {
         assert_eq!(
-            native_args("gpt-5", "codex", None),
+            native_args("gpt-5", "codex", None, "/lane/x"),
             vec![
                 "--model",
                 "gpt-5",
+                "-C",
+                "/lane/x",
                 "-c",
                 "check_for_update_on_startup=false"
             ]
@@ -952,18 +1000,20 @@ mod tests {
     #[test]
     fn native_args_applies_the_effort_table_per_kind() {
         assert_eq!(
-            native_args("opus", "claude", Some("high")),
+            native_args("opus", "claude", Some("high"), "/lane/x"),
             vec!["--model", "opus", "--effort", "high"]
         );
         assert_eq!(
-            native_args("grok-4", "grok", Some("low")),
+            native_args("grok-4", "grok", Some("low"), "/lane/x"),
             vec!["--model", "grok-4", "--reasoning-effort", "low"]
         );
         assert_eq!(
-            native_args("gpt-5", "codex", Some("high")),
+            native_args("gpt-5", "codex", Some("high"), "/lane/x"),
             vec![
                 "--model",
                 "gpt-5",
+                "-C",
+                "/lane/x",
                 "-c",
                 "model_reasoning_effort=high",
                 "-c",
@@ -975,8 +1025,34 @@ mod tests {
     #[test]
     fn native_args_with_an_unknown_kind_gets_model_alone() {
         assert_eq!(
-            native_args("some-model", "mastracode", Some("high")),
+            native_args("some-model", "mastracode", Some("high"), "/lane/x"),
             vec!["--model", "some-model"]
+        );
+    }
+
+    #[test]
+    fn native_args_pins_the_codex_root_to_the_given_worktree() {
+        assert_eq!(
+            native_args("gpt-5", "codex", None, "/lane/one"),
+            vec![
+                "--model",
+                "gpt-5",
+                "-C",
+                "/lane/one",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
+        );
+        assert_eq!(
+            native_args("gpt-5", "codex", None, "/lane/two"),
+            vec![
+                "--model",
+                "gpt-5",
+                "-C",
+                "/lane/two",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
         );
     }
 
@@ -986,6 +1062,42 @@ mod tests {
     fn command_stdin_defaults_to_none() {
         let _guard = HerdrBinPathGuard::unset();
         assert_eq!(agent_list().stdin, None);
+    }
+
+    #[test]
+    fn every_builder_marks_its_command_as_a_herdr_call() {
+        let _guard = HerdrBinPathGuard::unset();
+        assert!(agent_list().is_herdr);
+        assert!(pane_list(None).is_herdr);
+        assert!(agent_prompt("x", "go", false, None).is_herdr);
+        assert!(workspace_create("x", "/tmp", &[], false).is_herdr);
+    }
+
+    #[test]
+    fn a_direct_new_command_is_not_marked_as_herdr() {
+        // `HerdrCommand::new` is for a non-Herdr subprocess run through the
+        // shared runner (`du`, `pmset`, `lsof`, ...); only this module's own
+        // `herdr_binary()` builders set `is_herdr`.
+        assert!(!HerdrCommand::new(vec!["du".into()]).is_herdr);
+    }
+
+    /// `mv-state::worktrees::agent_list_snapshot` overrides `argv[0]` to a
+    /// caller-pinned Herdr binary after the command is built
+    /// (`HerdrLaneObserver::with_herdr_binary`). `is_herdr` is set once at
+    /// construction and must survive that override untouched — it must
+    /// never be re-derived from `argv[0]` later, which is what let this
+    /// mark go silently false whenever the pinned binary didn't match
+    /// `HERDR_BIN_PATH`.
+    #[test]
+    fn is_herdr_survives_an_argv0_override() {
+        let _guard = HerdrBinPathGuard::unset();
+        let mut command = agent_list();
+        assert!(command.is_herdr);
+        command.argv[0] = "/some/other/herdr-pin".to_string();
+        assert!(
+            command.is_herdr,
+            "overriding argv[0] must not clear is_herdr"
+        );
     }
 
     #[test]

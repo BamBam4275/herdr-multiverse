@@ -180,6 +180,37 @@ Rust about: Show account usage
 | Flag | Python | Rust | Notes |
 |---|---|---|---|
 | `--detail` | ACCOUNT | ACCOUNT | Same optional flag taking an account name. |
+| `--json` | — | flag | Rust-only (task `20261117-builder-0cbb48`, Scout finding `20261117-scout-c950ad`#4). Emits one line of JSON instead of the text table/tables; never changes the plain-text output. |
+
+**`--json` shape (stable script surface).** Bare `accounts usage --json`
+prints one JSON array, one flat object per configured account, sorted by
+account name, alphabetical keys:
+
+```json
+[{"account": "scout-1", "status": null, "usage": "42% left · daily window", "warn": null}]
+```
+
+- `account` — the configured account name.
+- `usage` — the same gauge/grok-summary text the plain line shows after the
+  account name, or `null` for "unknown" (no usage source produced
+  anything).
+- `status` — the breaker/draining suffix (`FENCED`/`FENCED (manual)` and
+  its detail), with the text line's leading `" · "` stripped, or `null`
+  when there is none.
+- `warn` — the WARN line's trailing message (grok session-volume warning),
+  or `null`.
+
+`accounts usage --detail ACCOUNT --json` prints one JSON object instead,
+with the per-day/per-project tables as typed arrays — field names taken
+straight from `mv_engine::grok_usage::{DailyUsage,ProjectUsage}`:
+
+```json
+{"account": "scout-2", "by_day": [{"day": "2026-11-17", "estimated_tokens": 1000, "sessions": 1}], "by_project": [{"estimated_tokens": 1000, "project": "demo", "sessions": 1}], "reason": null, "vendor": "grok"}
+```
+
+`by_day`/`by_project` are `null` together with a `reason` of
+`"unsupported_vendor"` (any vendor but grok) or `"no_sessions"` (a grok
+account with no sessions in the window) — never a partial pair.
 
 ### `activity`
 
@@ -823,7 +854,32 @@ Rust about: Start project Nexus sessions and clear a halt `down` set
 
 Rust about: List worker sessions
 
-No flags besides global `--config` / `--help`.
+| Flag | Python | Rust | Notes |
+|---|---|---|---|
+| `--json` | — | flag | Rust-only (task `20261117-builder-0cbb48`, Scout finding `20261117-scout-c950ad`#4). Emits one line of JSON instead of the table and summary lines; never changes the plain-text output. |
+
+**`--json` shape (stable script surface).** One JSON object, alphabetical
+keys:
+
+```json
+{"halted": null, "max_concurrent": 3, "nexus_sessions": 0, "projects": [{"ceiling": 3, "name": "sandbox", "open": 0}], "seats": [{"name": "seat-b", "open": 0}], "worker_count": 1, "workers": [{"age": null, "outcome": null, "project": null, "role": "scout", "seat": "seat-b", "status": "working", "task": null}]}
+```
+
+- `workers` — the table's own rows (`age`/`outcome`/`project`/`role`/
+  `seat`/`status`/`task`), or `null` when Herdr was unreachable (an empty,
+  reachable fleet is `[]`). A field the text table shows as `\u{2014}`
+  (no data joined) is JSON `null`, never `""`.
+- `worker_count` / `max_concurrent` — the `workers N/CAP` line's own two
+  numbers; `worker_count` is `null` exactly when `workers` is.
+- `seats` / `projects` — the `seats:`/`projects:` lines, one object per
+  configured seat/project; `open` is `null` only when Herdr was
+  unreachable.
+- `nexus_sessions` — the `nexus sessions N` line's count, `null` under the
+  same condition.
+- `halted` — `{"at": ..., "reason": ...}` when the fleet halt marker is
+  set, else `null`. Plain text still prints `halt_banner`'s separate line
+  first; `--json` folds the same state into this key instead, so stdout
+  stays one parseable value.
 
 ### `worktrees`
 

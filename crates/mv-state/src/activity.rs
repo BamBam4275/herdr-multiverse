@@ -1178,14 +1178,28 @@ impl FanOutReport {
 /// each sees it as an open ask in its own inbox, any one of them may
 /// `reply` to resolve it, and the sender's owed-replies count tracks one
 /// outstanding ask per recipient that has not yet replied.
-pub fn broadcast(
-    from_project: &str,
-    body: &str,
-    ask: bool,
-    recipients: &[(ProjectLog, bool)],
-    msg_id: &str,
-    redact: &dyn Fn(&str) -> String,
-) -> Result<FanOutReport, ActivityError> {
+/// [`broadcast`]'s parameters, named so adding or reordering a field is a
+/// struct-literal change at each call site rather than a positional one —
+/// the shape that let `tasks.rs`'s call site merge clean yet fail to
+/// compile against a changed signature (`a862f24`).
+pub struct BroadcastRequest<'a> {
+    pub from_project: &'a str,
+    pub body: &'a str,
+    pub ask: bool,
+    pub recipients: &'a [(ProjectLog, bool)],
+    pub msg_id: &'a str,
+    pub redact: &'a dyn Fn(&str) -> String,
+}
+
+pub fn broadcast(request: BroadcastRequest) -> Result<FanOutReport, ActivityError> {
+    let BroadcastRequest {
+        from_project,
+        body,
+        ask,
+        recipients,
+        msg_id,
+        redact,
+    } = request;
     if from_project != HUB_PROJECT_NAME {
         return Err(ActivityError::NotHub(from_project.to_string()));
     }
@@ -1375,6 +1389,22 @@ pub fn has_close_record(log: &ProjectLog, ask_seq: u64) -> Result<bool, Activity
 /// tagged so nobody reading it mistakes it for that project's own words.
 /// `None` reproduces the message byte-for-byte as it was before this
 /// parameter existed.
+///
+/// `find_open_ask` and the answer-plus-close that follows it all run under
+/// `own_log`'s lock (held for the whole call, via `ProjectLog::with_lock`'s
+/// reentrancy — [`close_ask`] takes the same lock again internally and the
+/// inner acquire is a no-op), closing the gap two concurrent `reply`/
+/// `close_ask` calls against the same ask used to race through: before this,
+/// `find_open_ask` ran with no lock held at all, so both could see the ask as
+/// open and both append an answer and a close (Scout `e9af11` item 2).
+/// `own_log` and `asker_log` are two different projects' locks, taken
+/// together for that span, so which one is acquired first follows
+/// `support::lock_order` — the same hub-first-then-alphabetical rule
+/// [`broadcast`] uses — rather than always `own_log` first: a fixed
+/// `own_log`-first order would deadlock the moment two projects reply to
+/// each other's asks at once (`own_log`/`asker_log` swap between the two
+/// calls, so "always lock `own_log` first" is two different orders, not
+/// one).
 #[allow(clippy::too_many_arguments)]
 pub fn reply(
     own_log: &ProjectLog,
@@ -1386,22 +1416,36 @@ pub fn reply(
     may_send_reverse: bool,
     redact: &dyn Fn(&str) -> String,
 ) -> Result<SendOutcome, ActivityError> {
-    let ask = find_open_ask(own_log, ask_seq)?;
-    debug_assert_eq!(ask.from_project, asker_log.project());
-    let outcome = send_message_relayed(
-        asker_log,
-        reply_id,
-        own_log.project(),
-        asker_log.project(),
-        reply_body,
-        false,
-        Some(ask_seq),
-        relayed_by,
-        may_send_reverse,
-        redact,
-    )?;
-    close_ask(own_log, ask_seq, "answered", &no_op_redact)?;
-    Ok(outcome)
+    let do_reply = || -> Result<SendOutcome, ActivityError> {
+        let ask = find_open_ask(own_log, ask_seq)?;
+        debug_assert_eq!(ask.from_project, asker_log.project());
+        let outcome = send_message_relayed(
+            asker_log,
+            reply_id,
+            own_log.project(),
+            asker_log.project(),
+            reply_body,
+            false,
+            Some(ask_seq),
+            relayed_by,
+            may_send_reverse,
+            redact,
+        )?;
+        close_ask(own_log, ask_seq, "answered", &no_op_redact)?;
+        Ok(outcome)
+    };
+    let ordered = support::lock_order(
+        HUB_PROJECT_NAME,
+        vec![
+            own_log.project().to_string(),
+            asker_log.project().to_string(),
+        ],
+    );
+    if ordered.first().map(String::as_str) == Some(own_log.project()) {
+        own_log.with_lock(|| asker_log.with_lock(do_reply))
+    } else {
+        asker_log.with_lock(|| own_log.with_lock(do_reply))
+    }
 }
 
 /// `"answered"`/`"declined"`-style reasons [`reply`]/[`close_ask`] write
@@ -1413,6 +1457,14 @@ fn no_op_redact(s: &str) -> String {
 
 /// `close_ask`/`resolve_ask` (`activity.py:1181-1231`): write an
 /// `event=close` into the **holder's own log**, never messaged elsewhere.
+///
+/// Re-checks [`has_close_record`] inside the same lock that then appends
+/// the close, so a second `close_ask`/`reply` racing this one on the same
+/// `ask_seq` gets the ordinary "not open" [`ActivityError::AskNotFound`]
+/// instead of appending its own close record on top of the first
+/// (Scout `e9af11` item 2) — `find_ask` above still returns an already-
+/// closed ask (unlike [`find_open_ask`]), so without this check the
+/// `AskNotHeldHere` identity check would pass and let a second close land.
 pub fn close_ask(
     holder_log: &ProjectLog,
     ask_seq: u64,
@@ -1429,6 +1481,9 @@ pub fn close_ask(
                 seq: ask_seq,
                 holder: ask.to_project,
             });
+        }
+        if has_close_record(holder_log, ask_seq)? {
+            return Err(ActivityError::AskNotFound(ask_seq));
         }
         holder_log.append_versioned_locked(|seq| encode_close(&when, seq, ask_seq, &redacted))
     })
@@ -2766,14 +2821,14 @@ mod tests {
     fn broadcast_is_refused_from_a_non_hub_project() {
         let dir = tempdir().unwrap();
         let recipient = log_in(dir.path(), "example");
-        let err = broadcast(
-            "not-the-hub",
-            "announcement",
-            false,
-            &[(recipient, true)],
-            "bcast-1",
-            &no_redact,
-        )
+        let err = broadcast(BroadcastRequest {
+            from_project: "not-the-hub",
+            body: "announcement",
+            ask: false,
+            recipients: &[(recipient, true)],
+            msg_id: "bcast-1",
+            redact: &no_redact,
+        })
         .unwrap_err();
         assert!(matches!(err, ActivityError::NotHub(_)));
     }
@@ -2785,14 +2840,14 @@ mod tests {
         let a = log_in(dir_a.path(), "project-a");
         let b = log_in(dir_b.path(), "project-b");
 
-        let report = broadcast(
-            HUB_PROJECT_NAME,
-            "fleet announcement",
-            false,
-            &[(a, true), (b, false)],
-            "bcast-1",
-            &no_redact,
-        )
+        let report = broadcast(BroadcastRequest {
+            from_project: HUB_PROJECT_NAME,
+            body: "fleet announcement",
+            ask: false,
+            recipients: &[(a, true), (b, false)],
+            msg_id: "bcast-1",
+            redact: &no_redact,
+        })
         .unwrap();
 
         let sent: Vec<&str> = report.sent().collect();
@@ -2809,14 +2864,14 @@ mod tests {
         let a = log_in(dir_a.path(), "project-a");
         let b = log_in(dir_b.path(), "project-b");
 
-        broadcast(
-            HUB_PROJECT_NAME,
-            "need a reply",
-            true,
-            &[(a, true), (b, true)],
-            "bcast-ask-1",
-            &no_redact,
-        )
+        broadcast(BroadcastRequest {
+            from_project: HUB_PROJECT_NAME,
+            body: "need a reply",
+            ask: true,
+            recipients: &[(a, true), (b, true)],
+            msg_id: "bcast-ask-1",
+            redact: &no_redact,
+        })
         .unwrap();
 
         for (dir, name) in [(&dir_a, "project-a"), (&dir_b, "project-b")] {
@@ -2968,6 +3023,166 @@ mod tests {
 
         // The close record never touched the asker's log.
         assert!(asker_log.inbox_messages().unwrap().is_empty());
+    }
+
+    /// Scout `e9af11` item 2: two concurrent `reply` calls against the same
+    /// ask, barrier-synced so both reach `find_open_ask` at once. Before the
+    /// fix, that call ran with no lock held, so both threads could see the
+    /// ask as still open and both send an answer into the asker's log
+    /// (`close_ask`'s own, separately-fixed duplicate-close check still
+    /// caught the second *close*, so the asker-inbox-length assertion below
+    /// is what actually catches this, not the close count) — reverting
+    /// `reply` to call `find_open_ask`/`send_message_relayed`/`close_ask`
+    /// unlocked, with this fix's `close_ask` duplicate-close check left in
+    /// place, reproduced two answers landing in the asker's log in all 200
+    /// of 200 runs of this test.
+    #[test]
+    fn concurrent_replies_to_the_same_ask_land_exactly_one_answer_and_close() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let asker_dir = tempdir().unwrap();
+        let holder_dir = tempdir().unwrap();
+        let asker_root = asker_dir.path().to_path_buf();
+        let holder_root = holder_dir.path().to_path_buf();
+        let holder_log = log_in(&holder_root, "holder");
+
+        send_message(
+            &holder_log,
+            "ask-1",
+            "asker",
+            "holder",
+            "will you do X?",
+            true,
+            None,
+            true,
+            &no_redact,
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["reply-a", "reply-b"]
+            .into_iter()
+            .map(|id| {
+                let asker_root = asker_root.clone();
+                let holder_root = holder_root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let holder_log = log_in(&holder_root, "holder");
+                    let asker_log = log_in(&asker_root, "asker");
+                    barrier.wait();
+                    reply(
+                        &holder_log,
+                        &asker_log,
+                        1,
+                        id,
+                        "yes",
+                        None,
+                        true,
+                        &no_redact,
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let sent = results
+            .iter()
+            .filter(|r| matches!(r, Ok(SendOutcome::Sent { .. })))
+            .count();
+        let refused = results
+            .iter()
+            .filter(|r| matches!(r, Err(ActivityError::AskNotFound(1))))
+            .count();
+        assert_eq!(
+            (sent, refused),
+            (1, 1),
+            "exactly one concurrent reply must land and the other must be refused \
+             as not-open: {results:?}"
+        );
+
+        let asker_log = log_in(&asker_root, "asker");
+        assert_eq!(
+            asker_log.inbox_messages().unwrap().len(),
+            1,
+            "the asker's log must receive exactly one answer, not one per racing reply"
+        );
+        let close_count = holder_log
+            .envelopes()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event == "close")
+            .count();
+        assert_eq!(
+            close_count, 1,
+            "the holder's log must record exactly one close, not one per racing reply"
+        );
+    }
+
+    /// Scout `e9af11` item 2, the `close_ask`-side half: two concurrent
+    /// direct closes of the same ask (the `close_ref` CLI path when a
+    /// retry races itself) must not both append a close record. Reverting
+    /// `close_ask`'s `has_close_record` re-check alone (leaving the append
+    /// as the only gate, the way it was before this fix) reproduced two
+    /// close records in all 200 of 200 runs of this test.
+    #[test]
+    fn concurrent_close_asks_on_the_same_ask_land_exactly_one_close() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let holder_dir = tempdir().unwrap();
+        let holder_root = holder_dir.path().to_path_buf();
+        let holder_log = log_in(&holder_root, "holder");
+
+        send_message(
+            &holder_log,
+            "ask-1",
+            "asker",
+            "holder",
+            "will you do X?",
+            true,
+            None,
+            true,
+            &no_redact,
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let holder_root = holder_root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let holder_log = log_in(&holder_root, "holder");
+                    barrier.wait();
+                    close_ask(&holder_log, 1, "declined", &no_redact)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let closed = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|r| matches!(r, Err(ActivityError::AskNotFound(1))))
+            .count();
+        assert_eq!(
+            (closed, refused),
+            (1, 1),
+            "exactly one concurrent close_ask must land and the other must be refused \
+             as not-open: {results:?}"
+        );
+
+        let close_count = holder_log
+            .envelopes()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event == "close")
+            .count();
+        assert_eq!(
+            close_count, 1,
+            "the holder's log must record exactly one close, not one per racing close_ask"
+        );
     }
 
     /// `find_message` (card `20261115-b-9ebad2`'s `activity show`): unlike
@@ -3125,14 +3340,14 @@ mod tests {
         ));
         let a = log_in(present.path(), "project-a");
         let ghost = ProjectLog::open("ghost", &missing);
-        let err = broadcast(
-            HUB_PROJECT_NAME,
-            "hello",
-            false,
-            &[(a, true), (ghost, true)],
-            "shared-1",
-            &no_redact,
-        )
+        let err = broadcast(BroadcastRequest {
+            from_project: HUB_PROJECT_NAME,
+            body: "hello",
+            ask: false,
+            recipients: &[(a, true), (ghost, true)],
+            msg_id: "shared-1",
+            redact: &no_redact,
+        })
         .unwrap_err();
         assert!(matches!(
             err,
@@ -3150,14 +3365,14 @@ mod tests {
         let b_path = b_dir.path().join("project-b");
         fs::write(&b_path, b"not-a-directory").unwrap();
         let b = ProjectLog::open("project-b", &b_path);
-        let err = broadcast(
-            HUB_PROJECT_NAME,
-            "hello",
-            false,
-            &[(a, true), (b, true)],
-            "shared-fanout",
-            &no_redact,
-        )
+        let err = broadcast(BroadcastRequest {
+            from_project: HUB_PROJECT_NAME,
+            body: "hello",
+            ask: false,
+            recipients: &[(a, true), (b, true)],
+            msg_id: "shared-fanout",
+            redact: &no_redact,
+        })
         .unwrap_err();
         match err {
             ActivityError::FanOutPartial {

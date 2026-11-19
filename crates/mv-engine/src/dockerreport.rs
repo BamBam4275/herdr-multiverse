@@ -95,6 +95,7 @@ pub fn collect_with_timeout(
         purpose: "report Multiverse Docker workloads".into(),
         stdin: None,
         expects_json: false, // Docker emits JSON lines, not a Herdr envelope.
+        is_herdr: false,
     };
     let output = mv_herdr::run::run(&command, Some(timeout))?;
     if output.returncode != 0 {
@@ -307,6 +308,7 @@ pub fn host_probe(program: &str, args: &[&str]) -> Option<String> {
         purpose: format!("read host {program} report"),
         stdin: None,
         expects_json: false,
+        is_herdr: false,
     };
     let result = mv_herdr::run::run(&command, Some(DEFAULT_TIMEOUT)).ok()?;
     (result.returncode == 0).then_some(result.stdout)

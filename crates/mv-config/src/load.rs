@@ -509,6 +509,81 @@ fn warn_unknown_keys(table: &Table, scope: &str, known: &[&str], warnings: &mut 
     }
 }
 
+/// Reject a value outside `accepted`, naming the key, the bad value, and
+/// the accepted set — with a "did you mean" suggestion (reusing
+/// [`levenshtein`]) when a typo or mis-cased value is close to one of them
+/// (Scout `e9af11` items 3, 4). Downstream code compares `write_scope` and
+/// account `kind` with exact-string equality, so an unvalidated typo or
+/// case mismatch silently took the wrong branch instead of erroring; this
+/// never normalizes the value itself — `"Claude"` is refused, not quietly
+/// rewritten to `"claude"`.
+fn require_one_of(
+    scope: &str,
+    key: &str,
+    value: &str,
+    accepted: &[&str],
+) -> Result<(), ConfigError> {
+    if accepted.contains(&value) {
+        return Ok(());
+    }
+    let suggestion = accepted
+        .iter()
+        .map(|k| (*k, levenshtein(value, k)))
+        .min_by_key(|(_, dist)| *dist)
+        .filter(|(_, dist)| *dist <= 2)
+        .map(|(k, _)| k);
+    let hint = match suggestion {
+        Some(s) => format!(" (did you mean {s:?}?)"),
+        None => String::new(),
+    };
+    Err(ConfigError::new(format!(
+        "{scope}: {key} must be one of {list}; got {value:?}{hint}",
+        list = accepted.join(", "),
+    )))
+}
+
+/// Warn (never refuse) about an `effort`/`review_effort` value outside
+/// [`KNOWN_EFFORT_LEVELS`] — same shape as [`warn_unknown_keys`],
+/// including the "did you mean" suggestion (reusing [`levenshtein`]): the
+/// config still loads and `argv.rs::effort_args` still forwards the value
+/// verbatim, since the vendor CLI, not this list, is the authority on
+/// what it accepts. `kinds` names the `[roles.<key>.models]` vendor
+/// kind(s) that would receive this value, when known; `review_policy`
+/// has no `models` table of its own, so its caller passes an empty slice
+/// and the warning omits that clause rather than guessing a kind.
+fn warn_unrecognized_effort(
+    scope: &str,
+    key: &str,
+    value: &str,
+    kinds: &[&str],
+    warnings: &mut Vec<String>,
+) {
+    if KNOWN_EFFORT_LEVELS.contains(&value) {
+        return;
+    }
+    let suggestion = KNOWN_EFFORT_LEVELS
+        .iter()
+        .map(|k| (*k, levenshtein(value, k)))
+        .min_by_key(|(_, dist)| *dist)
+        .filter(|(_, dist)| *dist <= 2)
+        .map(|(k, _)| k);
+    let hint = match suggestion {
+        Some(s) => format!(" (did you mean {s:?}?)"),
+        None => String::new(),
+    };
+    let kind_note = if kinds.is_empty() {
+        String::new()
+    } else {
+        format!(" for kind(s) {}", kinds.join(", "))
+    };
+    warnings.push(format!(
+        "{scope}: {key} {value:?} is not one of the values multiverse has seen accepted \
+         ({list}){kind_note}{hint}; the vendor CLI is the authority, so the value is still \
+         passed through",
+        list = KNOWN_EFFORT_LEVELS.join(", "),
+    ));
+}
+
 // ---------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------
@@ -600,9 +675,43 @@ const ACCOUNT_KEYS: &[&str] = &[
     "nexus_slots",
 ];
 
+/// The agent kinds Multiverse understands. Anything else is a config
+/// error at load time (Scout `e9af11` item 4): `runner.rs`, `limits.rs`,
+/// and `argv.rs` all gate vendor-specific behavior on an exact-lowercase
+/// match against one of these, so a typo'd or mis-cased `kind` that loaded
+/// unchecked would silently skip that handling instead of erroring.
+const ACCOUNT_KINDS: &[&str] = &["claude", "codex", "grok", "local"];
+
+/// The vendor families Multiverse understands. Anything else is a config
+/// error at load time (Scout `342332` item 5, mirroring item 4's `kind`
+/// check above): `selector.rs`, `limits.rs`, `accounts.rs`, and
+/// `sweep_nudges.rs` all gate vendor-specific behavior on an exact-lowercase
+/// match against one of these, so a typo'd or mis-cased explicit `vendor`
+/// would silently skip that handling instead of erroring. Only an
+/// explicitly written `vendor` is checked against this set — the default
+/// derived from `pool`'s prefix is the loader's own convention-following
+/// value, not user input, and `pool` is free-form grouping that need not
+/// resemble a vendor name (e.g. a shared quota pool named for its purpose).
+const KNOWN_VENDORS: &[&str] = &["claude", "codex", "grok", "chatgpt", "local"];
+
+/// The reasoning-effort levels Multiverse has seen accepted; the vendor
+/// CLI is the authority. Rework of `8174085`, which validated
+/// `roles.<key>.effort`/`review_policy.review_effort` against a closed
+/// set and refused anything outside it (exit code 3): `argv.rs::effort_args`
+/// forwards the value verbatim as `--effort`/`--reasoning-effort`/
+/// `-c model_reasoning_effort=` to whichever vendor CLI (`claude`, `codex`,
+/// `grok`) a seat runs, and those vendors accept different sets this repo
+/// cannot state as one closed list — Claude Code and codex accept
+/// `"xhigh"`, codex also accepts `"minimal"` but does not take `"max"` — so
+/// a hard error here would break a working config on a vendor-CLI upgrade.
+/// One `effort` string still covers every `kind` a role's
+/// `[roles.<key>.models]` table names (Q14 retired a per-kind value here
+/// along with the old single `model` scalar), so this set is intentionally
+/// not split by `kind` the way `ACCOUNT_KINDS`/`KNOWN_VENDORS` are.
+const KNOWN_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// The env var each known `kind` must select its account with
-/// (`config.py:328-332`). An unknown `kind` is passed through
-/// unchecked (`test_an_unknown_kind_is_not_checked_against_the_table`).
+/// (`config.py:328-332`).
 fn expected_config_dir_var(kind: &str) -> Option<&'static str> {
     match kind {
         "claude" => Some("CLAUDE_CONFIG_DIR"),
@@ -622,6 +731,7 @@ fn parse_account(
     warn_unknown_keys(table, &scope, ACCOUNT_KEYS, warnings);
 
     let kind = require_str(table, &scope, "kind")?;
+    require_one_of(&scope, "kind", &kind, ACCOUNT_KINDS)?;
     let config_dir_var = require_str(table, &scope, "config_dir_var")?;
     let config_dir_raw = require_str(table, &scope, "config_dir")?;
     let config_dir = MaybePlaceholder::parse(config_dir_raw);
@@ -637,8 +747,12 @@ fn parse_account(
     }
 
     let pool = optional_str(table, &scope, "pool")?.unwrap_or_else(|| name.to_string());
-    let vendor = optional_str(table, &scope, "vendor")?
-        .unwrap_or_else(|| pool.split(':').next().unwrap_or(&pool).to_string());
+    let vendor_explicit = optional_str(table, &scope, "vendor")?;
+    if let Some(ref v) = vendor_explicit {
+        require_one_of(&scope, "vendor", v, KNOWN_VENDORS)?;
+    }
+    let vendor =
+        vendor_explicit.unwrap_or_else(|| pool.split(':').next().unwrap_or(&pool).to_string());
     let command = optional_str(table, &scope, "command")?.unwrap_or_default();
     let short = optional_str(table, &scope, "short")?
         .unwrap_or_else(|| name.chars().take(2).collect::<String>().to_lowercase());
@@ -792,6 +906,13 @@ pub struct RoleSettings {
 
 const ROLE_KEYS: &[&str] = &["models", "write_scope", "effort", "on_exhausted", "skills"];
 
+/// The `write_scope` values Multiverse understands. Anything else is a
+/// config error at load time (Scout `e9af11` item 3): `trust.rs` and
+/// `brief.rs` both gate the write-deny rules on an exact `== "none"`
+/// match, so a typo'd or mis-cased value that loaded unchecked would
+/// silently fall into the writer branch instead of erroring.
+const WRITE_SCOPES: &[&str] = &["none", "declared"];
+
 /// `on_exhausted` (spec-config.md §B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -900,7 +1021,17 @@ fn parse_role_settings(
 
     let write_scope =
         optional_str(table, &scope, "write_scope")?.unwrap_or_else(|| "none".to_string());
+    require_one_of(&scope, "write_scope", &write_scope, WRITE_SCOPES)?;
     let effort = optional_str(table, &scope, "effort")?;
+    if let Some(ref level) = effort {
+        if level.is_empty() {
+            return Err(ConfigError::new(format!(
+                "{scope}: effort must be a non-empty string, got \"\""
+            )));
+        }
+        let kinds: Vec<&str> = models.keys().map(String::as_str).collect();
+        warn_unrecognized_effort(&scope, "effort", level, &kinds, warnings);
+    }
     let on_exhausted = match optional_str(table, &scope, "on_exhausted")? {
         None => default_on_exhausted(role),
         Some(s) => FallbackPolicy::parse(&s).ok_or_else(|| {
@@ -931,6 +1062,7 @@ pub struct Project {
     pub lane_setup: Option<String>,
     pub min_slots: u32,
     pub max_slots: Option<u32>,
+    pub autostart: bool,
 }
 
 const PROJECT_KEYS: &[&str] = &[
@@ -940,6 +1072,7 @@ const PROJECT_KEYS: &[&str] = &[
     "lane_setup",
     "min_slots",
     "max_slots",
+    "autostart",
 ];
 
 /// `^[a-z][a-z0-9_-]{1,3}$` — 2 to 4 characters (`PROJECT_SHORT_RE`).
@@ -1051,6 +1184,9 @@ fn parse_project(
             )));
         }
     }
+    // Read-only: `start --all` consults this to skip a project; `start
+    // <name>` still starts it. No writer edits this key.
+    let autostart = bool_with_default(table, &scope, "autostart", true)?;
 
     Ok(Project {
         name: name.to_string(),
@@ -1060,6 +1196,7 @@ fn parse_project(
         lane_setup,
         min_slots,
         max_slots,
+        autostart,
     })
 }
 
@@ -1275,7 +1412,10 @@ fn parse_review_policy(
                 "{scope}: review_effort must be a non-empty string, got \"\""
             )))
         }
-        Some(s) => s,
+        Some(s) => {
+            warn_unrecognized_effort(scope, "review_effort", &s, &[], warnings);
+            s
+        }
     };
     let output = optional_str(table, scope, "review_output")?.unwrap_or(defaults.output);
     if output != "terse" && output != "full" {
@@ -1512,6 +1652,15 @@ fn parse_board(value: &Value, warnings: &mut Vec<String>) -> Result<Board, Confi
     })
 }
 
+/// `[activity]` only ever reads `pairs` (Scout `342332` item 3): every
+/// other section calls `warn_unknown_keys` against its own `*_KEYS` const,
+/// but this one and `[mail]` below had none, so a typo like `piars` loaded
+/// silently with `activity_pairs` left empty and no warning at all.
+const ACTIVITY_KEYS: &[&str] = &["pairs"];
+
+/// `[mail]`'s sibling of [`ACTIVITY_KEYS`] — same gap, same fix.
+const MAIL_KEYS: &[&str] = &["pairs"];
+
 fn parse_pairs(value: &Value, scope: &str) -> Result<BTreeMap<String, Vec<String>>, ConfigError> {
     let table = require_table(value, scope)?;
     let mut pairs = BTreeMap::new();
@@ -1718,6 +1867,7 @@ pub fn load_config_str(content: &str, path: &Path) -> Result<Config, ConfigError
     let activity_pairs = match root.get("activity") {
         Some(v) => {
             let t = require_table(v, "activity").map_err(|e| ConfigError::at(path, e.message()))?;
+            warn_unknown_keys(t, "activity", ACTIVITY_KEYS, &mut warnings);
             match t.get("pairs") {
                 Some(p) => parse_pairs(p, "activity.pairs")
                     .map_err(|e| ConfigError::at(path, e.message()))?,
@@ -1729,6 +1879,7 @@ pub fn load_config_str(content: &str, path: &Path) -> Result<Config, ConfigError
     let mail_pairs = match root.get("mail") {
         Some(v) => {
             let t = require_table(v, "mail").map_err(|e| ConfigError::at(path, e.message()))?;
+            warn_unknown_keys(t, "mail", MAIL_KEYS, &mut warnings);
             match t.get("pairs") {
                 Some(p) => {
                     parse_pairs(p, "mail.pairs").map_err(|e| ConfigError::at(path, e.message()))?
@@ -2501,6 +2652,226 @@ scout = ["claude-personal"]
         assert!(config.warnings[0].contains("nexus_slots"));
     }
 
+    /// Scout `e9af11` item 4: a mis-cased `kind` is refused, naming the
+    /// key, the bad value, the accepted set, and suggesting the close
+    /// match — not silently rewritten to the canonical spelling.
+    #[test]
+    fn account_kind_rejects_a_mis_cased_value() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "[accounts.claude-personal]\nkind = \"claude\"",
+            "[accounts.claude-personal]\nkind = \"Claude\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let err = load_config_str(&content, &config_path).unwrap_err();
+        assert!(err.message().contains("kind"), "{}", err.message());
+        assert!(err.message().contains("\"Claude\""), "{}", err.message());
+        assert!(err.message().contains("claude"), "{}", err.message());
+        assert!(err.message().contains("codex"), "{}", err.message());
+        assert!(
+            err.message().contains("did you mean \"claude\""),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// Scout `e9af11` item 4: a typo'd `kind` close to a known value
+    /// gets a "did you mean" suggestion naming that value.
+    #[test]
+    fn account_kind_rejects_a_typo_suggesting_the_closest_match() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "[accounts.claude-personal]\nkind = \"claude\"",
+            "[accounts.claude-personal]\nkind = \"claudee\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let err = load_config_str(&content, &config_path).unwrap_err();
+        assert!(
+            err.message().contains("did you mean \"claude\""),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// Scout `e9af11` item 4: every `kind` the code really handles —
+    /// including `"local"` (gated elsewhere on `vendor == "local"`, not
+    /// `kind`, but still a real value the fixture at
+    /// `crates/mv-cli/src/commands/accounts.rs` relies on) — still loads.
+    #[test]
+    fn account_kind_accepts_every_known_value() {
+        let cases = [
+            ("claude", "CLAUDE_CONFIG_DIR"),
+            ("codex", "CODEX_HOME"),
+            ("grok", "GROK_HOME"),
+            ("local", "LOCAL_HOME"),
+        ];
+        for (kind, config_dir_var) in cases {
+            let content = format!(
+                r#"
+[accounts.a]
+kind = "{kind}"
+config_dir_var = "{config_dir_var}"
+config_dir = "<<PLACEHOLDER: x>>"
+"#
+            );
+            let config_path = Path::new("/tmp/does-not-matter/config.toml");
+            let config = load_config_str(&content, config_path)
+                .unwrap_or_else(|e| panic!("kind {kind:?} should load: {}", e.message()));
+            assert_eq!(config.accounts["a"].kind, kind);
+        }
+    }
+
+    /// Scout `342332` item 5: a mis-cased explicit `vendor` is refused,
+    /// naming the key, the bad value, the accepted set, and suggesting
+    /// the close match — the same shape as `kind`'s check above.
+    #[test]
+    fn account_vendor_rejects_a_mis_cased_value() {
+        let content = r#"
+[accounts.a]
+kind = "grok"
+config_dir_var = "GROK_HOME"
+config_dir = "<<PLACEHOLDER: x>>"
+vendor = "Grok"
+"#;
+        let config_path = Path::new("/tmp/does-not-matter/config.toml");
+        let err = load_config_str(content, config_path).unwrap_err();
+        assert!(err.message().contains("vendor"), "{}", err.message());
+        assert!(err.message().contains("\"Grok\""), "{}", err.message());
+        assert!(err.message().contains("chatgpt"), "{}", err.message());
+        assert!(
+            err.message().contains("did you mean \"grok\""),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// Scout `342332` item 5: every `vendor` the code really compares
+    /// against (`selector.rs`, `limits.rs`, `accounts.rs`,
+    /// `sweep_nudges.rs`) still loads when written explicitly.
+    #[test]
+    fn account_vendor_accepts_every_known_value() {
+        for vendor in ["claude", "codex", "grok", "chatgpt", "local"] {
+            let content = format!(
+                r#"
+[accounts.a]
+kind = "claude"
+config_dir_var = "CLAUDE_CONFIG_DIR"
+config_dir = "<<PLACEHOLDER: x>>"
+vendor = "{vendor}"
+"#
+            );
+            let config_path = Path::new("/tmp/does-not-matter/config.toml");
+            let config = load_config_str(&content, config_path)
+                .unwrap_or_else(|e| panic!("vendor {vendor:?} should load: {}", e.message()));
+            assert_eq!(config.accounts["a"].vendor, vendor);
+        }
+    }
+
+    /// `vendor`'s default is derived from `pool`'s prefix, and `pool` is
+    /// free-form grouping (spec-config.md: "Pool and vendor are separate
+    /// on purpose") that need not resemble a vendor name — a pool like
+    /// `"shared"` grouping two accounts under one quota is valid and must
+    /// keep loading. Only an explicitly written `vendor` is checked
+    /// against `KNOWN_VENDORS`.
+    #[test]
+    fn account_vendor_default_derived_from_an_unrecognized_pool_still_loads() {
+        let content = r#"
+[accounts.a]
+kind = "claude"
+config_dir_var = "CLAUDE_CONFIG_DIR"
+config_dir = "<<PLACEHOLDER: x>>"
+pool = "shared"
+"#;
+        let config_path = Path::new("/tmp/does-not-matter/config.toml");
+        let config = load_config_str(content, config_path).unwrap();
+        assert_eq!(config.accounts["a"].vendor, "shared");
+    }
+
+    /// Scout `e9af11` item 3: a mis-cased `write_scope` is refused,
+    /// naming the key, the bad value, the accepted set, and suggesting
+    /// the close match — not silently rewritten to the canonical
+    /// spelling.
+    #[test]
+    fn write_scope_rejects_a_mis_cased_value() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "write_scope = \"none\"",
+            "write_scope = \"None\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let err = load_config_str(&content, &config_path).unwrap_err();
+        assert!(err.message().contains("write_scope"), "{}", err.message());
+        assert!(err.message().contains("\"None\""), "{}", err.message());
+        assert!(err.message().contains("declared"), "{}", err.message());
+        assert!(
+            err.message().contains("did you mean \"none\""),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// Scout `e9af11` item 3: a typo'd `write_scope` close to a known
+    /// value gets a "did you mean" suggestion naming that value.
+    #[test]
+    fn write_scope_rejects_a_typo_suggesting_the_closest_match() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config(&project_root).replacen(
+            "write_scope = \"none\"",
+            "write_scope = \"declar\"",
+            1,
+        );
+        let config_path = dir.path().join("config.toml");
+
+        let err = load_config_str(&content, &config_path).unwrap_err();
+        assert!(
+            err.message().contains("did you mean \"declared\""),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// Scout `e9af11` item 3: both values the code actually treats as
+    /// meaningful (`trust.rs`/`brief.rs` compare only against `"none"`;
+    /// everything else, including `"declared"`, takes the writer branch)
+    /// still load.
+    #[test]
+    fn write_scope_accepts_every_known_value() {
+        for write_scope in ["none", "declared"] {
+            let dir = tempdir().unwrap();
+            let project_root = dir.path().join("example-project");
+            fs::create_dir_all(&project_root).unwrap();
+            let content = minimal_config(&project_root).replacen(
+                "write_scope = \"none\"",
+                &format!("write_scope = \"{write_scope}\""),
+                1,
+            );
+            let config_path = dir.path().join("config.toml");
+
+            let config = load_config_str(&content, &config_path).unwrap_or_else(|e| {
+                panic!("write_scope {write_scope:?} should load: {}", e.message())
+            });
+            assert_eq!(
+                config.roles[&Role::Scout].write_scope,
+                write_scope,
+                "write_scope {write_scope:?}"
+            );
+        }
+    }
+
     #[test]
     fn malformed_toml_names_the_file() {
         let config_path = Path::new("/tmp/does-not-matter/config.toml");
@@ -2852,6 +3223,67 @@ min_slots = 2
     }
 
     #[test]
+    fn a_project_with_no_autostart_key_defaults_to_true() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let config = load_config_str(
+            &minimal_config(&project_root),
+            &dir.path().join("config.toml"),
+        )
+        .unwrap();
+        assert!(config.projects["example"].autostart);
+    }
+
+    /// Inserts `autostart = {value}` into `minimal_config`'s
+    /// `[projects.example]` block — appending it after the whole string
+    /// would instead land under the trailing `[projects.example.chains]`
+    /// header, since a TOML key always belongs to the table header most
+    /// recently seen above it.
+    fn minimal_config_with_autostart(project_path: &Path, value: &str) -> String {
+        minimal_config(project_path).replacen(
+            "[projects.example]\n",
+            &format!("[projects.example]\nautostart = {value}\n"),
+            1,
+        )
+    }
+
+    #[test]
+    fn autostart_true_is_accepted() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config_with_autostart(&project_root, "true");
+        let config = load_config_str(&content, &dir.path().join("config.toml")).unwrap();
+        assert!(config.projects["example"].autostart);
+    }
+
+    #[test]
+    fn autostart_false_is_accepted() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config_with_autostart(&project_root, "false");
+        let config = load_config_str(&content, &dir.path().join("config.toml")).unwrap();
+        assert!(!config.projects["example"].autostart);
+    }
+
+    #[test]
+    fn a_non_boolean_autostart_is_refused() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let content = minimal_config_with_autostart(&project_root, "\"nope\"");
+        let err = load_config_str(&content, &dir.path().join("config.toml")).unwrap_err();
+        assert!(err.message().contains("autostart"), "{}", err.message());
+        assert!(
+            err.message().contains("must be a boolean"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
     fn two_projects_reaching_the_same_directory_via_a_symlink_collide() {
         let dir = tempdir().unwrap();
         let real = dir.path().join("real");
@@ -3037,6 +3469,49 @@ allowlist = "security/.gitleaks.toml"
             "{:?}",
             config.warnings
         );
+    }
+
+    /// Scout `342332` item 3: `[activity]` had no unknown-key checking at
+    /// all — a typo like `piars` for `pairs` loaded silently with
+    /// `activity_pairs` left empty and no warning. Same message shape as
+    /// every other section's `warn_unknown_keys` call (e.g.
+    /// `secrets_scan_rejects_an_unknown_key` above).
+    #[test]
+    fn activity_rejects_an_unknown_key() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let content = "[activity]\npiars = {}\n";
+        let config = load_config_str(content, &config_path).unwrap();
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("activity: unknown key \"piars\"")
+                    && w.contains("did you mean \"pairs\"?")),
+            "{:?}",
+            config.warnings
+        );
+        assert!(config.activity_pairs.is_empty());
+    }
+
+    /// `[mail]`'s sibling of `activity_rejects_an_unknown_key` above —
+    /// same gap, same fix, same message shape.
+    #[test]
+    fn mail_rejects_an_unknown_key() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let content = "[mail]\npiars = {}\n";
+        let config = load_config_str(content, &config_path).unwrap();
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("mail: unknown key \"piars\"")
+                    && w.contains("did you mean \"pairs\"?")),
+            "{:?}",
+            config.warnings
+        );
+        assert!(config.mail_pairs.is_empty());
     }
 
     #[test]
@@ -3725,6 +4200,96 @@ unavailable_until = "{value}"
         let config_path = dir.path().join("config.toml");
         let err = load_config_str(content, &config_path).unwrap_err();
         assert!(err.message().contains("non-empty"));
+    }
+
+    /// `"xhigh"` and `"minimal"` (added by the rework in this commit,
+    /// since codex accepts `"minimal"` and Claude Code/codex accept
+    /// `"xhigh"`) are in [`KNOWN_EFFORT_LEVELS`] along with every level
+    /// already documented, so none of them warn.
+    #[test]
+    fn review_effort_accepts_every_known_level_with_no_warning() {
+        for level in KNOWN_EFFORT_LEVELS {
+            let dir = tempdir().unwrap();
+            let content = format!("[review_policy]\nreview_effort = \"{level}\"\n");
+            let config_path = dir.path().join("config.toml");
+            let config = load_config_str(&content, &config_path)
+                .unwrap_or_else(|e| panic!("{level:?} should parse: {e}"));
+            assert_eq!(config.review_policy.effort, *level);
+            assert!(
+                config.warnings.is_empty(),
+                "{level:?} should not warn: {:?}",
+                config.warnings
+            );
+        }
+    }
+
+    /// Rework of `8174085`: an unrecognized `review_effort` used to be a
+    /// load-time error (exit code 3); it is now exactly one load warning,
+    /// and the config still loads with the value passed through
+    /// unchanged. Revert check: turning `warn_unrecognized_effort` back
+    /// into a `require_one_of` call makes this test fail, since
+    /// `load_config_str` would then return `Err` instead of `Ok`.
+    #[test]
+    fn review_effort_warns_on_an_unrecognized_level_but_still_loads() {
+        let dir = tempdir().unwrap();
+        let content = "[review_policy]\nreview_effort = \"hihg\"\n";
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(content, &config_path).unwrap();
+        assert_eq!(config.review_policy.effort, "hihg");
+        assert_eq!(config.warnings.len(), 1);
+        assert!(config.warnings[0].contains("hihg"));
+    }
+
+    #[test]
+    fn role_effort_refuses_an_empty_string() {
+        let dir = tempdir().unwrap();
+        let content = "[roles.scout]\nwrite_scope = \"none\"\neffort = \"\"\n\n\
+             [roles.scout.models]\nclaude = \"m\"\n";
+        let config_path = dir.path().join("config.toml");
+        let err = load_config_str(content, &config_path).unwrap_err();
+        assert!(err.message().contains("non-empty"));
+    }
+
+    #[test]
+    fn role_effort_accepts_every_known_level_with_no_warning() {
+        for level in KNOWN_EFFORT_LEVELS {
+            let dir = tempdir().unwrap();
+            let content = format!(
+                "[roles.scout]\nwrite_scope = \"none\"\neffort = \"{level}\"\n\n\
+                 [roles.scout.models]\nclaude = \"m\"\n"
+            );
+            let config_path = dir.path().join("config.toml");
+            let config = load_config_str(&content, &config_path)
+                .unwrap_or_else(|e| panic!("{level:?} should parse: {e}"));
+            assert_eq!(config.roles[&Role::Scout].effort.as_deref(), Some(*level));
+            assert!(
+                config.warnings.is_empty(),
+                "{level:?} should not warn: {:?}",
+                config.warnings
+            );
+        }
+    }
+
+    /// Rework of `8174085`: an unrecognized role `effort` used to be a
+    /// load-time error (exit code 3); it is now exactly one load warning
+    /// naming the value and the `models` kind(s) it would be forwarded
+    /// to, and the config still loads. Revert check: turning
+    /// `warn_unrecognized_effort` back into a `require_one_of` call makes
+    /// this test fail, since `load_config_str` would then return `Err`.
+    #[test]
+    fn role_effort_warns_on_an_unrecognized_level_but_still_loads() {
+        let dir = tempdir().unwrap();
+        let content = "[roles.scout]\nwrite_scope = \"none\"\neffort = \"extreme\"\n\n\
+             [roles.scout.models]\nclaude = \"m\"\n";
+        let config_path = dir.path().join("config.toml");
+        let config = load_config_str(content, &config_path).unwrap();
+        assert_eq!(
+            config.roles[&Role::Scout].effort.as_deref(),
+            Some("extreme")
+        );
+        assert_eq!(config.warnings.len(), 1);
+        assert!(config.warnings[0].contains("extreme"));
+        assert!(config.warnings[0].contains("claude"));
     }
 
     /// Guards `HOME` for [`resolve_home_dir_falls_back_to_the_passwd_home_when_home_is_unset`]

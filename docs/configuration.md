@@ -65,7 +65,10 @@ intended fleet-wide schema:
   settings.
 - `[accounts.<name>]` — one seat per vendor login (`kind`,
   `config_dir_var`, `config_dir`, `pool`, `available`, optional `short`,
-  `interactive`, `command`, `model`, `nexus_slots`). `command` is required
+  `interactive`, `command`, `model`, `nexus_slots`). `kind` must be one of
+  `claude`, `codex`, `grok`, `local` — anything else, including a
+  mis-cased spelling, is a load-time config error (exit code 3) that
+  names the bad value and suggests the closest accepted one. `command` is required
   for every `kind = "claude"` account, not only an `interactive` one — a
   chain that reaches a `claude` seat with no `command` set loads fine but
   refuses at dispatch time ("no command wrapper configured"). Codex and
@@ -75,9 +78,31 @@ intended fleet-wide schema:
   counts worker panes only, so a Nexus pane never eats a shared seat's
   worker capacity, and the fleet-wide `max_concurrent` check excludes
   Nexus panes entirely. `multiverse accounts` reports both counts on a
-  capped seat: `workers N/cap, nexus M/nexus_slots`.
+  capped seat: `workers N/cap, nexus M/nexus_slots`. An explicitly written
+  `vendor` must be one of `claude`, `codex`, `grok`, `chatgpt`, `local` —
+  anything else, including a mis-cased spelling, is a load-time config
+  error (exit code 3) that names the bad value and suggests the closest
+  accepted one, the same check `kind` gets above. `vendor` defaults to the
+  part of `pool` before its first `:` when left unset; that derived
+  default is not checked against the list, since `pool` is free-form
+  grouping and need not resemble a vendor name.
 - `[roles.<key>]` — write scope, effort, `on_exhausted`, skills, and a
-  `[roles.<key>.models]` table keyed by agent kind. The stable keys are
+  `[roles.<key>.models]` table keyed by agent kind. `write_scope` must be
+  one of `none` or `declared` — anything else, including a mis-cased
+  spelling, is a load-time config error (exit code 3) that names the bad
+  value and suggests the closest accepted one. An explicitly written
+  `effort` outside `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — the
+  values multiverse has seen accepted; the vendor CLI is the authority —
+  is a load warning, not a load-time error: it names the bad value, the
+  `models` kind(s) it would be forwarded to, and the known values, and the
+  config still loads with the value passed through unchanged. An empty
+  string is still a load-time config error. This one `effort` string
+  applies to every `kind` the role's `models` table names, not per vendor,
+  since Multiverse forwards it verbatim to whichever vendor CLI that seat
+  runs, and the vendors accept different sets this repo cannot state as
+  one closed list (Claude Code and codex accept `xhigh`; codex also
+  accepts `minimal` but not `max`) — a hard error here would break a
+  working config on a vendor-CLI upgrade. The stable keys are
   `scout`, `builder`, `archivist`, `critic`, `seer`, `artisan`, `watcher`,
   plus `nexus` / `council` chains. Seven worker roles dispatch with
   `--role`; Council is its own subcommand; Nexus is seeded by `start`.
@@ -87,8 +112,22 @@ intended fleet-wide schema:
   to `<state dir>/home` when omitted — `multiverse start multiverse` creates
   that directory if it does not exist yet. If no chain is configured for a
   role, loading that dispatch is a configuration error (exit code 3) naming
-  the role and project, not a silent default.
-- Optional `[review_policy]`, `[secrets_scan]`, and `[activity.pairs]`.
+  the role and project, not a silent default. `autostart` (boolean, default
+  `true`) is read-only — nothing writes it — and only changes what
+  `multiverse start --all` does: a project with `autostart = false` is
+  skipped, with one line naming it, while `multiverse start <name>` still
+  starts that project when named explicitly. A non-boolean value is a
+  configuration error (exit code 3).
+- Optional `[review_policy]`, `[secrets_scan]`, `[activity.pairs]`, and
+  `[mail.pairs]`. Like every other section, `[activity]` and `[mail]` warn
+  on any key other than `pairs` and suggest the closest match (a typo'd
+  `piars`, say) rather than silently ignoring it — this is a warning, not
+  a load-time error, since an unknown key here does not block loading the
+  way a bad `kind` or `vendor` value does above. An explicitly written
+  `review_policy.review_effort` outside the same known values as
+  `roles.<key>.effort` is the same kind of load warning described above —
+  the config still loads and the value is still passed through. An empty
+  string is still a load-time config error.
 
 A `<<PLACEHOLDER: ...>>` marker is carried through, never guessed at, by
 any tool that loads the file (`mv_config::placeholder::MaybePlaceholder`)
@@ -161,7 +200,7 @@ which accounts a role's chain draws from, per project.
 | `MULTIVERSE_CONFIG` | Absolute config-file path. Plugin wrapper sets it from `$HERDR_PLUGIN_CONFIG_DIR/config.toml`; `dispatch`/`council` set it on every worker or council pane to the dispatcher's already-resolved path, so a worker's own `multiverse` uses the dispatcher's config. Direct `bin/multiverse` invocations also use it as a development/testing override. | plugin wrapper; `RealDispatchStore::prepare` / `render_card`; `mv_config::load::resolve_config_path_from_env` |
 | `MULTIVERSE_STATE_DIR` | Absolute fleet state directory. Plugin wrapper sets it from `$HERDR_PLUGIN_STATE_DIR`; `dispatch`/`council` set it on every worker or council pane to the dispatcher's already-resolved state dir, so a worker's own `multiverse` uses the dispatcher's state. Direct `bin/multiverse` invocations also use it as a development/testing override. | plugin wrapper; `RealDispatchStore::prepare` / `render_card`; `mv_config::load::config_state_dir_from_env` |
 | `MULTIVERSE_INVOCATION` | The command a pane uses to re-invoke Multiverse; set by the start action | plugin wrapper, Nexus seed renderer |
-| `MULTIVERSE_READ_ONLY` | Set on every plugin action except `start` | plugin wrapper |
+| `MULTIVERSE_READ_ONLY` | Set on every plugin action except `start` or `import-python` | plugin wrapper |
 | `MULTIVERSE_PROMPTS_DIR` | Override embedded `prompts/` | `mv-engine::prompts` |
 | `MULTIVERSE_TEMPLATES_DIR` | Override embedded `templates/` | `mv-engine::prompts` |
 | `MULTIVERSE_DIRECTIVES` | Override the fleet directives directory | `mv-engine::directives` |

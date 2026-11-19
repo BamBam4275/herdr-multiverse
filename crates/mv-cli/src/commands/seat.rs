@@ -1,5 +1,8 @@
 //! `multiverse seat show <account> [--json]`: metadata and stored cap.
-//! Config errors are operation errors (exit 1). This inspection
+//! An unresolvable config *path* is a needs-config exit (3), matching
+//! every other command (Scout finding `20261117-scout-9077fc`#1); a
+//! config file that loads but is invalid, or an unknown seat name, stay
+//! operation errors (exit 1) here on purpose. This inspection
 //! treats an unreadable Herdr listing as an unknown open-agent count.
 //! Open count is worker panes only — a busy Nexus pane on the same seat
 //! is excluded, matching `accounts`/`check` (card `20261115-b-4ded07`).
@@ -103,9 +106,8 @@ impl LiveConfig {
         config_override: Option<&Path>,
         count: impl FnOnce(&str, &Config) -> Option<seatstate::SeatOpenCounts>,
     ) -> Result<SeatState, Failure> {
-        let path = resolve_config_path_from_env(config_override).map_err(|error| {
-            Failure::Operation(format!("cannot resolve the config path: {error}"))
-        })?;
+        let path = resolve_config_path_from_env(config_override)
+            .map_err(|error| Failure::Config(format!("cannot resolve the config path: {error}")))?;
         let config = load_config(&path)
             .map_err(|error| Failure::Operation(config_error_message(error.to_string())))?;
         let account = config

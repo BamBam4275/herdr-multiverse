@@ -203,6 +203,7 @@ mod tests {
             lane_setup: None,
             min_slots: 0,
             max_slots: None,
+            autostart: true,
         }
     }
 
@@ -253,6 +254,49 @@ mod tests {
         );
         assert_eq!(lines.next().unwrap(), "  /tmp/demo.md");
         assert_eq!(lines.next().unwrap(), "  Continue history.");
+    }
+
+    /// Card `20261117-builder-725c8e` (Scout `0b79b7` item 3):
+    /// `run_set`'s `"directives set: no directive was written"` refusal
+    /// (`directives.rs:77-80`) was reached only by its own `return Err`,
+    /// no test calling `run_set` directly. An invalid project name fails
+    /// `mv_engine::directives::write` deterministically — before any
+    /// filesystem access, so `state_dir` need not exist — without needing
+    /// a read-only directory or other fs trickery.
+    #[test]
+    fn run_set_refuses_when_every_write_fails() {
+        let a = project("in/valid", "/tmp/mv-cli-directives-test-a");
+        let b = project("also/bad", "/tmp/mv-cli-directives-test-b");
+        let selected = [&a, &b];
+        let state_dir = Path::new("/tmp/mv-cli-directives-test-unused-state-dir");
+        let m = crate::args::command()
+            .try_get_matches_from(["multiverse", "directives", "set", "--body", "hello"])
+            .unwrap();
+        let sub = m
+            .subcommand_matches("directives")
+            .unwrap()
+            .subcommand_matches("set")
+            .unwrap();
+        let err = run_set(state_dir, &selected, sub).unwrap_err();
+        assert_eq!(err.to_string(), "directives set: no directive was written");
+        assert_eq!(err.code(), crate::exit::ERROR);
+    }
+
+    /// Same card/finding as the test above, for `run_show`'s
+    /// `"directives show: could not read any directive"` refusal
+    /// (`directives.rs:100-103`): an invalid project name fails
+    /// `mv_engine::directives::read` the same deterministic way.
+    #[test]
+    fn run_show_refuses_when_every_read_fails() {
+        let a = project("in/valid", "/tmp/mv-cli-directives-test-a");
+        let selected = [&a];
+        let state_dir = Path::new("/tmp/mv-cli-directives-test-unused-state-dir");
+        let err = run_show(state_dir, &selected).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "directives show: could not read any directive"
+        );
+        assert_eq!(err.code(), crate::exit::ERROR);
     }
 
     #[test]

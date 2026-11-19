@@ -446,6 +446,85 @@ mod tests {
     }
 
     #[test]
+    fn a_live_branch_without_a_recorded_base_falls_back_to_the_merge_base() {
+        let repo = Repo::new();
+        let task = "20261101-fixer-abcdef";
+        let branch = format!("multiverse/{task}");
+        git_ok(repo.path(), &["checkout", "-q", "-b", &branch]);
+        repo.write_commit("src/auth/login.rs", "fn login() {}\n", "work");
+        git_ok(repo.path(), &["checkout", "-q", "main"]);
+        let merge_base = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["merge-base", "HEAD", &branch])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        // Advance `main` past the fork point so a buggy fallback (e.g. one
+        // that just diffed against `main`'s current `HEAD` instead of
+        // computing a real merge-base) would resolve a different, wrong
+        // base.
+        repo.write_commit(
+            "main_only.txt",
+            "advance\n",
+            "advance main past the fork point",
+        );
+        let expected_base = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["rev-parse", "--short", &merge_base])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+
+        // No `repo.record_base(task)` call — `base_recorded` is false, so
+        // `lane_diff` must fall back to `git merge-base HEAD branch`.
+        let diff = lane_diff(repo.path(), task, 1500).unwrap();
+        assert_eq!(diff.base, expected_base.trim());
+        assert_eq!(diff.touched_files, vec!["src/auth/login.rs".to_string()]);
+    }
+
+    #[test]
+    fn a_live_branch_without_a_recorded_base_and_no_common_ancestor_falls_back_to_head() {
+        let repo = Repo::new();
+        let task = "20261101-fixer-abcdef";
+        let branch = format!("multiverse/{task}");
+        // An orphan branch shares no history with `main` at all, so `git
+        // merge-base HEAD branch` itself fails — the fallback-to-`"HEAD"`
+        // branch, one step further than the previous test's successful
+        // merge-base case.
+        git_ok(repo.path(), &["checkout", "-q", "--orphan", &branch]);
+        git_ok(repo.path(), &["rm", "-rf", "-q", "."]);
+        repo.write_commit("src/orphan.rs", "fn orphan() {}\n", "orphan work");
+        git_ok(repo.path(), &["checkout", "-q", "main"]);
+
+        let expected_base = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+
+        // No `repo.record_base(task)` call, and no common ancestor either —
+        // `lane_diff` must fall back all the way to `"HEAD"`.
+        let diff = lane_diff(repo.path(), task, 1500).unwrap();
+        assert_eq!(diff.base, expected_base.trim());
+        assert!(diff.touched_files.contains(&"src/orphan.rs".to_string()));
+    }
+
+    #[test]
     fn a_merged_lane_recovers_its_tip_from_the_merge_commit() {
         let repo = Repo::new();
         let task = "20261101-fixer-abcdef";

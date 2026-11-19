@@ -292,6 +292,81 @@ migrate, idempotency, a comment-count check, `doctor`, and `check`
 against a disposable copy of a config file, if you want to rehearse
 this step before touching your real one.
 
+### Other load-time checks on the migrated file
+
+Retired role keys aren't the only thing that can make a config refuse
+to load, or earn a new warning, once you're on the Rust binary. None
+of these need `multiverse config migrate` — each is a value you fix by
+hand in `config.toml`.
+
+**`kind` and `write_scope` must be in a fixed set (exit code 3).**
+`[accounts.<name>].kind` only accepts `claude`, `codex`, `grok`,
+`local` (`crates/mv-config/src/load.rs:683,734`); `[roles.<key>].write_scope`
+only accepts `none`, `declared` (`load.rs:914,1024`). The refusal
+names the key, the bad value, the accepted set, and a "did you mean"
+suggestion when the value is a close typo or mis-casing:
+
+```
+accounts.claude-personal: kind must be one of claude, codex, grok, local; got "Claude" (did you mean "claude"?)
+roles.scout: write_scope must be one of none, declared; got "None" (did you mean "none"?)
+```
+
+Fix: correct the value to one of the accepted spellings, lowercase and
+exact. A Python-origin `write_scope = "None"` used to load and then
+silently take the writer branch, since `trust.rs`/`brief.rs` compare
+only against the lowercase `"none"`; it now refuses to load instead of
+loading wrong.
+
+**An explicitly written account `vendor` must also be in a fixed set
+(exit code 3) — a `pool`-derived one is not checked.** When you write
+`[accounts.<name>].vendor` yourself, it only accepts `claude`, `codex`,
+`grok`, `chatgpt`, `local` (`load.rs:695`, checked at `load.rs:750-753`):
+
+```
+accounts.a: vendor must be one of claude, codex, grok, chatgpt, local; got "Grok" (did you mean "grok"?)
+```
+
+If you leave `vendor` unset, it defaults to `pool`'s prefix before the
+first `:` (`load.rs:754-755`), and that derived value is never checked
+against this set — `pool` is free-form grouping and need not resemble
+a vendor name. Fix: only touch a `vendor` line that is both present
+and wrong; an absent `vendor` key never needs this fix.
+
+**An unrecognized `effort`/`review_effort` is a warning, not a
+refusal.** `[roles.<key>].effort` and `[review_policy].review_effort`
+are checked against `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max` — the values multiverse has seen vendor CLIs accept — but the
+config still loads either way, since the vendor CLI, not this list, is
+the real authority (`load.rs:697-711`). An unrecognized value prints
+one load warning naming the value, the known values, and — for a
+role's `effort` — which `[roles.<key>.models]` kind(s) it would be
+forwarded to (`load.rs:554-585`, called at `load.rs:1025-1033` for
+roles and `load.rs:1408-1418` for `review_policy`):
+
+```
+roles.scout: effort "extreme" is not one of the values multiverse has seen accepted (minimal, low, medium, high, xhigh, max) for kind(s) claude; the vendor CLI is the authority, so the value is still passed through
+review_policy: review_effort "hihg" is not one of the values multiverse has seen accepted (minimal, low, medium, high, xhigh, max); the vendor CLI is the authority, so the value is still passed through
+```
+
+Fix: optional. Clean up the value only if it was actually a typo — a
+genuinely new vendor-specific level still loads and is still forwarded
+as-is. An empty `effort`/`review_effort` string is still a load-time
+error, unchanged from before.
+
+**`[activity]` and `[mail]` now warn on an unknown key.** Both
+sections previously had no unknown-key checking at all, so a typo like
+`piars` for `pairs` loaded silently with that section's pairs left
+empty (`load.rs:1655-1662`, checked at `load.rs:1870` and `load.rs:1882`):
+
+```
+activity: unknown key "piars" (did you mean "pairs"?)
+mail: unknown key "piars" (did you mean "pairs"?)
+```
+
+Fix: rename the key to `pairs`. The config loaded before with that
+section silently empty; it still loads now, but the warning explains
+why activity/mail routing wasn't doing anything.
+
 ## Step 5 — What the role rename means in practice
 
 | History / on-disk name | Current name |

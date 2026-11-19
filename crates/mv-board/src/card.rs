@@ -22,6 +22,12 @@ pub enum LiveAgentStatus {
     HerdrBlocked,
     /// The prompt classifier caught a dialog Herdr mislabels idle/done/unknown.
     PromptBlocked,
+    /// The status file holds a token outside `done`/`blocked`/`failed` — a
+    /// garbled (e.g. truncated) write, not silence. Always wins over
+    /// `Running`/`Stalled`/`Awaiting`, no matter what the live pane
+    /// reports — card `20261117-b-46b159`, matching `tasks`'s own
+    /// `garbled` row (card `20261117-b-437eeb`).
+    Garbled,
 }
 
 /// A task's recorded terminal outcome, if any.
@@ -255,9 +261,16 @@ pub fn split_dispatched(tasks: &[DispatchedTaskSnapshot]) -> (Vec<Card>, Vec<Car
                 continue;
             }
         }
+        // `Garbled` carries no recorded `blocked` outcome either — a status
+        // file holding an unrecognized token is not Herdr's own report, but
+        // it is exactly as much "needs a look, not plain running" as the
+        // other two, so it joins them here rather than falling through to
+        // IN PROGRESS below.
         let herdr_says_blocked = matches!(
             task.live_status,
-            Some(LiveAgentStatus::HerdrBlocked) | Some(LiveAgentStatus::PromptBlocked)
+            Some(LiveAgentStatus::HerdrBlocked)
+                | Some(LiveAgentStatus::PromptBlocked)
+                | Some(LiveAgentStatus::Garbled)
         );
         if herdr_says_blocked {
             blocked.push(task_card(task));
@@ -327,6 +340,15 @@ mod tests {
     #[test]
     fn a_herdr_blocked_live_agent_lands_in_blocked_not_in_progress() {
         let t = dispatched(None, Some(LiveAgentStatus::HerdrBlocked));
+        let (blocked, in_progress) = split_dispatched(&[t]);
+        assert_eq!(blocked.len(), 1);
+        assert!(in_progress.is_empty());
+    }
+
+    #[test]
+    fn a_garbled_status_task_lands_in_blocked_not_in_progress() {
+        let mut t = dispatched(None, Some(LiveAgentStatus::Garbled));
+        t.state_note = Some("status file holds an unrecognized value".into());
         let (blocked, in_progress) = split_dispatched(&[t]);
         assert_eq!(blocked.len(), 1);
         assert!(in_progress.is_empty());

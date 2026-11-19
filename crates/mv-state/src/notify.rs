@@ -745,12 +745,17 @@ fn suppressed_suffixed(
 /// "flush delivers queued outbox records without re-running dedup/rate
 /// decide ... so a retried flush still delivers"). Failed pushes requeue
 /// normally; a fresh claim is removed only after the whole replay. An error
-/// retains the claim for stale-claim recovery. An episode-backed record
-/// whose table is missing or unreadable is requeued without a send
-/// attempt (`notify.py:1108-1122`, card `20261103-b-51b151`). A sweep that
-/// already holds the episode-table lock is the same posture: requeue
-/// rather than read the still-readable old table (`notify.py:1103-1108`,
-/// card `20261103-b-906b57`).
+/// retains the claim for stale-claim recovery — but the claim is rewritten
+/// to drop each record's own copy the moment that record is settled
+/// (delivered, re-queued into the outbox, or dropped as stale/unknown), so
+/// a mid-batch error after some records already left the claim does not
+/// hand a later stale-claim reclaim the already-settled ones to replay a
+/// second time (card `20261117-b-25c9d3`). An episode-backed record whose
+/// table is missing or unreadable is requeued without a send attempt
+/// (`notify.py:1108-1122`, card `20261103-b-51b151`). A sweep that already
+/// holds the episode-table lock is the same posture: requeue rather than
+/// read the still-readable old table (`notify.py:1103-1108`, card
+/// `20261103-b-906b57`).
 pub fn flush(
     state_dir: &Path,
     push: &mut impl FnMut(&QueuedNotification) -> bool,
@@ -761,8 +766,18 @@ pub fn flush(
     if let Some(path) = &claim {
         records.extend(load_outbox(path)?);
     }
+    let collapsed = collapse_down_recovered_pairs(records);
     let mut results = Vec::new();
-    for record in collapse_down_recovered_pairs(records) {
+    for (idx, record) in collapsed.iter().enumerate() {
+        // Rewrite the claim to the still-unsettled suffix before this
+        // record's own fallible step (push/enqueue below): once this write
+        // lands, every record before `idx` has already left the claim, so
+        // an error partway through this record (or a later one) leaves a
+        // stale-claim reclaim nothing to re-deliver except what is still
+        // genuinely outstanding.
+        if let Some(path) = &claim {
+            save_outbox(path, &collapsed[idx..])?;
+        }
         // Critic finding critic-safety.md#6: redaction lives in `send`
         // (`notify.py:832-838`, ported above as `redact_record`), which
         // this loop deliberately does not call again for its dedup/rate
@@ -772,7 +787,7 @@ pub fn flush(
         // enqueue, or an older on-disk record predating this function)
         // pushed to ntfy verbatim. Idempotent on already-redacted text, so
         // this costs nothing on the common path.
-        let record = redact_record(&record);
+        let record = redact_record(record);
         let (acquired, _replay_lock) = episode_replay_lock(record.episode_state.as_deref());
         if !acquired {
             // Sweep holds `notify_episodes::LOCK_FILENAME`. Keep the record
@@ -1010,6 +1025,92 @@ mod tests {
         })
         .unwrap();
         assert_eq!(suppressed.outcome, Outcome::Suppressed);
+    }
+
+    /// Proves card `20261117-b-25c9d3`: before this fix, the claim file a
+    /// `flush` renames the outbox to kept every record of the batch on
+    /// disk, not just the ones still outstanding. A record already pushed
+    /// earlier in the same batch stayed in that claim's on-disk copy, so
+    /// when a later record's own re-enqueue then failed — returning `Err`
+    /// before the claim is removed — a subsequent stale-claim reclaim
+    /// handed the already-delivered record back to `flush` to push a
+    /// second time.
+    #[test]
+    fn a_mid_batch_enqueue_failure_does_not_redeliver_an_already_pushed_record() {
+        let dir = tempdir().unwrap();
+        let outbox = dir.path().join("notify-outbox.jsonl");
+        let first = sample("demo-app", "first");
+        let second = sample("demo-app", "second");
+        enqueue(&outbox, first.clone()).unwrap();
+        enqueue(&outbox, second.clone()).unwrap();
+
+        let outbox_for_push = outbox.clone();
+        let mut call = 0;
+        let first_run = flush(dir.path(), &mut |_| {
+            call += 1;
+            if call == 1 {
+                true
+            } else {
+                // Force the second record's re-enqueue to fail: a
+                // directory sitting where the outbox file needs to go
+                // makes `load_outbox` inside `enqueue` return an `Err`
+                // instead of treating a missing file as empty.
+                fs::create_dir(&outbox_for_push).unwrap();
+                false
+            }
+        });
+        assert!(
+            first_run.is_err(),
+            "the second record's enqueue must fail and propagate: {first_run:?}"
+        );
+
+        let claimed = claim_path(&outbox, std::process::id());
+        assert!(
+            claimed.exists(),
+            "an error mid-replay must leave the claim behind for stale-claim recovery"
+        );
+        assert_eq!(
+            load_outbox(&claimed).unwrap(),
+            vec![second.clone()],
+            "the claim must already have dropped the first record, settled before the \
+             second record's own fallible step ran"
+        );
+
+        // Clear the way for a second flush: drop the directory blocking
+        // the outbox path, and backdate the claim past `STALE_CLAIM_AFTER`
+        // so this flush's own stale-claim reclaim picks it up.
+        fs::remove_dir(&outbox).unwrap();
+        let far_past = std::time::SystemTime::now()
+            .checked_sub(STALE_CLAIM_AFTER + Duration::from_secs(60))
+            .unwrap();
+        let claim_file = fs::OpenOptions::new().write(true).open(&claimed).unwrap();
+        claim_file
+            .set_times(fs::FileTimes::new().set_modified(far_past))
+            .unwrap();
+        drop(claim_file);
+
+        let mut first_pushes = 0;
+        let mut second_pushes = 0;
+        let second_run = flush(dir.path(), &mut |r| {
+            if r.title == first.title {
+                first_pushes += 1;
+            }
+            if r.title == second.title {
+                second_pushes += 1;
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(
+            first_pushes, 0,
+            "a record already pushed before the mid-batch failure must not be pushed again"
+        );
+        assert_eq!(
+            second_pushes, 1,
+            "the record that never settled must still be delivered"
+        );
+        assert_eq!(second_run.len(), 1);
     }
 
     /// `rereview-engine.md` finding "`flush` bypasses rate caps for

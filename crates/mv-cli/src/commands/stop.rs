@@ -519,6 +519,7 @@ mod tests {
             lane_setup: None,
             min_slots: 0,
             max_slots: None,
+            autostart: true,
         }
     }
 

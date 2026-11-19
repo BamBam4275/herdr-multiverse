@@ -2,9 +2,13 @@
 //! (`mv_engine::sweep_nudges`, card `20261102-b-b4ede0`): `finish-nudge-
 //! memory.json`, `stuck-resume-memory.json`, `runtime-cap-memory.json`,
 //! the two-pass `stuck-signal-memory.json` a confirmed-stuck verdict needs
-//! before a resume nudge may ever claim its own slot, and
+//! before a resume nudge may ever claim its own slot,
 //! `stranded-trip-memory.json` (`accounts reset`'s still-parked pane
-//! snapshot, card `20261103-b-ffa660`).
+//! snapshot, card `20261103-b-ffa660`), and `stuck-resume-send-
+//! failures.json`/`runtime-cap-send-failures.json` (critic `3c0098`
+//! finding 4, task `20261118-builder-6b9075`: consecutive-failed-send
+//! counts bounding how long a send outage retries before the
+//! resume/cap claim is left spent to arm its own escalation leg instead).
 //!
 //! One file per project under `.multiverse/`, mirroring Python's own
 //! `_finish_nudge_memory_path` & co (`tasks.py`) byte-for-byte: same
@@ -19,7 +23,7 @@
 //! every sweep pass, so failing open would resend unboundedly rather than
 //! miss one nudge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +40,26 @@ pub const STRANDED_TRIP_MEMORY_FILENAME: &str = "stranded-trip-memory.json";
 /// Same bound `mv_engine::breaker::ESCALATION_RESET_WINDOW` uses. Duplicated
 /// here so `mv-state` does not depend on `mv-engine`.
 const STRANDED_TRIP_RETENTION: time::Duration = time::Duration::minutes(30);
+/// A one-shot claim in `finish-nudge-memory.json`/`runtime-cap-memory.json`
+/// (both backed by [`load_claim_map`]) or `stuck-resume-memory.json` can no
+/// longer matter once its task is done being nudged: either its task has a
+/// recorded terminal outcome in the project's routing log — read once per
+/// prune pass via [`mv_state::tasks::sweep_tasks`]'s own `SweepTask::
+/// recorded`, never a second log scan per entry — or the claim has simply
+/// sat unrecorded long enough that nothing could still be waiting on it.
+/// Fourteen days is `worktrees::WORKTREE_STATE_RETENTION`, the retention
+/// that module already gives an abandoned worktree-state copy it cannot
+/// otherwise prove redundant; duplicated here (that constant is private to
+/// its own module, and measured in `std::time::Duration` there against
+/// `time::Duration` here) rather than imported, since an unrecorded claim
+/// this old has just as thoroughly outlived anything that could still need
+/// it. A first attempt at this pruning (task `20261118-builder-678fd1`)
+/// used a flat 24h age cutoff with no recorded-outcome check at all; that
+/// re-armed a still-RUNNING lane's nudge/resume/cap prompt a second time,
+/// and dropped a stuck-resume claim's recorded pane/fingerprint, the
+/// moment a lane lived past a day — which a host sleep alone can cause
+/// (task `20261118-builder-bda758`).
+const UNRECORDED_CLAIM_RETENTION: time::Duration = time::Duration::days(14);
 
 fn memory_path(project_root: &Path, filename: &str) -> PathBuf {
     project_root.join(".multiverse").join(filename)
@@ -62,11 +86,33 @@ pub fn fingerprint(text: &str) -> String {
         .collect()
 }
 
-fn load_claim_map(path: &Path) -> BTreeMap<String, String> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+/// An entry is dropped on every read when its task is in `recorded` (it can
+/// no longer be nudged — done being nudged, not merely done being waited
+/// on) or when it is older than [`UNRECORDED_CLAIM_RETENTION`]; an
+/// unrecorded entry younger than that is always kept, no matter how long
+/// its task has been running. `recorded` is the caller's own routing-log
+/// read, gathered once per prune pass and shared across every entry here —
+/// never re-derived per entry.
+fn load_claim_map(
+    path: &Path,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> BTreeMap<String, String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(raw) = serde_json::from_str::<BTreeMap<String, String>>(&text) else {
+        return BTreeMap::new();
+    };
+    let cutoff = now - UNRECORDED_CLAIM_RETENTION;
+    raw.into_iter()
+        .filter(|(task_id, sent_at)| {
+            if recorded.contains(task_id.as_str()) {
+                return false;
+            }
+            mv_core::time::parse_flexible(sent_at).is_ok_and(|observed| observed >= cutoff)
+        })
+        .collect()
 }
 
 fn save_claim_map(path: &Path, map: &BTreeMap<String, String>) -> std::io::Result<()> {
@@ -74,19 +120,35 @@ fn save_claim_map(path: &Path, map: &BTreeMap<String, String>) -> std::io::Resul
     mv_core::atomic::write_atomic(path, &bytes)
 }
 
-fn already_claimed(project_root: &Path, filename: &str, task_id: &str) -> bool {
-    load_claim_map(&memory_path(project_root, filename)).contains_key(task_id)
+fn already_claimed(
+    project_root: &Path,
+    filename: &str,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+) -> bool {
+    load_claim_map(
+        &memory_path(project_root, filename),
+        recorded,
+        mv_core::time::now_utc(),
+    )
+    .contains_key(task_id)
 }
 
 /// Reserve `task_id`'s one claim in `filename`'s memory, atomically.
 /// `true` only for the call that wins the reservation — two sweeps racing
 /// the same candidate still send exactly one prompt between them.
-fn claim_once(project_root: &Path, filename: &str, task_id: &str, now: OffsetDateTime) -> bool {
+fn claim_once(
+    project_root: &Path,
+    filename: &str,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> bool {
     let path = memory_path(project_root, filename);
     let Ok(_guard) = mv_core::lock::acquire_default(&lock_path(&path), filename) else {
         return false;
     };
-    let mut map = load_claim_map(&path);
+    let mut map = load_claim_map(&path, recorded, now);
     if map.contains_key(task_id) {
         return false;
     }
@@ -96,25 +158,137 @@ fn claim_once(project_root: &Path, filename: &str, task_id: &str, now: OffsetDat
 
 /// Whether `task_id` has already had its one finish nudge
 /// (`FINISH_NUDGE_MEMORY_FILENAME`). Read-only, so a renderer can report
-/// what already happened without sending anything itself.
-pub fn finish_nudge_already_sent(project_root: &Path, task_id: &str) -> bool {
-    already_claimed(project_root, FINISH_NUDGE_MEMORY_FILENAME, task_id)
+/// what already happened without sending anything itself. `recorded` is
+/// the caller's own routing-log read (see `UNRECORDED_CLAIM_RETENTION`),
+/// gathered once per prune pass.
+pub fn finish_nudge_already_sent(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+) -> bool {
+    already_claimed(
+        project_root,
+        FINISH_NUDGE_MEMORY_FILENAME,
+        task_id,
+        recorded,
+    )
 }
 
 /// Atomically reserve `task_id`'s one finish nudge.
-pub fn claim_finish_nudge(project_root: &Path, task_id: &str, now: OffsetDateTime) -> bool {
-    claim_once(project_root, FINISH_NUDGE_MEMORY_FILENAME, task_id, now)
+pub fn claim_finish_nudge(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> bool {
+    claim_once(
+        project_root,
+        FINISH_NUDGE_MEMORY_FILENAME,
+        task_id,
+        recorded,
+        now,
+    )
 }
 
 /// Whether `task_id` has already had its one runtime-cap nudge
 /// (`RUNTIME_CAP_MEMORY_FILENAME`).
-pub fn runtime_cap_already_sent(project_root: &Path, task_id: &str) -> bool {
-    already_claimed(project_root, RUNTIME_CAP_MEMORY_FILENAME, task_id)
+pub fn runtime_cap_already_sent(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+) -> bool {
+    already_claimed(project_root, RUNTIME_CAP_MEMORY_FILENAME, task_id, recorded)
 }
 
 /// Atomically reserve `task_id`'s one runtime-cap nudge.
-pub fn claim_runtime_cap(project_root: &Path, task_id: &str, now: OffsetDateTime) -> bool {
-    claim_once(project_root, RUNTIME_CAP_MEMORY_FILENAME, task_id, now)
+pub fn claim_runtime_cap(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> bool {
+    claim_once(
+        project_root,
+        RUNTIME_CAP_MEMORY_FILENAME,
+        task_id,
+        recorded,
+        now,
+    )
+}
+
+/// Undo a [`claim_runtime_cap`] reservation whose send never actually went
+/// out, so the next qualifying pass can claim and retry it instead of
+/// finding a permanently spent claim that got neither a cap prompt nor,
+/// later, the cap escalation this memory also backs (Scout
+/// `20261117-scout-342332` rank 6; mirrors [`release_stuck_resume_claim`]).
+/// Best effort, matching every other write here: a lock or write failure
+/// just leaves the claim spent, same as before this existed.
+pub fn release_runtime_cap_claim(project_root: &Path, task_id: &str, recorded: &BTreeSet<&str>) {
+    let path = memory_path(project_root, RUNTIME_CAP_MEMORY_FILENAME);
+    let Ok(_guard) = mv_core::lock::acquire_default(&lock_path(&path), RUNTIME_CAP_MEMORY_FILENAME)
+    else {
+        return;
+    };
+    let mut map = load_claim_map(&path, recorded, mv_core::time::now_utc());
+    map.remove(task_id);
+    let _ = save_claim_map(&path, &map);
+}
+
+const RUNTIME_CAP_FAILURE_MEMORY_FILENAME: &str = "runtime-cap-send-failures.json";
+const STUCK_RESUME_FAILURE_MEMORY_FILENAME: &str = "stuck-resume-send-failures.json";
+
+fn load_failure_map(path: &Path) -> BTreeMap<String, u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_failure_map(path: &Path, map: &BTreeMap<String, u32>) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(map).expect("failure map always serializes");
+    mv_core::atomic::write_atomic(path, &bytes)
+}
+
+/// Bump `task_id`'s consecutive-failed-send count in `filename`'s memory,
+/// atomically, returning the count *after* this failure (`0` on a lock or
+/// write error — the caller then treats this attempt as if it were the
+/// first, matching every other best-effort write here: a storage failure
+/// must not itself force the bounded-retry path closed). A send that
+/// later succeeds never clears this count; the task's own one-shot claim
+/// is spent or armed by then regardless, so the stray counter entry is
+/// inert, the same already-accepted unbounded-task-id-map shape every
+/// other claim memory in this module has.
+fn record_send_failure(project_root: &Path, filename: &str, task_id: &str) -> u32 {
+    let path = memory_path(project_root, filename);
+    let Ok(_guard) = mv_core::lock::acquire_default(&lock_path(&path), filename) else {
+        return 0;
+    };
+    let mut map = load_failure_map(&path);
+    let count = map.entry(task_id.to_string()).or_insert(0);
+    *count = count.saturating_add(1);
+    let attempts = *count;
+    let _ = save_failure_map(&path, &map);
+    attempts
+}
+
+/// Finding 4 (critic `3c0098`, task `20261118-builder-6b9075`): how many
+/// consecutive sends `mv_engine::sweep_nudges::resume_stuck_lanes` has
+/// now failed for `task_id`'s one-shot resume claim — new, dedicated
+/// memory rather than a field on [`StuckResumeClaim`], since that claim's
+/// own `pane`/`fingerprint` already mean "a send went out," and an
+/// attempt count must keep counting through every release-and-reclaim
+/// cycle a failing send causes. The caller bounds retries against this
+/// count; once the bound is spent it arms the escalation safety net
+/// instead of releasing the claim again.
+pub fn record_stuck_resume_send_failure(project_root: &Path, task_id: &str) -> u32 {
+    record_send_failure(project_root, STUCK_RESUME_FAILURE_MEMORY_FILENAME, task_id)
+}
+
+/// Mirrors [`record_stuck_resume_send_failure`] for
+/// `mv_engine::sweep_nudges::cap_long_running_lanes`'s own one-shot
+/// runtime-cap claim.
+pub fn record_runtime_cap_send_failure(project_root: &Path, task_id: &str) -> u32 {
+    record_send_failure(project_root, RUNTIME_CAP_FAILURE_MEMORY_FILENAME, task_id)
 }
 
 /// One task's resume-nudge claim. `pane`/`fingerprint` are populated only
@@ -140,15 +314,28 @@ pub struct StuckResumeClaim {
     pub fingerprint: Option<String>,
 }
 
-fn load_stuck_resume_map(path: &Path) -> BTreeMap<String, StuckResumeClaim> {
+/// Mirrors [`load_claim_map`]'s own recorded-outcome-or-[`UNRECORDED_CLAIM_
+/// RETENTION`] cutoff: an entry is dropped on every read once its task is
+/// in `recorded`, or once its `sent_at` is older than that retention,
+/// whichever comes first; an unrecorded entry younger than that is kept
+/// regardless of its task's own runtime.
+fn load_stuck_resume_map(
+    path: &Path,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> BTreeMap<String, StuckResumeClaim> {
     let Ok(text) = fs::read_to_string(path) else {
         return BTreeMap::new();
     };
     let Ok(serde_json::Value::Object(raw)) = serde_json::from_str(&text) else {
         return BTreeMap::new();
     };
+    let cutoff = now - UNRECORDED_CLAIM_RETENTION;
     raw.into_iter()
         .filter_map(|(task_id, value)| {
+            if recorded.contains(task_id.as_str()) {
+                return None;
+            }
             let claim = match value {
                 serde_json::Value::String(sent_at) => StuckResumeClaim {
                     sent_at,
@@ -165,6 +352,10 @@ fn load_stuck_resume_map(path: &Path) -> BTreeMap<String, StuckResumeClaim> {
                 },
                 _ => return None,
             };
+            let observed = mv_core::time::parse_flexible(&claim.sent_at).ok()?;
+            if observed < cutoff {
+                return None;
+            }
             Some((task_id, claim))
         })
         .collect()
@@ -178,25 +369,49 @@ fn save_stuck_resume_map(
     mv_core::atomic::write_atomic(path, &bytes)
 }
 
-/// `task_id`'s resume-nudge claim, if one has already been made.
-pub fn stuck_resume_claim(project_root: &Path, task_id: &str) -> Option<StuckResumeClaim> {
-    load_stuck_resume_map(&memory_path(project_root, STUCK_RESUME_MEMORY_FILENAME)).remove(task_id)
+/// `task_id`'s resume-nudge claim, if one has already been made. `recorded`
+/// is the caller's own routing-log read (see `UNRECORDED_CLAIM_RETENTION`),
+/// gathered once per prune pass.
+pub fn stuck_resume_claim(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+) -> Option<StuckResumeClaim> {
+    load_stuck_resume_map(
+        &memory_path(project_root, STUCK_RESUME_MEMORY_FILENAME),
+        recorded,
+        mv_core::time::now_utc(),
+    )
+    .remove(task_id)
 }
 
 /// Whether `task_id` has already had its one resume nudge.
-pub fn stuck_resume_already_sent(project_root: &Path, task_id: &str) -> bool {
-    stuck_resume_claim(project_root, task_id).is_some()
+pub fn stuck_resume_already_sent(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+) -> bool {
+    stuck_resume_claim(project_root, task_id, recorded).is_some()
 }
 
-/// Atomically reserve `task_id`'s one resume nudge.
-pub fn claim_stuck_resume(project_root: &Path, task_id: &str, now: OffsetDateTime) -> bool {
+/// Atomically reserve `task_id`'s one resume nudge. The claim is only
+/// truly spent once [`remember_stuck_resume_signal`] confirms the send; a
+/// caller whose send fails must release it with
+/// [`release_stuck_resume_claim`] so a later pass can retry rather than
+/// finding a claim with no recorded `pane`/`fingerprint` it can never match.
+pub fn claim_stuck_resume(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> bool {
     let path = memory_path(project_root, STUCK_RESUME_MEMORY_FILENAME);
     let Ok(_guard) =
         mv_core::lock::acquire_default(&lock_path(&path), STUCK_RESUME_MEMORY_FILENAME)
     else {
         return false;
     };
-    let mut map = load_stuck_resume_map(&path);
+    let mut map = load_stuck_resume_map(&path, recorded, now);
     if map.contains_key(task_id) {
         return false;
     }
@@ -215,20 +430,49 @@ pub fn claim_stuck_resume(project_root: &Path, task_id: &str, now: OffsetDateTim
 /// text, so a later pass can tell "still showing the same connection-loss
 /// banner" from "a different pane, or different text, now occupies this
 /// claim." A failure to persist leaves the one-time claim intact.
-pub fn remember_stuck_resume_signal(project_root: &Path, task_id: &str, pane: &str, text: &str) {
+pub fn remember_stuck_resume_signal(
+    project_root: &Path,
+    task_id: &str,
+    pane: &str,
+    text: &str,
+    recorded: &BTreeSet<&str>,
+) {
     let path = memory_path(project_root, STUCK_RESUME_MEMORY_FILENAME);
     let Ok(_guard) =
         mv_core::lock::acquire_default(&lock_path(&path), STUCK_RESUME_MEMORY_FILENAME)
     else {
         return;
     };
-    let mut map = load_stuck_resume_map(&path);
+    let mut map = load_stuck_resume_map(&path, recorded, mv_core::time::now_utc());
     let Some(entry) = map.get_mut(task_id) else {
         return;
     };
     entry.pane = Some(pane.to_string());
     entry.fingerprint = Some(fingerprint(text));
     let _ = save_stuck_resume_map(&path, &map);
+}
+
+/// Undo a [`claim_stuck_resume`] reservation whose send never actually
+/// went out, so the next qualifying pass can claim and retry it instead of
+/// finding a permanently unmatchable `pane: None` entry
+/// (`resume_stuck_lanes`'s escalation branch requires `previous.pane` to
+/// equal the current pane, which a freshly reserved, never-confirmed claim
+/// can never satisfy). A no-op if the claim was already confirmed (has a
+/// `pane` recorded) or already removed — never undoes a real send. Best
+/// effort, matching every other write here: a lock or write failure just
+/// leaves the claim spent, same as before this existed.
+pub fn release_stuck_resume_claim(project_root: &Path, task_id: &str, recorded: &BTreeSet<&str>) {
+    let path = memory_path(project_root, STUCK_RESUME_MEMORY_FILENAME);
+    let Ok(_guard) =
+        mv_core::lock::acquire_default(&lock_path(&path), STUCK_RESUME_MEMORY_FILENAME)
+    else {
+        return;
+    };
+    let mut map = load_stuck_resume_map(&path, recorded, mv_core::time::now_utc());
+    if map.get(task_id).is_some_and(|claim| claim.pane.is_none()) {
+        map.remove(task_id);
+        let _ = save_stuck_resume_map(&path, &map);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,45 +714,199 @@ mod tests {
         mv_core::time::now_utc()
     }
 
+    /// No task is recorded — the common case, every candidate still RUNNING.
+    fn none() -> BTreeSet<&'static str> {
+        BTreeSet::new()
+    }
+
+    /// `ids` have a recorded terminal outcome in this pass's routing log.
+    fn recorded_set(ids: &[&'static str]) -> BTreeSet<&'static str> {
+        ids.iter().copied().collect()
+    }
+
     #[test]
     fn a_claim_wins_exactly_once() {
         let root = temp_project();
-        assert!(!finish_nudge_already_sent(&root, "t1"));
-        assert!(claim_finish_nudge(&root, "t1", now()));
-        assert!(finish_nudge_already_sent(&root, "t1"));
-        assert!(!claim_finish_nudge(&root, "t1", now()));
+        assert!(!finish_nudge_already_sent(&root, "t1", &none()));
+        assert!(claim_finish_nudge(&root, "t1", &none(), now()));
+        assert!(finish_nudge_already_sent(&root, "t1", &none()));
+        assert!(!claim_finish_nudge(&root, "t1", &none(), now()));
+    }
+
+    #[test]
+    fn an_unrecorded_finish_nudge_claim_3_days_old_is_kept() {
+        let root = temp_project();
+        let age = now() - time::Duration::days(3);
+        assert!(claim_finish_nudge(&root, "t1", &none(), age));
+        assert!(finish_nudge_already_sent(&root, "t1", &none()));
+    }
+
+    #[test]
+    fn a_fresh_finish_nudge_claim_for_a_recorded_task_is_pruned() {
+        let root = temp_project();
+        assert!(claim_finish_nudge(&root, "t1", &none(), now()));
+        let recorded = recorded_set(&["t1"]);
+        assert!(!finish_nudge_already_sent(&root, "t1", &recorded));
+        // Pruned, not merely invisible: the slot is free to claim again.
+        assert!(claim_finish_nudge(&root, "t1", &recorded, now()));
+    }
+
+    #[test]
+    fn an_unrecorded_finish_nudge_claim_15_days_old_is_pruned() {
+        let root = temp_project();
+        let stale = now() - time::Duration::days(15);
+        assert!(claim_finish_nudge(&root, "t1", &none(), stale));
+        assert!(!finish_nudge_already_sent(&root, "t1", &none()));
+        assert!(claim_finish_nudge(&root, "t1", &none(), now()));
+    }
+
+    #[test]
+    fn a_kept_finish_nudge_claim_is_not_resent_on_a_later_pass() {
+        let root = temp_project();
+        let age = now() - time::Duration::days(3);
+        assert!(claim_finish_nudge(&root, "t1", &none(), age));
+        // A second sweep pass, the task still unrecorded: the one-shot slot
+        // stays spent rather than re-arming the prompt.
+        assert!(!claim_finish_nudge(&root, "t1", &none(), now()));
+        assert!(finish_nudge_already_sent(&root, "t1", &none()));
+    }
+
+    #[test]
+    fn an_unrecorded_runtime_cap_claim_3_days_old_is_kept() {
+        let root = temp_project();
+        let age = now() - time::Duration::days(3);
+        assert!(claim_runtime_cap(&root, "t1", &none(), age));
+        assert!(runtime_cap_already_sent(&root, "t1", &none()));
+    }
+
+    #[test]
+    fn a_fresh_runtime_cap_claim_for_a_recorded_task_is_pruned() {
+        let root = temp_project();
+        assert!(claim_runtime_cap(&root, "t1", &none(), now()));
+        let recorded = recorded_set(&["t1"]);
+        assert!(!runtime_cap_already_sent(&root, "t1", &recorded));
+        assert!(claim_runtime_cap(&root, "t1", &recorded, now()));
+    }
+
+    #[test]
+    fn an_unrecorded_runtime_cap_claim_15_days_old_is_pruned() {
+        let root = temp_project();
+        let stale = now() - time::Duration::days(15);
+        assert!(claim_runtime_cap(&root, "t1", &none(), stale));
+        assert!(!runtime_cap_already_sent(&root, "t1", &none()));
+        assert!(claim_runtime_cap(&root, "t1", &none(), now()));
+    }
+
+    #[test]
+    fn an_unrecorded_stuck_resume_claim_3_days_old_is_kept() {
+        let root = temp_project();
+        let age = now() - time::Duration::days(3);
+        assert!(claim_stuck_resume(&root, "t1", &none(), age));
+        assert!(stuck_resume_claim(&root, "t1", &none()).is_some());
+    }
+
+    #[test]
+    fn a_fresh_stuck_resume_claim_for_a_recorded_task_is_pruned() {
+        let root = temp_project();
+        assert!(claim_stuck_resume(&root, "t1", &none(), now()));
+        let recorded = recorded_set(&["t1"]);
+        assert!(stuck_resume_claim(&root, "t1", &recorded).is_none());
+        // Pruned, not merely invisible: the slot is free to claim again.
+        assert!(claim_stuck_resume(&root, "t1", &recorded, now()));
+    }
+
+    #[test]
+    fn an_unrecorded_stuck_resume_claim_15_days_old_is_pruned() {
+        let root = temp_project();
+        let stale = now() - time::Duration::days(15);
+        assert!(claim_stuck_resume(&root, "t1", &none(), stale));
+        assert!(stuck_resume_claim(&root, "t1", &none()).is_none());
+        assert!(claim_stuck_resume(&root, "t1", &none(), now()));
+    }
+
+    #[test]
+    fn send_failure_counts_increment_and_stay_independent_by_purpose() {
+        let root = temp_project();
+        assert_eq!(record_stuck_resume_send_failure(&root, "t1"), 1);
+        assert_eq!(record_stuck_resume_send_failure(&root, "t1"), 2);
+        // A different task's count starts fresh.
+        assert_eq!(record_stuck_resume_send_failure(&root, "t2"), 1);
+        // The cap counter is a separate memory, not shared with resume's.
+        assert_eq!(record_runtime_cap_send_failure(&root, "t1"), 1);
     }
 
     #[test]
     fn finish_and_runtime_cap_memories_are_independent() {
         let root = temp_project();
-        assert!(claim_finish_nudge(&root, "t1", now()));
-        assert!(!runtime_cap_already_sent(&root, "t1"));
-        assert!(claim_runtime_cap(&root, "t1", now()));
-        assert!(finish_nudge_already_sent(&root, "t1"));
-        assert!(runtime_cap_already_sent(&root, "t1"));
+        assert!(claim_finish_nudge(&root, "t1", &none(), now()));
+        assert!(!runtime_cap_already_sent(&root, "t1", &none()));
+        assert!(claim_runtime_cap(&root, "t1", &none(), now()));
+        assert!(finish_nudge_already_sent(&root, "t1", &none()));
+        assert!(runtime_cap_already_sent(&root, "t1", &none()));
+    }
+
+    #[test]
+    fn releasing_a_runtime_cap_claim_makes_it_retryable() {
+        let root = temp_project();
+        assert!(claim_runtime_cap(&root, "t1", &none(), now()));
+        assert!(!claim_runtime_cap(&root, "t1", &none(), now()));
+        release_runtime_cap_claim(&root, "t1", &none());
+        assert!(!runtime_cap_already_sent(&root, "t1", &none()));
+        assert!(claim_runtime_cap(&root, "t1", &none(), now()));
+    }
+
+    #[test]
+    fn releasing_an_unclaimed_runtime_cap_is_a_no_op() {
+        let root = temp_project();
+        release_runtime_cap_claim(&root, "t1", &none());
+        assert!(!runtime_cap_already_sent(&root, "t1", &none()));
     }
 
     #[test]
     fn stuck_resume_claim_then_remember_round_trips_pane_and_fingerprint() {
         let root = temp_project();
-        assert!(claim_stuck_resume(&root, "t1", now()));
-        assert!(!claim_stuck_resume(&root, "t1", now()));
-        let claim = stuck_resume_claim(&root, "t1").unwrap();
+        assert!(claim_stuck_resume(&root, "t1", &none(), now()));
+        assert!(!claim_stuck_resume(&root, "t1", &none(), now()));
+        let claim = stuck_resume_claim(&root, "t1", &none()).unwrap();
         assert_eq!(claim.pane, None);
-        remember_stuck_resume_signal(&root, "t1", "w1:p1", "connection lost");
-        let claim = stuck_resume_claim(&root, "t1").unwrap();
+        remember_stuck_resume_signal(&root, "t1", "w1:p1", "connection lost", &none());
+        let claim = stuck_resume_claim(&root, "t1", &none()).unwrap();
         assert_eq!(claim.pane.as_deref(), Some("w1:p1"));
         assert_eq!(claim.fingerprint, Some(fingerprint("connection lost")));
+    }
+
+    #[test]
+    fn releasing_a_never_confirmed_claim_makes_it_retryable() {
+        let root = temp_project();
+        assert!(claim_stuck_resume(&root, "t1", &none(), now()));
+        assert!(!claim_stuck_resume(&root, "t1", &none(), now()));
+        release_stuck_resume_claim(&root, "t1", &none());
+        assert!(stuck_resume_claim(&root, "t1", &none()).is_none());
+        assert!(claim_stuck_resume(&root, "t1", &none(), now()));
+    }
+
+    #[test]
+    fn releasing_a_confirmed_claim_is_a_no_op() {
+        let root = temp_project();
+        assert!(claim_stuck_resume(&root, "t1", &none(), now()));
+        remember_stuck_resume_signal(&root, "t1", "w1:p1", "connection lost", &none());
+        release_stuck_resume_claim(&root, "t1", &none());
+        let claim = stuck_resume_claim(&root, "t1", &none()).unwrap();
+        assert_eq!(claim.pane.as_deref(), Some("w1:p1"));
     }
 
     #[test]
     fn stuck_resume_memory_reads_a_legacy_bare_string_entry() {
         let root = temp_project();
         let path = memory_path(&root, STUCK_RESUME_MEMORY_FILENAME);
-        fs::write(&path, r#"{"t1": "2026-01-01T00:00:00+00:00"}"#).unwrap();
-        let claim = stuck_resume_claim(&root, "t1").unwrap();
-        assert_eq!(claim.sent_at, "2026-01-01T00:00:00+00:00");
+        // Fresh, not a fixed historical date: a legacy entry old enough to
+        // be pruned (which a date more than 14 days old still would be,
+        // the same as under the previous 24h rule) would make this a
+        // pruning test, not a format test.
+        let sent_at = mv_core::time::format_seconds_utc(now());
+        fs::write(&path, format!(r#"{{"t1": "{sent_at}"}}"#)).unwrap();
+        let claim = stuck_resume_claim(&root, "t1", &none()).unwrap();
+        assert_eq!(claim.sent_at, sent_at);
         assert_eq!(claim.pane, None);
     }
 

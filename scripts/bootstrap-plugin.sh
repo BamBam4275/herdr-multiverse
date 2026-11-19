@@ -167,7 +167,7 @@ if [ -n "$TRIPLE" ]; then
                         mkdir -p "$EXTRACT_DIR"
                         if tar -xzf "$TMP_DIR/$ARCHIVE" -C "$EXTRACT_DIR" && [ -f "$EXTRACT_DIR/multiverse" ]; then
                             mkdir -p "$BIN_DIR"
-                            chmod +x "$EXTRACT_DIR/multiverse"
+                            chmod 0755 "$EXTRACT_DIR/multiverse"
                             mv -f "$EXTRACT_DIR/multiverse" "$BIN"
                             DOWNLOAD_OK=1
                         fi

@@ -331,10 +331,18 @@ impl ProjectLock {
     ) -> Result<LogRecord, LogError> {
         // Base the next sequence on the index's cached high-water mark
         // rather than re-parsing every record; holding the lock already
-        // rules out a concurrent writer moving it underneath us.
-        let seq = index::records(&self.path, Selector::All)?
-            .last()
-            .map_or(0, |record| record.entry.high_water_seq)
+        // rules out a concurrent writer moving it underneath us. Prefer the
+        // cheap, validated read that costs a handful of small reads
+        // regardless of log size; fall back to the full index scan whenever
+        // that trust can't be established (missing/stale fingerprint, torn
+        // tail, deleted index).
+        let high_water_seq = match index::high_water_seq(&self.path)? {
+            Some(high_water_seq) => high_water_seq,
+            None => index::records(&self.path, Selector::All)?
+                .last()
+                .map_or(0, |record| record.entry.high_water_seq),
+        };
+        let seq = high_water_seq
             .checked_add(1)
             .ok_or(LogError::SequenceExhausted)?;
         let line = encode_versioned(when, seq, event, fields)?;
@@ -606,6 +614,49 @@ pub(crate) mod tests {
             Err(LogError::Damaged(_))
         ));
         assert_eq!(fs::read(log.path()).unwrap(), b"torn");
+    }
+
+    #[test]
+    fn append_versioned_seqs_match_the_full_scan_baseline_across_many_calls_and_a_deleted_index() {
+        let project = TempProject::new();
+        let log = project.log();
+        let guard = log.lock().unwrap();
+        for i in 0..50 {
+            let expected_next = index::records(log.path(), Selector::All)
+                .unwrap()
+                .last()
+                .map_or(0, |record| record.entry.high_water_seq)
+                + 1;
+            let record = guard
+                .append_versioned(WHEN, "update", &[("task", &format!("t{i}"))])
+                .unwrap();
+            assert_eq!(record.seq, Some(expected_next));
+        }
+        // Deleting the sidecar outright forces every subsequent call back
+        // onto the full-scan path; the assigned seq must still agree with
+        // it, not skip or repeat the last cached value.
+        fs::remove_file(index::index_path(log.path())).unwrap();
+        fs::remove_file(index::fingerprint_path(log.path())).unwrap();
+        for i in 50..55 {
+            let expected_next = index::records(log.path(), Selector::All)
+                .unwrap()
+                .last()
+                .map_or(0, |record| record.entry.high_water_seq)
+                + 1;
+            let record = guard
+                .append_versioned(WHEN, "update", &[("task", &format!("t{i}"))])
+                .unwrap();
+            assert_eq!(record.seq, Some(expected_next));
+        }
+        assert_eq!(
+            index::records(log.path(), Selector::All)
+                .unwrap()
+                .last()
+                .unwrap()
+                .entry
+                .high_water_seq,
+            55
+        );
     }
 
     #[test]

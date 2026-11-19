@@ -768,6 +768,26 @@ fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
     render_with_stalled(config, agents, &HashSet::new())
 }
 
+/// Structured form of `workers`' report: the live table rows (`None` only
+/// when Herdr was unreachable — an empty, reachable fleet is `Some(vec![])`
+/// and still renders a table) plus the four summary lines' own numbers.
+/// Shared by the text renderer and `--json` so the seat/project occupancy
+/// computation below (the heavily-tested part of this module) is derived
+/// exactly once — the same split `mv_engine::health`'s `HealthReport` /
+/// `problems_json` uses between computing and rendering.
+struct WorkersReport {
+    rows: Option<Vec<WorkerRow>>,
+    worker_count: Option<u32>,
+    max_concurrent: u32,
+    /// `(seat name, open count)`; `open` is `None` only when Herdr was
+    /// unreachable.
+    seats: Vec<(String, Option<u32>)>,
+    /// `(project name, open count, ceiling)`; `open` is `None` only when
+    /// Herdr was unreachable.
+    projects: Vec<(String, Option<u32>, u32)>,
+    orchestrator_count: Option<u32>,
+}
+
 /// Builds the full `workers` report. Takes already-fetched live agents
 /// (`None` means Herdr was unreachable or unparseable) so this stays unit
 /// testable without a subprocess; see the module docs for why a live
@@ -778,11 +798,11 @@ fn render(config: &Config, agents: Option<&[LiveAgent]>) -> String {
 /// STATUS column's displayed text — never seat/project occupancy, which
 /// still reads `agent.status` exactly as Herdr reported it, so a pane
 /// shown `stalled` here still occupies its seat precisely as before.
-fn render_with_stalled(
+fn build_report(
     config: &Config,
     agents: Option<&[LiveAgent]>,
     stalled_panes: &HashSet<String>,
-) -> String {
+) -> WorkersReport {
     let display_status = |agent: &LiveAgent| {
         if !agent.pane.is_empty() && stalled_panes.contains(&agent.pane) {
             "stalled".to_string()
@@ -795,7 +815,6 @@ fn render_with_stalled(
     let mut accounts: Vec<&String> = config.accounts.keys().collect();
     accounts.sort();
 
-    let mut sections = Vec::new();
     let history: Vec<_> = config
         .projects
         .values()
@@ -810,7 +829,7 @@ fn render_with_stalled(
     let mut seat_counts = BTreeMap::<&str, u32>::new();
     let mut project_counts = BTreeMap::<&str, u32>::new();
 
-    let (table, worker_count, orchestrator_count) = match agents {
+    let (rows, worker_count, orchestrator_count) = match agents {
         Some(agents) => {
             seat_counts = open_seat_counts(config, &history, agents);
             let mut rows = Vec::new();
@@ -923,48 +942,78 @@ fn render_with_stalled(
                 (&a.project, &a.task, &a.role, &a.seat)
                     .cmp(&(&b.project, &b.task, &b.role, &b.seat))
             });
-            sections.push(render_table(&rows));
-            (true, Some(cap_count), Some(orchestrators))
+            (Some(rows), Some(cap_count), Some(orchestrators))
         }
-        None => (false, None, None),
+        None => (None, None, None),
     };
-    let _ = table;
+
+    let seats = accounts
+        .iter()
+        .map(|name| {
+            let open = agents.map(|_| seat_counts.get(name.as_str()).copied().unwrap_or(0));
+            (name.to_string(), open)
+        })
+        .collect();
+
+    let projects = projects
+        .iter()
+        .map(|name| {
+            let project = &config.projects[*name];
+            let ceiling = project.max_slots.unwrap_or(config.max_concurrent);
+            let open = agents.map(|_| project_counts.get(name.as_str()).copied().unwrap_or(0));
+            (name.to_string(), open, ceiling)
+        })
+        .collect();
+
+    WorkersReport {
+        rows,
+        worker_count,
+        max_concurrent: config.max_concurrent,
+        seats,
+        projects,
+        orchestrator_count,
+    }
+}
+
+/// Renders [`WorkersReport`] exactly as `workers`' plain-text output has
+/// always read: `render_table`'s block (only when Herdr was reachable),
+/// a blank line, then the four `workers`/`seats`/`projects`/`nexus
+/// sessions` summary lines, each number a bare `?` for "unknown" (Herdr
+/// unreachable) — never the `--json` renderer's `null`.
+fn render_text(report: &WorkersReport) -> String {
+    let mut sections = Vec::new();
+    if let Some(rows) = &report.rows {
+        sections.push(render_table(rows));
+    }
 
     let worker_line = format!(
         "workers {}/{}",
-        worker_count.map_or("?".to_string(), |n| n.to_string()),
-        config.max_concurrent
+        report
+            .worker_count
+            .map_or("?".to_string(), |n| n.to_string()),
+        report.max_concurrent
     );
 
     let seat_line = format!(
         "seats: {}",
-        accounts
+        report
+            .seats
             .iter()
-            .map(|name| {
-                let open = agents.map(|_| seat_counts.get(name.as_str()).copied().unwrap_or(0));
-                format!("{name} {}", open.map_or("?".to_string(), |n| n.to_string()))
-            })
+            .map(|(name, open)| format!(
+                "{name} {}",
+                open.map_or("?".to_string(), |n| n.to_string())
+            ))
             .collect::<Vec<_>>()
             .join("  ")
     );
 
     let project_line = format!(
         "projects: {}",
-        projects
+        report
+            .projects
             .iter()
-            .map(|name| {
-                let project = &config.projects[*name];
-                let ceiling = project.max_slots.unwrap_or(config.max_concurrent);
-                let open_text = agents.map_or_else(
-                    || "?".into(),
-                    |_| {
-                        project_counts
-                            .get(name.as_str())
-                            .copied()
-                            .unwrap_or(0)
-                            .to_string()
-                    },
-                );
+            .map(|(name, open, ceiling)| {
+                let open_text = open.map_or_else(|| "?".to_string(), |n| n.to_string());
                 format!("{name} {open_text} open, ceiling {ceiling}")
             })
             .collect::<Vec<_>>()
@@ -975,13 +1024,149 @@ fn render_with_stalled(
 
     let orchestrator_line = format!(
         "nexus sessions {} (excluded from workers; they do not count against max_concurrent)",
-        orchestrator_count.map_or("?".to_string(), |n| n.to_string())
+        report
+            .orchestrator_count
+            .map_or("?".to_string(), |n| n.to_string())
     );
 
     sections.push(format!(
         "{worker_line}\n{seat_line}\n{project_line}\n{orchestrator_line}"
     ));
     sections.join("\n\n")
+}
+
+/// [`build_report`] followed by [`render_text`] — test-only now that
+/// `run` calls both directly so it can branch to [`render_json`] on
+/// `--json` without re-running the whole computation.
+#[cfg(test)]
+fn render_with_stalled(
+    config: &Config,
+    agents: Option<&[LiveAgent]>,
+    stalled_panes: &HashSet<String>,
+) -> String {
+    render_text(&build_report(config, agents, stalled_panes))
+}
+
+/// Minimal ASCII-only JSON string escaper (`ensure_ascii=True` style),
+/// duplicated from `mv_state::halt`'s own private `json_escape` — that one
+/// is out of this task's write scope to make `pub(crate)`, and `mv-cli`
+/// carries no runtime `serde_json` dependency (`Cargo.toml`: dev-dependency
+/// only), so every `--json` renderer in this crate hand-builds its output
+/// (`commands::presence`, `mv_engine::seatstate::show_json`'s string
+/// splice). `pub(super)` so `commands::accounts`'s own `--json` renderer
+/// (same task, `20261117-builder-0cbb48`) reuses it instead of a second copy.
+pub(super) fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        let code = ch as u32;
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            _ if (0x20..=0x7e).contains(&code) => out.push(ch),
+            _ if code <= 0xffff => out.push_str(&format!("\\u{code:04x}")),
+            _ => {
+                let v = code - 0x10000;
+                let high = 0xd800 + (v >> 10);
+                let low = 0xdc00 + (v & 0x3ff);
+                out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `WorkerRow`'s own empty-string convention (no data joined — rendered as
+/// [`DASH`] in the table) becomes JSON `null`, not `""`.
+fn json_string_or_null(value: &str) -> String {
+    if value.is_empty() {
+        "null".to_owned()
+    } else {
+        json_escape(value)
+    }
+}
+
+fn json_opt_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "null".to_owned(), |n| n.to_string())
+}
+
+/// Renders [`WorkersReport`] as one line of JSON, with `halt`'s state
+/// folded into a top-level `halted` key (`null` when the fleet is not
+/// halted) rather than `render_text`'s separate banner line — stdout must
+/// stay one parseable JSON value, so no non-JSON line can precede it.
+/// Object keys are alphabetical throughout, matching
+/// `mv_engine::seatstate::show_json`'s own convention.
+fn render_json(report: &WorkersReport, halt: &mv_state::halt::HaltState) -> String {
+    let workers = match &report.rows {
+        Some(rows) => {
+            let items: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{{\"age\": {}, \"outcome\": {}, \"project\": {}, \"role\": {}, \"seat\": {}, \"status\": {}, \"task\": {}}}",
+                        json_string_or_null(&row.age),
+                        json_string_or_null(&row.outcome),
+                        json_string_or_null(&row.project),
+                        json_string_or_null(&row.role),
+                        json_string_or_null(&row.seat),
+                        json_string_or_null(&row.status),
+                        json_string_or_null(&row.task),
+                    )
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        None => "null".to_owned(),
+    };
+    let seats: Vec<String> = report
+        .seats
+        .iter()
+        .map(|(name, open)| {
+            format!(
+                "{{\"name\": {}, \"open\": {}}}",
+                json_escape(name),
+                json_opt_u32(*open)
+            )
+        })
+        .collect();
+    let projects: Vec<String> = report
+        .projects
+        .iter()
+        .map(|(name, open, ceiling)| {
+            format!(
+                "{{\"ceiling\": {ceiling}, \"name\": {}, \"open\": {}}}",
+                json_escape(name),
+                json_opt_u32(*open)
+            )
+        })
+        .collect();
+    let halted = if halt.halted {
+        format!(
+            "{{\"at\": {}, \"reason\": {}}}",
+            halt.at
+                .as_deref()
+                .map_or_else(|| "null".to_owned(), json_escape),
+            halt.reason
+                .as_deref()
+                .map_or_else(|| "null".to_owned(), json_escape),
+        )
+    } else {
+        "null".to_owned()
+    };
+    format!(
+        "{{\"halted\": {halted}, \"max_concurrent\": {}, \"nexus_sessions\": {}, \"projects\": [{}], \"seats\": [{}], \"worker_count\": {}, \"workers\": {workers}}}",
+        report.max_concurrent,
+        json_opt_u32(report.orchestrator_count),
+        projects.join(", "),
+        seats.join(", "),
+        json_opt_u32(report.worker_count),
+    )
 }
 
 /// Python `cmd_workers` (`cli.py:8808-8810`) prints the fleet-halt line
@@ -995,10 +1180,13 @@ fn halt_banner(state: &mv_state::halt::HaltState) -> Option<String> {
     }
 }
 
-/// `multiverse workers`'s entry point: loads config, prints the fleet halt
-/// banner if one is on disk, fetches live agents from Herdr (best-effort —
-/// an unreachable fleet still renders, with `?` where live counts would
-/// go), and prints [`render_with_stalled`]'s report.
+/// `multiverse workers`'s entry point: loads config, fetches live agents
+/// from Herdr (best-effort — an unreachable fleet still renders, with `?`
+/// where live counts would go), and prints the report. Plain text prints
+/// the fleet-halt banner line first, then [`render_text`]'s report;
+/// `--json` folds the halt state into the single JSON line's `halted` key
+/// instead, so stdout stays one parseable value (card for this task,
+/// `20261117-builder-0cbb48`).
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -1012,9 +1200,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
         .map_err(|error| Failure::Config(error.to_string()))?;
 
     let state_dir = state_dir_from_config(&config_path);
-    if let Some(line) = halt_banner(&mv_state::halt::read_halt_state(&state_dir)) {
-        println!("{line}");
-    }
+    let halt_state = mv_state::halt::read_halt_state(&state_dir);
 
     let binary = herdr_binary();
     let agents = fetch_live_agents(&binary);
@@ -1025,16 +1211,22 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
             stalled_panes(&state_dir, &pane_hashes, mv_core::time::now_utc())
         })
         .unwrap_or_default();
-    println!(
-        "{}",
-        render_with_stalled(&config, agents.as_deref(), &stalled)
-    );
+    let report = build_report(&config, agents.as_deref(), &stalled);
+    if args.get_flag("json") {
+        println!("{}", render_json(&report, &halt_state));
+    } else {
+        if let Some(line) = halt_banner(&halt_state) {
+            println!("{line}");
+        }
+        println!("{}", render_text(&report));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args;
     use mv_config::load::load_config_str;
     use std::path::Path;
 
@@ -1880,5 +2072,142 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
         let text = render_with_stalled(&config, Some(&agents), &stalled);
         assert!(text.contains("stalled"), "{text}");
         assert!(text.contains("seats: seat-b 1"), "{text}");
+    }
+
+    #[test]
+    fn json_escape_round_trips_quotes_backslashes_and_control_characters() {
+        let escaped = json_escape("a\"b\\c\nd\u{7}e");
+        let parsed: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(parsed, "a\"b\\c\nd\u{7}e");
+    }
+
+    /// Proof for Scout finding `20261117-scout-c950ad`#4: `--json` carries
+    /// the same table shape `render_matches_the_conformance_shape_for_a_
+    /// recognized_worker` pins for text, every documented key present, and
+    /// the "no data joined" fields (`project`/`task`/`outcome`/`age`,
+    /// `\u{2014}` in text) read as JSON `null`.
+    #[test]
+    fn render_json_includes_every_documented_key_for_a_recognized_worker() {
+        let config = config();
+        let agents = [LiveAgent {
+            name: "sandbox-scou-sb".to_string(),
+            status: "working".to_string(),
+            ..Default::default()
+        }];
+        let report = build_report(&config, Some(&agents), &HashSet::new());
+        let halt = mv_state::halt::HaltState {
+            halted: false,
+            reason: None,
+            at: None,
+        };
+        let json = render_json(&report, &halt);
+        assert!(
+            !json.contains('\n'),
+            "json output must be a single line: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        for key in [
+            "halted",
+            "max_concurrent",
+            "nexus_sessions",
+            "projects",
+            "seats",
+            "worker_count",
+            "workers",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "missing top-level key {key:?}: {json}"
+            );
+        }
+        assert_eq!(value["halted"], serde_json::Value::Null);
+        assert_eq!(value["max_concurrent"], 3);
+        assert_eq!(value["nexus_sessions"], 0);
+        assert_eq!(value["worker_count"], 1);
+
+        let workers = value["workers"].as_array().expect("workers array");
+        assert_eq!(workers.len(), 1);
+        let row = &workers[0];
+        for key in [
+            "age", "outcome", "project", "role", "seat", "status", "task",
+        ] {
+            assert!(
+                row.get(key).is_some(),
+                "missing worker row key {key:?}: {json}"
+            );
+        }
+        assert_eq!(row["role"], "scout");
+        assert_eq!(row["seat"], "seat-b");
+        assert_eq!(row["status"], "working");
+        assert_eq!(row["project"], serde_json::Value::Null);
+        assert_eq!(row["task"], serde_json::Value::Null);
+        assert_eq!(row["outcome"], serde_json::Value::Null);
+        assert_eq!(row["age"], serde_json::Value::Null);
+
+        let seats = value["seats"].as_array().expect("seats array");
+        assert_eq!(seats.len(), 1);
+        assert_eq!(seats[0]["name"], "seat-b");
+        assert_eq!(seats[0]["open"], 0);
+
+        let projects = value["projects"].as_array().expect("projects array");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], "sandbox");
+        assert_eq!(projects[0]["open"], 0);
+        assert_eq!(projects[0]["ceiling"], 3);
+    }
+
+    #[test]
+    fn render_json_fails_open_to_null_when_herdr_is_unreachable() {
+        let config = config();
+        let report = build_report(&config, None, &HashSet::new());
+        let halt = mv_state::halt::HaltState {
+            halted: false,
+            reason: None,
+            at: None,
+        };
+        let json = render_json(&report, &halt);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["workers"], serde_json::Value::Null);
+        assert_eq!(value["worker_count"], serde_json::Value::Null);
+        assert_eq!(value["nexus_sessions"], serde_json::Value::Null);
+        assert_eq!(value["seats"][0]["open"], serde_json::Value::Null);
+        assert_eq!(value["projects"][0]["open"], serde_json::Value::Null);
+    }
+
+    /// `run`'s own reason for folding halt state into the JSON object
+    /// rather than printing `halt_banner`'s line first: stdout must stay
+    /// one parseable value.
+    #[test]
+    fn render_json_embeds_the_halt_state_instead_of_a_banner_line() {
+        let config = config();
+        let report = build_report(&config, Some(&[]), &HashSet::new());
+        let halt = mv_state::halt::HaltState {
+            halted: true,
+            reason: Some("fuzz maintenance".into()),
+            at: Some("2026-11-03T00:00:00+00:00".into()),
+        };
+        let json = render_json(&report, &halt);
+        assert!(
+            !json.contains('\n'),
+            "json output must be a single line: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["halted"]["reason"], "fuzz maintenance");
+        assert_eq!(value["halted"]["at"], "2026-11-03T00:00:00+00:00");
+        assert_eq!(value["workers"], serde_json::json!([]));
+    }
+
+    /// Card for this task (`20261117-builder-0cbb48`): `--json` must not
+    /// change `workers`' plain-text output at all. `json_flag_is_accepted`
+    /// below proves the flag parses; every other `render`/`render_with_
+    /// stalled` test in this module still asserts the identical literal
+    /// text it always has, with no `--json`-aware branch in that path.
+    #[test]
+    fn json_flag_is_accepted_by_the_parser() {
+        let m = args::command()
+            .try_get_matches_from(["multiverse", "workers", "--json"])
+            .unwrap();
+        let workers = m.subcommand_matches("workers").unwrap();
+        assert!(workers.get_flag("json"));
     }
 }

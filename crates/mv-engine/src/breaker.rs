@@ -506,12 +506,39 @@ pub fn escalated_cooldown_minutes(
     (ESCALATION_STEPS_MINUTES[step_index], next_count)
 }
 
+/// The filename-safe transform for a pool name, shared by
+/// [`write_evidence`] (which writes it into a filename) and
+/// [`recent_evidence`] (which matches it back out of a directory listing)
+/// — kept as one function so the two sides can never drift apart.
+fn safe_pool_component(pool: &str) -> String {
+    let safe: String = pool
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.replace("..", "_");
+    if safe.is_empty() {
+        "_".to_string()
+    } else {
+        safe
+    }
+}
+
+/// The length, in bytes, of the filename-embedded timestamp
+/// [`write_evidence`] stamps every evidence file with: `YYYYMMDDTHHMMSSZ`.
+const EVIDENCE_TIMESTAMP_LEN: usize = 16;
+
 /// Save redacted pane text as project-local diagnostic evidence.
 /// Matches Python's `.multiverse/evidence/<UTC timestamp>-<safe pool>.txt`
 /// layout and plain UTF-8 content, without adding a header or newline.
 /// Evidence is best-effort: an I/O failure must never prevent a trip or
 /// stuck-lane escalation.
-pub(crate) fn write_evidence(
+pub fn write_evidence(
     project_root: &Path,
     pool: &str,
     now: OffsetDateTime,
@@ -521,22 +548,7 @@ pub(crate) fn write_evidence(
         let directory = project_root.join(".multiverse/evidence");
         fs::create_dir_all(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        let safe_pool: String = pool
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let safe_pool = safe_pool.replace("..", "_");
-        let safe_pool = if safe_pool.is_empty() {
-            "_"
-        } else {
-            &safe_pool
-        };
+        let safe_pool = safe_pool_component(pool);
         let timestamp = format_seconds_utc(now)
             .replace("+00:00", "Z")
             .replace(['-', ':'], "");
@@ -551,6 +563,125 @@ pub(crate) fn write_evidence(
         Ok(path)
     };
     write().ok()
+}
+
+/// Parse an evidence filename's own `YYYYMMDDTHHMMSSZ` stamp back into an
+/// [`OffsetDateTime`] — the exact inverse of the stamp [`write_evidence`]
+/// builds from `format_seconds_utc`. `None` for anything that is not
+/// exactly that shape.
+fn parse_evidence_timestamp(stamp: &str) -> Option<OffsetDateTime> {
+    let format = time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+    time::PrimitiveDateTime::parse(stamp, &format)
+        .ok()
+        .map(time::PrimitiveDateTime::assume_utc)
+}
+
+/// How far back [`recent_evidence`] counts a pool's sweep-escalation
+/// evidence files. `spec-seats-quotas.md` names no window of its own for
+/// this surfacing; a week keeps the account listing pointing at genuinely
+/// recent escalations rather than accumulating forever (card
+/// `20261118-b-75220a` step 1 — evidence only, no automatic trip).
+pub const EVIDENCE_WINDOW: time::Duration = time::Duration::days(7);
+
+/// One pool's recent sweep-escalation evidence, as surfaced by
+/// `multiverse accounts` — read-only, so an operator sees a repeatedly
+/// failing pool before deciding by hand whether to trip it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvidenceSummary {
+    /// How many of `pool`'s evidence files, across every project root
+    /// passed to [`recent_evidence`], were written within
+    /// [`EVIDENCE_WINDOW`] of `now`.
+    pub count: usize,
+    /// The earliest of those files' own timestamps — the "since" an
+    /// operator reads as when this pool started escalating.
+    pub earliest_at: OffsetDateTime,
+    /// The most recently written of those files.
+    pub latest_path: PathBuf,
+    pub latest_at: OffsetDateTime,
+}
+
+/// Read-only: count `pool`'s sweep cap/resume escalation evidence
+/// ([`write_evidence`], called from `sweep_nudges.rs`'s `resume_stuck_
+/// lanes`/`cap_long_running_lanes`) written within [`EVIDENCE_WINDOW`] of
+/// `now`, across every path in `project_roots` — sweep writes into
+/// whichever project it was sweeping, and a pool can be shared by accounts
+/// in more than one configured project. `None` when there is no evidence
+/// directory, or nothing recent for this pool; never an error, since a
+/// missing or unreadable directory just means nothing to report.
+pub fn recent_evidence(
+    project_roots: &[&Path],
+    pool: &str,
+    now: OffsetDateTime,
+) -> Option<EvidenceSummary> {
+    let safe_pool = safe_pool_component(pool);
+    let cutoff = now - EVIDENCE_WINDOW;
+    let mut count = 0usize;
+    let mut earliest: Option<OffsetDateTime> = None;
+    let mut latest: Option<(PathBuf, OffsetDateTime)> = None;
+    for root in project_roots {
+        let evidence_dir = root.join(".multiverse/evidence");
+        // `fs::read_dir` on a symlinked *directory* lists the target's own
+        // entries — `symlink_metadata` (not `metadata`) is what tells a
+        // real evidence directory apart from one a project root symlinks
+        // elsewhere, the same check `hostdisk::dir_size` already makes
+        // for a lane's `target/` (card `20261118-b-c328a3` M3).
+        let Ok(dir_meta) = fs::symlink_metadata(&evidence_dir) else {
+            continue;
+        };
+        if dir_meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&evidence_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // A symlinked file dirent would otherwise display as an
+            // in-tree `evidence/` path while its bytes live wherever the
+            // link points — never read here, but the count and `latest:`
+            // path are still misleading enough to skip it outright.
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.file_type().is_symlink() => {}
+                _ => continue,
+            }
+            let Some(stem) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".txt"))
+            else {
+                continue;
+            };
+            if stem.len() <= EVIDENCE_TIMESTAMP_LEN + 1
+                || !stem.is_char_boundary(EVIDENCE_TIMESTAMP_LEN)
+                || !stem.is_char_boundary(EVIDENCE_TIMESTAMP_LEN + 1)
+                || stem.as_bytes()[EVIDENCE_TIMESTAMP_LEN] != b'-'
+            {
+                continue;
+            }
+            if stem[EVIDENCE_TIMESTAMP_LEN + 1..] != safe_pool {
+                continue;
+            }
+            let Some(observed_at) = parse_evidence_timestamp(&stem[..EVIDENCE_TIMESTAMP_LEN])
+            else {
+                continue;
+            };
+            if observed_at < cutoff {
+                continue;
+            }
+            count += 1;
+            earliest = Some(earliest.map_or(observed_at, |e| e.min(observed_at)));
+            if latest.as_ref().is_none_or(|(_, at)| observed_at > *at) {
+                latest = Some((path, observed_at));
+            }
+        }
+    }
+    let (latest_path, latest_at) = latest?;
+    Some(EvidenceSummary {
+        count,
+        earliest_at: earliest.expect("count > 0 implies earliest was recorded"),
+        latest_path,
+        latest_at,
+    })
 }
 
 /// Everything a trip needs that isn't the pool name or `now`.
@@ -2145,5 +2276,155 @@ mod tests {
             is_pane_live: |_: &str| false,
         };
         assert!(store.claim_trial("chatgpt", "task-1", None).is_none());
+    }
+
+    #[test]
+    fn recent_evidence_is_none_with_no_evidence_at_all() {
+        let project = tempfile::tempdir().unwrap();
+        let now = datetime!(2026-11-18 12:00:00 UTC);
+        assert!(recent_evidence(&[project.path()], "chatgpt:codex", now).is_none());
+    }
+
+    #[test]
+    fn recent_evidence_counts_only_the_matching_pool_within_the_window() {
+        let project = tempfile::tempdir().unwrap();
+        let now = datetime!(2026-11-18 12:00:00 UTC);
+        write_evidence(
+            project.path(),
+            "chatgpt:codex",
+            now - time::Duration::days(1),
+            "first",
+        )
+        .unwrap();
+        let latest = write_evidence(
+            project.path(),
+            "chatgpt:codex",
+            now - time::Duration::hours(1),
+            "second",
+        )
+        .unwrap();
+        // An 8-day-old file is outside the 7-day window and must not count.
+        write_evidence(
+            project.path(),
+            "chatgpt:codex",
+            now - time::Duration::days(8),
+            "stale",
+        )
+        .unwrap();
+        // A different pool's evidence must not bleed into this count.
+        write_evidence(
+            project.path(),
+            "chatgpt:other",
+            now - time::Duration::hours(2),
+            "unrelated pool",
+        )
+        .unwrap();
+
+        let summary =
+            recent_evidence(&[project.path()], "chatgpt:codex", now).expect("two recent files");
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.earliest_at, now - time::Duration::days(1));
+        assert_eq!(summary.latest_at, now - time::Duration::hours(1));
+        assert_eq!(summary.latest_path, latest);
+
+        let other =
+            recent_evidence(&[project.path()], "chatgpt:other", now).expect("one matching file");
+        assert_eq!(other.count, 1);
+
+        assert!(recent_evidence(&[project.path()], "no-such-pool", now).is_none());
+    }
+
+    #[test]
+    fn recent_evidence_spans_every_project_root_passed_in() {
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        let now = datetime!(2026-11-18 12:00:00 UTC);
+        write_evidence(
+            project_a.path(),
+            "pool",
+            now - time::Duration::hours(3),
+            "a",
+        )
+        .unwrap();
+        write_evidence(
+            project_b.path(),
+            "pool",
+            now - time::Duration::hours(1),
+            "b",
+        )
+        .unwrap();
+
+        let summary = recent_evidence(&[project_a.path(), project_b.path()], "pool", now)
+            .expect("evidence from both roots");
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.earliest_at, now - time::Duration::hours(3));
+        assert_eq!(summary.latest_at, now - time::Duration::hours(1));
+    }
+
+    /// Card `20261118-b-c328a3` M3: `fs::read_dir` on a symlinked
+    /// *directory* lists the target's own entries, so a project root
+    /// whose `.multiverse/evidence` is a symlink elsewhere must never be
+    /// walked at all — the same posture `hostdisk::dir_size` already
+    /// takes for a lane's `target/`. Revert check: drop the
+    /// `symlink_metadata`/`is_symlink` guard on `evidence_dir` and this
+    /// fails (count becomes 1, pulled from outside the project).
+    #[test]
+    fn recent_evidence_ignores_a_symlinked_evidence_directory() {
+        let outside = tempfile::tempdir().unwrap();
+        let now = datetime!(2026-11-18 12:00:00 UTC);
+        write_evidence(
+            outside.path(),
+            "chatgpt:codex",
+            now - time::Duration::hours(1),
+            "outside",
+        )
+        .unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join(".multiverse")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join(".multiverse/evidence"),
+            project.path().join(".multiverse/evidence"),
+        )
+        .unwrap();
+
+        assert!(
+            recent_evidence(&[project.path()], "chatgpt:codex", now).is_none(),
+            "a symlinked evidence directory must never be walked"
+        );
+    }
+
+    /// Card `20261118-b-c328a3` M3: a regular-file symlink *inside* a
+    /// real evidence directory, named to match the counted pattern, must
+    /// be skipped the same way — its bytes live wherever the link
+    /// points, never read here, but the count and `latest:` path would
+    /// otherwise mislead. Revert check: drop the per-entry
+    /// `symlink_metadata`/`is_symlink` guard and this fails (count
+    /// becomes 1).
+    #[test]
+    fn recent_evidence_skips_a_symlinked_file_dirent() {
+        let outside = tempfile::tempdir().unwrap();
+        let now = datetime!(2026-11-18 12:00:00 UTC);
+        let real = write_evidence(
+            outside.path(),
+            "chatgpt:codex",
+            now - time::Duration::hours(1),
+            "outside",
+        )
+        .unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join(".multiverse/evidence");
+        fs::create_dir_all(&directory).unwrap();
+        let stamp = format_seconds_utc(now - time::Duration::hours(1))
+            .replace("+00:00", "Z")
+            .replace(['-', ':'], "");
+        std::os::unix::fs::symlink(&real, directory.join(format!("{stamp}-chatgpt_codex.txt")))
+            .unwrap();
+
+        assert!(
+            recent_evidence(&[project.path()], "chatgpt:codex", now).is_none(),
+            "a symlinked file dirent must never be counted"
+        );
     }
 }

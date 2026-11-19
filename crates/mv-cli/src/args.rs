@@ -282,7 +282,7 @@ pub fn command() -> Command {
                     .arg(value("until", "TIMESTAMP", "Directive expiration time")))
                 .subcommand(Command::new("show").about("Show project directives").arg(projects())),
         )
-        .subcommand(Command::new("workers").about("List worker sessions"))
+        .subcommand(Command::new("workers").about("List worker sessions").arg(json()))
         .subcommand(
             group("config", "Manage the configuration file")
                 .subcommand(
@@ -464,11 +464,16 @@ fn accounts() -> Command {
                 )
                 .arg(flag("off", "Clear the capacity limit")),
         )
-        .subcommand(Command::new("usage").about("Show account usage").arg(value(
-            "detail",
-            "ACCOUNT",
-            "Per-day and per-project usage tables for one account",
-        )))
+        .subcommand(
+            Command::new("usage")
+                .about("Show account usage")
+                .arg(value(
+                    "detail",
+                    "ACCOUNT",
+                    "Per-day and per-project usage tables for one account",
+                ))
+                .arg(json()),
+        )
         .subcommand(
             Command::new("lend")
                 .about("Set interactive seat lending")

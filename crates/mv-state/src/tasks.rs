@@ -173,25 +173,90 @@ fn read_status_maybe_since(
     }
 }
 
+/// A task's own id paired with the lane id its worktree status file
+/// lives under — named fields instead of two adjacent `&str`s so a
+/// cross-crate call site can't transpose them without the swap being
+/// visible in the field names at the call site itself.
+pub struct TaskRef<'a> {
+    pub task_id: &'a str,
+    pub lane_task_id: &'a str,
+}
+
 /// Writer status is read from the lane worktree first, then the project
 /// `.multiverse/tasks/` tree. A status whose mtime predates `since`
 /// (this run's `event=started`, else `event=dispatch`) is ignored as an
 /// earlier occupant's leftover — Python's `resolve` / `_status_predates_run`.
 pub fn read_writer_status(
     root: &Path,
-    task_id: &str,
-    lane_task_id: &str,
+    task: TaskRef,
     since: Option<OffsetDateTime>,
 ) -> Option<TaskStatus> {
-    let since = since.and_then(offset_to_system_time);
-    if let Some(lane) = safe_lane_root(root, lane_task_id) {
-        if let Some(status) =
-            status_path_under(&lane, task_id).and_then(|path| read_status_maybe_since(&path, since))
+    match read_writer_status_verbose(root, task, since) {
+        StatusRead::Terminal(status) => Some(status),
+        StatusRead::Absent | StatusRead::Unrecognized(_) => None,
+    }
+}
+
+/// Like [`read_status_verbose`], but a status file whose mtime predates
+/// `since` reads as [`StatusRead::Absent`] rather than whatever it holds —
+/// the same `since` rule [`read_status_maybe_since`] applies for the
+/// terminal-only reader.
+fn read_status_verbose_maybe_since(
+    path: &Path,
+    since: Option<std::time::SystemTime>,
+) -> StatusRead {
+    if let Some(since) = since {
+        match std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
         {
-            return Some(status);
+            Some(modified) if modified < since => return StatusRead::Absent,
+            Some(_) => {}
+            None => return StatusRead::Absent,
         }
     }
-    status_path_under(root, task_id).and_then(|path| read_status_maybe_since(&path, since))
+    read_status_verbose(path)
+}
+
+/// Like [`read_writer_status`], but keeps an unrecognized status file's raw
+/// contents instead of collapsing it to the same `None` a never-written
+/// file reads as — the read [`sweep_tasks`] needs so a garbled token
+/// (card `20261117-b-437eeb`) can be told apart from a silent crash
+/// downstream, in [`SweepTask::unrecognized_status`].
+///
+/// Same lane-then-root precedence as [`read_writer_status`]: a *terminal*
+/// value at either location wins outright (lane first). Failing that, an
+/// unrecognized value from either location is still worth surfacing — the
+/// lane's own copy first, since that is where a dispatched writer's status
+/// file actually lives — rather than letting a root-side absence erase
+/// evidence the lane side already found.
+pub fn read_writer_status_verbose(
+    root: &Path,
+    task: TaskRef,
+    since: Option<OffsetDateTime>,
+) -> StatusRead {
+    let TaskRef {
+        task_id,
+        lane_task_id,
+    } = task;
+    let since = since.and_then(offset_to_system_time);
+    let lane_read = safe_lane_root(root, lane_task_id)
+        .and_then(|lane| status_path_under(&lane, task_id))
+        .map(|path| read_status_verbose_maybe_since(&path, since))
+        .unwrap_or(StatusRead::Absent);
+    if matches!(lane_read, StatusRead::Terminal(_)) {
+        return lane_read;
+    }
+    let root_read = status_path_under(root, task_id)
+        .map(|path| read_status_verbose_maybe_since(&path, since))
+        .unwrap_or(StatusRead::Absent);
+    if matches!(root_read, StatusRead::Terminal(_)) {
+        return root_read;
+    }
+    match lane_read {
+        StatusRead::Unrecognized(_) => lane_read,
+        _ => root_read,
+    }
 }
 
 fn lane_holds_current_status(root: &Path, task: &SweepTask) -> bool {
@@ -951,11 +1016,25 @@ pub struct SweepTask {
     /// dirty-lane handling non-writing roles don't need.
     pub role: String,
     /// The most recently known pane for this task: `result`'s own `pane`
-    /// field when a result was already written, else `started`'s.
+    /// field when a result was already written, else `started`'s, else
+    /// the durable `event=pane` line `record_pane` appends the instant the
+    /// pane exists — before `started` ever lands (Scout 67a619 finding 1).
+    /// A pre-fix log with no `event=pane` line for an old dispatch simply
+    /// has nothing to fall back to here, same as before this field existed.
     pub pane: Option<String>,
     /// This task's status *file* contents, when readable — distinct from
     /// [`Self::status`] (the routing log's recorded outcome).
     pub file_status: Option<TaskStatus>,
+    /// The raw (trimmed) contents of this task's status file when it holds
+    /// something other than one of [`TaskStatus`]'s three tokens — `None`
+    /// both when the file is simply absent (a crashed agent that wrote
+    /// nothing) and when [`Self::recorded`] already made reading it moot.
+    /// [`Self::file_status`] collapses both cases to `None` alike, by
+    /// design, for every consumer that only needs "terminal or not"; this
+    /// field is what lets a garbled write (e.g. `donedone` from a
+    /// truncated write) be told apart from silence downstream — card
+    /// `20261117-b-437eeb`.
+    pub unrecognized_status: Option<String>,
     /// Whether an `event=result`/`event=supersede` record already closed
     /// this task's loop in the routing log.
     pub recorded: bool,
@@ -1011,6 +1090,9 @@ struct TaskEvents {
     account: Option<String>,
     dispatched_at: Option<OffsetDateTime>,
     dispatch_ordinal: u64,
+    /// `event=pane`'s own `pane=` field — written the instant the pane
+    /// exists, before `started_pane` (Scout 67a619 finding 1).
+    pane_event_pane: Option<String>,
     started_pane: Option<String>,
     started_at: Option<OffsetDateTime>,
     result_pane: Option<String>,
@@ -1071,6 +1153,7 @@ fn task_events(root: &Path) -> HashMap<String, TaskEvents> {
                         account: parsed.fields.get("account").cloned(),
                         dispatched_at: mv_core::time::parse_flexible(&parsed.when).ok(),
                         dispatch_ordinal: record.entry.ordinal,
+                        pane_event_pane: None,
                         started_pane: None,
                         started_at: None,
                         result_pane: None,
@@ -1080,6 +1163,10 @@ fn task_events(root: &Path) -> HashMap<String, TaskEvents> {
                         revisions: 0,
                     },
                 );
+            }
+            "pane" => {
+                let entry = by_task.entry(task_id).or_default();
+                entry.pane_event_pane = parsed.fields.get("pane").cloned();
             }
             "started" => {
                 let entry = by_task.entry(task_id).or_default();
@@ -1119,6 +1206,66 @@ fn task_events(root: &Path) -> HashMap<String, TaskEvents> {
     by_task
 }
 
+/// For every task `root`'s routing log currently resolves a pane for,
+/// that pane's id paired with the agent name its *current* record named
+/// (`dispatch`'s own `agent=` field) — [`sweep_tasks`]'s own per-task
+/// fold (`task_events`'s per-task, per-dispatch reset), not a forever-
+/// union of every pane any dispatch round of that task id has ever
+/// named. `tasks --reconcile`'s orphan-pane report (card
+/// `20261118-b-fde912`) used to key on raw pane-id membership in that
+/// forever-union (the old `known_panes`), which meant a pane recorded
+/// once stayed "known" even after Herdr closed it and recycled the same
+/// id for a completely different, never-dispatched agent — a real orphan
+/// that read as accounted for (card `20261118-b-c328a3` M1). Keying on
+/// the (pane, agent) pair instead mirrors the same reused-pane-id
+/// identity check `is_awaiting` already makes for a *recorded* task's
+/// own liveness: a live agent only reads as "this project's own" when
+/// both the pane *and* the name currently match what the log says
+/// belongs there.
+pub fn current_pane_agents(root: &Path) -> HashMap<String, HashSet<String>> {
+    // Every agent recorded on a pane, not just one: Herdr can reuse a pane
+    // id, so a finished task and a live recorded lane may share it, and a
+    // single-valued map would keep whichever task came last and could list
+    // the live lane as an orphan.
+    let mut panes: HashMap<String, HashSet<String>> = HashMap::new();
+    for task in sweep_tasks(root) {
+        if let Some(pane) = task.pane {
+            panes
+                .entry(pane)
+                .or_default()
+                .insert(task.agent.unwrap_or_default());
+        }
+    }
+    panes
+}
+
+#[cfg(test)]
+mod current_pane_agents_tests {
+    use super::*;
+
+    #[test]
+    fn a_reused_pane_keeps_every_recorded_agent() {
+        let root = std::env::temp_dir().join(format!(
+            "mv-current-pane-agents-reuse-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".multiverse")).unwrap();
+        let log = "\
+2026-11-18T01:00:00+00:00\tevent=dispatch\ttask=20261118-builder-bbbbbb\tproject=p\trole=builder\taccount=claude\tagent=lane-new\n\
+2026-11-18T01:00:01+00:00\tevent=started\ttask=20261118-builder-bbbbbb\tpane=w1:p1\n\
+2026-11-18T00:00:00+00:00\tevent=dispatch\ttask=20261118-builder-aaaaaa\tproject=p\trole=builder\taccount=claude\tagent=lane-old\n\
+2026-11-18T00:00:01+00:00\tevent=started\ttask=20261118-builder-aaaaaa\tpane=w1:p1\n\
+2026-11-18T00:30:00+00:00\tevent=result\ttask=20261118-builder-aaaaaa\tstatus=done\tstate=reconciled\trevisions=0\tpane=w1:p1\n";
+        std::fs::write(root.join(".multiverse/routing.log"), log).unwrap();
+        let panes = current_pane_agents(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let agents = panes.get("w1:p1").expect("pane recorded");
+        assert!(agents.contains("lane-new"), "{panes:?}");
+        assert!(agents.contains("lane-old"), "{panes:?}");
+    }
+}
+
 /// Every task `root`'s routing log knows about, joined with each one's own
 /// status file. A missing or unreadable log is "no history for any task",
 /// the same fail-open posture [`read_status`] already takes for one file.
@@ -1141,21 +1288,30 @@ pub fn sweep_tasks(root: &Path) -> Vec<SweepTask> {
             // nearly every task in a project's history is long since
             // recorded, and each one paid for a status file neither read nor
             // needed (card `20261105-b-69a655`).
-            let file_status = if recorded {
-                None
+            let (file_status, unrecognized_status) = if recorded {
+                (None, None)
             } else {
                 let lane_id = events
                     .branch
                     .strip_prefix("multiverse/")
                     .unwrap_or(&task_id);
-                read_writer_status(
+                match read_writer_status_verbose(
                     root,
-                    &task_id,
-                    lane_id,
+                    TaskRef {
+                        task_id: &task_id,
+                        lane_task_id: lane_id,
+                    },
                     events.started_at.or(events.dispatched_at),
-                )
+                ) {
+                    StatusRead::Terminal(status) => (Some(status), None),
+                    StatusRead::Unrecognized(raw) => (None, Some(raw)),
+                    StatusRead::Absent => (None, None),
+                }
             };
-            let pane = events.result_pane.or(events.started_pane);
+            let pane = events
+                .result_pane
+                .or(events.started_pane)
+                .or(events.pane_event_pane);
             let status = events.result_status.as_deref().and_then(TaskStatus::parse);
             SweepTask {
                 task_id,
@@ -1163,6 +1319,7 @@ pub fn sweep_tasks(root: &Path) -> Vec<SweepTask> {
                 role: events.role,
                 pane,
                 file_status,
+                unrecognized_status,
                 recorded,
                 agent: events.agent,
                 account: events.account,
@@ -1398,9 +1555,15 @@ fn cached_lane_porcelain(
 }
 
 /// A `done` outcome needs a readable, non-empty `result.md` in its own
-/// task directory before `reconcile` will record it (`_usable_result`).
-/// Unlike Python, this never falls back to a lane-root copy of the same
-/// file — see this task's result.md for why that fallback was left out.
+/// task directory before sweep's own automatic reconcile leg
+/// (`is_reconcile_candidate`) will record it (`_usable_result`). `tasks
+/// --reconcile`'s own gate (`is_tasks_reconcile_candidate`) still calls
+/// this, but no longer to decide *whether* to record — only to choose
+/// [`DONE_WITHOUT_RESULT`] over the ordinary `reconciled` state (Scout
+/// `20261117-scout-9c0832` rank 2: a `done` status with no usable
+/// `result.md` used to be unrecordable by any command at all). Unlike
+/// Python, this never falls back to a lane-root copy of the same file —
+/// see this task's result.md for why that fallback was left out.
 ///
 /// `pub` (card `20261102-b-b4ede0`) so `mv_engine::sweep_nudges` can reuse
 /// it for the identical "did this task leave a result behind" question
@@ -1426,6 +1589,11 @@ pub fn has_usable_result(root: &Path, task_id: &str) -> bool {
 /// `tasks --reconcile`; `is_working` must answer that question, not
 /// `SweepTask`'s broader pane-liveness one, or a settled pane Herdr has not
 /// yet dropped from its listing is left unrecorded a sweep pass too long.
+/// Unlike [`is_tasks_reconcile_candidate`], this still skips a `done`
+/// status with no usable `result.md` outright — sweep's own unattended
+/// background pass stays conservative about writing a terminal outcome
+/// nobody explicitly asked it to; only `tasks --reconcile`'s own gate was
+/// taught to record that case instead.
 fn is_reconcile_candidate(
     root: &Path,
     task: &SweepTask,
@@ -1454,7 +1622,12 @@ fn is_reconcile_candidate(
 /// round still spending), but record an idle/done/blocked/unknown live
 /// pane so `_close_settled_panes` can tidy it. Distinct from
 /// [`is_reconcile_candidate`], which sweep uses and which treats any live
-/// pane as still in flight.
+/// pane as still in flight — and which still skips a `done` status with
+/// no usable `result.md` outright, left unchanged. This gate no longer
+/// does: a `done` status with no usable `result.md` is still a candidate
+/// here, so [`reconcile_project`]'s write leg can record it as
+/// [`DONE_WITHOUT_RESULT`] instead of leaving it permanently unrecorded
+/// with no command able to clear it.
 fn is_tasks_reconcile_candidate(
     root: &Path,
     task: &SweepTask,
@@ -1473,9 +1646,6 @@ fn is_tasks_reconcile_candidate(
         }
     }
     if lane_is_dirty(root, task, cache) {
-        return false;
-    }
-    if task.file_status == Some(TaskStatus::Done) && !has_usable_result_for(root, task) {
         return false;
     }
     true
@@ -1572,7 +1742,24 @@ pub fn reconcile_project(
         let status = task
             .file_status
             .expect("is_reconcile_candidate already required a status file");
-        if record_reconciled(root, &task.task_id, status, task.pane.as_deref()) {
+        // A `done` status with no usable `result.md` is recorded as the
+        // status the file actually said — matching every other
+        // reconciliation's literal transcription — with `state` carrying
+        // the missing-evidence annotation instead of inventing a fourth
+        // terminal status, or (the old behavior) leaving it unrecorded
+        // forever with no command able to clear it.
+        let wrote = if status == TaskStatus::Done && !has_usable_result_for(root, task) {
+            append_outcome_if_absent(
+                root,
+                &task.task_id,
+                status,
+                DONE_WITHOUT_RESULT,
+                task.pane.as_deref(),
+            )
+        } else {
+            record_reconciled(root, &task.task_id, status, task.pane.as_deref())
+        };
+        if wrote {
             recorded_ids.push(task.task_id.clone());
             if let Some(pane) = task.pane.as_deref() {
                 let first = live_status
@@ -1771,6 +1958,18 @@ fn append_outcome_if_absent(
     );
     lock.append(&line).is_ok()
 }
+
+/// `tasks --reconcile`'s own state for a `done` status with no usable
+/// `result.md` behind it — the mirror image of [`ABANDONED_PARTIAL_RESULT`]
+/// (a `result.md` with no status file). Recorded with `status=done`,
+/// matching the status file's own literal claim rather than downgrading it
+/// to `failed`: every other reconciliation already transcribes the status
+/// file as-is without second-guessing the evidence behind it, and
+/// `status=done` is what keeps `tasks`'s own listing from still flagging
+/// this task as needing a look once it is recorded. This `state` is the
+/// part that preserves the missing-evidence fact for anyone reading
+/// `routing.log` (Scout `20261117-scout-9c0832` rank 2).
+pub const DONE_WITHOUT_RESULT: &str = "done-without-result";
 
 /// Appends the `event=result` line sweep's reconcile leg owes a settled,
 /// unrecorded task: the same legacy (unversioned) shape `dispatch`/
@@ -2389,6 +2588,36 @@ pub const UNKNOWN_NEEDS_HUMAN: &str = "unknown-needs-human";
 /// A `result.md` left behind with no status file — mirrors
 /// `tasks.ABANDONED_PARTIAL_RESULT`.
 pub const ABANDONED_PARTIAL_RESULT: &str = "abandoned-partial-result";
+/// A status file written, but holding a value outside `done`/`blocked`/
+/// `failed` — a garbled (e.g. truncated) write, not silence. Card
+/// `20261117-b-437eeb`: this is new, not a Python-reference constant, since
+/// Python's own reader has the same `read_status` collapse this one works
+/// around.
+pub const UNRECOGNIZED_STATUS_TOKEN: &str = "unrecognized-status-token";
+
+/// How much of an unrecognized status token [`describe_unrecognized_token`]
+/// keeps before truncating — a label for a one-line evidence string, not a
+/// document.
+const UNRECOGNIZED_TOKEN_DISPLAY_LIMIT: usize = 80;
+
+/// Caps and escapes an unrecognized status token before it goes into
+/// `close_stranded`'s evidence text, which `close_stranded_and_report`
+/// prints to the operator's terminal unsanitized. A garbled status write is
+/// exactly the case where its raw bytes cannot be trusted — a control byte
+/// (including an ANSI escape) is replaced with `.` rather than reaching the
+/// terminal, and anything past [`UNRECOGNIZED_TOKEN_DISPLAY_LIMIT`] is
+/// dropped behind a trailing `…`.
+fn describe_unrecognized_token(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if out.chars().count() >= UNRECOGNIZED_TOKEN_DISPLAY_LIMIT {
+            out.push('…');
+            break;
+        }
+        out.push(if ch.is_control() { '.' } else { ch });
+    }
+    out
+}
 
 /// One stranded task's determination, and whether `close_stranded` actually
 /// recorded it. Mirrors `tasks.StrandedClosure`: returned whether or not
@@ -2437,6 +2666,18 @@ fn is_awaiting(task: &SweepTask, live_name: &impl Fn(&str) -> Option<String>) ->
                 Some(name) => name != task.agent.as_deref().unwrap_or(""),
             },
         }
+}
+
+/// Whether `task` holds a garbled (unrecognized-token) status write
+/// `close_stranded` can record a terminal outcome for — card
+/// `20261117-b-437eeb`. Deliberately *not* gated on pane liveness the way
+/// [`is_awaiting`] is: a status file holding something other than silence
+/// is itself the evidence, regardless of what Herdr currently reports for
+/// the pane — a corrupted write is exactly the case where that pane may
+/// still look "live" (busy or otherwise) while the agent that wrote it is
+/// never going to produce a recognizable terminal status on its own.
+fn is_garbled_status_candidate(task: &SweepTask) -> bool {
+    !task.recorded && task.unrecognized_status.is_some()
 }
 
 /// Where `task_id` left its `result.md`, if anywhere — the lane's own copy
@@ -2891,6 +3132,31 @@ pub fn close_stranded(
 
     let mut closures = Vec::new();
     for task in &tasks {
+        if is_garbled_status_candidate(task) {
+            let token =
+                describe_unrecognized_token(task.unrecognized_status.as_deref().unwrap_or(""));
+            let evidence = format!(
+                "status file holds an unrecognized value ('{token}') — neither empty (a crash \
+                 that wrote nothing) nor one of done/blocked/failed; a human needs to read the \
+                 pane and record the real outcome"
+            );
+            let recorded = apply
+                && record_stranded_closure(
+                    root,
+                    &task.task_id,
+                    TaskStatus::Blocked,
+                    UNRECOGNIZED_STATUS_TOKEN,
+                    task.pane.as_deref(),
+                );
+            closures.push(StrandedClosure {
+                task_id: task.task_id.clone(),
+                status: TaskStatus::Blocked,
+                state: UNRECOGNIZED_STATUS_TOKEN,
+                evidence,
+                recorded,
+            });
+            continue;
+        }
         if !is_awaiting(task, &live_name) {
             continue;
         }
@@ -5356,6 +5622,90 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_settled_records_a_done_task_with_no_result_md_at_all() {
+        // Scout `20261117-scout-9c0832` rank 2: a `done` status file with
+        // no `result.md` behind it used to be unrecordable by any command,
+        // including `--reconcile` itself, despite the CLI's own message
+        // claiming `--reconcile` would fix it. `is_tasks_reconcile_candidate`
+        // must now treat this as a candidate and record it as `done`,
+        // tagged `done-without-result` rather than the ordinary
+        // `reconciled` state.
+        let root = temp_dir("reconcile-settled-no-result");
+        write(&root.join(".multiverse/routing.log"), UNRECORDED_LOG);
+        write(
+            &root.join(".multiverse/tasks/20250101-fixer-aaaaaa/status"),
+            "done",
+        );
+        // Deliberately no result.md written at all.
+
+        let mut agents = FakeAgents::new(&[]);
+        let written = reconcile_settled(&root, None, &mut agents);
+        assert_eq!(
+            written,
+            vec!["20250101-fixer-aaaaaa".to_string()],
+            "a done task with no result.md must still be recorded, not silently skipped"
+        );
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(log.lines().last().unwrap().contains(
+            "event=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=done-without-result"
+        ));
+    }
+
+    #[test]
+    fn reconcile_settled_records_a_done_task_with_an_empty_result_md() {
+        // Same gap as the missing-file case above, but for a `result.md`
+        // that exists and is empty/whitespace-only — `has_usable_result`
+        // treats both the same way, so `--reconcile` must too.
+        let root = temp_dir("reconcile-settled-empty-result");
+        write(&root.join(".multiverse/routing.log"), UNRECORDED_LOG);
+        write(
+            &root.join(".multiverse/tasks/20250101-fixer-aaaaaa/status"),
+            "done",
+        );
+        write(
+            &root.join(".multiverse/tasks/20250101-fixer-aaaaaa/result.md"),
+            "   \n",
+        );
+
+        let mut agents = FakeAgents::new(&[]);
+        let written = reconcile_settled(&root, None, &mut agents);
+        assert_eq!(written, vec!["20250101-fixer-aaaaaa".to_string()]);
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(log.lines().last().unwrap().contains(
+            "event=result\ttask=20250101-fixer-aaaaaa\tstatus=done\tstate=done-without-result"
+        ));
+    }
+
+    #[test]
+    fn sweep_project_still_skips_a_done_task_with_no_usable_result() {
+        // `is_reconcile_candidate` (sweep's own automatic reconcile leg,
+        // distinct from `tasks --reconcile`'s `is_tasks_reconcile_candidate`)
+        // must keep its existing behavior: this fix is scoped to the
+        // explicit `--reconcile` path only, never sweep's unattended one.
+        let root = temp_dir("sweep-done-without-result-unchanged");
+        write(&root.join(".multiverse/routing.log"), UNRECORDED_LOG);
+        write(
+            &root.join(".multiverse/tasks/20250101-fixer-aaaaaa/status"),
+            "done",
+        );
+        // Deliberately no result.md written at all.
+
+        let mut agents = FakeAgents::new(&[]);
+        let report = sweep_project(&root, false, 60, &HashMap::new(), now_utc(), &mut agents);
+        assert_eq!(
+            report.recorded, 0,
+            "sweep's own automatic reconcile must still leave this task unrecorded"
+        );
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            !log.contains("state=done-without-result") && !log.contains("state=reconciled"),
+            "sweep must not have written any outcome for this task: {log:?}"
+        );
+    }
+
+    #[test]
     fn reconcile_settled_with_a_task_filter_ignores_every_other_candidate() {
         let root = temp_dir("reconcile-settled-filtered");
         write(
@@ -5635,6 +5985,99 @@ mod tests {
             closures.is_empty(),
             "a live-paned task and an already-recorded one are never stranded: {closures:?}"
         );
+    }
+
+    #[test]
+    fn close_stranded_leaves_a_live_pane_alone_when_only_event_pane_was_recorded() {
+        // Scout 67a619 finding 1's own kill point: the host dies after the
+        // pane is created but before `record_started` ever appends
+        // `event=started` — `runner.rs::start_dispatch`'s `record_pane`
+        // call (right after the pane exists, before rename/start/prompt)
+        // is the fix, appending `event=pane` durably enough that this
+        // task's `.pane` is never `None` through that window. Revert
+        // `record_pane`'s call, or drop the `"pane"` match arm in
+        // `task_events`, and `tasks[0].pane` reads back `None` here;
+        // `is_awaiting` then treats a `None` pane as unconditionally gone,
+        // and `close_stranded --apply` would fabricate a terminal status
+        // onto a pane Herdr still reports live under this task's own
+        // agent.
+        let root = temp_dir("close-stranded-pane-event-only");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-paneonl\t\
+             branch=multiverse/20260101-fixer-paneonl\trole=fixer\tagent=agent-a\n\
+             2026-01-01T00:00:30+00:00\tevent=pane\ttask=20260101-fixer-paneonl\tpane=w1:p1\n",
+        );
+
+        let tasks = sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].pane.as_deref(),
+            Some("w1:p1"),
+            "the durable pane event must populate .pane with no started/result event at all"
+        );
+
+        let mut agents = FakeAgents::new_idle(&[("w1:p1", "agent-a")]);
+        let closures = close_stranded(&root, true, &mut agents);
+        assert!(
+            closures.is_empty(),
+            "a pane Herdr still reports live under this task's own agent must never be closed: {closures:?}"
+        );
+    }
+
+    #[test]
+    fn close_stranded_records_a_garbled_status_even_with_a_live_same_agent_pane() {
+        // Card 20261117-b-437eeb (Scout 9c0832 rank 5): a truncated or
+        // otherwise corrupted status write ("donedone") collapses through
+        // `read_status` to the exact same `None` a never-written file
+        // reads as. Before this fix, a task whose pane Herdr still
+        // reports live under its own dispatched agent name was excluded
+        // from `--reconcile` (`file_status.is_none()`) *and* from
+        // `close_stranded`'s own `is_awaiting` gate (the pane reads as
+        // still occupied by this task's own agent, same as
+        // `close_stranded_never_touches_a_running_or_recorded_task`
+        // above) — nothing could ever force a terminal recording for it.
+        let root = temp_dir("close-stranded-garbled");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-garbld\t\
+             branch=multiverse/20260101-fixer-garbld\trole=fixer\tagent=agent-a\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-fixer-garbld\tpane=w1:p1\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20260101-fixer-garbld/status"),
+            "donedone",
+        );
+
+        // Confirm the premise: the live listing says this task's own
+        // agent still occupies the pane, so `is_awaiting` alone would
+        // refuse it exactly as it refuses a genuinely running task.
+        let tasks = sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].unrecognized_status.as_deref(), Some("donedone"));
+        assert!(tasks[0].file_status.is_none());
+        let live_name = |pane: &str| (pane == "w1:p1").then(|| "agent-a".to_string());
+        assert!(
+            !is_awaiting(&tasks[0], &live_name),
+            "the pane still reads as this task's own agent, so is_awaiting alone must refuse it"
+        );
+
+        let mut agents =
+            FakeAgents::new_idle(&[("w1:p1", "agent-a")]).with_status("w1:p1", AgentState::Working);
+        let closures = close_stranded(&root, true, &mut agents);
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].task_id, "20260101-fixer-garbld");
+        assert_eq!(closures[0].status, TaskStatus::Blocked);
+        assert_eq!(closures[0].state, UNRECOGNIZED_STATUS_TOKEN);
+        assert!(
+            closures[0].evidence.contains("donedone"),
+            "evidence was: {}",
+            closures[0].evidence
+        );
+        assert!(closures[0].recorded);
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(log.contains("status=blocked"), "log was:\n{log}");
     }
 
     #[test]
@@ -6067,6 +6510,7 @@ mod tests {
             role: "fixer".to_string(),
             pane: None,
             file_status: None,
+            unrecognized_status: None,
             recorded: false,
             agent: None,
             account: None,
@@ -6377,6 +6821,113 @@ mod tests {
             Some(TaskStatus::Done),
             "the worktree status must win over a leftover main-checkout copy"
         );
+    }
+
+    #[test]
+    fn current_pane_agents_drops_a_redispatched_tasks_abandoned_pane() {
+        // `task_events`'s own fold resets a task id's fields on every
+        // `dispatch` line — the first round's pane must drop out of
+        // `current_pane_agents` the moment a second dispatch reuses the
+        // id, unlike the old `known_panes` forever-union this replaced
+        // (card `20261118-b-c328a3` M1): that union kept an abandoned
+        // first-round pane "known" forever, so a live, unrecorded agent
+        // that Herdr later put on it never read as an orphan.
+        let root = temp_dir("current-pane-agents-drops-redispatched-pane");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-aaaaaa\t\
+             branch=main\trole=fixer\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-fixer-aaaaaa\t\
+             pane=w1:p1\n\
+             2026-01-01T00:02:00+00:00\tevent=result\ttask=20260101-fixer-aaaaaa\t\
+             status=done\tstate=done\trevisions=0\tpane=w1:p1\n\
+             2026-01-02T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-aaaaaa\t\
+             branch=main\trole=fixer\n\
+             2026-01-02T00:01:00+00:00\tevent=started\ttask=20260101-fixer-aaaaaa\t\
+             pane=w2:p2\n",
+        );
+        let panes = current_pane_agents(&root);
+        assert!(!panes.contains_key("w1:p1"), "{panes:?}");
+        assert!(panes.contains_key("w2:p2"), "{panes:?}");
+    }
+
+    #[test]
+    fn current_pane_agents_is_empty_for_a_project_with_no_routing_log() {
+        let root = temp_dir("current-pane-agents-no-log");
+        assert!(current_pane_agents(&root).is_empty());
+    }
+
+    #[test]
+    fn sweep_tasks_surfaces_an_unrecognized_status_token_distinct_from_absence() {
+        // Card 20261117-b-437eeb: `file_status` alone cannot tell a
+        // never-written status file from a garbled one — both read as
+        // `None`. `unrecognized_status` is what keeps them apart.
+        let root = temp_dir("sweep-unrecognized-status");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-garbld\t\
+             branch=multiverse/20260101-fixer-garbld\trole=fixer\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20260101-fixer-garbld/status"),
+            "donedone",
+        );
+        let tasks = sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].file_status, None);
+        assert_eq!(tasks[0].unrecognized_status.as_deref(), Some("donedone"));
+    }
+
+    #[test]
+    fn sweep_tasks_surfaces_the_lanes_unrecognized_token_when_root_has_nothing() {
+        let root = temp_dir("sweep-unrecognized-lane-only");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-bbbbbb\t\
+             branch=multiverse/20260101-fixer-bbbbbb\trole=fixer\n",
+        );
+        write(
+            &root
+                .join(".multiverse/worktrees/20260101-fixer-bbbbbb")
+                .join(".multiverse/tasks/20260101-fixer-bbbbbb/status"),
+            "doneblocked",
+        );
+        let tasks = sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].file_status, None);
+        assert_eq!(
+            tasks[0].unrecognized_status.as_deref(),
+            Some("doneblocked"),
+            "the lane's own garbled status must surface even when the main checkout has none"
+        );
+    }
+
+    #[test]
+    fn sweep_tasks_prefers_a_terminal_status_over_an_unrecognized_one_at_either_location() {
+        let root = temp_dir("sweep-terminal-over-unrecognized");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-aaaaaa\t\
+             branch=multiverse/20260101-fixer-aaaaaa\trole=fixer\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20260101-fixer-aaaaaa/status"),
+            "done",
+        );
+        write(
+            &root
+                .join(".multiverse/worktrees/20260101-fixer-aaaaaa")
+                .join(".multiverse/tasks/20260101-fixer-aaaaaa/status"),
+            "donedone",
+        );
+        let tasks = sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].file_status,
+            Some(TaskStatus::Done),
+            "a root-side terminal value must win over a garbled lane-side one"
+        );
+        assert_eq!(tasks[0].unrecognized_status, None);
     }
 
     #[test]

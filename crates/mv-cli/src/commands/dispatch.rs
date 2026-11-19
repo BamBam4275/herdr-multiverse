@@ -873,7 +873,10 @@ fn load_config(cli_override: Option<&str>) -> Result<Config, EngineError> {
 /// `target`, made absolute against `cwd` and canonicalized (following
 /// symlinks, unlike `mv_config::load::resolve_config_path` — this is a
 /// project *path*, not a config path; see `spec-config.md` §C).
-fn resolve_user_path(raw: &str, cwd: &Path) -> Result<PathBuf, String> {
+///
+/// `pub(super)`: shared with `commands::backlog`'s `list` project
+/// resolution (card `20261117-b-a59293`), not only used here.
+pub(super) fn resolve_user_path(raw: &str, cwd: &Path) -> Result<PathBuf, String> {
     let candidate = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
@@ -887,7 +890,10 @@ fn resolve_user_path(raw: &str, cwd: &Path) -> Result<PathBuf, String> {
 /// every `[projects.<name>]` whose own (canonicalized) `path` is `target`
 /// or an ancestor of it is a candidate; the deepest one wins, so a project
 /// nested inside another beats the outer one.
-fn resolve_project<'c>(config: &'c Config, target: &Path) -> Option<(&'c str, PathBuf)> {
+///
+/// `pub(super)`: shared with `commands::backlog`'s `list` project
+/// resolution (card `20261117-b-a59293`), not only used here.
+pub(super) fn resolve_project<'c>(config: &'c Config, target: &Path) -> Option<(&'c str, PathBuf)> {
     let mut best: Option<(&str, PathBuf)> = None;
     for (name, project) in &config.projects {
         let Some(raw) = project.path.value() else {
@@ -1353,7 +1359,13 @@ fn is_task_pane_still_open(
 /// `agents` listing, the same fail-closed posture [`live_open_counts`]
 /// already takes for the per-seat cap; callers must never read that as
 /// "every pane is gone".
-fn live_agent_statuses() -> Option<HashMap<String, String>> {
+///
+/// `pub(super)`, like [`fleet_open_counts`]/[`is_nexus_role`] above, so
+/// `commands::council` can retry its own conservative `fleet_open_counts`
+/// call with a real listing the same way `plan_dispatch`'s own
+/// `capacity_source` does, rather than keeping a second copy of this call
+/// (card `20261117-b-f2b742`).
+pub(super) fn live_agent_statuses() -> Option<HashMap<String, String>> {
     let mut herdr = runner::ProcessHerdr;
     let result = herdr
         .call(&argv::agent_list(), Duration::from_secs(10))
@@ -2008,7 +2020,7 @@ fn render_card(resolved: &Resolved, request: &Request) -> Result<String, EngineE
         out.push_str("  Re-run with --full to print them inline.\n");
     }
     section(&mut out, "WOULD RUN");
-    let native = argv::native_args(&store.model, &account.kind, store.effort.as_deref());
+    let native = argv::native_args(&store.model, &account.kind, store.effort.as_deref(), &cwd);
     let multiverse_config = resolved.config.source_path.display().to_string();
     let multiverse_state_dir = resolved.config_dir.display().to_string();
     let env = [
@@ -3218,6 +3230,18 @@ impl RealDispatchStore {
             "Reference paths and line numbers; do not paste file contents into the result."
                 .to_string(),
         );
+        // Card 20261117-b-249af1: Codex has no flag that restricts what it
+        // can *read* (only `-C`/`--cd`, pinning where it is rooted, is
+        // passed at launch — `argv::native_args`), so the lane itself has
+        // to be told not to search above its own worktree.
+        if self.account.kind == "codex" {
+            constraints.push(
+                "Your root is this worktree. Codex has no sandbox flag that restricts \
+                 reads, so do not list, search, or read anything above it: no `..`, \
+                 no parent directories, and no other project checkouts."
+                    .to_string(),
+            );
+        }
         brief.constraints = constraints;
 
         // Review metadata is shared by the preview and the dispatched brief.
@@ -3885,6 +3909,7 @@ impl mv_state::worktrees::LaneObserver for AlreadyCheckedLaneObserver {
     fn record_prune(
         &mut self,
         _lane: &mv_state::worktrees::Lane,
+        _task_records: &[mv_state::index::IndexedRecord],
     ) -> std::result::Result<(), mv_state::worktrees::WorktreeError> {
         Ok(())
     }
@@ -4180,8 +4205,12 @@ impl DispatchStore for RealDispatchStore {
         } else {
             AUTH_VARS_TO_CLEAR.iter().map(|s| s.to_string()).collect()
         };
-        let mut native_args =
-            argv::native_args(&self.model, &self.account.kind, self.effort.as_deref());
+        let mut native_args = argv::native_args(
+            &self.model,
+            &self.account.kind,
+            self.effort.as_deref(),
+            &cwd,
+        );
         // Card 20261105-b-50b425: every dispatched claude seat — an
         // ordinary dispatch's own `new()` and a council seat's `for_seat()`
         // alike, since both share this one `prepare` — gets the same
@@ -4326,6 +4355,15 @@ impl DispatchStore for RealDispatchStore {
         };
         engine_dispatch::check_halt_before_pane_creation(&halt, self.force)
             .map_err(|e| RunnerError::Refused(e.to_string()))
+    }
+
+    /// `event=pane` — the durable record `DispatchStore::record_pane`'s own
+    /// doc comment calls for, appended the instant the pane exists so a
+    /// kill before `event=started` still leaves the pane known.
+    fn record_pane(&mut self, launch: &PreparedLaunch, pane: &str) -> Result<(), RunnerError> {
+        let when = mv_core::time::now_stamp();
+        let line = format!("{when}\tevent=pane\ttask={}\tpane={pane}", launch.task_id);
+        self.append_routing(&line)
     }
 
     fn record_started(
@@ -7218,6 +7256,46 @@ review_scope = "repo"
     }
 
     #[test]
+    fn record_pane_appends_event_pane_with_the_task_and_pane() {
+        // Scout 67a619 finding 1: this append is what makes the pane
+        // durable the instant it exists, before rename/start/prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut store = store_for(
+            &project,
+            config_dir.path(),
+            Role::Builder,
+            "20261102-builder-eeeeee",
+        );
+        let launch = PreparedLaunch {
+            project_root: project.clone(),
+            cwd: project.clone(),
+            task_id: "20261102-builder-eeeeee".into(),
+            agent_name: "a".into(),
+            role: "builder".into(),
+            kind: "codex".into(),
+            model: "m".into(),
+            seat: "s".into(),
+            brief: String::new(),
+            native_args: Vec::new(),
+            environment: Vec::new(),
+            clear_auth: Vec::new(),
+            command: None,
+        };
+
+        store.record_pane(&launch, "w1:p1").unwrap();
+
+        let log = std::fs::read_to_string(project.join(".multiverse/routing.log")).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(
+            line.ends_with("\tevent=pane\ttask=20261102-builder-eeeeee\tpane=w1:p1"),
+            "{line:?}"
+        );
+    }
+
+    #[test]
     fn lane_setup_is_skipped_entirely_for_a_reader() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
@@ -8992,17 +9070,27 @@ review_scope = "repo"
     /// (`AlreadyCheckedLaneObserver`) must trust that result rather than
     /// asking again.
     ///
-    /// A fake Herdr that sleeps on exactly that `agent list` call proves
-    /// it: `prepare` is timed while `routing.log.lock` is held, and must
-    /// return in well under the sleep. Revert check: putting
-    /// `HerdrLaneObserver::new(...)` back in `prepare`'s own `adopt` call,
-    /// as before this fix, makes `prepare` itself sleep for `sleep_secs`
-    /// while holding that lock, failing the elapsed-time assertion below.
+    /// The fake Herdr appends every invocation it receives (its whole
+    /// argv) to a log file the test owns, rather than sleeping on the
+    /// `agent list` call. `prepare` runs with `routing.log.lock` held,
+    /// and the test asserts no line was appended to that log between
+    /// taking the lock and `prepare` returning — i.e. no Herdr call of
+    /// any kind happened while the lock was held, not merely that
+    /// `prepare` returned before some fixed delay elapsed. (A sleep-vs-
+    /// elapsed version of this proof is flaky under host load: `prepare`
+    /// alone can take 2.3-3.1s on a busy host, independent of any extra
+    /// Herdr call, so comparing its wall-clock time against a fixed
+    /// subprocess sleep fails even when the code is correct.) A generous
+    /// 30s bound is kept only as a hang guard, not as the proof. Revert
+    /// check: putting `HerdrLaneObserver::new(...)` back in `prepare`'s
+    /// own `adopt` call, as before this fix, makes `prepare` log a fresh
+    /// `agent list` call while the lock is held, failing the
+    /// no-new-calls assertion below.
     #[test]
     fn into_adopt_never_calls_herdr_while_prepares_project_lock_is_held() {
-        let sleep_secs = 2;
+        let calls = tempfile::NamedTempFile::new().unwrap();
         let script = tempfile::Builder::new()
-            .prefix("mv-cli-slow-herdr-")
+            .prefix("mv-cli-logging-herdr-")
             .suffix(".sh")
             .tempfile()
             .unwrap()
@@ -9030,8 +9118,9 @@ review_scope = "repo"
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = agent ] && [ \"$2\" = list ]; then\n  \
-                 sleep {sleep_secs}\nfi\nprintf '%s' '{{\"result\": {{\"agents\": []}}}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf '%s' '{{\"result\": \
+                 {{\"agents\": []}}}}'\n",
+                calls.path().display(),
             ),
         )
         .unwrap();
@@ -9073,18 +9162,29 @@ review_scope = "repo"
 
         store.recheck_admission().unwrap();
 
+        let before_lines = std::fs::read_to_string(calls.path())
+            .unwrap()
+            .lines()
+            .count();
+
         let _project_lock = mv_state::log::ProjectLog::new(&project).lock().unwrap();
         let started = Instant::now();
         let launch = store.prepare().unwrap();
         let elapsed = started.elapsed();
+        let during = std::fs::read_to_string(calls.path()).unwrap();
         drop(_project_lock);
 
         assert_eq!(launch.task_id, "20261102-builder-bbbbbb");
+        let calls_while_locked: Vec<&str> = during.lines().skip(before_lines).collect();
         assert!(
-            elapsed < Duration::from_secs(sleep_secs),
-            "prepare() took {elapsed:?} while routing.log.lock was held and Herdr's `agent \
-             list` sleeps for {sleep_secs}s — prepare's own --into adopt call must not ask \
-             Herdr again while that lock is held"
+            calls_while_locked.is_empty(),
+            "prepare() made Herdr call(s) {calls_while_locked:?} while routing.log.lock was \
+             held — prepare's own --into adopt call must not ask Herdr again while that lock \
+             is held"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "prepare() took {elapsed:?} while routing.log.lock was held — possible hang"
         );
     }
 }

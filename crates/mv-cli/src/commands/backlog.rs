@@ -68,6 +68,36 @@ fn resolve(root: &Path, token: &str) -> Result<String, Failure> {
     backlog::resolve_item_id(ids, token).map_err(|e| Failure::ItemLookup(e.to_string()))
 }
 
+/// Same single `read_items` as `resolve()`, but returns the matched item
+/// itself — for `show`/`answer`, which need the full record, not just its
+/// id. Doing one read instead of `resolve()`'s read followed by a second,
+/// independent `read_items()` call closes the window a concurrent writer
+/// (another sweep tick, another seat's `done`/`reopen`) could use to remove
+/// or renumber the item in between the two reads.
+fn resolve_item(root: &Path, token: &str) -> Result<BacklogItem, Failure> {
+    let items = backlog::read_items(root, false);
+    let ids: Vec<&str> = items.iter().map(|i| i.item.as_str()).collect();
+    let id =
+        backlog::resolve_item_id(ids, token).map_err(|e| Failure::ItemLookup(e.to_string()))?;
+    item_in(items, &id, token)
+}
+
+/// `id` is known-good — the caller just resolved it from `items`' own id
+/// list — so this only returns `Err` if `items` and `id` disagree, which is
+/// exactly the shape the old concurrent-write race produced via two
+/// independent reads: `backlog show`/`answer` used to hit
+/// `.expect("resolve() only returns a known id")` here, a raw panic with a
+/// repo-relative source line and internal invariant text. Split out so that
+/// shape is reachable and assertable from a test without real concurrency.
+fn item_in(items: Vec<BacklogItem>, id: &str, token: &str) -> Result<BacklogItem, Failure> {
+    items.into_iter().find(|i| i.item == id).ok_or_else(|| {
+        Failure::ItemLookup(format!(
+            "{token} matched '{id}', but the backlog changed while this command was reading \
+             it — likely a concurrent write; try the command again."
+        ))
+    })
+}
+
 /// Resolve the caller through its live pane identity, never task environment
 /// hints. Unreachable or unresolvable Herdr identity fails open.
 fn dispatched_caller_name(args: &ArgMatches) -> Result<Option<String>, Failure> {
@@ -78,7 +108,13 @@ fn dispatched_caller_name(args: &ArgMatches) -> Result<Option<String>, Failure> 
     else {
         return Ok(None);
     };
-    let result = mv_engine::mv_herdr::run::run(&mv_engine::mv_herdr::argv::agent_list(), None).ok();
+    let result = mv_engine::mv_herdr::run::run(
+        &mv_engine::mv_herdr::argv::agent_list(),
+        Some(std::time::Duration::from_secs_f64(
+            mv_engine::mv_herdr::argv::LISTING_TIMEOUT_SECONDS,
+        )),
+    )
+    .ok();
     let Some(result) = result.filter(|result| result.ok()) else {
         return Ok(None);
     };
@@ -399,6 +435,33 @@ fn projects_in_declaration_order(config: &Config) -> Vec<Project> {
         .collect()
 }
 
+/// A project token — from `backlog list`, `activity nudge`, or `tasks`'s
+/// own `--projects`/positional arguments — is a literal `[projects.<name>]`
+/// key first (so a configured name wins even when it also happens to name a
+/// real path), else whatever `commands::dispatch`'s own project resolver
+/// accepts: `.`, a relative path, or an absolute path, resolved against
+/// `cwd` the same way `dispatch`'s positional project argument is (card
+/// `20261117-b-a59293` — `backlog list .` used to fail with "unknown
+/// project(s): ." because this lookup was a bare key match with no path
+/// handling at all; card `20261117-b-486a55` widened visibility so `nudge`
+/// and `tasks` could reuse it instead of carrying the identical gap).
+/// `cwd` is `None` only when the current directory cannot be read, in which
+/// case the literal-key match is all that is tried, same as before this
+/// resolver existed.
+pub(super) fn resolve_named_project(
+    config: &Config,
+    cwd: Option<&Path>,
+    token: &str,
+) -> Option<Project> {
+    if let Some(project) = config.projects.get(token) {
+        return Some(project.clone());
+    }
+    let cwd = cwd?;
+    let target = super::dispatch::resolve_user_path(token, cwd).ok()?;
+    let (name, _root) = super::dispatch::resolve_project(config, &target)?;
+    config.projects.get(name).cloned()
+}
+
 /// `cmd_backlog`'s `list` scope resolution: named projects if given, else
 /// `cmd_board`'s own hub rule (cwd inside the hub project, or outside every
 /// project, widens to the whole fleet; cwd inside any other project narrows
@@ -409,11 +472,15 @@ fn resolve_list_projects(config: &Config, args: &ArgMatches) -> Result<Vec<Proje
         .map(|values| values.cloned().collect())
         .unwrap_or_default();
     if !named.is_empty() {
-        let unknown: Vec<&str> = named
-            .iter()
-            .map(String::as_str)
-            .filter(|name| !config.projects.contains_key(*name))
-            .collect();
+        let cwd = std::env::current_dir().ok();
+        let mut resolved = Vec::with_capacity(named.len());
+        let mut unknown: Vec<&str> = Vec::new();
+        for name in &named {
+            match resolve_named_project(config, cwd.as_deref(), name) {
+                Some(project) => resolved.push(project),
+                None => unknown.push(name.as_str()),
+            }
+        }
         if !unknown.is_empty() {
             let known = config
                 .projects
@@ -431,10 +498,7 @@ fn resolve_list_projects(config: &Config, args: &ArgMatches) -> Result<Vec<Proje
                 }
             )));
         }
-        return Ok(named
-            .iter()
-            .map(|name| config.projects[name].clone())
-            .collect());
+        return Ok(resolved);
     }
     match cwd_project(config) {
         Some(project) if project.name == mv_state::activity::HUB_PROJECT_NAME => {
@@ -619,12 +683,7 @@ fn reprioritize(args: &ArgMatches) -> Result<(), Failure> {
 fn show(args: &ArgMatches) -> Result<(), Failure> {
     let token = args.get_one::<String>("item").expect("required");
     let (_, root) = current_project(args)?;
-    let id = resolve(&root, token)?;
-    let items = backlog::read_items(&root, false);
-    let item = items
-        .into_iter()
-        .find(|i| i.item == id)
-        .expect("resolve() only returns a known id");
+    let item = resolve_item(&root, token)?;
     print_item(&item);
     Ok(())
 }
@@ -687,23 +746,19 @@ fn answer(args: &ArgMatches) -> Result<(), Failure> {
     let token = args.get_one::<String>("item").expect("required");
     let note = args.get_one::<String>("note").expect("required");
     let (_, root) = current_project(args)?;
-    let id = resolve(&root, token)?;
-    let item = backlog::read_items(&root, false)
-        .into_iter()
-        .find(|item| item.item == id)
-        .expect("resolved item");
+    let item = resolve_item(&root, token)?;
     if item.state != "asked" {
         return Err(Failure::Operation(format!(
             "{} is {:?}, not asked; answer only applies to a question waiting on a human.",
             item.item, item.state
         )));
     }
-    let recorded =
-        backlog::append_annotation_if_absent(&root, &id, "human", note, None).map_err(fail)?;
+    let recorded = backlog::append_annotation_if_absent(&root, &item.item, "human", note, None)
+        .map_err(fail)?;
     if recorded {
-        println!("recorded the answer on {id}.");
+        println!("recorded the answer on {}.", item.item);
     } else {
-        println!("already recorded; nothing written for {id}.");
+        println!("already recorded; nothing written for {}.", item.item);
     }
     Ok(())
 }
@@ -790,6 +845,61 @@ mod tests {
     fn resolving_an_unknown_item_refuses() {
         let root = temp_dir("unknown");
         assert!(resolve(&root, "no-such-item").is_err());
+    }
+
+    #[test]
+    fn resolve_item_returns_the_full_record_for_an_exact_or_prefix_token() {
+        let root = temp_dir("resolve-item");
+        let item = backlog::add(
+            &root,
+            "Repair fixture issue",
+            "sandbox",
+            "A reproducible failure",
+            None,
+            None,
+            Some("builder"),
+            "P2",
+            None,
+        )
+        .unwrap();
+
+        let exact = resolve_item(&root, &item.item).unwrap();
+        assert_eq!(exact.item, item.item);
+        assert_eq!(exact.why, "A reproducible failure");
+
+        let prefix = &item.item[..item.item.len() - 1];
+        let by_prefix = resolve_item(&root, prefix).unwrap();
+        assert_eq!(by_prefix.item, item.item);
+    }
+
+    /// Card 20261117-scout-342332 rank 2: `show`/`answer` used to re-read
+    /// the backlog independently after `resolve()` had already read it once
+    /// to find `id`, and `.expect("resolve() only returns a known id")` the
+    /// second read's `find()`. An ordinary concurrent write between the two
+    /// reads — another sweep tick, another seat's `done`/`reopen` removing
+    /// or renumbering the item — could make that `find()` come up empty and
+    /// panic with a raw source line and internal invariant text. `item_in`
+    /// is the extracted tail of that lookup, so the race's shape (a known
+    /// id no longer present in the items just read) is reachable here
+    /// without real concurrency. The revert check for this task ran with
+    /// `item_in` stubbed back down to the bare `.expect(...)`, and this
+    /// test panicked (failing the test) exactly as expected before the
+    /// real fix was restored.
+    #[test]
+    fn item_in_returns_a_clean_lookup_error_instead_of_panicking_when_the_id_vanishes() {
+        let error = item_in(Vec::new(), "20261117-b-abc123", "abc123").unwrap_err();
+        assert_eq!(error.code(), crate::exit::NEEDS_CONFIG);
+        let message = error.to_string();
+        assert!(message.contains("concurrent write"), "{message}");
+        assert!(message.contains("try the command again"), "{message}");
+        assert!(
+            !message.contains(".rs:"),
+            "leaked a source location: {message}"
+        );
+        assert!(
+            !message.contains("only returns a known id"),
+            "leaked the old internal invariant text: {message}"
+        );
     }
 
     /// `cli.py`'s `show`/`done`/`reopen`/`annotate`/`reprioritize` branches
@@ -945,5 +1055,102 @@ mod tests {
         assert!(message.contains("20261102-builder-abc123"));
         assert!(message.contains("Nexus"));
         assert!(!message.to_lowercase().contains("orchestrator"));
+    }
+
+    /// Two configured projects, `a` and `b`, as real directories under
+    /// `dir` — enough for `resolve_named_project`/`resolve_list_projects`
+    /// to canonicalize and match against, mirroring `commands::dispatch`'s
+    /// own minimal project-only fixtures (e.g.
+    /// `resolve_project_picks_the_deepest_matching_root`).
+    fn two_project_config(dir: &Path) -> (Config, PathBuf, PathBuf) {
+        let project_a = dir.join("project-a");
+        let project_b = dir.join("project-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        let toml = format!(
+            "[projects.a]\npath = \"{}\"\n[projects.b]\npath = \"{}\"\n",
+            project_a.display(),
+            project_b.display(),
+        );
+        let config = mv_config::load::load_config_str(&toml, &dir.join("config.toml")).unwrap();
+        (config, project_a, project_b)
+    }
+
+    #[test]
+    fn resolve_named_project_matches_a_literal_configured_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _a, _b) = two_project_config(dir.path());
+        let project = resolve_named_project(&config, None, "a").expect("literal key resolves");
+        assert_eq!(project.name, "a");
+    }
+
+    /// Card `20261117-b-a59293`: `backlog list .` used to fail with
+    /// "unknown project(s): ." because the old lookup only matched a
+    /// literal configured name. `.` is not a key, so this is the case the
+    /// fix exists for — the revert check for this task ran with
+    /// `resolve_named_project` stubbed back down to the bare `contains_key`
+    /// lookup, and this test failed exactly as expected before the real
+    /// fix was restored.
+    #[test]
+    fn resolve_named_project_resolves_dot_to_the_cwd_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, project_a, _b) = two_project_config(dir.path());
+        let project = resolve_named_project(&config, Some(&project_a), ".")
+            .expect("'.' resolves from inside the project");
+        assert_eq!(project.name, "a");
+    }
+
+    #[test]
+    fn resolve_named_project_resolves_a_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _a, _b) = two_project_config(dir.path());
+        let project = resolve_named_project(&config, Some(dir.path()), "project-b")
+            .expect("a relative path under cwd resolves");
+        assert_eq!(project.name, "b");
+    }
+
+    #[test]
+    fn resolve_named_project_resolves_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, project_a, _b) = two_project_config(dir.path());
+        let absolute = project_a.display().to_string();
+        // `cwd` is deliberately a different directory: an absolute token
+        // must resolve on its own, ignoring cwd entirely.
+        let project = resolve_named_project(&config, Some(dir.path()), &absolute)
+            .expect("an absolute path resolves regardless of cwd");
+        assert_eq!(project.name, "a");
+    }
+
+    #[test]
+    fn resolve_named_project_returns_none_for_an_unknown_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _a, _b) = two_project_config(dir.path());
+        assert!(resolve_named_project(&config, Some(dir.path()), "no-such-project").is_none());
+    }
+
+    #[test]
+    fn resolve_list_projects_accepts_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, project_a, _b) = two_project_config(dir.path());
+        let absolute = project_a.display().to_string();
+        let args = backlog_subcommand_matches(&["backlog", "list", &absolute], "list");
+        let projects = resolve_list_projects(&config, &args).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "a");
+    }
+
+    /// Same message and exit code as before this task: an unresolvable
+    /// token (no configured key, no path dispatch's resolver accepts) is
+    /// still `EXIT_NEEDS_CONFIG`, not a newly invented error shape.
+    #[test]
+    fn resolve_list_projects_unknown_name_keeps_the_existing_message_and_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _a, _b) = two_project_config(dir.path());
+        let args = backlog_subcommand_matches(&["backlog", "list", "no-such-project"], "list");
+        let error = resolve_list_projects(&config, &args).unwrap_err();
+        assert_eq!(error.code(), crate::exit::NEEDS_CONFIG);
+        let message = error.to_string();
+        assert!(message.contains("unknown project(s): no-such-project"));
+        assert!(message.contains("configured: a, b"));
     }
 }

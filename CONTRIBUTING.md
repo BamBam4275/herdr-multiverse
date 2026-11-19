@@ -76,8 +76,10 @@ for current passing test and conformance counts.
 - Fill out the [pull request template](.github/pull_request_template.md)
   completely, including the security/permission review checklist for any
   change that touches actions, panes, worktrees, or subprocess execution.
-- Add a `CHANGELOG.md` entry under `[Unreleased]` for any user-visible
-  change.
+- Add a changelog fragment under `changelog.d/<task-or-slug>.<section>.md`
+  (see `changelog.d/README.md`) for any user-visible change, instead of
+  hand-editing `CHANGELOG.md`'s `[Unreleased]` section directly;
+  `scripts/release/collect-changelog.sh` merges fragments into it.
 - Update `docs/roles.md` or `docs/configuration.md` alongside any change in
   role behavior, write scope, or configuration shape.
 

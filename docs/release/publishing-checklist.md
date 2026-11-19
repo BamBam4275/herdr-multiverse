@@ -158,14 +158,24 @@ fact.
 
 ## 5. Each release (steady state)
 
-1. Land one version-bump commit on the dev repo's trunk: the workspace
-   `[workspace.package].version` in `Cargo.toml`, every crate's own pinned
-   version under `[workspace.dependencies]` in the same file,
-   `Cargo.lock`'s matching entries, `herdr-plugin.toml`'s top-level
-   `version`, the `README.md` Status line, and `CHANGELOG.md` (move the
-   `[Unreleased]` entries under a new `## [X.Y.Z] - YYYY-MM-DD` heading and
-   add its link reference at the bottom). Merge it to `main` before
-   releasing.
+1. Run `scripts/release/collect-changelog.sh` first, so every
+   `changelog.d/` fragment (see `changelog.d/README.md`) is merged into
+   `[Unreleased]` and its fragment file removed before that section gets
+   moved below — a fragment left uncollected would otherwise ship into
+   the public tree unchanged, since `export-fresh.sh`'s `git archive`
+   exports whatever is still tracked. Then land one version-bump commit
+   on the dev repo's trunk: the workspace `[workspace.package].version`
+   in `Cargo.toml`, every crate's own pinned version under
+   `[workspace.dependencies]` in the same file, `Cargo.lock`'s matching
+   entries, `herdr-plugin.toml`'s top-level `version`, the `README.md`
+   Status line, and `CHANGELOG.md` (move the `[Unreleased]` entries under
+   a new `## [X.Y.Z] - YYYY-MM-DD` heading and add its link reference at
+   the bottom). Merge it to `main` before releasing. As a backstop,
+   `export-fresh.sh`'s "changelog.d fragments collected" check refuses
+   the export (and therefore `sync-public.sh`) if any file besides
+   `README.md` is still present in `changelog.d/` at `HEAD`, in case this
+   step is skipped. No script performs the `[Unreleased]` → dated-version
+   move itself; it stays a hand edit.
 2. From the dev repo, with all four `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
    variables exported, run:
 

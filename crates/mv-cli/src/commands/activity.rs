@@ -16,7 +16,7 @@
 //! never sent keystrokes; an already-working agent is prompted once and
 //! reported unverifiable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::ArgMatches;
@@ -264,6 +264,31 @@ fn partition_nudge_targets(
     (permitted, skipped)
 }
 
+/// Resolves `nudge`'s requested project tokens the same way `backlog
+/// list`'s own tokens resolve (`backlog::resolve_named_project`): a literal
+/// `[projects.<name>]` key first, else `.`, a relative path, or an
+/// absolute path resolved against `cwd` (card `20261117-b-486a55` —
+/// `nudge` used to require an exact config key, with no path handling at
+/// all, so `activity nudge .` failed with "no such project: ." even from
+/// inside the hub's own directory). Returns the canonical configured name
+/// for every token that resolves, and every token that resolves to
+/// nothing, in request order.
+fn resolve_requested_projects<'a>(
+    config: &mv_config::load::Config,
+    cwd: Option<&Path>,
+    requested: &'a [String],
+) -> (Vec<String>, Vec<&'a String>) {
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut unknown = Vec::new();
+    for name in requested {
+        match super::backlog::resolve_named_project(config, cwd, name) {
+            Some(project) => resolved.push(project.name),
+            None => unknown.push(name),
+        }
+    }
+    (resolved, unknown)
+}
+
 /// `activity nudge [PROJECTS...]`: hub-only, like `broadcast`/`fan_out`
 /// (card `20260911-b-13d412`). Resolves which configured projects the
 /// `[activity.pairs]` table permits reaching (Python's
@@ -298,10 +323,8 @@ fn nudge(args: &ArgMatches) -> Result<(), Failure> {
         .get_many::<String>("projects")
         .map(|values| values.cloned().collect())
         .unwrap_or_default();
-    let unknown: Vec<&String> = requested
-        .iter()
-        .filter(|name| !config.projects.contains_key(*name))
-        .collect();
+    let cwd = std::env::current_dir().ok();
+    let (resolved, unknown) = resolve_requested_projects(&config, cwd.as_deref(), &requested);
     if !unknown.is_empty() {
         let mut known: Vec<&str> = config.projects.keys().map(String::as_str).collect();
         known.sort_unstable();
@@ -323,7 +346,7 @@ fn nudge(args: &ArgMatches) -> Result<(), Failure> {
     let mut candidates: Vec<String> = if requested.is_empty() {
         config.projects.keys().cloned().collect()
     } else {
-        requested
+        resolved
     };
     candidates.sort_unstable();
     let (permitted, skipped) = partition_nudge_targets(&from, candidates, &config.activity_pairs);
@@ -1125,8 +1148,15 @@ fn broadcast(args: &ArgMatches) -> Result<(), Failure> {
             may_send(&config, &from, project_name),
         ));
     }
-    let report =
-        activity::broadcast(&from, body, ask, &recipients, &msg_id, &redact).map_err(fail)?;
+    let report = activity::broadcast(activity::BroadcastRequest {
+        from_project: &from,
+        body,
+        ask,
+        recipients: &recipients,
+        msg_id: &msg_id,
+        redact: &redact,
+    })
+    .map_err(fail)?;
     let sent_count = report.sent().count();
     let skipped_count = report.skipped().count();
     for name in report.sent() {
@@ -1569,6 +1599,78 @@ mod tests {
             nudge_line("unreached", name, Some(reason)),
             "unreached project — herdr: dialog"
         );
+    }
+
+    /// Two configured projects, `a` and `b`, each a real directory under
+    /// `dir` so a path token has something on disk to resolve against.
+    fn two_project_config(dir: &std::path::Path) -> (mv_config::load::Config, std::path::PathBuf) {
+        let project_a = dir.join("project-a");
+        std::fs::create_dir_all(&project_a).unwrap();
+        let project_b = dir.join("project-b");
+        std::fs::create_dir_all(&project_b).unwrap();
+        let toml = format!(
+            "[projects.a]\npath = \"{}\"\n[projects.b]\npath = \"{}\"\n",
+            project_a.display(),
+            project_b.display(),
+        );
+        let config = mv_config::load::load_config_str(&toml, &dir.join("config.toml")).unwrap();
+        (config, project_a)
+    }
+
+    #[test]
+    fn resolve_requested_projects_matches_a_literal_configured_name() {
+        let dir = temp_dir("resolve-requested-literal");
+        let (config, _a) = two_project_config(&dir);
+        let requested = vec!["a".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, None, &requested);
+        assert_eq!(resolved, vec!["a".to_string()]);
+        assert!(unknown.is_empty());
+    }
+
+    /// Card `20261117-b-486a55`: `activity nudge .` used to fail with "no
+    /// such project: ." because this lookup was a bare `contains_key`
+    /// match with no path handling at all — the revert check for this
+    /// task ran with [`resolve_requested_projects`] stubbed back down to
+    /// that bare check, and this test failed exactly as expected before
+    /// the real fix was restored.
+    #[test]
+    fn resolve_requested_projects_resolves_dot_to_the_cwd_project() {
+        let dir = temp_dir("resolve-requested-dot");
+        let (config, project_a) = two_project_config(&dir);
+        let requested = vec![".".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&project_a), &requested);
+        assert_eq!(resolved, vec!["a".to_string()]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn resolve_requested_projects_resolves_a_relative_path() {
+        let dir = temp_dir("resolve-requested-relative");
+        let (config, _a) = two_project_config(&dir);
+        let requested = vec!["project-b".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&dir), &requested);
+        assert_eq!(resolved, vec!["b".to_string()]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn resolve_requested_projects_resolves_an_absolute_path() {
+        let dir = temp_dir("resolve-requested-absolute");
+        let (config, project_a) = two_project_config(&dir);
+        let requested = vec![project_a.display().to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&dir), &requested);
+        assert_eq!(resolved, vec!["a".to_string()]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn resolve_requested_projects_reports_an_unknown_token() {
+        let dir = temp_dir("resolve-requested-unknown");
+        let (config, _a) = two_project_config(&dir);
+        let requested = vec!["no-such-project".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&dir), &requested);
+        assert!(resolved.is_empty());
+        assert_eq!(unknown, vec![&requested[0]]);
     }
 
     #[test]

@@ -106,8 +106,16 @@ fn do_read(root: &Path, task: &str, panes: &mut impl ScratchPanes) -> Result<(),
     let text = store
         .read(task, panes)
         .map_err(|e| Failure::Operation(e.to_string()))?;
-    print!("{}", mv_board::layout::sanitize_multiline(&text));
+    print!("{}", render_pane_text(&text));
     Ok(())
+}
+
+/// Strip control sequences, then redact credential-shaped text, matching
+/// every other pane-text-derived consumer (`dispatch.rs`'s subprocess log
+/// capture, `runner.rs`'s agent report text): a scratch pane is a live
+/// agent terminal and can echo a secret.
+fn render_pane_text(text: &str) -> String {
+    mv_core::redact::redact_text(&mv_board::layout::sanitize_multiline(text))
 }
 
 fn do_close(root: &Path, task: &str, panes: &mut impl ScratchPanes) -> Result<(), Failure> {
@@ -407,9 +415,25 @@ mod tests {
     #[test]
     fn pane_text_printed_by_read_strips_osc_52_and_keeps_newlines() {
         let dirty = "visible\n\u{1b}]52;c;QUJDRA==\u{07}still here\n";
-        let clean = mv_board::layout::sanitize_multiline(dirty);
+        let clean = render_pane_text(dirty);
         assert!(!clean.contains('\u{1b}'));
         assert!(!clean.contains('\u{07}'));
         assert_eq!(clean, "visible\nstill here\n");
+    }
+
+    /// A scratch pane is a live agent terminal and can echo a credential;
+    /// every other pane-text consumer redacts before printing, and `read`
+    /// must too.
+    #[test]
+    fn pane_text_printed_by_read_redacts_credential_shaped_text() {
+        let dirty = "password=supersecret\n\u{1b}]52;c;QUJDRA==\u{07}still here\n";
+        let rendered = render_pane_text(dirty);
+        assert!(
+            !rendered.contains("supersecret"),
+            "secret leaked into {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{07}'));
+        assert_eq!(rendered, "password=…[redacted]\nstill here\n");
     }
 }

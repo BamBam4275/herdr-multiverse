@@ -378,7 +378,7 @@ pub fn write_fsync(path: &Path, contents: &str) -> io::Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(path)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
@@ -885,5 +885,22 @@ mod tests {
         brief.write_to(&path).unwrap();
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, brief.render());
+    }
+
+    /// Every sibling state file (`log.rs`, `notify.rs`, `scratch.rs`,
+    /// `activity.rs`, `mail.rs`, `worktrees.rs`) writes 0o600; a brief
+    /// carries unredacted free text (`task_text`, `context`, `write_scope`,
+    /// `scope`) and must not be left world-readable.
+    #[test]
+    fn write_to_writes_the_brief_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_file("write-to-mode");
+        let brief = a_brief();
+        brief.write_to(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

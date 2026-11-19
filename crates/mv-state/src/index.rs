@@ -5,7 +5,7 @@
 //! falling back to a full scan whenever the cache can't be trusted.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,7 @@ use crate::log::{looks_versioned, split_fields, DamagedRecord, LogRecord};
 
 const TASK_EVENTS: &[&str] = &[
     "dispatch",
+    "pane",
     "started",
     "result",
     "supersede",
@@ -137,13 +138,43 @@ impl IndexedRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Fingerprint {
     dev: u64,
     ino: u64,
     hash: String,
     boundary: u64,
+    // Identity of the sidecar index file itself (not the log) as of when
+    // this fingerprint was written. Lets an appender trust the index file
+    // by identity instead of re-scanning its content, while still detecting
+    // an index file tampered with or replaced out from under it (the
+    // mtime/length pair almost never survives that).
+    index_len: u64,
+    index_mtime_secs: i64,
+    index_mtime_nanos: i64,
+    // Resume point for the fast append path: the index's own entry count
+    // and last high-water seq as of this fingerprint. Carried here so an
+    // appender can resume without decoding the index file at all. Not part
+    // of this fingerprint's identity below — there is nothing independent
+    // to check them against short of a full decode, so they are trusted
+    // data once the identity fields above are confirmed unchanged.
+    count: u64,
+    high_water_seq: u64,
 }
+
+impl PartialEq for Fingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.hash == other.hash
+            && self.boundary == other.boundary
+            && self.index_len == other.index_len
+            && self.index_mtime_secs == other.index_mtime_secs
+            && self.index_mtime_nanos == other.index_mtime_nanos
+    }
+}
+
+impl Eq for Fingerprint {}
 
 struct Snapshot {
     bytes: Vec<u8>,
@@ -164,7 +195,13 @@ impl Snapshot {
         })
     }
 
-    fn fingerprint(&self, boundary: usize) -> Fingerprint {
+    fn fingerprint(
+        &self,
+        boundary: usize,
+        index: IndexStat,
+        count: u64,
+        high_water_seq: u64,
+    ) -> Fingerprint {
         let bytes = &self.bytes[..boundary];
         let mut sampled = bytes[..bytes.len().min(4096)].to_vec();
         sampled.extend_from_slice(&bytes[bytes.len().saturating_sub(4096)..]);
@@ -173,7 +210,33 @@ impl Snapshot {
             ino: self.ino,
             hash: sha1_hex(&sampled),
             boundary: boundary as u64,
+            index_len: index.len,
+            index_mtime_secs: index.mtime_secs,
+            index_mtime_nanos: index.mtime_nanos,
+            count,
+            high_water_seq,
         }
+    }
+}
+
+/// Identity of the on-disk sidecar index file right now: its size and
+/// modification time. Cheap (one `stat`) compared to re-decoding or
+/// re-scanning its content to check it hasn't changed since it was trusted.
+#[derive(Debug, Clone, Copy)]
+struct IndexStat {
+    len: u64,
+    mtime_secs: i64,
+    mtime_nanos: i64,
+}
+
+impl IndexStat {
+    fn read(log_path: &Path) -> io::Result<Self> {
+        let meta = fs::metadata(index_path(log_path))?;
+        Ok(Self {
+            len: meta.len(),
+            mtime_secs: meta.mtime(),
+            mtime_nanos: meta.mtime_nsec(),
+        })
     }
 }
 
@@ -217,13 +280,30 @@ fn metadata(bytes: &[u8], ordinal: u64, offset: u64, previous: u64) -> IndexEntr
 }
 
 fn scan(bytes: &[u8]) -> Vec<IndexEntry> {
+    scan_from(bytes, 0, 0, 0, 0)
+}
+
+/// Like `scan`, but only decodes `bytes[start..]`, threading `ordinal`/
+/// `offset`/`high_water` onward from the values they would already hold at
+/// `start` in a full scan. Lets a caller that already trusts everything
+/// before `start` extend an index without re-decoding it.
+fn scan_from(
+    bytes: &[u8],
+    start: usize,
+    ordinal_start: u64,
+    offset_start: u64,
+    high_water_start: u64,
+) -> Vec<IndexEntry> {
     let mut entries = Vec::new();
-    let mut offset = 0;
-    let mut high_water = 0;
+    let mut offset = offset_start;
+    let mut high_water = high_water_start;
     // high_water threads across lines so each entry's high_water_seq covers
     // every line scanned so far, not just its own seq.
-    for (ordinal, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
-        let entry = metadata(line, ordinal as u64, offset, high_water);
+    for (index, line) in bytes[start..]
+        .split_inclusive(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        let entry = metadata(line, ordinal_start + index as u64, offset, high_water);
         offset += entry.length;
         high_water = entry.high_water_seq;
         entries.push(entry);
@@ -246,13 +326,78 @@ fn decode(bytes: &[u8]) -> Option<Vec<IndexEntry>> {
 fn trusted_entries(log_path: &Path, snapshot: &Snapshot) -> Option<Vec<IndexEntry>> {
     let fingerprint: Fingerprint =
         serde_json::from_slice(&fs::read(fingerprint_path(log_path)).ok()?).ok()?;
+    let index_stat = IndexStat::read(log_path).ok()?;
     if fingerprint.boundary != snapshot.bytes.len() as u64
-        || fingerprint != snapshot.fingerprint(snapshot.bytes.len())
+        || fingerprint
+            != snapshot.fingerprint(
+                snapshot.bytes.len(),
+                index_stat,
+                fingerprint.count,
+                fingerprint.high_water_seq,
+            )
     {
         return None;
     }
     let entries = decode(&fs::read(index_path(log_path)).ok()?)?;
     (entries == scan(&snapshot.bytes)).then_some(entries)
+}
+
+/// Cheap, validated high-water seq: trusts the fingerprint's cached
+/// `high_water_seq` once the log's current length, identity, and sampled
+/// bytes still match what the fingerprint recorded — the same identity
+/// check `trusted_entries` performs, but without reading the index file's
+/// content or the log's full bytes into memory. Costs a handful of small
+/// reads regardless of log size. Returns `None` whenever that trust can't
+/// be established (missing/corrupt fingerprint, no index file, or a log
+/// that no longer matches), so the caller must fall back to a full read.
+pub fn high_water_seq(log_path: &Path) -> io::Result<Option<u64>> {
+    let fingerprint: Fingerprint = match fs::read(fingerprint_path(log_path)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => return Ok(None),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let index_stat = match IndexStat::read(log_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(boundary) = usize::try_from(fingerprint.boundary) else {
+        return Ok(None);
+    };
+    let mut file = match File::open(log_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if meta.len() as usize != boundary {
+        return Ok(None);
+    }
+    // Same head+tail sample `Snapshot::fingerprint` hashes, read directly
+    // from the file instead of slicing an in-memory copy of the whole log.
+    let head_len = boundary.min(4096);
+    let mut sampled = vec![0u8; head_len];
+    file.read_exact(&mut sampled)?;
+    let tail_len = boundary.min(4096);
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::Start((boundary - tail_len) as u64))?;
+    file.read_exact(&mut tail)?;
+    sampled.extend_from_slice(&tail);
+    let candidate = Fingerprint {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        hash: sha1_hex(&sampled),
+        boundary: fingerprint.boundary,
+        index_len: index_stat.len,
+        index_mtime_secs: index_stat.mtime_secs,
+        index_mtime_nanos: index_stat.mtime_nanos,
+        count: fingerprint.count,
+        high_water_seq: fingerprint.high_water_seq,
+    };
+    Ok((candidate == fingerprint).then_some(fingerprint.high_water_seq))
 }
 
 /// Read-only: absent/corrupt/stale caches are a full-scan fallback. Rendering
@@ -303,9 +448,17 @@ fn write_index(log_path: &Path, snapshot: &Snapshot, entries: &[IndexEntry]) -> 
     // the next reader safely falls back to a full scan instead of trusting
     // a half-updated cache.
     write_atomic(&index_path(log_path), &bytes)?;
+    let index_stat = IndexStat::read(log_path)?;
+    let count = entries.len() as u64;
+    let high_water_seq = entries.last().map_or(0, |entry| entry.high_water_seq);
     write_atomic(
         &fingerprint_path(log_path),
-        &json_bytes(&snapshot.fingerprint(snapshot.bytes.len()))?,
+        &json_bytes(&snapshot.fingerprint(
+            snapshot.bytes.len(),
+            index_stat,
+            count,
+            high_water_seq,
+        ))?,
     )
 }
 
@@ -321,42 +474,71 @@ pub fn rebuild(log_path: &Path) -> io::Result<Vec<IndexEntry>> {
 /// wrong boundary, rotation, truncation, or changed metadata rebuilds the cache.
 pub fn append(log_path: &Path, append_offset: u64) -> io::Result<()> {
     let snapshot = Snapshot::read(log_path)?;
-    let entries = scan(&snapshot.bytes);
-    let old_entries = fs::read(index_path(log_path))
-        .ok()
-        .and_then(|bytes| decode(&bytes));
     let old_fingerprint = fs::read(fingerprint_path(log_path))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Fingerprint>(&bytes).ok());
-    // Only trust the existing index as a prefix of the new one if: the old
-    // boundary still lies inside the file, falls exactly on a line end (not
-    // mid-line), the old fingerprint still matches the log up to that
-    // boundary (no rewrite/rotation of the prefix), and a fresh scan of
-    // that prefix matches what the old index actually recorded. If any of
-    // that fails, something other than a clean append happened, so a full
-    // rebuild is required instead of a cheap append.
+    let index_stat = IndexStat::read(log_path).ok();
+    // Only trust the existing index as a prefix of the new one if: there is
+    // an old fingerprint, the old boundary still lies inside the file, falls
+    // exactly on a line end (not mid-line), the old fingerprint still
+    // matches the log up to that boundary (no rewrite/rotation/truncation of
+    // the prefix since it was last validated), and the index file's own
+    // identity still matches what that fingerprint recorded (nobody
+    // replaced or edited the sidecar itself since). If any of that fails,
+    // something other than a clean append happened, so a full rebuild is
+    // required instead of a cheap append. Trusting identity for the
+    // unchanged prefix instead of re-decoding and re-scanning the index and
+    // the log keeps the check — and the index file read itself — bounded by
+    // the new bytes rather than the whole file.
     let boundary = usize::try_from(append_offset).ok();
-    let valid = boundary.is_some_and(|boundary| {
-        boundary <= snapshot.bytes.len()
-            && (boundary == 0 || snapshot.bytes[boundary - 1] == b'\n')
-            && old_fingerprint.as_ref() == Some(&snapshot.fingerprint(boundary))
-            && old_entries.as_ref() == Some(&scan(&snapshot.bytes[..boundary]))
-    });
+    let valid = boundary
+        .zip(index_stat)
+        .zip(old_fingerprint.as_ref())
+        .is_some_and(|((boundary, index_stat), old_fingerprint)| {
+            boundary <= snapshot.bytes.len()
+                && (boundary == 0 || snapshot.bytes[boundary - 1] == b'\n')
+                && *old_fingerprint
+                    == snapshot.fingerprint(
+                        boundary,
+                        index_stat,
+                        old_fingerprint.count,
+                        old_fingerprint.high_water_seq,
+                    )
+        });
     if !valid {
+        let entries = scan(&snapshot.bytes);
         return write_index(log_path, &snapshot, &entries);
     }
-    let previous_count = old_entries.as_ref().map_or(0, Vec::len);
+    let boundary = boundary.expect("validated above");
+    let old_fingerprint = old_fingerprint.expect("validated above");
+    let new_entries = scan_from(
+        &snapshot.bytes,
+        boundary,
+        old_fingerprint.count,
+        boundary as u64,
+        old_fingerprint.high_water_seq,
+    );
     // Fast path: append only the new entries to the index file (opened for
-    // append, not rewritten), sync durably, then update the fingerprint to
-    // cover the whole file.
+    // append, not rewritten, and never read back), sync durably, then
+    // update the fingerprint to cover the whole file.
     let mut file = crate::log::private_file(&index_path(log_path), true)?;
-    for entry in &entries[previous_count..] {
+    for entry in &new_entries {
         file.write_all(&json_bytes(entry)?)?;
     }
     file.sync_all()?;
+    let index_stat = IndexStat::read(log_path)?;
+    let count = old_fingerprint.count + new_entries.len() as u64;
+    let high_water_seq = new_entries
+        .last()
+        .map_or(old_fingerprint.high_water_seq, |entry| entry.high_water_seq);
     write_atomic(
         &fingerprint_path(log_path),
-        &json_bytes(&snapshot.fingerprint(snapshot.bytes.len()))?,
+        &json_bytes(&snapshot.fingerprint(
+            snapshot.bytes.len(),
+            index_stat,
+            count,
+            high_water_seq,
+        ))?,
     )
 }
 
@@ -547,6 +729,96 @@ mod tests {
         assert!(read_index(log.path()).unwrap().is_none());
         append(log.path(), 0).unwrap();
         assert_eq!(read_index(log.path()).unwrap().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incremental_append_matches_full_rebuild_over_many_appends() {
+        let project = TempProject::new();
+        let log = project.log();
+        let guard = log.lock().unwrap();
+        for i in 0..60 {
+            guard
+                .append_versioned(WHEN, "update", &[("task", &format!("t{i}"))])
+                .unwrap();
+        }
+        drop(guard);
+        // What the fast path actually left on disk, versus an independent
+        // full rebuild from scratch — not the rebuild compared to itself.
+        let incremental = read_index(log.path()).unwrap().unwrap();
+        let rebuilt = rebuild(log.path()).unwrap();
+        assert_eq!(incremental, rebuilt);
+        assert_eq!(incremental.len(), 60);
+    }
+
+    #[test]
+    fn damaged_or_truncated_tail_falls_back_to_full_rebuild() {
+        let project = TempProject::new();
+        let log = project.log();
+        let guard = log.lock().unwrap();
+        for i in 0..10 {
+            guard
+                .append_versioned(WHEN, "update", &[("task", &format!("t{i}"))])
+                .unwrap();
+        }
+        drop(guard);
+        let full_len = fs::metadata(log.path()).unwrap().len();
+        // Tear the tail mid-line, then report the append as if it had landed
+        // at the file's old (now too-large) length: the reported boundary no
+        // longer fits inside the truncated file, so the fast path must
+        // refuse it and fall back to a full rebuild instead of trusting a
+        // stale, now-torn prefix.
+        let bytes = fs::read(log.path()).unwrap();
+        fs::write(log.path(), &bytes[..bytes.len() - 3]).unwrap();
+        append(log.path(), full_len).unwrap();
+        let expected = scan(&fs::read(log.path()).unwrap());
+        assert_eq!(read_index(log.path()).unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn high_water_seq_matches_full_scan_across_appends_a_torn_tail_and_deleted_index() {
+        let project = TempProject::new();
+        let log = project.log();
+        let guard = log.lock().unwrap();
+        let full_scan_high_water = |log_path: &Path| {
+            records(log_path, Selector::All)
+                .unwrap()
+                .last()
+                .map_or(0, |record| record.entry.high_water_seq)
+        };
+        for i in 0..40 {
+            guard
+                .append_versioned(WHEN, "update", &[("task", &format!("t{i}"))])
+                .unwrap();
+            assert_eq!(
+                high_water_seq(log.path()).unwrap(),
+                Some(full_scan_high_water(log.path()))
+            );
+        }
+        drop(guard);
+
+        // Torn tail: the cached fingerprint's boundary no longer matches the
+        // log's current length, so the cheap read must refuse to answer —
+        // never guess from a prefix it can no longer trust — exactly like
+        // `trusted_entries`' full-scan fallback does for the same log.
+        let full_len = fs::metadata(log.path()).unwrap().len();
+        let bytes = fs::read(log.path()).unwrap();
+        fs::write(log.path(), &bytes[..bytes.len() - 3]).unwrap();
+        assert_eq!(high_water_seq(log.path()).unwrap(), None);
+        let after_tear = full_scan_high_water(log.path());
+
+        // Recover the cache the same way a live appender would, then
+        // confirm the cheap read resumes and still agrees with a full scan.
+        append(log.path(), full_len).unwrap();
+        assert_eq!(
+            high_water_seq(log.path()).unwrap(),
+            Some(full_scan_high_water(log.path()))
+        );
+
+        // Deleted sidecar: no fingerprint to trust at all.
+        fs::remove_file(index_path(log.path())).unwrap();
+        fs::remove_file(fingerprint_path(log.path())).unwrap();
+        assert_eq!(high_water_seq(log.path()).unwrap(), None);
+        assert_eq!(full_scan_high_water(log.path()), after_tear);
     }
 
     #[test]

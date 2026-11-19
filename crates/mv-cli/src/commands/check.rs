@@ -278,6 +278,7 @@ fn idle_sleep_warning_with_timeout(timeout: Duration) -> Option<String> {
         purpose: "read idle-sleep settings".into(),
         stdin: None,
         expects_json: false,
+        is_herdr: false,
     };
     let output = match mv_engine::mv_herdr::run::run(&command, Some(timeout)) {
         Ok(output) => output,
@@ -793,6 +794,7 @@ fn du_size_kb(path: &Path, timeout: Duration) -> Option<u64> {
         purpose: "size scratch".into(),
         stdin: None,
         expects_json: false,
+        is_herdr: false,
     };
     let output = mv_engine::mv_herdr::run::run(&command, Some(timeout)).ok()?;
     let first = output.stdout.split_whitespace().next()?;
@@ -810,6 +812,7 @@ fn du_size_kb_many(paths: &[PathBuf], timeout: Duration) -> Option<BTreeMap<Path
         purpose: "size scratch copies".into(),
         stdin: None,
         expects_json: false,
+        is_herdr: false,
     };
     let output = mv_engine::mv_herdr::run::run(&command, Some(timeout)).ok()?;
     let mut sizes = BTreeMap::new();

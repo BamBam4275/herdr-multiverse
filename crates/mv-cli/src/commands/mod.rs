@@ -52,7 +52,7 @@ fn config_override(args: &ArgMatches) -> Option<PathBuf> {
 pub(crate) fn load_config(args: &ArgMatches) -> Result<mv_config::load::Config, Failure> {
     let override_path = config_override(args);
     let path = mv_config::load::resolve_config_path_from_env(override_path.as_deref())
-        .map_err(|e| Failure::Operation(format!("cannot resolve config path: {e}")))?;
+        .map_err(|e| Failure::Config(format!("cannot resolve config path: {e}")))?;
     mv_config::load::load_config(&path).map_err(|e| Failure::Config(e.to_string()))
 }
 
@@ -94,6 +94,56 @@ mod config_error_mapping_tests {
     fn an_unrelated_config_error_is_not_mistaken_for_one() {
         assert!(!is_retired_role_key_error("malformed TOML: oops"));
         assert!(!is_retired_role_key_error("no such project: demo"));
+    }
+
+    /// Scout finding `20261117-scout-9077fc`#1: `load_config` used to map
+    /// an unresolvable config *path* to `Failure::Operation` (exit 1),
+    /// unlike `migrate.rs`/`review_policy.rs`'s identical failure, which
+    /// already used `Failure::Config` (exit 3) — `exit.rs`'s own
+    /// `NEEDS_CONFIG` doc places "bad config" here. Reached by the
+    /// `.cargo/config.toml`-forced `MULTIVERSE_CONFIG` sentinel with no
+    /// `--config` override, the same mechanism `mv-config`'s own
+    /// `resolve_config_path_from_env_refuses_the_forced_sentinel_when_unguarded`
+    /// test uses, so no cwd manipulation is needed. Revert-checked: this
+    /// failed (`code 1`) while the mapping above was still `Operation`.
+    #[test]
+    fn an_unresolvable_config_path_is_needs_config_not_operation() {
+        use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+
+        struct ForbiddenConfigEnvGuard {
+            _herdr: HerdrEnvGuard,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl ForbiddenConfigEnvGuard {
+            fn set() -> Self {
+                let herdr = HerdrEnvGuard::unreachable();
+                let previous = std::env::var_os("MULTIVERSE_CONFIG");
+                std::env::set_var(
+                    "MULTIVERSE_CONFIG",
+                    mv_config::load::FORBIDDEN_LIVE_CONFIG_SENTINEL,
+                );
+                Self {
+                    _herdr: herdr,
+                    previous,
+                }
+            }
+        }
+        impl Drop for ForbiddenConfigEnvGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                    None => std::env::remove_var("MULTIVERSE_CONFIG"),
+                }
+            }
+        }
+
+        let _guard = ForbiddenConfigEnvGuard::set();
+        let matches = crate::args::command()
+            .try_get_matches_from(["multiverse", "projects"])
+            .unwrap();
+        let err = load_config(matches.subcommand_matches("projects").unwrap()).unwrap_err();
+        assert_eq!(err.code(), 3);
+        assert!(err.to_string().contains("cannot resolve config path"));
     }
 }
 

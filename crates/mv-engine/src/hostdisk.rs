@@ -533,6 +533,7 @@ fn stale_temp_is_open(path: &Path, timeout: Duration) -> bool {
         purpose: "read-only stale-temp open-file probe".into(),
         stdin: None,
         expects_json: false,
+        is_herdr: false,
     };
     let Ok(result) = mv_herdr::run::run(&command, Some(timeout)) else {
         return false;

@@ -52,9 +52,8 @@ pub(crate) fn resolve_config_path(
     } else {
         "default location"
     };
-    let path = mv_config::load::resolve_config_path_from_env(cli_override.map(Path::new)).map_err(
-        |error| Failure::Operation(format!("could not resolve the config path: {error}")),
-    )?;
+    let path = mv_config::load::resolve_config_path_from_env(cli_override.map(Path::new))
+        .map_err(|error| Failure::Config(format!("could not resolve the config path: {error}")))?;
     Ok((path, label))
 }
 
@@ -496,6 +495,53 @@ mod tests {
         let _state = SimulatedAmbientStateDirGuard::set(dir.path());
         let resolved = state_dir_from_config(Path::new("/irrelevant/config.toml"));
         assert_eq!(resolved, dir.path());
+    }
+
+    /// [`ForbiddenConfigEnvGuard`]'s twin for `MULTIVERSE_CONFIG`, so this
+    /// test can force `resolve_config_path`'s `--config`-less branch to
+    /// hit the sentinel refusal without touching cwd.
+    struct ForbiddenConfigEnvGuard {
+        _herdr: HerdrEnvGuard,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ForbiddenConfigEnvGuard {
+        fn set() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let previous = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var(
+                "MULTIVERSE_CONFIG",
+                mv_config::load::FORBIDDEN_LIVE_CONFIG_SENTINEL,
+            );
+            Self {
+                _herdr: herdr,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ForbiddenConfigEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
+    /// Scout finding `20261117-scout-9077fc`#1: `resolve_config_path` used
+    /// to map an unresolvable config path to `Failure::Operation` (exit
+    /// 1), unlike `migrate.rs`/`review_policy.rs`'s identical failure.
+    /// Revert-checked: this failed (`code 1`) while the mapping above was
+    /// still `Operation`.
+    #[test]
+    fn an_unresolvable_config_path_is_needs_config_not_operation() {
+        let _guard = ForbiddenConfigEnvGuard::set();
+        let err = resolve_config_path(None).unwrap_err();
+        assert_eq!(err.code(), 3);
+        assert!(err
+            .to_string()
+            .contains("could not resolve the config path"));
     }
 
     #[test]

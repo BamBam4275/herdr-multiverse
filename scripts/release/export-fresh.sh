@@ -92,11 +92,38 @@ rm -f "$ARCHIVE"
 trap - 0 HUP INT TERM
 ok "exported $(git -C "$PLUGIN_ROOT" rev-parse --short HEAD) into $OUT_DIR"
 
+note "== changelog.d fragments collected =="
+# A fragment left uncollected (collect-changelog.sh not run before the
+# release's changelog.d move -- see docs/release/publishing-checklist.md
+# section 5 step 1) would otherwise ship into the public tree unchanged,
+# since git archive HEAD exports whatever is tracked.
+if [ -d "$OUT_DIR/changelog.d" ]; then
+    LEFTOVER=$(find "$OUT_DIR/changelog.d" -mindepth 1 -maxdepth 1 ! -name 'README.md')
+else
+    LEFTOVER=""
+fi
+if [ -n "$LEFTOVER" ]; then
+    echo "export-fresh: changelog.d/ still holds uncollected fragment(s) -- run scripts/release/collect-changelog.sh first:" >&2
+    printf '%s\n' "$LEFTOVER" >&2
+    bad "changelog.d fragments collected"
+else
+    ok "changelog.d fragments collected"
+fi
+
 note "== starting fresh history =="
 git -C "$OUT_DIR" init -q -b main
 git -C "$OUT_DIR" add -A
 git -C "$OUT_DIR" commit -q -m "chore: initial public release"
 ok "single commit on main ($(git -C "$OUT_DIR" rev-parse --short HEAD))"
+
+# Captured now, right after the only commit this script makes, so that a
+# check phase below which writes into an already-committed file -- not just
+# produces new, disposable build output -- is caught before publish instead
+# of silently surviving sync-public.sh's later `git clean`, which only
+# removes untracked/ignored paths. --untracked-files=no on purpose: build
+# output that isn't yet gitignored must not make this a false positive.
+BEFORE_STATUS=$(git -C "$OUT_DIR" status --porcelain --untracked-files=no)
+BEFORE_TREE=$(git -C "$OUT_DIR" rev-parse HEAD^{tree})
 
 note "== cargo build --locked =="
 if (cd "$OUT_DIR" && cargo build --locked); then
@@ -153,6 +180,15 @@ elif command -v docker >/dev/null 2>&1; then
 else
     echo "export-fresh: gitleaks is not installed and docker is not available -- install gitleaks >= v$GITLEAKS_VERSION (https://github.com/gitleaks/gitleaks/releases) or Docker, then retry." >&2
     bad "gitleaks dir scan"
+fi
+
+note "== tracked tree unchanged by checks =="
+AFTER_STATUS=$(git -C "$OUT_DIR" status --porcelain --untracked-files=no)
+AFTER_TREE=$(git -C "$OUT_DIR" rev-parse HEAD^{tree})
+if [ "$AFTER_STATUS" = "$BEFORE_STATUS" ] && [ "$AFTER_TREE" = "$BEFORE_TREE" ]; then
+    ok "tracked tree unchanged by checks"
+else
+    bad "tracked tree unchanged by checks -- a build/test/conformance/scan step modified a committed file"
 fi
 
 note ""

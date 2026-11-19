@@ -108,6 +108,11 @@ pub enum SeatOutcome {
         result_path: PathBuf,
     },
     Failed(String),
+    /// Seated and printed in the roster, then dropped by the convene-time
+    /// recheck (a cap or availability check run again under the fleet lock
+    /// immediately before starting) before it ever ran — distinct from
+    /// [`Self::Failed`], which is a seat that *ran* and did not answer.
+    Skipped(String),
 }
 
 /// One seat's outcome, paired with which account held it.
@@ -307,8 +312,14 @@ pub fn run(args: &ArgMatches, engine: &dyn Engine, out: &mut dyn Write) -> Resul
             SeatOutcome::Failed(reason) => {
                 let _ = writeln!(out, "  FAILED — {}: {reason}", seat.account);
             }
+            SeatOutcome::Skipped(reason) => {
+                let _ = writeln!(out, "  {}: {reason}", seat.account);
+            }
         }
     }
+    // A seat skipped at convene time is printed above with its reason.
+    // Like a seat skipped while seating, it does not by itself refuse a
+    // council the remaining seats still make quorate.
     if convened.is_quorate() {
         let _ = writeln!(
             out,
@@ -654,6 +665,71 @@ fn roster_seats(
     Ok(seats)
 }
 
+/// One councillor's [`SeatOutcome`] — skipped by the convene-time recheck
+/// (`admit`, run inside [`council::convene_with_admission`]) takes
+/// priority over a dispatch result, since a skipped seat never dispatched
+/// at all.
+fn councillor_outcome(
+    councillor: &council::Councillor,
+    roster_seat: &RosterSeat,
+    project_root: &Path,
+) -> SeatOutcome {
+    if councillor.skipped {
+        return SeatOutcome::Skipped(councillor.error.clone());
+    }
+    match &councillor.status {
+        Some(status) if councillor.error.is_empty() => {
+            // `RealDispatchStore::prepare` can rebind `task_id` on an
+            // on-disk collision — this path uses the *requested* id,
+            // which is only guaranteed to match what actually landed when
+            // no such collision occurred (see this task's result.md).
+            let result_path = project_root
+                .join(".multiverse/tasks")
+                .join(&roster_seat.task_id)
+                .join("result.md");
+            SeatOutcome::Answered {
+                status: status.to_string(),
+                result_path,
+            }
+        }
+        _ => SeatOutcome::Failed(if councillor.error.is_empty() {
+            "MISSING ANSWER".to_string()
+        } else {
+            councillor.error.clone()
+        }),
+    }
+}
+
+/// `RealEngine::convene`'s per-seat report, built from the councillors a
+/// convene actually settled and the roster printed before it started.
+/// Every councillor skipped at convene time — not merely one skipped
+/// before the roster was ever printed — must appear here with its
+/// reason, so a partial run cannot print as full success
+/// (`council-skipped-builder.md`, Scout `e9af11` item 1): only accounts
+/// present in `roster` were ever printed, so an already-skipped-at-`seat()`
+/// -time councillor (never in `roster`) is still dropped, correctly.
+fn seat_reports_from(
+    councillors: &[council::Councillor],
+    roster: &[RosterSeat],
+    project_root: &Path,
+) -> Vec<SeatReport> {
+    let roster_by_account: HashMap<&str, &RosterSeat> =
+        roster.iter().map(|s| (s.account.as_str(), s)).collect();
+    councillors
+        .iter()
+        .filter_map(|councillor| {
+            roster_by_account
+                .get(councillor.seat.account.as_str())
+                .copied()
+                .map(|roster_seat| (councillor, roster_seat))
+        })
+        .map(|(councillor, roster_seat)| SeatReport {
+            account: roster_seat.account.clone(),
+            outcome: councillor_outcome(councillor, roster_seat, project_root),
+        })
+        .collect()
+}
+
 fn to_selector_policy(policy: ConfigFallbackPolicy) -> selector::FallbackPolicy {
     match policy {
         ConfigFallbackPolicy::Degrade => selector::FallbackPolicy::Degrade,
@@ -881,38 +957,44 @@ impl RealEngine {
     }
 }
 
-/// Fleet-wide open count of **worker** panes only, plus each *other*
-/// project's own floor gap, the same shape `commands::dispatch`'s own
-/// `fleet_open_counts` builds — card `20261115-b-65fe80`: the fleet-wide
-/// `max_concurrent` check excludes Nexus panes here too, so a Council
-/// convene sees the same fleet capacity a worker dispatch would.
-fn fleet_open_counts(config: &Config, current_project: &str) -> (u32, Vec<(String, u32)>) {
-    let mut fleet_open = 0u32;
-    let mut other_floor_gaps = Vec::new();
-    for (name, project) in &config.projects {
-        let Some(raw) = project.path.value() else {
-            continue;
-        };
-        let Ok(root) = std::fs::canonicalize(raw) else {
-            continue;
-        };
-        let tasks = mv_state::tasks::sweep_tasks(&root);
-        let open_tasks = tasks
-            .iter()
-            .filter(|task| !task.recorded && task.file_status.is_none());
-        let open = open_tasks.clone().count() as u32;
-        let worker_open = open_tasks
-            .filter(|task| !super::dispatch::is_nexus_role(&task.role))
-            .count() as u32;
-        fleet_open += worker_open;
-        if name != current_project {
-            let gap = project.min_slots.saturating_sub(open);
-            if gap > 0 {
-                other_floor_gaps.push((name.clone(), gap));
-            }
-        }
+/// Fleet capacity inputs for one convene's admission check, built the same
+/// way `commands::dispatch`'s own `capacity_source` closure builds them: a
+/// conservative, no-Herdr-call [`super::dispatch::fleet_open_counts`]
+/// first, and a live `agent list` retry (via
+/// [`super::dispatch::live_agent_statuses`]) only when that conservative
+/// count would itself refuse — so a fleet nowhere near its cap never pays
+/// for the round trip (card `20261116-b-8b5b22`). `commands::council` used
+/// to keep a private copy of `fleet_open_counts` with no such retry at
+/// all, so a stranded worker (no recorded result, no status file, no live
+/// pane, outside its account's startup grace) held a fleet slot forever
+/// here even after cards `20261116-b-8b5b22`/`20261117-b-d49eb3` fixed the
+/// same bug for `commands::dispatch`'s own caller; this now shares that
+/// exact fix instead of re-deriving a second, drifting copy of it (card
+/// `20261117-b-f2b742`).
+fn fleet_capacity_inputs(
+    council: &council::Council,
+    config: &Config,
+    project_name: &str,
+    project_root: &Path,
+) -> engine_dispatch::FleetCapacityInputs {
+    let (fleet_open, other_floor_gaps) =
+        super::dispatch::fleet_open_counts(config, project_name, None);
+    let project = &config.projects[project_name];
+    let mut inputs = engine_dispatch::FleetCapacityInputs {
+        max_concurrent: config.max_concurrent,
+        fleet_open,
+        project_open: super::dispatch::open_task_count(project_root),
+        project_min_slots: project.min_slots,
+        project_max_slots: project.max_slots,
+        other_floor_gaps,
+        batch_count: council.councillors.iter().filter(|c| !c.skipped).count() as u32,
+    };
+    if engine_dispatch::check_fleet_capacity(&inputs).is_err() {
+        let live_statuses = super::dispatch::live_agent_statuses();
+        inputs.fleet_open =
+            super::dispatch::fleet_open_counts(config, project_name, live_statuses.as_ref()).0;
     }
-    (fleet_open, other_floor_gaps)
+    inputs
 }
 
 impl Engine for RealEngine {
@@ -1009,17 +1091,7 @@ impl Engine for RealEngine {
                     .map_err(|e| EngineError::TooSmallRoster(e.to_string()))?;
                 council::recheck_seat_availability(council, &mut chain_selector)
                     .map_err(|e| EngineError::TooSmallRoster(e.to_string()))?;
-                let (fleet_open, other_floor_gaps) = fleet_open_counts(config, project_name);
-                let project = &config.projects[project_name];
-                let capacity = engine_dispatch::FleetCapacityInputs {
-                    max_concurrent: config.max_concurrent,
-                    fleet_open,
-                    project_open: super::dispatch::open_task_count(project_root),
-                    project_min_slots: project.min_slots,
-                    project_max_slots: project.max_slots,
-                    other_floor_gaps,
-                    batch_count: 1,
-                };
+                let capacity = fleet_capacity_inputs(council, config, project_name, project_root);
                 council::capacity_or_raise(council, capacity)
                     .map_err(|e| EngineError::Refused(e.to_string()))?;
                 Ok(())
@@ -1032,48 +1104,7 @@ impl Engine for RealEngine {
             .map(|c| c.seat.vendor.as_str())
             .collect::<HashSet<_>>()
             .len();
-        let roster_by_account: HashMap<&str, &RosterSeat> =
-            roster.iter().map(|s| (s.account.as_str(), s)).collect();
-        let seat_reports = seated
-            .councillors
-            .iter()
-            .filter(|c| !c.skipped)
-            .filter_map(|councillor| {
-                roster_by_account
-                    .get(councillor.seat.account.as_str())
-                    .copied()
-                    .map(|roster_seat| (councillor, roster_seat))
-            })
-            .map(|(councillor, roster_seat)| {
-                let outcome = match &councillor.status {
-                    Some(status) if councillor.error.is_empty() => {
-                        // `RealDispatchStore::prepare` can rebind `task_id`
-                        // on an on-disk collision — this path uses the
-                        // *requested* id, which is only guaranteed to match
-                        // what actually landed when no such collision
-                        // occurred (see this task's result.md).
-                        let result_path = resolved
-                            .project_root
-                            .join(".multiverse/tasks")
-                            .join(&roster_seat.task_id)
-                            .join("result.md");
-                        SeatOutcome::Answered {
-                            status: status.to_string(),
-                            result_path,
-                        }
-                    }
-                    _ => SeatOutcome::Failed(if councillor.error.is_empty() {
-                        "MISSING ANSWER".to_string()
-                    } else {
-                        councillor.error.clone()
-                    }),
-                };
-                SeatReport {
-                    account: roster_seat.account.clone(),
-                    outcome,
-                }
-            })
-            .collect();
+        let seat_reports = seat_reports_from(&seated.councillors, &roster, &resolved.project_root);
         Ok(Convened {
             answered,
             vendors,
@@ -1092,6 +1123,7 @@ pub fn run_default(args: &ArgMatches) -> Result<(), Failure> {
 mod tests {
     use super::*;
     use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Backlog `20261108-b-49556b`: `RealEngine::resolve` (`council.rs`
     /// line ~730) reads `mv_config::load::config_state_dir_from_env`
@@ -1489,6 +1521,58 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!(
                 "{}  claude: status done /proj/.multiverse/tasks/t-claude/result.md\n",
+                roster_lines()
+            )
+        );
+    }
+
+    /// `council-skipped-builder.md` (Scout `e9af11` item 1): a seat the
+    /// convene-time recheck newly skips must still be printed, with its
+    /// reason. The remaining seats are still quorate, so the council
+    /// proceeds, as it does for a seat skipped while seating.
+    #[test]
+    fn a_seat_skipped_at_convene_time_is_reported_and_a_quorate_council_proceeds() {
+        let fake = Fake {
+            plan: Ok(roster()),
+            convene: Ok(Convened {
+                answered: 2,
+                vendors: 2,
+                seats: vec![
+                    SeatReport {
+                        account: "claude".into(),
+                        outcome: SeatOutcome::Answered {
+                            status: "done".into(),
+                            result_path: PathBuf::from(
+                                "/proj/.multiverse/tasks/t-claude/result.md",
+                            ),
+                        },
+                    },
+                    SeatReport {
+                        account: "codex".into(),
+                        outcome: SeatOutcome::Answered {
+                            status: "done".into(),
+                            result_path: PathBuf::from("/proj/.multiverse/tasks/t-codex/result.md"),
+                        },
+                    },
+                    SeatReport {
+                        account: "grok".into(),
+                        outcome: SeatOutcome::Skipped(
+                            "SKIPPED at convene time: at its open-agent cap (1/1 open)".into(),
+                        ),
+                    },
+                ],
+            }),
+        };
+        let args = matches(&["council", "proj", "question", "--yes"]);
+        let mut out = Vec::new();
+        run(&args, &fake, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{}  claude: status done /proj/.multiverse/tasks/t-claude/result.md\n\
+                 \x20 codex: status done /proj/.multiverse/tasks/t-codex/result.md\n\
+                 \x20 grok: SKIPPED at convene time: at its open-agent cap (1/1 open)\n\
+                 2 councillors answered across 2 vendors. Nothing was synthesized.\n",
                 roster_lines()
             )
         );
@@ -2478,29 +2562,104 @@ mod tests {
         );
     }
 
-    /// Card `20261115-b-65fe80`: council's own `fleet_open_counts` mirrors
-    /// `commands::dispatch`'s — a busy Nexus pane must not count toward
-    /// the fleet-wide `max_concurrent` check here either.
-    #[test]
-    fn fleet_open_counts_excludes_a_busy_nexus_pane_from_the_fleet_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("here");
-        std::fs::create_dir_all(&root).unwrap();
+    /// Config/account boilerplate shared by the two proofs below: one
+    /// project, `max_concurrent = 1`, and one worker task dispatched in
+    /// 2020 — unrecorded, no status file, no agent on the routing log —
+    /// long outside its account's default 600s startup grace.
+    fn stranded_worker_config(root: &Path, config_dir: &Path) -> Config {
         std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-builder-aaaaaa")).unwrap();
-        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-nexus-bbbbbb")).unwrap();
         std::fs::write(
             root.join(".multiverse/routing.log"),
-            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n\
-             2020-01-01T00:00:01+00:00\tevent=dispatch\ttask=20250101-nexus-bbbbbb\tproject=here\trole=nexus\taccount=seat\tpool=p\toutcome=chain-primary\treason=\tbranch=main\n",
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\t\
+             project=here\trole=builder\taccount=seat\tpool=p\toutcome=chain-primary\t\
+             reason=\tbranch=main\n",
         )
         .unwrap();
-        let toml = format!("[projects.here]\npath = \"{}\"\n", root.display());
-        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+        let toml = format!(
+            "max_concurrent = 1\n[projects.here]\npath = \"{}\"\n\
+             [accounts.seat]\nkind = \"codex\"\nshort = \"se\"\n\
+             config_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{}/codex\"\npool = \"codex:test\"\n",
+            root.display(),
+            config_dir.display(),
+        );
+        load::load_config_str(&toml, &config_dir.join("config.toml")).unwrap()
+    }
 
-        let (fleet_open, _) = fleet_open_counts(&config, "here");
+    /// A one-seat council batch, matching the shape [`fleet_capacity_inputs`]
+    /// actually receives from `convene`'s admission closure.
+    fn one_seat_council() -> council::Council {
+        council::Council {
+            question: "q".into(),
+            councillors: vec![council::Councillor {
+                seat: council::Seat {
+                    vendor: "v".into(),
+                    account: "seat".into(),
+                },
+                status: None,
+                error: String::new(),
+                skipped: false,
+                unanswered: false,
+                is_fallback: false,
+                reason: String::new(),
+            }],
+        }
+    }
+
+    /// Card `20261117-b-f2b742`, proof: with `max_concurrent = 1`, the
+    /// stranded task above conservatively holds the fleet's only slot, so
+    /// a one-seat council batch refuses on it alone. Once a live `agent
+    /// list` listing is actually available and says nothing about that
+    /// task's account, [`fleet_capacity_inputs`] must free the slot the
+    /// same way `commands::dispatch`'s own `capacity_source` already
+    /// does. Revert check: council's former private `fleet_open_counts`
+    /// copy never made this live retry at all, so this fails under that
+    /// copy — `fleet_open` would still read `1`.
+    #[test]
+    fn fleet_capacity_inputs_frees_a_stranded_worker_once_a_live_listing_says_it_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("here");
+        let config = stranded_worker_config(&root, dir.path());
+
+        let script = tempfile::Builder::new()
+            .prefix("mv-cli-fake-herdr-")
+            .suffix(".sh")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1 $2\" in\n  \"agent list\") printf '%s' \
+             '{\"result\": {\"agents\": []}}' ;;\n  *) printf '%s' '{\"result\": {}}' ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let _guard = HerdrEnvGuard::set(&script);
+
+        let council = one_seat_council();
+        let inputs = fleet_capacity_inputs(&council, &config, "here", &root);
         assert_eq!(
-            fleet_open, 1,
-            "the busy Nexus pane must not count toward the fleet cap"
+            inputs.fleet_open, 0,
+            "a live listing that says nothing about the stranded task's account must free its slot"
+        );
+    }
+
+    /// Companion to the proof above: when the live listing cannot be read
+    /// at all (Herdr unreachable), the same stranded task must keep
+    /// costing its slot — an unknown must never free one.
+    #[test]
+    fn fleet_capacity_inputs_keeps_a_stranded_worker_when_the_live_listing_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("here");
+        let config = stranded_worker_config(&root, dir.path());
+        let _guard = HerdrEnvGuard::unreachable();
+
+        let council = one_seat_council();
+        let inputs = fleet_capacity_inputs(&council, &config, "here", &root);
+        assert_eq!(
+            inputs.fleet_open, 1,
+            "a failed live listing must keep counting the stranded task conservatively"
         );
     }
 
@@ -2532,6 +2691,129 @@ mod tests {
             counts.get("seat"),
             None,
             "a busy Nexus pane must not occupy the seat's worker cap"
+        );
+    }
+
+    /// `council-skipped-builder.md` (Scout `e9af11` item 1): a seat that
+    /// passes `seat()` fine and is printed in the roster, then fails the
+    /// convene-time recheck (here, a real `council::recheck_seat_caps`
+    /// call — the same one `RealEngine::convene`'s `admit` closure runs
+    /// under the fleet lock), must still appear in `seat_reports_from`'s
+    /// output as `SeatOutcome::Skipped` with its reason, not be dropped
+    /// from the report entirely. Revert check: put back
+    /// `.filter(|c| !c.skipped)` ahead of the `filter_map` in
+    /// `seat_reports_from` and this fails — `reports.len()` comes back 2,
+    /// not 3, and `grok-c`'s report is simply absent.
+    #[test]
+    fn seat_reports_from_surfaces_a_seat_skipped_at_convene_time() {
+        let roster = vec![
+            roster_seat("new-seat", "claude"),
+            roster_seat("codex-b", "chatgpt"),
+            roster_seat("grok-c", "grok"),
+        ];
+        let mut seated = council::Council {
+            question: "q".into(),
+            councillors: vec![
+                council::Councillor {
+                    seat: council::Seat {
+                        vendor: "claude".into(),
+                        account: "new-seat".into(),
+                    },
+                    status: None,
+                    error: String::new(),
+                    skipped: false,
+                    unanswered: false,
+                    is_fallback: false,
+                    reason: String::new(),
+                },
+                council::Councillor {
+                    seat: council::Seat {
+                        vendor: "chatgpt".into(),
+                        account: "codex-b".into(),
+                    },
+                    status: Some(mv_engine::gateway::TaskStatus::Done),
+                    error: String::new(),
+                    skipped: false,
+                    unanswered: false,
+                    is_fallback: false,
+                    reason: String::new(),
+                },
+                council::Councillor {
+                    seat: council::Seat {
+                        vendor: "grok".into(),
+                        account: "grok-c".into(),
+                    },
+                    status: None,
+                    error: String::new(),
+                    skipped: false,
+                    unanswered: false,
+                    is_fallback: false,
+                    reason: String::new(),
+                },
+            ],
+        };
+        assert!(
+            seated.councillors.iter().all(|c| !c.skipped),
+            "every seat must still look fine right after seat() — this is \
+             the state the roster line prints from"
+        );
+
+        // `new-seat` is already at its cap of 1, with one live open agent —
+        // exactly what the convene-time recheck (never run during `seat()`
+        // itself) exists to catch.
+        let config_dir = tempfile::tempdir().unwrap();
+        mv_state::seatstate_store::save(
+            config_dir.path(),
+            &mv_state::seatstate_store::SeatMap::from([(
+                "new-seat".to_string(),
+                mv_state::seatstate_store::SeatEntry {
+                    cap: Some(1),
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        let counts = HashMap::from([("new-seat".to_string(), 1u32)]);
+        council::recheck_seat_caps(&mut seated, config_dir.path(), Some(&counts)).unwrap();
+        assert!(
+            seated.councillors[0].skipped,
+            "setup must actually reproduce a convene-time skip"
+        );
+
+        let project_root = PathBuf::from("/proj");
+        let reports = seat_reports_from(&seated.councillors, &roster, &project_root);
+
+        assert_eq!(
+            reports.len(),
+            3,
+            "the skipped seat must still appear — it was in the roster"
+        );
+        let skipped = reports
+            .iter()
+            .find(|r| r.account == "new-seat")
+            .expect("new-seat must be in the report");
+        match &skipped.outcome {
+            SeatOutcome::Skipped(reason) => {
+                assert!(
+                    reason.starts_with("SKIPPED at convene time:"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        let answered = reports
+            .iter()
+            .find(|r| r.account == "codex-b")
+            .expect("codex-b must be in the report");
+        assert_eq!(
+            answered.outcome,
+            SeatOutcome::Answered {
+                status: "done".into(),
+                result_path: PathBuf::from(
+                    "/proj/.multiverse/tasks/20261105-council-codex-b/result.md"
+                ),
+            },
+            "a non-skipped seat's outcome must be unaffected"
         );
     }
 }

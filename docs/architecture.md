@@ -71,8 +71,8 @@ remaining module-list-only stub.
 | `mv-core` | `atomic`, `crc32`, `error`, `exit`, `id`, `lock`, `redact`, `secure_open`, `time` | Implemented |
 | `mv-config` | `edit`, `error`, `load`, `migrate`, `placeholder`, `roles`, `roster` | Implemented |
 | `mv-herdr` | `argv`, `envelope`, `error`, `run`, `shapes`, plus `bin/fake-herdr.rs` | Implemented |
-| `mv-state` | `activity`, `backlog`, `breaker_store`, `gauge`, `halt`, `hostsleep_store`, `index`, `log`, `mail`, `notify`, `nudge_memory`, `paths`, `scratch`, `seatstate_store`, `tasks`, `worktrees` | Implemented |
-| `mv-engine` | `breaker`, `brief`, `codex_trust`, `codex_worktree_permissions`, `council`, `directives`, `dispatch`, `dockerreport`, `fleet_start`, `gateway`, `grok_usage`, `health`, `hostsleep`, `lane_diff`, `limits`, `nexus_seed`, `prompts`, `risk_paths`, `runner`, `seatstate`, `selector`, `skills`, `sweep_nudges`, `trust`, `usage` | Implemented as libraries. `runner`/`council`/`fleet_start` are all now called from `mv-cli` (`dispatch --yes`, `council --yes`/`--dry-run`, `start`/`stop`) — see [Commands](#commands) below |
+| `mv-state` | `activity`, `backlog`, `breaker_store`, `gauge`, `halt`, `hostsleep_store`, `index`, `log`, `mail`, `notify`, `notify_episodes`, `nudge_memory`, `pane_watch_store`, `paths`, `scratch`, `seatstate_store`, `tasks`, `worktrees` | Implemented |
+| `mv-engine` | `blocking_prompt`, `breaker`, `brief`, `codex_trust`, `codex_worktree_permissions`, `council`, `directives`, `dispatch`, `dockerreport`, `fleet_start`, `gateway`, `grok_usage`, `health`, `hostdisk`, `hostsleep`, `lane_diff`, `limits`, `nexus_seed`, `prompts`, `risk_paths`, `runner`, `seatstate`, `selector`, `skills`, `sweep_nudges`, `trust`, `usage` | Implemented as libraries. `runner`/`council`/`fleet_start` are all now called from `mv-cli` (`dispatch --yes`, `council --yes`/`--dry-run`, `start`/`stop`) — see [Commands](#commands) below |
 | `mv-board` | `accounts`, `card`, `columns`, `layout`, `render`, `status_cards`, `watch` | Implemented |
 | `mv-cli` | `args`, `commands`, `exit`, `main` | Parsing, authorization, and exit mapping implemented. Every command handler calls real library code, each with its own documented scope cuts short of full Python parity (see the table below and each handler's own module doc) |
 
@@ -113,7 +113,7 @@ binding — see each one's own module doc for the complete list.
 | `council` | Ask Council; execution requires `--yes` | Real: a missing `--yes` seats the roster and prints it before refusing; `--yes` convenes every seated seat through `mv-engine::council::convene` against `ProcessHerdr` (see `commands::council`'s own module doc for scope cuts: no live `agent list` probe while seating, `accounts prefer` reordering not applied, per-seat result lines not rendered) |
 | `accounts` | List accounts, or `trip` / `reset` / `limit` / `usage` / `lend` / `prefer` | Real |
 | `seat show` | Inspect an account seat | Real |
-| `worktrees` | Inspect, prune, rescue, or restore task worktrees | Real |
+| `worktrees` | Inspect, prune, rescue, restore, or merge task worktrees | Real |
 | `check` | Readiness (exit 0 ready, 3 needs configuration) | Real |
 | `doctor` | Installation prerequisites (exit 0 pass, 1 fail) | Real |
 | `import-python` | Copy a standalone Python install's config and fleet state into this install's config/state directories | Real: copies only, never moves or deletes the source; refuses to overwrite an existing destination file without `--force` |
@@ -124,7 +124,7 @@ binding — see each one's own module doc for the complete list.
 | `notify` | Queue or flush operator notifications | Real |
 | `inspect` | Inspect project context | Real |
 | `result` | Read a task result | Real |
-| `activity` | `send` / `reply` / `close` / `broadcast` / `nudge` / `inbox` / `update` | Real for all seven: `nudge` types Python's exact `NUDGE_PROMPT` into each permitted recipient's live Nexus pane and confirms it landed, through the same `FleetState::orchestrator_agent` / `deliver_prompt_to` pair `start --reseed` uses, but does not reproduce Python's fine-grained reached/unconfirmed/unverifiable/unreached split or its composer-text/dialog-menu pane-read checks (`commands::activity`'s own module doc) |
+| `activity` | `send` / `reply` / `close` / `show` / `broadcast` / `nudge` / `inbox` / `update` | Real for all eight: `nudge` types Python's exact `NUDGE_PROMPT` into each permitted recipient's live Nexus pane and confirms it landed, through the same `FleetState::orchestrator_agent` / `deliver_prompt_to` pair `start --reseed` uses, but does not reproduce Python's fine-grained reached/unconfirmed/unverifiable/unreached split or its composer-text/dialog-menu pane-read checks (`commands::activity`'s own module doc) |
 | `backlog` | `add` / `list` / `done` / `reopen` / `annotate` / `reprioritize` / `show` / `ask` / `mark-asked` / `answer` | Real |
 | `directives set\|show` | Standing project directives | Real |
 | `workers` | List worker sessions | Real |

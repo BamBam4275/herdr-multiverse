@@ -77,6 +77,7 @@ pub fn run_pmset_log_with(binary: &str) -> Result<String, PmsetError> {
         purpose: "read the pmset sleep/wake log".into(),
         stdin: None,
         expects_json: false, // Plain pmset text, not a Herdr envelope.
+        is_herdr: false,
     };
     let output = mv_herdr::run::run(&command, Some(Duration::from_secs(10)))?;
     if output.returncode != 0 {
@@ -255,6 +256,92 @@ pub fn total_sleep_minutes(intervals: &[SleepInterval]) -> i64 {
         .filter_map(|interval| {
             let start = interval.start?;
             Some((interval.end - start).whole_minutes().max(0))
+        })
+        .sum()
+}
+
+/// Re-parse one of [`report_with`]'s own formatted lines back into the
+/// `(start, end)` bounds it describes — the durable record a caller wants
+/// read back structured rather than re-derived from scratch (critic
+/// `3c0098` finding 1): [`mv_state::hostsleep_store`]'s pending queue
+/// already keeps every reported line across sweep passes (nothing in this
+/// fleet clears it yet, see [`known_intervals`]), so re-parsing it recovers
+/// sleep this pass's own `report()` call would otherwise never mention
+/// again once the watermark has moved past it. A "from before" lower-bound
+/// line's own `earliest` is kept as `start` here too: it is itself a real
+/// instant sleep was known to already be underway, so a caller measuring
+/// overlap against it undercounts, never invents — the same no-guess
+/// posture [`total_sleep_minutes`] already takes for this exact ambiguity,
+/// just with a known floor instead of zero. `None` for a line this does
+/// not recognize (not one of [`report_with`]'s own two shapes).
+pub fn parse_reported_line(line: &str) -> Option<SleepInterval> {
+    let body = line
+        .strip_prefix("host: slept from before ")
+        .or_else(|| line.strip_prefix("host: slept "))?;
+    let (span, _) = body.split_once(" (")?;
+    let (start_text, end_text) = span.split_once("Z-")?;
+    let end_text = end_text.strip_suffix('Z')?;
+    let start = crate::breaker::parse_stored_timestamp(start_text)?;
+    let end = crate::breaker::parse_stored_timestamp(end_text)?;
+    Some(SleepInterval {
+        start: Some(start),
+        end,
+        lower_bound: false,
+        power: String::new(),
+    })
+}
+
+/// Every sleep interval this project still has a durable record of —
+/// [`mv_state::hostsleep_store::read_pending`]'s own queue (never cleared
+/// by `sweep` itself, only ever by a notification pass consuming it) plus
+/// `current_report`'s own lines when they have not yet been queued there
+/// (a dry run's own preview: [`report_with`] only ever queues on `apply`)
+/// — re-parsed via [`parse_reported_line`]. The durable, multi-pass record
+/// a caller like `commands::sweep` needs to discount host sleep against a
+/// *task's* own window rather than only this one call's own newly
+/// reported total (critic `3c0098` finding 1): once the watermark advances
+/// past an interval, [`report_with`] never mentions it again, even while
+/// the task whose window it falls inside is still running. A line this
+/// cannot parse is silently dropped, the same "say nothing rather than
+/// guess" posture every other best-effort read in this module already
+/// takes.
+pub fn known_intervals(project_root: &Path, current_report: &SleepReport) -> Vec<SleepInterval> {
+    let mut lines: Vec<String> = mv_state::hostsleep_store::read_pending(project_root)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect();
+    if !current_report.persisted {
+        lines.extend(current_report.lines.iter().cloned());
+    }
+    lines
+        .iter()
+        .filter_map(|line| parse_reported_line(line))
+        .collect()
+}
+
+/// Minutes of `intervals` that overlap `[window_start, window_end]` — the
+/// host-sleep discount a single task's own elapsed-since-dispatch window
+/// needs (critic `3c0098` finding 1), as opposed to [`total_sleep_minutes`]'s
+/// single pass-wide total. A lower-bound interval (`start: None`) is
+/// excluded, the same undercount-not-guess posture [`total_sleep_minutes`]
+/// already takes for it.
+pub fn sleep_minutes_overlapping(
+    intervals: &[SleepInterval],
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
+) -> i64 {
+    intervals
+        .iter()
+        .filter_map(|interval| {
+            let start = interval.start?;
+            let overlap_start = start.max(window_start);
+            let overlap_end = interval.end.min(window_end);
+            if overlap_end > overlap_start {
+                Some((overlap_end - overlap_start).whole_minutes())
+            } else {
+                None
+            }
         })
         .sum()
 }
@@ -581,6 +668,104 @@ mod tests {
         ];
         // 60 minutes known + 0 for the unknown-duration lower bound.
         assert_eq!(total_sleep_minutes(&intervals), 60);
+    }
+
+    #[test]
+    fn parse_reported_line_round_trips_both_line_shapes() {
+        let known = parse_reported_line(
+            "host: slept 2026-11-02T06:00:00Z-2026-11-02T07:00:00Z (60 min, AC)",
+        )
+        .unwrap();
+        assert_eq!(known.start, Some(datetime!(2026-11-02 06:00:00 UTC)));
+        assert_eq!(known.end, datetime!(2026-11-02 07:00:00 UTC));
+
+        let lower_bound = parse_reported_line(
+            "host: slept from before 2026-11-02T11:00:00Z-2026-11-02T11:30:00Z (30+ min, battery)",
+        )
+        .unwrap();
+        assert_eq!(lower_bound.start, Some(datetime!(2026-11-02 11:00:00 UTC)));
+        assert_eq!(lower_bound.end, datetime!(2026-11-02 11:30:00 UTC));
+
+        assert!(parse_reported_line("not a sleep line at all").is_none());
+    }
+
+    #[test]
+    fn sleep_minutes_overlapping_sums_only_the_part_inside_the_window() {
+        let intervals = vec![SleepInterval {
+            start: Some(datetime!(2026-11-02 01:00:00 UTC)),
+            end: datetime!(2026-11-02 09:00:00 UTC),
+            lower_bound: false,
+            power: "AC".to_string(),
+        }];
+        // Window starts an hour into the sleep and ends an hour before it
+        // wakes: only the middle six hours of the eight-hour interval
+        // overlap it.
+        assert_eq!(
+            sleep_minutes_overlapping(
+                &intervals,
+                datetime!(2026-11-02 02:00:00 UTC),
+                datetime!(2026-11-02 08:00:00 UTC),
+            ),
+            360
+        );
+        // A window entirely before the interval has zero overlap.
+        assert_eq!(
+            sleep_minutes_overlapping(
+                &intervals,
+                datetime!(2026-11-01 00:00:00 UTC),
+                datetime!(2026-11-02 00:30:00 UTC),
+            ),
+            0
+        );
+        // A lower-bound interval never contributes (undercount, not a guess).
+        let unknown_start = vec![SleepInterval {
+            start: None,
+            end: datetime!(2026-11-02 09:00:00 UTC),
+            lower_bound: true,
+            power: "unknown".to_string(),
+        }];
+        assert_eq!(
+            sleep_minutes_overlapping(
+                &unknown_start,
+                datetime!(2026-11-01 00:00:00 UTC),
+                datetime!(2026-11-03 00:00:00 UTC),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn known_intervals_recovers_a_pending_entry_a_later_pass_never_reports_again() {
+        let root = temp_project("known-intervals");
+        // Pass 1 queues a report containing one sleep line, the same shape
+        // `report_with` writes into the pending queue on `apply`.
+        mv_state::hostsleep_store::queue_pending(
+            &root,
+            vec!["host: slept 2026-11-02T01:00:00Z-2026-11-02T09:00:00Z (480 min, AC)".to_string()],
+        )
+        .unwrap();
+        // Pass 2's own `report()` call finds nothing new (the watermark
+        // already moved past it) — this is exactly the empty `SleepReport`
+        // a gated-out or probe-skipped call returns.
+        let empty_report = SleepReport::default();
+        let intervals = known_intervals(&root, &empty_report);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].start, Some(datetime!(2026-11-02 01:00:00 UTC)));
+        assert_eq!(intervals[0].end, datetime!(2026-11-02 09:00:00 UTC));
+    }
+
+    #[test]
+    fn known_intervals_adds_an_unpersisted_dry_run_lines_of_its_own() {
+        let root = temp_project("known-intervals-dry-run");
+        let dry_run_report = SleepReport {
+            lines: vec![
+                "host: slept 2026-11-02T01:00:00Z-2026-11-02T09:00:00Z (480 min, AC)".to_string(),
+            ],
+            authoritative: true,
+            persisted: false,
+        };
+        let intervals = known_intervals(&root, &dry_run_report);
+        assert_eq!(intervals.len(), 1);
     }
 
     #[test]

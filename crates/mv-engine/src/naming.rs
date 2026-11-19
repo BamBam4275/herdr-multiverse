@@ -20,6 +20,13 @@ use super::RunnerError;
 
 const MAX_LEN: usize = 32;
 
+/// [`unique_agent_name`]'s own collision-retry budget: instance `1` through
+/// this value, inclusive. `commands::tasks::project_lane_agent_names`
+/// (the orphan-pane check's own lane-name enumeration) shares this constant
+/// rather than hand-copying the bound, so the two budgets cannot drift
+/// apart the way they did at instance `9` (card `20261118-b-c328a3` M4).
+pub const MAX_NAME_INSTANCE: u32 = 99;
+
 fn slugify(text: &str, max_len: usize, leading_letter: bool) -> String {
     let mut slug = String::new();
     let mut separator = false;
@@ -205,7 +212,7 @@ pub fn unique_agent_name(
     short: &str,
     taken: &HashSet<String>,
 ) -> Result<String, RunnerError> {
-    for instance in 1..100 {
+    for instance in 1..=MAX_NAME_INSTANCE {
         let suffix = instance.to_string();
         let name = agent_name(
             project,

@@ -140,6 +140,24 @@ pub trait DispatchStore {
     fn check_halt_before_pane_creation(&mut self) -> Result<(), RunnerError> {
         Ok(())
     }
+    /// Append the `event=pane` routing-log line the instant the pane
+    /// exists — before it is renamed, before the agent is started, before
+    /// `deliver_prompt` ever runs — so a hard kill anywhere between pane
+    /// creation and [`record_started`](Self::record_started)'s own append
+    /// still leaves this task's pane durably known (Scout 67a619 finding
+    /// 1). Without this, a kill in that span leaves `started_pane` and
+    /// `result_pane` both unset forever, `SweepTask::pane` reads `None`,
+    /// and `is_awaiting`/`close_stranded` (`mv_state::tasks`) treat a
+    /// `None` pane as unconditionally gone — fabricating a terminal
+    /// status onto a pane Herdr still reports live under this task's own
+    /// agent. Best effort like `record_started`, not propagated: the pane
+    /// already exists by the time this runs, so a logging failure here
+    /// must not tear down a pane that is otherwise fine. The default
+    /// `Ok(())` only covers a store with no routing log wired in yet.
+    fn record_pane(&mut self, launch: &PreparedLaunch, pane: &str) -> Result<(), RunnerError> {
+        let _ = (launch, pane);
+        Ok(())
+    }
     /// Append-only started/routing record; failures become warnings.
     /// `started_at` is this run's own staleness floor (`Dispatched::started_at`,
     /// captured before the prompt was ever sent), logged as `event=started`'s
@@ -424,7 +442,7 @@ fn write_brief(launch: &PreparedLaunch) -> Result<PathBuf, RunnerError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(&brief)?;
     file.write_all(launch.brief.as_bytes())?;
     file.sync_all()?;
@@ -1947,6 +1965,15 @@ pub fn start_dispatch(
         };
         owned_pane = Some(pane.clone());
         owned_agent = Some(launch.agent_name.clone());
+        // Durable the instant the pane exists — before rename, start, or
+        // prompt, any of which can be the kill point this is guarding
+        // against (finding 1).
+        if let Err(error) = store.record_pane(&launch, &pane) {
+            store.warn(&format!(
+                "could not record pane for task {:?}: {error}",
+                launch.task_id
+            ));
+        }
         checked(
             herdr,
             argv::pane_rename(&pane, &pane_label(&launch)),
@@ -2369,7 +2396,8 @@ fn usable_wait_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use mv_herdr::shapes::{pre_rename_agent, Shape};
+    use serde_json::{json, Map};
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -2422,6 +2450,10 @@ mod tests {
         shell_retry: Duration,
         dispatched: Vec<String>,
         started: Vec<String>,
+        /// `(agent_name, pane)` for every [`DispatchStore::record_pane`]
+        /// call this store received.
+        panes: Vec<(String, String)>,
+        panes_fails: bool,
         /// `(agent_name, pane, reason)` for every
         /// [`DispatchStore::record_failed_to_start_reason`] call this store
         /// received.
@@ -2473,6 +2505,15 @@ mod tests {
             assert_eq!(self.locks.load(Ordering::SeqCst), 1);
             if self.halt_failed {
                 return Err(RunnerError::Refused("fleet halt active".into()));
+            }
+            Ok(())
+        }
+        fn record_pane(&mut self, launch: &PreparedLaunch, pane: &str) -> Result<(), RunnerError> {
+            assert_eq!(self.locks.load(Ordering::SeqCst), 1);
+            self.panes
+                .push((launch.agent_name.clone(), pane.to_owned()));
+            if self.panes_fails {
+                return Err(RunnerError::Refused("routing unavailable".into()));
             }
             Ok(())
         }
@@ -2608,6 +2649,13 @@ mod tests {
         script: PathBuf,
         state: PathBuf,
         locks: Arc<AtomicU8>,
+        /// Whether a call this fixture does not itself intercept falls
+        /// through to the real `fake-herdr` subprocess (`script`) or to
+        /// [`fake_in_process_call`]'s in-memory equivalent. `fixture()`
+        /// defaults this to `false`: real-subprocess coverage (argv/env/
+        /// timeout fidelity) is opted into per test by setting this `true`,
+        /// per card `20261117-b-29aedd`.
+        subprocess: bool,
         calls: Vec<HerdrCommand>,
         fail: Option<&'static str>,
         trust: bool,
@@ -3021,9 +3069,13 @@ mod tests {
                 }
                 assert!(!command.argv.iter().any(|a| a == "--wait"));
             }
-            let mut redirected = command.clone();
-            redirected.argv[0] = self.script.to_string_lossy().into_owned();
-            let result = mv_herdr::run::run(&redirected, Some(timeout))?;
+            let result = if self.subprocess {
+                let mut redirected = command.clone();
+                redirected.argv[0] = self.script.to_string_lossy().into_owned();
+                mv_herdr::run::run(&redirected, Some(timeout))?
+            } else {
+                fake_in_process_call(&self.state, command)
+            };
             if action == "split" {
                 self.split_done = true;
             }
@@ -3063,6 +3115,466 @@ mod tests {
         }
     }
 
+    // --- Fake's in-process backend (card `20261117-b-29aedd`) --------------
+    //
+    // The command/response shapes `fake-herdr`'s own `State::execute`
+    // produces (crates/mv-herdr/src/bin/fake-herdr.rs), computed directly
+    // against the shared on-disk JSON state instead of spawning that
+    // binary as a subprocess for every call — the dominant cost of this
+    // module's test suite. `pane layout` is never implemented by
+    // `fake-herdr` either (confirmed by reading it: no such arm exists),
+    // so every dispatch through `fixture()`'s `Fake` already takes
+    // `Placement::Split(None, "right")` and never reaches `pane resize`/
+    // `tab create`; only the actions below are ever exercised here.
+    // `Shape::record`/`Shape::envelope`/`pre_rename_agent` are reused
+    // directly from `mv_herdr::shapes` so record defaults, template
+    // fields, and shape validation stay identical to the real fake.
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().expect("literal object").clone()
+    }
+
+    /// Field-for-field what `fake-herdr`'s own `State::default()` writes
+    /// on its first mutating call.
+    fn default_fake_state() -> Value {
+        json!({
+            "workspaces": Shape::Workspace.records(),
+            "panes": Shape::Pane.records(),
+            "agents": Shape::Agent.records(),
+            "tabs": Shape::Tab.records(),
+            "next_pane": 100,
+            "next_workspace": 100,
+            "sequence": 5000,
+            "text": {},
+            "pending_text": [],
+            "pending_prompts": {},
+        })
+    }
+
+    fn load_fake_state(path: &Path) -> Value {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(default_fake_state)
+    }
+
+    fn save_fake_state(path: &Path, state: &Value) {
+        fs::write(path, serde_json::to_vec(state).unwrap()).unwrap();
+    }
+
+    fn fake_pane_index(state: &Value, id: &str) -> Option<usize> {
+        state["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|p| p["pane_id"] == id)
+    }
+
+    fn fake_agent_index(state: &Value, name: &str) -> Option<usize> {
+        state["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|a| a["name"] == name || a["pane_id"] == name)
+    }
+
+    fn fake_err(argv: &[String], message: impl Into<String>) -> CommandResult {
+        CommandResult {
+            argv: argv.to_vec(),
+            returncode: 1,
+            stdout: String::new(),
+            stderr: json!({"error": {"code": "fake_herdr_error", "message": message.into()}})
+                .to_string(),
+            payload: None,
+            protocol_error: None,
+        }
+    }
+
+    fn fake_ok_json(argv: &[String], group: &str, action: &str, fields: Value) -> CommandResult {
+        let mut result = object(fields);
+        result.insert("type".into(), json!(format!("{group}_{action}")));
+        CommandResult {
+            argv: argv.to_vec(),
+            returncode: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            payload: Some(json!({"id": format!("cli:{group}:{action}"), "result": result})),
+            protocol_error: None,
+        }
+    }
+
+    fn fake_ok_text(argv: &[String], text: impl Into<String>) -> CommandResult {
+        CommandResult {
+            argv: argv.to_vec(),
+            returncode: 0,
+            stdout: text.into(),
+            stderr: String::new(),
+            payload: None,
+            protocol_error: None,
+        }
+    }
+
+    /// Mirrors `fake-herdr`'s `classify_command_route`: a command-routed
+    /// (vendor-CLI wrapper) script gets a nameless, `agent_status:
+    /// "unknown"` stub agent that a later `agent rename` claims; the
+    /// non-command dispatch's own `cd ...`/`cd ... && unset ...` script
+    /// never does.
+    fn fake_classify_command_route(state: &mut Value, pane_index: usize, script: &str) {
+        let status = match script.split_once("&& ") {
+            Some((_, rest)) if !rest.starts_with("unset ") => "unknown",
+            Some(_) => return,
+            None if !script.starts_with("cd ") => "idle",
+            None => return,
+        };
+        let pane = state["panes"][pane_index].clone();
+        let pane_id = pane["pane_id"].as_str().unwrap().to_owned();
+        if fake_agent_index(state, &pane_id).is_some() {
+            return;
+        }
+        let sequence = state["sequence"].as_u64().unwrap() + 1;
+        state["sequence"] = json!(sequence);
+        let agent = pre_rename_agent(object(json!({
+            "pane_id": pane_id, "agent_status": status,
+            "workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"],
+            "cwd": pane["cwd"], "foreground_cwd": pane["foreground_cwd"],
+            "focused": pane["focused"], "terminal_id": pane["terminal_id"],
+            "state_change_seq": sequence,
+        })))
+        .expect("fixture agent override must match the Herdr agent shape");
+        state["agents"].as_array_mut().unwrap().push(agent);
+    }
+
+    /// Mirrors `fake-herdr`'s `brief_path`: the first backtick- or
+    /// whitespace-delimited token naming an existing `brief.md`.
+    fn fake_brief_path(prompt: &str) -> Option<PathBuf> {
+        prompt
+            .split('`')
+            .chain(prompt.split_whitespace())
+            .find_map(|token| {
+                let path = Path::new(token.trim_end_matches(['.', ',']).trim_matches(['"', '\'']));
+                (path.file_name().is_some_and(|name| name == "brief.md") && path.is_file())
+                    .then(|| path.to_owned())
+            })
+    }
+
+    /// Mirrors `fake-herdr`'s `complete_prompt`: settles the agent at
+    /// `done`, advances its sequence, and — only when `prompt` names an
+    /// existing `brief.md` — writes the sibling `result.md`/`status` a
+    /// real dispatch's own prompt text would have the agent write.
+    fn fake_complete_prompt(state: &mut Value, index: usize, prompt: &str) -> Value {
+        if let Some(brief) = fake_brief_path(prompt) {
+            if let Some(parent) = brief.parent() {
+                let _ = fs::write(
+                    parent.join("result.md"),
+                    "# Fake Herdr result\n\nTask completed.\n",
+                );
+                let _ = fs::write(parent.join("status"), "done\n");
+            }
+        }
+        let sequence = state["sequence"].as_u64().unwrap() + 1;
+        state["sequence"] = json!(sequence);
+        state["agents"][index]["agent_status"] = json!("done");
+        state["agents"][index]["state_change_seq"] = json!(sequence);
+        state["agents"][index]["completion_seq"] = json!(sequence);
+        let pane_id = state["agents"][index]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        state["text"][&pane_id] = json!("Task completed.\n");
+        if let Some(pane_index) = fake_pane_index(state, &pane_id) {
+            state["panes"][pane_index]["agent_status"] = json!("done");
+        }
+        state["agents"][index].clone()
+    }
+
+    /// `Fake`'s default [`Herdr::call`] backend: every action it does not
+    /// itself intercept, computed in-process against `state` instead of
+    /// through the real `fake-herdr` subprocess. Assumes (as every
+    /// fixture name, pane id, and prompt text in this module's tests
+    /// does) that no positional value looks like a flag, so each
+    /// command's own argv positions (established by `mv_herdr::argv`'s
+    /// non-flag-name branch) can be read directly rather than reparsed.
+    fn fake_in_process_call(state_path: &Path, command: &HerdrCommand) -> CommandResult {
+        let argv = &command.argv;
+        let group = argv[1].as_str();
+        let action = argv[2].as_str();
+        let mut state = load_fake_state(state_path);
+        let result = match (group, action) {
+            ("pane", "split") => {
+                let mut pane_opt = None;
+                let mut focus = false;
+                let mut cwd = String::new();
+                let mut i = 3;
+                while i < argv.len() {
+                    match argv[i].as_str() {
+                        "--pane" => {
+                            pane_opt = Some(argv[i + 1].clone());
+                            i += 2;
+                        }
+                        "--current" => i += 1,
+                        "--direction" => i += 2,
+                        "--cwd" => {
+                            cwd = argv[i + 1].clone();
+                            i += 2;
+                        }
+                        "--env" => i += 2,
+                        "--focus" => {
+                            focus = true;
+                            i += 1;
+                        }
+                        "--no-focus" => i += 1,
+                        _ => i += 1,
+                    }
+                }
+                let parent_index = match &pane_opt {
+                    Some(id) => fake_pane_index(&state, id),
+                    None => {
+                        let panes = state["panes"].as_array().unwrap();
+                        panes
+                            .iter()
+                            .position(|p| p["focused"] == true)
+                            .or(if panes.is_empty() { None } else { Some(0) })
+                    }
+                };
+                let Some(parent_index) = parent_index else {
+                    return fake_err(argv, "no current pane");
+                };
+                let parent = state["panes"][parent_index].clone();
+                let workspace = parent["workspace_id"].as_str().unwrap().to_owned();
+                let mut next_pane = state["next_pane"].as_u64().unwrap();
+                let mut id;
+                loop {
+                    id = format!("{workspace}:p{next_pane}");
+                    next_pane += 1;
+                    if fake_pane_index(&state, &id).is_none() {
+                        break;
+                    }
+                }
+                state["next_pane"] = json!(next_pane);
+                let pane = Shape::Pane
+                    .record(object(json!({
+                        "pane_id": id, "workspace_id": workspace, "tab_id": parent["tab_id"],
+                        "cwd": cwd, "focused": focus,
+                        "agent_status": "unknown", "revision": 0, "terminal_id": format!("fake-{id}"),
+                    })))
+                    .expect("fixture pane override must match the Herdr pane shape");
+                if focus {
+                    for existing in state["panes"].as_array_mut().unwrap() {
+                        existing["focused"] = json!(false);
+                    }
+                }
+                state["panes"].as_array_mut().unwrap().push(pane.clone());
+                fake_ok_json(argv, "pane", "split", json!({"pane": pane}))
+            }
+            ("pane", "get") => {
+                let id = &argv[3];
+                match fake_pane_index(&state, id) {
+                    Some(i) => {
+                        fake_ok_json(argv, "pane", "get", json!({"pane": state["panes"][i]}))
+                    }
+                    None => fake_err(argv, format!("pane not found: {id}")),
+                }
+            }
+            ("pane", "rename") => {
+                let (id, label) = (&argv[3], &argv[4]);
+                match fake_pane_index(&state, id) {
+                    Some(i) => {
+                        state["panes"][i]["label"] = json!(label);
+                        fake_ok_text(argv, "")
+                    }
+                    None => fake_err(argv, format!("pane not found: {id}")),
+                }
+            }
+            ("pane", "close") => {
+                let id = &argv[3];
+                match fake_pane_index(&state, id) {
+                    Some(i) => {
+                        state["panes"].as_array_mut().unwrap().remove(i);
+                        state["agents"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|a| a["pane_id"] != *id);
+                        state["text"].as_object_mut().unwrap().remove(id);
+                        fake_ok_text(argv, "")
+                    }
+                    None => fake_err(argv, format!("pane not found: {id}")),
+                }
+            }
+            ("pane", "run") => {
+                let (id, script) = (&argv[3], &argv[4]);
+                match fake_pane_index(&state, id) {
+                    Some(i) => {
+                        fake_classify_command_route(&mut state, i, script);
+                        fake_ok_text(argv, "")
+                    }
+                    None => fake_err(argv, format!("pane not found: {id}")),
+                }
+            }
+            ("pane", "read") => {
+                let id = &argv[3];
+                match fake_pane_index(&state, id) {
+                    Some(_) => {
+                        let text = state["text"]
+                            .get(id)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        fake_ok_text(argv, text)
+                    }
+                    None => fake_err(argv, format!("pane not found: {id}")),
+                }
+            }
+            ("agent", "start") => {
+                let name = argv[3].clone();
+                let mut kind = String::new();
+                let mut pane_id = String::new();
+                let mut i = 4;
+                while i < argv.len() {
+                    match argv[i].as_str() {
+                        "--kind" => {
+                            kind = argv[i + 1].clone();
+                            i += 2;
+                        }
+                        "--pane" => {
+                            pane_id = argv[i + 1].clone();
+                            i += 2;
+                        }
+                        "--timeout" => i += 2,
+                        _ => break,
+                    }
+                }
+                if state["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["name"] == name || a["pane_id"] == pane_id)
+                {
+                    fake_err(argv, format!("agent name or pane already occupied: {name}"))
+                } else if let Some(pane_index) = fake_pane_index(&state, &pane_id) {
+                    let sequence = state["sequence"].as_u64().unwrap() + 1;
+                    state["sequence"] = json!(sequence);
+                    state["panes"][pane_index]["agent"] = json!(kind);
+                    state["panes"][pane_index]["agent_status"] = json!("idle");
+                    state["text"][&pane_id] = json!("Ready >\n");
+                    let pane = state["panes"][pane_index].clone();
+                    let agent = Shape::Agent
+                        .record(object(json!({
+                            "name": name, "agent": kind, "agent_status": "idle", "pane_id": pane_id,
+                            "workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"],
+                            "cwd": pane["cwd"], "foreground_cwd": pane["foreground_cwd"],
+                            "focused": pane["focused"], "terminal_id": pane["terminal_id"],
+                            "state_change_seq": sequence,
+                        })))
+                        .expect("fixture agent override must match the Herdr agent shape");
+                    state["agents"].as_array_mut().unwrap().push(agent.clone());
+                    fake_ok_json(argv, "agent", "start", json!({"agent": agent}))
+                } else {
+                    fake_err(argv, format!("pane not found: {pane_id}"))
+                }
+            }
+            ("agent", "rename") => {
+                let (target, name) = (argv[3].clone(), argv[4].clone());
+                if state["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["name"] == name)
+                {
+                    fake_err(argv, format!("agent already exists: {name}"))
+                } else if let Some(index) = fake_agent_index(&state, &target) {
+                    state["agents"][index]["name"] = json!(name);
+                    state["agents"][index]["agent_status"] = json!("idle");
+                    let pane_id = state["agents"][index]["pane_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    if let Some(pane_index) = fake_pane_index(&state, &pane_id) {
+                        state["panes"][pane_index]["agent_status"] = json!("idle");
+                    }
+                    state["text"][&pane_id] = json!("Ready >\n");
+                    fake_ok_text(argv, "")
+                } else {
+                    // Command-routed accounts run a wrapper in a pane, then
+                    // rename it: `target` is the pane id `fake-herdr` never
+                    // classified.
+                    let start_argv = vec![
+                        argv[0].clone(),
+                        "agent".into(),
+                        "start".into(),
+                        name,
+                        "--kind".into(),
+                        "claude".into(),
+                        "--pane".into(),
+                        target,
+                    ];
+                    save_fake_state(state_path, &state);
+                    let start = fake_in_process_call(
+                        state_path,
+                        &HerdrCommand {
+                            argv: start_argv,
+                            ..command.clone()
+                        },
+                    );
+                    return if start.ok() {
+                        fake_ok_text(argv, "")
+                    } else {
+                        start
+                    };
+                }
+            }
+            ("agent", "get") => {
+                let name = &argv[3];
+                match fake_agent_index(&state, name) {
+                    Some(i) => {
+                        fake_ok_json(argv, "agent", "get", json!({"agent": state["agents"][i]}))
+                    }
+                    None => fake_err(argv, format!("agent not found: {name}")),
+                }
+            }
+            ("agent", "list") => {
+                let agents = state["agents"].clone();
+                fake_ok_json(argv, "agent", "list", json!({"agents": agents}))
+            }
+            ("agent", "prompt") => {
+                let (name, text) = (argv[3].clone(), argv[4].clone());
+                match fake_agent_index(&state, &name) {
+                    Some(_) if text.is_empty() => fake_err(argv, "agent prompt must not be empty"),
+                    Some(index) => {
+                        let agent = fake_complete_prompt(&mut state, index, &text);
+                        fake_ok_json(argv, "agent", "prompt", json!({"agent": agent}))
+                    }
+                    None => fake_err(argv, format!("agent not found: {name}")),
+                }
+            }
+            ("agent", "send-keys") => {
+                let name = &argv[3];
+                match fake_agent_index(&state, name) {
+                    Some(index) => {
+                        let pane_id = state["agents"][index]["pane_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        let pending = state["pending_prompts"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(&pane_id);
+                        match pending.and_then(|v| v.as_str().map(str::to_owned)) {
+                            Some(prompt) => {
+                                let agent = fake_complete_prompt(&mut state, index, &prompt);
+                                fake_ok_json(argv, "agent", "send-keys", json!({"agent": agent}))
+                            }
+                            None => fake_ok_text(argv, ""),
+                        }
+                    }
+                    None => fake_err(argv, format!("agent not found: {name}")),
+                }
+            }
+            _ => fake_err(argv, format!("unsupported command: {group} {action}")),
+        };
+        save_fake_state(state_path, &state);
+        result
+    }
+
     fn fixture() -> (Sandbox, Store, Fake) {
         let sandbox = Sandbox::new();
         let locks = Arc::new(AtomicU8::new(0));
@@ -3078,9 +3590,10 @@ mod tests {
             quote(&fake_binary().to_string_lossy()), quote(&state.to_string_lossy()), quote(&sandbox.0.to_string_lossy()),
             quote(&config.to_string_lossy()), quote(&runtime.to_string_lossy()), quote(&fake_binary().to_string_lossy()))).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let cwd = sandbox.0.join("writer's lane");
         let launch = PreparedLaunch {
             project_root: sandbox.0.clone(),
-            cwd: sandbox.0.join("writer's lane"),
+            cwd: cwd.clone(),
             task_id: "20261102-builder-abcdef".into(),
             agent_name: "example-builder".into(),
             role: "builder".into(),
@@ -3088,7 +3601,7 @@ mod tests {
             model: "test-model".into(),
             seat: "test-seat".into(),
             brief: "scoped task\n".into(),
-            native_args: argv::native_args("test-model", "codex", Some("high")),
+            native_args: argv::native_args("test-model", "codex", Some("high"), &cwd),
             environment: vec![("CODEX_HOME".into(), config.to_string_lossy().into_owned())],
             clear_auth: vec!["OPENAI_API_KEY".into()],
             command: None,
@@ -3111,6 +3624,8 @@ mod tests {
             shell_retry: Duration::ZERO,
             dispatched: Vec::new(),
             started: Vec::new(),
+            panes: Vec::new(),
+            panes_fails: false,
             failed_to_start: Vec::new(),
             failed_to_start_fails: false,
             trips: Vec::new(),
@@ -3120,6 +3635,7 @@ mod tests {
             script,
             state,
             locks,
+            subprocess: false,
             calls: Vec::new(),
             fail: None,
             trust: false,
@@ -3175,8 +3691,46 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_records_the_pane_durably_the_instant_it_exists() {
+        // Scout 67a619 finding 1: the routing-log append this proves must
+        // happen before rename/start/prompt, since a host kill anywhere in
+        // that span is exactly the crash window the fix closes — see
+        // `close_stranded_leaves_a_live_pane_alone_when_only_event_pane_was_recorded`
+        // (`mv_state::tasks`) for the read side this write enables.
+        let (_sandbox, mut store, mut fake) = fixture();
+        let task = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+        assert_eq!(
+            store.panes,
+            vec![(task.launch.agent_name.clone(), task.pane.clone())]
+        );
+        assert!(task.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_failed_pane_recording_is_only_a_warning_and_never_aborts_the_dispatch() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        store.panes_fails = true;
+        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+        assert_eq!(store.panes.len(), 1);
+        assert!(
+            store
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not record pane")),
+            "{:?}",
+            store.warnings
+        );
+    }
+
+    #[test]
     fn fake_dispatch_writes_brief_before_prompt_and_releases_lock_before_wait() {
         let (_sandbox, mut store, mut fake) = fixture();
+        // Kept on the real `fake-herdr` subprocess (card `20261117-b-29aedd`):
+        // this is the one test that drives split/start/prompt/wait_for_result
+        // through the actual binary + wrapper script + `mv_herdr::run::run`,
+        // so a drift between that real pipeline and `fake_in_process_call`'s
+        // in-process mirror still has somewhere to show up.
+        fake.subprocess = true;
         let task = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
         assert_eq!(store.released, 0);
         assert!(task.warnings.is_empty());
@@ -3291,6 +3845,42 @@ mod tests {
         // override too — unlike the earlier `record_dispatch` snapshot,
         // taken before this override is computed and so never sees it.
         assert_eq!(tail, task.launch.native_args.as_slice());
+    }
+
+    /// Card `20261117-b-249af1`: Codex has no flag that restricts what it
+    /// can *read* on macOS, so the only enforceable mitigation is pinning
+    /// its working root with `-C`/`--cd` to the lane `prepare` already
+    /// created, rather than letting it inherit the pane's shell `cd`
+    /// alone. Asserts against the argv `agent start` actually received,
+    /// the same fake-herdr round trip as the permissions-override test
+    /// above — proving the pin without ever invoking real Codex.
+    #[test]
+    fn codex_is_launched_with_its_worktree_pinned_as_the_root() {
+        let (_sandbox, mut store, mut fake) = fixture();
+        let lane = store.launch.cwd.clone();
+
+        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+
+        let start = &fake.called("agent", "start")[0].argv;
+        let boundary = start.iter().position(|s| s == "--").unwrap();
+        let tail = &start[boundary + 1..];
+        let dash_c = tail
+            .iter()
+            .position(|s| s == "-C")
+            .expect("a codex lane must pin its root with -C");
+        assert_eq!(tail[dash_c + 1], lane.to_str().unwrap());
+    }
+
+    #[test]
+    fn a_dispatched_brief_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_sandbox, mut store, mut fake) = fixture();
+
+        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+
+        let brief = task_dir(&store.launch).join("brief.md");
+        let mode = fs::metadata(&brief).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "brief.md mode was {mode:o}");
     }
 
     #[test]
@@ -3419,7 +4009,8 @@ mod tests {
         let (_sandbox, mut store, mut fake) = fixture();
         store.launch.kind = "claude".into();
         store.launch.command = Some("CACHE=1 test-wrapper".into());
-        store.launch.native_args = argv::native_args("test-model", "claude", Some("high"));
+        store.launch.native_args =
+            argv::native_args("test-model", "claude", Some("high"), &store.launch.cwd);
         fake.command_route = true;
         let task = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
         assert!(fake.called("agent", "start").is_empty());
@@ -3442,7 +4033,8 @@ mod tests {
         let (_sandbox, mut store, mut fake) = fixture();
         store.launch.kind = "claude".into();
         store.launch.command = Some("CACHE=1 test-wrapper".into());
-        store.launch.native_args = argv::native_args("test-model", "claude", Some("high"));
+        store.launch.native_args =
+            argv::native_args("test-model", "claude", Some("high"), &store.launch.cwd);
         fake.command_route = true;
         fake.claude_detect_delay = 1;
         let patient = Timing {
@@ -3477,7 +4069,8 @@ mod tests {
         let (_sandbox, mut store, mut fake) = fixture();
         store.launch.kind = "claude".into();
         store.launch.command = Some("CACHE=1 test-wrapper".into());
-        store.launch.native_args = argv::native_args("test-model", "claude", Some("high"));
+        store.launch.native_args =
+            argv::native_args("test-model", "claude", Some("high"), &store.launch.cwd);
         fake.command_route = true;
         fake.claude_detect_delay = usize::MAX;
         let impatient = Timing {
@@ -3919,7 +4512,8 @@ mod tests {
         let (_sandbox, mut store, mut fake) = fixture();
         store.launch.kind = "claude".into();
         store.launch.command = Some("CACHE=1 test-wrapper".into());
-        store.launch.native_args = argv::native_args("test-model", "claude", Some("high"));
+        store.launch.native_args =
+            argv::native_args("test-model", "claude", Some("high"), &store.launch.cwd);
         fake.command_route = true;
         fake.stuck_pastes = 1;
         let task = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
@@ -4602,7 +5196,8 @@ mod tests {
         let (_sandbox, mut store, mut fake) = fixture();
         store.launch.kind = "claude".into();
         store.launch.command = Some("CACHE=1 test-wrapper".into());
-        store.launch.native_args = argv::native_args("test-model", "claude", Some("high"));
+        store.launch.native_args =
+            argv::native_args("test-model", "claude", Some("high"), &store.launch.cwd);
         fake.command_route = true;
         fake.banner = Some(CLAUDE_ROLLING);
         fake.stalled_prompts = 2;

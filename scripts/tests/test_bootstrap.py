@@ -2,6 +2,7 @@
 """Fast bootstrap regressions; also reused with real release artifacts."""
 
 from pathlib import Path
+import os
 import platform
 import shutil
 import subprocess
@@ -389,6 +390,34 @@ class BootstrapTests(unittest.TestCase):
             "build --release --locked -p mv-cli",
         )
         self.assert_version()
+
+    def test_archive_member_with_group_other_write_is_clamped(self):
+        """A packed `multiverse` entry carrying group/other write (an
+        accidental build-machine umask, or a tampered/mirrored archive) is
+        clamped to 0o755 on install, not left writable by anyone but the
+        owner. umask 0 removes the host's own umask as a confound -- `tar`
+        extraction otherwise masks the packed mode down to a safe value on
+        its own, independent of bootstrap-plugin.sh's chmod."""
+        payload = self.work / "writable-payload"
+        payload.write_text(f"#!/bin/sh\nprintf 'multiverse {self.version}\\n'\n")
+        payload.chmod(0o666)
+        archive = self.releases / self.archive_name
+        with tarfile.open(archive, "w:gz") as bundle:
+            bundle.add(payload, arcname="multiverse")
+        checksum = subprocess.check_output(
+            ["shasum", "-a", "256", archive.name], cwd=self.releases, text=True,
+        )
+        (self.releases / "SHA256SUMS").write_text(checksum)
+        old_umask = os.umask(0)
+        try:
+            result = self.bootstrap()
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("from release", result.stdout)
+        self.assert_version()
+        mode = self.binary.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o755, oct(mode))
 
     def test_missing_release_and_cargo_explains_recovery(self):
         """With neither a matching release archive nor cargo on PATH,

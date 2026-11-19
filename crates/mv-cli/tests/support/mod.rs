@@ -84,6 +84,16 @@ pub struct SlowPaneLayoutDispatch {
     pub child: KillOnDrop,
     pub layout_started: PathBuf,
     pub layout_finished: PathBuf,
+    layout_release: PathBuf,
+}
+
+impl SlowPaneLayoutDispatch {
+    /// Lets the paused `pane layout` call proceed. Call this only after
+    /// observing whatever the test needed to observe while it was paused —
+    /// releasing early is the point, not a courtesy.
+    pub fn release_pane_layout(&self) {
+        fs::write(&self.layout_release, b"").unwrap();
+    }
 }
 
 pub struct Sandbox {
@@ -276,31 +286,37 @@ recipient = ["sandbox"]
     }
 
     /// Spawns `dispatch` in the background against a `HERDR_BIN_PATH`
-    /// wrapper that pauses for `sleep_secs` on the very first `pane layout`
-    /// call — the earliest Herdr round trip dispatch makes once pane
-    /// placement starts — then execs the repository's real `fake-herdr` for
-    /// every call, including that one, so the dispatch itself still
-    /// completes normally. The wrapper drops a marker file immediately
-    /// before and after that pause (`layout_started`/`layout_finished`), so
-    /// a test can observe whether the layout call is still in progress
-    /// without racing a wall-clock bound: it can assert a concurrent
-    /// `activity send` into the same project completed while
-    /// `layout_finished` does not yet exist, to prove dispatch's own
-    /// project lock (`routing.log.lock`) was not still held across that
-    /// Herdr call (card `20261115-b-c8bcb5`).
-    pub fn dispatch_background_with_slow_pane_layout(
-        &self,
-        task: &str,
-        sleep_secs: u64,
-    ) -> SlowPaneLayoutDispatch {
+    /// wrapper that pauses on the very first `pane layout` call — the
+    /// earliest Herdr round trip dispatch makes once pane placement starts —
+    /// then execs the repository's real `fake-herdr` for every call,
+    /// including that one, so the dispatch itself still completes normally.
+    /// The pause is a signal the test controls, not a sleep: the wrapper
+    /// drops a marker file the instant it starts pausing (`layout_started`),
+    /// then polls for a release marker ([`SlowPaneLayoutDispatch::release_pane_layout`])
+    /// every 100ms before dropping a second marker the instant it stops
+    /// (`layout_finished`) and exec'ing the real call. A test can therefore
+    /// observe whether the layout call is still in progress, and control
+    /// exactly how long it stays that way, without racing a wall-clock
+    /// bound: it can assert a concurrent `activity send` into the same
+    /// project completed while `layout_finished` does not yet exist, to
+    /// prove dispatch's own project lock (`routing.log.lock`) was not still
+    /// held across that Herdr call (card `20261115-b-c8bcb5`). The poll is
+    /// itself bounded to 5s so that a regression which keeps the lock held
+    /// (and so keeps the concurrent `activity send` blocked, so the test
+    /// never reaches the point of releasing the pane layout call) still
+    /// resolves as a failed assertion — `layout_finished` already present by
+    /// the time the blocked call returns — rather than hanging forever.
+    pub fn dispatch_background_with_slow_pane_layout(&self, task: &str) -> SlowPaneLayoutDispatch {
         let script_path = self.root.join("slow-herdr.sh");
         let layout_started = self.root.join("layout-started");
         let layout_finished = self.root.join("layout-finished");
+        let layout_release = self.root.join("layout-release");
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = layout ]; then\n  : > \"{started}\"\n  sleep {sleep_secs}\n  : > \"{finished}\"\nfi\nexec \"{real}\" \"$@\"\n",
+                "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = layout ]; then\n  : > \"{started}\"\n  i=0\n  while [ ! -f \"{release}\" ] && [ \"$i\" -lt 50 ]; do\n    sleep 0.1\n    i=$((i + 1))\n  done\n  : > \"{finished}\"\nfi\nexec \"{real}\" \"$@\"\n",
                 started = layout_started.display(),
+                release = layout_release.display(),
                 finished = layout_finished.display(),
                 real = fake_binary().display(),
             ),
@@ -332,6 +348,7 @@ recipient = ["sandbox"]
             child: KillOnDrop::new(child),
             layout_started,
             layout_finished,
+            layout_release,
         }
     }
 

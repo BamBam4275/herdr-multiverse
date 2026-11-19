@@ -3,18 +3,25 @@
 //!
 //! Validation (duplicate name/path checks) goes through the real
 //! `mv_config::load::Config` merged in from `main` partway through this
-//! task. The actual *write* still appends plain text rather than using
+//! task. The actual *write* still renders plain text rather than using
 //! `mv_config::edit`'s `toml_edit`-based appender: that appender needs a
 //! `toml_edit::DocumentMut` in the caller's own code, and `toml_edit` is
 //! not a declared `mv-cli` dependency (unlike `mv-config` itself, which
 //! `mv-cli` already depends on for reading). Adding it was judged outside
 //! this task's scope — see `result.md`'s undecided-calls list — so this
-//! keeps the same "append, never rewrite" discipline as a plain-text
-//! append, without `toml_edit`'s comment-preserving round-trip.
+//! keeps the same "append, never rewrite" *content* discipline as a
+//! plain-text append, without `toml_edit`'s comment-preserving round-trip.
+//! The write itself goes through [`mv_core::atomic::write_atomic`] (same
+//! temp-file-plus-rename helper `mv_config::migrate::migrate_file` uses for
+//! its own live-config write) rather than an in-place `OpenOptions::append`,
+//! so a crash mid-write can never leave `config.toml` holding a truncated
+//! block — the live path is always either the old bytes or the full new
+//! bytes. `write_atomic` sets its temp file to mode `0600` before the
+//! rename; `register` restores the config file's own prior mode afterward
+//! so this write does not silently narrow permissions on a config that was
+//! e.g. group-readable.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
@@ -395,6 +402,13 @@ fn toml_quote_key(name: &str) -> String {
 /// after `git init`, matching spec-cli.md §2's description of the Python
 /// original: "`new`... calls `cmd_add`/`cmd_start` directly (in-process)").
 ///
+/// The write rereads `config_path`'s current bytes, appends the block in
+/// memory, and rewrites the whole file through
+/// [`mv_core::atomic::write_atomic`] — a same-directory temp file, fsync,
+/// rename, directory fsync — rather than opening `config_path` and
+/// appending to it directly, so a crash partway through never leaves the
+/// live file holding a truncated block.
+///
 /// Returns the rendered block (for `--dry-run` display) without writing
 /// when `dry_run` is true.
 pub(crate) fn register(
@@ -440,21 +454,70 @@ pub(crate) fn register(
         return Ok(block);
     }
 
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(config_path)
-        .map_err(|error| {
-            Failure::Operation(format!("could not open {}: {error}", config_path.display()))
-        })?;
-    file.write_all(block.as_bytes()).map_err(|error| {
+    // Resolve symlinks first: the atomic write renames a temp file over
+    // its destination, and a rename onto a symlink replaces the link
+    // itself. A config.toml symlinked into a dotfiles repo must keep
+    // being a link, with the new bytes landing in its target.
+    let resolved = std::fs::canonicalize(config_path).map_err(|error| {
+        Failure::Operation(format!(
+            "could not resolve {}: {error}",
+            config_path.display()
+        ))
+    })?;
+    let config_path = resolved.as_path();
+    let original_mode = file_mode(config_path)?;
+    let mut new_contents = std::fs::read(config_path).map_err(|error| {
+        Failure::Operation(format!("could not read {}: {error}", config_path.display()))
+    })?;
+    new_contents.extend_from_slice(block.as_bytes());
+
+    mv_core::atomic::write_atomic(config_path, &new_contents).map_err(|error| {
         Failure::Operation(format!(
             "could not write {}: {error}",
             config_path.display()
         ))
     })?;
+    restore_file_mode(config_path, original_mode)?;
 
     println!("Added to {}:{block}", config_path.display());
     Ok(block)
+}
+
+/// `config_path`'s current permission mode, read before [`write_atomic`]
+/// replaces the file — `write_atomic` always leaves its temp file at mode
+/// `0600`, so the caller restores the original afterward rather than
+/// silently narrowing a config that was, say, group-readable.
+///
+/// [`write_atomic`]: mv_core::atomic::write_atomic
+#[cfg(unix)]
+fn file_mode(config_path: &Path) -> Result<u32, Failure> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(config_path)
+        .map(|metadata| metadata.permissions().mode())
+        .map_err(|error| {
+            Failure::Operation(format!("could not stat {}: {error}", config_path.display()))
+        })
+}
+
+#[cfg(not(unix))]
+fn file_mode(_config_path: &Path) -> Result<(), Failure> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_file_mode(config_path: &Path, mode: u32) -> Result<(), Failure> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+        Failure::Operation(format!(
+            "could not restore permissions on {}: {error}",
+            config_path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn restore_file_mode(_config_path: &Path, _mode: ()) -> Result<(), Failure> {
+    Ok(())
 }
 
 /// Resolve `raw_path` to an existing directory, or report why not.
@@ -598,6 +661,134 @@ mod tests {
                 .matches("[projects.added]")
                 .count(),
             1
+        );
+    }
+
+    /// Scout finding `da3b15` item 4: `register`'s write must produce the
+    /// same bytes a plain-text append always did — old bytes, comments
+    /// included, untouched, with the rendered block tacked on at the
+    /// end — even though it now goes through a read-whole-file-then-
+    /// atomic-rewrite path rather than `OpenOptions::append`.
+    #[test]
+    fn register_appends_the_block_byte_identically_to_a_config_with_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("newrepo");
+        std::fs::create_dir(&project_dir).unwrap();
+        let config_path = dir.path().join("config.toml");
+        let toml = "\
+# leading comment, must survive untouched
+[accounts.seat]
+kind = \"codex\" # inline comment
+config_dir_var = \"CODEX_HOME\"
+config_dir = \"/tmp\"
+pool = \"codex:a\"
+
+[roles.scout]
+[roles.scout.models]
+codex = \"m\"
+# trailing comment, must survive untouched
+";
+        std::fs::write(&config_path, toml).unwrap();
+        let config = mv_config::load::load_config_str(toml, &config_path).unwrap();
+
+        let block = register(&config_path, &config, &project_dir, "newrepo", false).unwrap();
+
+        let expected = format!("{toml}{block}");
+        assert_eq!(std::fs::read(&config_path).unwrap(), expected.as_bytes());
+    }
+
+    /// Scout finding `da3b15` item 4, proof (2): modeled on
+    /// `migrate_file_never_leaves_the_live_path_truncated_on_a_simulated_crash`
+    /// (`crates/mv-config/src/migrate.rs`). That test can't simulate a real
+    /// `kill -9` either — the invariant it checks is structural: a
+    /// same-directory temp file plus `rename` can only ever expose the old,
+    /// fully-written file or the new, fully-written file at `config_path`,
+    /// because a rename is the one filesystem operation that swaps a
+    /// directory entry's target atomically. An in-place `OpenOptions::append`
+    /// has no such guarantee — a crash partway through its `write_all` can
+    /// leave the live path holding a truncated block.
+    ///
+    /// This is checked two ways: no leftover temp file, and — the part a
+    /// raw append cannot pass — the live path's inode changes, proving the
+    /// write replaced the file via rename rather than mutating it in place.
+    /// Revert `register` to the raw append and the inode assertion fails,
+    /// because an in-place append never changes the file's inode.
+    #[test]
+    #[cfg(unix)]
+    fn register_replaces_the_live_config_by_atomic_rename_never_in_place() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("newrepo");
+        std::fs::create_dir(&project_dir).unwrap();
+        let config_path = dir.path().join("config.toml");
+        let toml = "# comment\n[accounts.seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:a\"\n\n[roles.scout]\n[roles.scout.models]\ncodex = \"m\"\n";
+        std::fs::write(&config_path, toml).unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let config = mv_config::load::load_config_str(toml, &config_path).unwrap();
+
+        let before = std::fs::metadata(&config_path).unwrap();
+
+        let block = register(&config_path, &config, &project_dir, "newrepo", false).unwrap();
+
+        let after = std::fs::metadata(&config_path).unwrap();
+        assert_ne!(
+            before.ino(),
+            after.ino(),
+            "register must replace the live config via a same-directory \
+             temp-file-then-rename, not an in-place write — only a rename \
+             guarantees the live path is never observed mid-write"
+        );
+        assert_eq!(
+            before.permissions().mode() & 0o777,
+            after.permissions().mode() & 0o777,
+            "register must restore the config file's own mode after the \
+             atomic write, which always leaves its temp file at 0600"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "config.toml" && name != "newrepo")
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp file(s): {leftovers:?}");
+
+        let final_contents = std::fs::read(&config_path).unwrap();
+        assert_eq!(final_contents, format!("{toml}{block}").as_bytes());
+    }
+
+    /// `new --yes` passes `register` an unresolved config path. A
+    /// `config.toml` that is a symlink (for example into a dotfiles
+    /// repo) must stay a symlink after the atomic write, with the new
+    /// block written into the link's target.
+    #[test]
+    #[cfg(unix)]
+    fn register_keeps_a_symlinked_config_a_symlink_and_writes_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("newrepo");
+        std::fs::create_dir(&project_dir).unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let target = dotfiles.join("config.toml");
+        let toml = "# comment\n[accounts.seat]\nkind = \"codex\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:a\"\n\n[roles.scout]\n[roles.scout.models]\ncodex = \"m\"\n";
+        std::fs::write(&target, toml).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let config = mv_config::load::load_config_str(toml, &link).unwrap();
+
+        let block = register(&link, &config, &project_dir, "newrepo", false).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlinked config must still be a symlink after register"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            format!("{toml}{block}").as_bytes(),
+            "the new block must land in the symlink's target"
         );
     }
 

@@ -559,6 +559,21 @@ fn git(root: &Path, args: &[&str], input: Option<&str>) -> Result<String> {
         .map_err(|_| WorktreeError::Refused("non-UTF-8 git output".into()))
 }
 
+/// Paths `git` currently reports as unmerged — conflicted stage `U` in
+/// `git status --porcelain` — via `git diff --name-only --diff-filter=U`.
+/// [`Worktrees::merge`] uses this both to refuse before starting when the
+/// trunk checkout already has some left over from an earlier operation,
+/// and to name them after aborting a merge its own `git merge --no-ff
+/// --no-edit` just conflicted into.
+fn conflicting_paths(root: &Path) -> Result<Vec<String>> {
+    let output = git(root, &["diff", "--name-only", "--diff-filter=U"], None)?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Runs a secrets-scanner subprocess (`gitleaks`/`trufflehog`), synchronously,
 /// never through a shell. `program` may be a bare command (resolved against
 /// `PATH`) or an explicit path, matching how `[secrets_scan]` documents both
@@ -733,7 +748,16 @@ pub struct Lane {
 /// statuses only; never liveness. Called again immediately before mutation.
 pub trait LaneObserver {
     fn check(&mut self, lane: &Lane, force: bool) -> Result<()>;
-    fn record_prune(&mut self, lane: &Lane) -> Result<()>;
+    /// `task_records` is `Worktrees::task_records`'s output, passed in
+    /// rather than fetched here so a caller pruning many lanes in one pass
+    /// (`Worktrees::prune_with_ignored`) shares one scan of the routing log
+    /// across every lane's own outcome recording, instead of each lane
+    /// re-scanning it on its own.
+    fn record_prune(
+        &mut self,
+        lane: &Lane,
+        task_records: &[crate::index::IndexedRecord],
+    ) -> Result<()>;
 }
 
 /// What `Worktrees::prune`/`prune_with_ignored` did with one lane. `Kept`
@@ -1977,7 +2001,7 @@ impl Worktrees {
         // — skipping only an occupant this lane never actually dispatched
         // (no task directory ever written for it), so a pristine,
         // never-used lane from a bare `create` stays freely adoptable.
-        self.terminal_statuses(&lane, false, true)?;
+        self.terminal_statuses(&lane, false, true, false, &self.task_records())?;
         if has_process_cwd(&lane.path)? {
             return Err(WorktreeError::Refused("lane has a live process cwd".into()));
         }
@@ -2041,6 +2065,21 @@ impl Worktrees {
         Ok(())
     }
 
+    /// Every task-lifecycle record in this project's routing log, decoded
+    /// once. [`Self::terminal_statuses`] and [`Self::retirement_authorized`]
+    /// (via [`has_terminal_outcome_in`]/[`recorded_task_outcomes_in`]) both
+    /// read this same ledger; a caller that walks every lane in one pass
+    /// (`prune_with_ignored`) fetches and validates it here exactly once for
+    /// the whole call, not once per lane — see `prune_with_ignored`'s own
+    /// `build_scope`, computed the same way for the same reason.
+    fn task_records(&self) -> Vec<crate::index::IndexedRecord> {
+        crate::index::records(
+            &self.project.join(".multiverse/routing.log"),
+            crate::index::Selector::Tasks,
+        )
+        .unwrap_or_default()
+    }
+
     /// `skip_never_dispatched`: when true, an occupant whose
     /// `.multiverse/tasks/<task>` directory was never written in either the
     /// project or the lane — [`Self::task_directory_exists`], i.e. no
@@ -2050,14 +2089,39 @@ impl Worktrees {
     /// terminal outcome) before it is destroyed. `adopt` passes `true`: a
     /// pristine lane is freely reusable, but one that was actually
     /// dispatched into and never settled is not.
+    ///
+    /// `lane_task_abandoned`: when true, *only* the lane's own task
+    /// (`lane.task`, never another occupant `occupant_tasks` turns up) is
+    /// also skipped regardless of directory existence — [`Self::
+    /// abandoned_before_dispatch`]'s own conclusion, already proven for
+    /// `lane.task` specifically (age, no commits, and either no directory
+    /// or, Scout 67a619 finding 2, a directory with no `event=dispatch`
+    /// record for it at all — a brief written just before the host died,
+    /// with the dispatch append that follows it in `runner.rs` never
+    /// landing). `prune_with_ignored` is the only caller that ever passes
+    /// `true` here, with the exact value `abandoned_before_dispatch`
+    /// already computed for this lane; `adopt` always passes `false` — it
+    /// has no age guard of its own, so a brief that exists at all, dispatch
+    /// record or not, still means "touched", not "reusable".
+    ///
+    /// `task_records` is [`Self::task_records`]'s output, passed in rather
+    /// than fetched here so a caller checking many lanes (or this same lane
+    /// more than once) shares one scan of the ledger instead of paying for
+    /// one per call — and is also `lane_task_abandoned`'s own evidence, via
+    /// [`has_terminal_outcome_in`]'s sibling [`has_dispatch_record_in`].
     fn terminal_statuses(
         &self,
         lane: &Lane,
         force: bool,
         skip_never_dispatched: bool,
+        lane_task_abandoned: bool,
+        task_records: &[crate::index::IndexedRecord],
     ) -> Result<()> {
         for task in occupant_tasks(&self.project, lane)? {
             if skip_never_dispatched && !self.task_directory_exists(lane, &task)? {
+                continue;
+            }
+            if lane_task_abandoned && task == lane.task {
                 continue;
             }
             let relative = Path::new(".multiverse/tasks").join(&task).join("status");
@@ -2076,7 +2140,7 @@ impl Worktrees {
                 // recorded for this task's latest dispatch — a status file
                 // missing because `close_stranded` recovered the outcome
                 // after a crash, never a reason to keep the lane.
-                if force || has_terminal_outcome(&self.project, &task) {
+                if force || has_terminal_outcome_in(task_records, &task) {
                     continue;
                 }
                 return Err(WorktreeError::Refused(format!(
@@ -2108,6 +2172,87 @@ impl Worktrees {
         let relative = Path::new(".multiverse/tasks").join(task);
         Ok(guarded_path(&self.project, &relative, true)?.try_exists()?
             || guarded_path(&lane.path, &relative, true)?.try_exists()?)
+    }
+
+    /// Whether `task`'s lane is exactly the shape rank-7 (card
+    /// 20261117-b-437eeb) names: `create` returned a checkout and a branch,
+    /// but no brief was ever written for it (`task`'s own copy of
+    /// `.multiverse/tasks/<task>` — the project's, or `lane_path`'s when the
+    /// checkout still exists, matching [`Self::task_directory_exists`]) —
+    /// **or** the brief *was* written but the host died before the
+    /// routing-log `event=dispatch` append that follows it in
+    /// `runner.rs::start_dispatch` (Scout 67a619 finding 2): a task
+    /// directory with no matching `event=dispatch` record anywhere in
+    /// `task_records` reads the same as no directory at all, since that is
+    /// the one window where the directory exists but the dispatch itself
+    /// never happened — and no commit was ever made past its recorded cut
+    /// point ([`has_commits`]). `lane_path` is `None` once the checkout is
+    /// already gone (`prune_orphans`'s own use, on a branch `prune` already
+    /// removed the lane directory for) — only the project's copy can still
+    /// be checked then, which is exactly what a never-dispatched task
+    /// leaves nothing in either way. `task_records` is the caller's own
+    /// routing-log fetch ([`Worktrees::task_records`]), shared across every
+    /// lane/orphan one call checks rather than re-scanned per task.
+    ///
+    /// Age comes from `task`'s own branch reflog — the one timestamp
+    /// `create`'s `git worktree add -b` always leaves, readable whether or
+    /// not the checkout is still on disk — compared against
+    /// [`WORKTREE_STATE_RETENTION`], the same age this module already
+    /// waits out before treating other abandoned state as safe to reclaim
+    /// (`prune_quarantine`'s `RetentionExpired`): this is the same
+    /// question — "has enough time passed that this can no longer be the
+    /// in-flight window between `create` returning and `write_brief`/
+    /// `record_dispatch` finishing" — not a new kind of guard needing its
+    /// own number. A branch with no reflog entry at all (expired, or
+    /// `core.logAllRefUpdates` off) answers `false`: age can't be proven,
+    /// so every existing guard — `terminal_statuses`, `has_terminal_outcome`
+    /// — stays in force.
+    fn abandoned_before_dispatch(
+        &self,
+        task: &str,
+        lane_path: Option<&Path>,
+        task_records: &[crate::index::IndexedRecord],
+    ) -> Result<bool> {
+        let relative = Path::new(".multiverse/tasks").join(task);
+        let directory_exists = guarded_path(&self.project, &relative, true)?.try_exists()?
+            || match lane_path {
+                Some(lane_path) => guarded_path(lane_path, &relative, true)?.try_exists()?,
+                None => false,
+            };
+        if directory_exists && has_dispatch_record_in(task_records, task) {
+            return Ok(false);
+        }
+        if has_commits(&self.project, task)? {
+            return Ok(false);
+        }
+        let branch_ref = format!("refs/heads/{}", branch_name(task)?);
+        // `%gd`, not `%cd`: the reflog's own date (`--date=unix` applies to
+        // the `@{...}` it prints), independent of the commit's own
+        // committer date — `tip == base` means that commit's date is
+        // whenever `base` was originally made, which can predate this
+        // branch by months and says nothing about this lane's own age.
+        let logged = git(
+            &self.project,
+            &[
+                "log",
+                "-g",
+                "--format=%gd",
+                "--date=unix",
+                "-1",
+                &branch_ref,
+            ],
+            None,
+        )?;
+        let Some(created) = logged
+            .trim()
+            .rsplit_once("@{")
+            .and_then(|(_, rest)| rest.strip_suffix('}'))
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+        else {
+            return Ok(false);
+        };
+        let created = UNIX_EPOCH + Duration::from_secs(created);
+        Ok(created < SystemTime::now() - WORKTREE_STATE_RETENTION)
     }
 
     /// Rescue never overwrites: different bytes, symlinks, and special files
@@ -2196,6 +2341,15 @@ impl Worktrees {
             let main_dir = find_main_checkout_build_dir(&root, &self.project);
             (root, main_dir)
         });
+        // Likewise resolved once per call, not once per lane: every lane
+        // below that needs a terminal-status or archive-authority decision
+        // shares this one ledger scan (`task_records`) and this one
+        // candidate listing (`retirement_candidates`) instead of each lane
+        // re-scanning the whole routing log and re-walking every task
+        // directory on its own.
+        let task_records = self.task_records();
+        let recorded_outcomes = recorded_task_outcomes_in(&task_records);
+        let mut retirement_candidates = self.retirement_candidates()?;
         let mut outcomes = Vec::new();
         for lane in self.lanes()? {
             // Set the instant `observer.check` itself passes, before any
@@ -2205,15 +2359,42 @@ impl Worktrees {
             // unmerged, …) never needs a second `agent list` call just to
             // ask the same question `kept_target_bytes` cares about.
             let mut pane_clear = false;
+            // "Created but never dispatched into" (rank-7, card
+            // 20261117-b-437eeb): `occupant_tasks` always includes the
+            // lane's own task name, so a lane `create` made but no brief
+            // ever followed would otherwise need `force` forever — see
+            // `abandoned_before_dispatch`'s own doc comment. Computed inside
+            // the closure, after `observer.check`, not before it: a lane
+            // whose branch does not even exist yet (an unregistered
+            // directory `adopt` already refuses) must still fail through
+            // this same closure's own error-to-`Kept` handling, not abort
+            // `prune` outright on `?`.
+            let mut skip_never_dispatched = false;
             let check = (|| {
                 observer.check(&lane, force)?;
                 pane_clear = true;
-                self.terminal_statuses(&lane, force, false)?;
+                // Fail safe: if abandonment cannot be proven (a git error,
+                // e.g. no HEAD yet), keep every existing guard in force.
+                skip_never_dispatched = self
+                    .abandoned_before_dispatch(&lane.task, Some(&lane.path), &task_records)
+                    .unwrap_or(false);
+                self.terminal_statuses(
+                    &lane,
+                    force,
+                    skip_never_dispatched,
+                    skip_never_dispatched,
+                    &task_records,
+                )?;
                 let tip = self.tip(&lane.task)?;
                 let archiving = !ancestor(&self.project, &tip)?;
                 if archiving
                     && !self.patch_landed(&tip)?
-                    && !self.retirement_authorized(&lane.task, &tip)?
+                    && !self.retirement_authorized_with(
+                        &lane.task,
+                        &tip,
+                        &recorded_outcomes,
+                        &retirement_candidates,
+                    )?
                 {
                     return Err(WorktreeError::Refused(
                         "branch is not merged into HEAD and has no archive authority".into(),
@@ -2228,9 +2409,15 @@ impl Worktrees {
             })();
             let archiving = match check {
                 Err(error) => {
-                    let target_freed = self.kept_target_bytes(&lane, pane_clear, dry_run);
-                    let build_dir_freed =
-                        self.kept_build_dir_bytes(&lane, pane_clear, dry_run, build_scope.as_ref());
+                    let target_freed =
+                        self.kept_target_bytes(&lane, pane_clear, dry_run, &task_records);
+                    let build_dir_freed = self.kept_build_dir_bytes(
+                        &lane,
+                        pane_clear,
+                        dry_run,
+                        build_scope.as_ref(),
+                        &task_records,
+                    );
                     outcomes.push(PruneOutcome::Kept {
                         task: lane.task,
                         reason: error.to_string(),
@@ -2256,7 +2443,13 @@ impl Worktrees {
                     }
                 } else {
                     let branch_refusal = self
-                        .terminal_statuses(&lane, false, false)
+                        .terminal_statuses(
+                            &lane,
+                            false,
+                            skip_never_dispatched,
+                            skip_never_dispatched,
+                            &task_records,
+                        )
                         .err()
                         .map(|_| format!("no recorded outcome for {}", lane.task));
                     PruneOutcome::WouldRemove {
@@ -2267,8 +2460,14 @@ impl Worktrees {
                 });
             } else {
                 observer.check(&lane, force)?;
-                self.terminal_statuses(&lane, force, false)?;
-                observer.record_prune(&lane)?;
+                self.terminal_statuses(
+                    &lane,
+                    force,
+                    skip_never_dispatched,
+                    skip_never_dispatched,
+                    &task_records,
+                )?;
+                observer.record_prune(&lane, &task_records)?;
                 // Rescue *before* removing, never after — see `remove_lane`'s
                 // own doc comment. This is the one call whose copied-path
                 // list a caller can report; `remove_lane`'s own internal
@@ -2283,6 +2482,11 @@ impl Worktrees {
                         .map(|dir| (root.clone(), dir))
                 });
                 let retained_state = self.remove_lane(&lane, archiving, allow_ignored)?;
+                // That lane's task dirs now live in the main checkout (the
+                // rescue above), not in the lane just removed, so the
+                // shared listing would point a later lane's authority check
+                // at a path that is gone. Re-list only after a real removal.
+                retirement_candidates = self.retirement_candidates()?;
                 let build_dir_freed = build_dir.and_then(|(root, dir)| {
                     let size = deep_prune_size(&dir);
                     if size == 0 {
@@ -2300,7 +2504,9 @@ impl Worktrees {
                         build_dir_freed,
                     }
                 } else {
-                    let branch_refusal = if has_terminal_outcome(&self.project, &lane.task) {
+                    let branch_refusal = if has_terminal_outcome_in(&task_records, &lane.task)
+                        || skip_never_dispatched
+                    {
                         self.reclaim_locked(&lane.task).err().map(|e| e.to_string())
                     } else {
                         Some(format!("no recorded outcome for {}", lane.task))
@@ -2346,11 +2552,20 @@ impl Worktrees {
     /// regardless of `prune`'s own `force` argument: that argument confirms
     /// *removing* an otherwise-removable lane, not relaxing the evidence a
     /// kept lane's build cache gets judged by.
-    fn kept_target_bytes(&self, lane: &Lane, pane_clear: bool, dry_run: bool) -> Option<u64> {
+    fn kept_target_bytes(
+        &self,
+        lane: &Lane,
+        pane_clear: bool,
+        dry_run: bool,
+        task_records: &[crate::index::IndexedRecord],
+    ) -> Option<u64> {
         if !pane_clear {
             return None;
         }
-        if self.terminal_statuses(lane, false, false).is_err() {
+        if self
+            .terminal_statuses(lane, false, false, false, task_records)
+            .is_err()
+        {
             return None;
         }
         if has_process_cwd(&lane.path).unwrap_or(true) {
@@ -2382,11 +2597,15 @@ impl Worktrees {
         pane_clear: bool,
         dry_run: bool,
         build_scope: Option<&(PathBuf, Option<PathBuf>)>,
+        task_records: &[crate::index::IndexedRecord],
     ) -> Option<u64> {
         if !pane_clear {
             return None;
         }
-        if self.terminal_statuses(lane, false, false).is_err() {
+        if self
+            .terminal_statuses(lane, false, false, false, task_records)
+            .is_err()
+        {
             return None;
         }
         if has_process_cwd(&lane.path).unwrap_or(true) {
@@ -2570,9 +2789,17 @@ impl Worktrees {
         } else {
             Some(lock(&self.project)?)
         };
+        // Fetched once for the whole call, not once per task: only
+        // `abandoned_before_dispatch` below needs the ledger itself, and it
+        // checks every orphan candidate this loop walks.
+        let task_records = self.task_records();
         let mut outcomes = Vec::new();
         for task in self.orphan_branches()? {
-            if !has_terminal_outcome(&self.project, &task) {
+            if !has_terminal_outcome(&self.project, &task)
+                && !self
+                    .abandoned_before_dispatch(&task, None, &task_records)
+                    .unwrap_or(false)
+            {
                 outcomes.push(BranchOutcome::Kept {
                     reason: format!("no recorded outcome for {task}"),
                     task,
@@ -2614,12 +2841,23 @@ impl Worktrees {
     /// `quarantine_is_redundant` proves every file it holds is already
     /// saved, byte-identical, under this project's own live `.multiverse/`
     /// — regardless of the copy's age — or, failing that proof, once
-    /// `WORKTREE_STATE_RETENTION` has passed since its own newest write.
-    /// Neither guard fires early: a copy that is neither provably redundant
-    /// nor past retention is always kept. `dry_run` reports what each copy
-    /// would become without removing anything or taking the worktree lock,
-    /// matching `prune_orphans`'s own preview behavior; a real run takes the
-    /// lock once for the whole sweep.
+    /// `WORKTREE_STATE_RETENTION` has passed since its own newest write
+    /// *and* a rescue of it — the same `check_copy`/`copy_without_overwrite`
+    /// a direct `rescue()` call would run — does not conflict with anything
+    /// already there. That second clause is what keeps a crash inside
+    /// `remove_lane`, between its own rename into quarantine and the
+    /// redirect symlink right after it, from ever losing the copy: nothing
+    /// had rescued it before the crash, so it is not yet redundant, but it
+    /// is still rescued here, before retention age could otherwise excuse
+    /// deleting the only copy of it. A copy whose rescue would conflict — a
+    /// genuine byte mismatch against something already rescued under the
+    /// same name — is kept rather than destroyed; task state with no
+    /// rescued copy is never deleted. Neither guard fires early: a copy
+    /// that is neither provably redundant nor past retention is always
+    /// kept. `dry_run` reports what each copy would become without
+    /// removing, rescuing, or writing anything, or taking the worktree
+    /// lock, matching `prune_orphans`'s own preview behavior; a real run
+    /// takes the lock once for the whole sweep.
     pub fn prune_quarantine(&self, dry_run: bool) -> Result<Vec<QuarantineOutcome>> {
         let _lock = if dry_run {
             None
@@ -2654,7 +2892,20 @@ impl Worktrees {
             let reason = if quarantine_is_redundant(&path, &project_state)? {
                 Some(QuarantineReason::Redundant)
             } else if deep_prune_newest_mtime(&path).is_some_and(|mtime| mtime < cutoff) {
-                Some(QuarantineReason::RetentionExpired)
+                // Not provably redundant, but old enough to otherwise drop:
+                // rescue it first, so what this copy alone holds — whether
+                // from a late write or from a `remove_lane` crash that never
+                // reached its own `rescue_state` call — lands in the
+                // project's own live state before the copy itself goes. A
+                // genuine conflict there (`check_copy`/`copy_without_overwrite`
+                // both refuse one the same way `rescue()` does) keeps this
+                // copy instead of deleting task state no rescue ever saved.
+                let rescued = if dry_run {
+                    check_copy(&path, &project_state).is_ok()
+                } else {
+                    copy_without_overwrite(&path, &project_state).is_ok()
+                };
+                rescued.then_some(QuarantineReason::RetentionExpired)
             } else {
                 None
             };
@@ -2915,14 +3166,22 @@ impl Worktrees {
     /// would find, because that run rescues the authorizing task's own
     /// lane first — exactly the "model the rescue step in the preview"
     /// gap card `20261110-b-d3ba4f` names.
-    fn retirement_candidates(&self, exclude: &str) -> Result<Vec<(String, PathBuf)>> {
+    ///
+    /// Unfiltered: every lane's own task may itself be a candidate here, so
+    /// a caller excludes its own task by name at use time
+    /// ([`Self::retirement_authorized_with`]) rather than this listing
+    /// recomputing itself once per excluded task — `prune_with_ignored`'s
+    /// per-lane loop shares one listing across every lane this way instead
+    /// of re-walking the project's and every lane's `.multiverse/tasks`
+    /// directory for each one.
+    fn retirement_candidates(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
         let project_tasks = guarded_path(&self.project, Path::new(".multiverse/tasks"), true)?;
         if let Ok(entries) = fs::read_dir(&project_tasks) {
             for entry in entries {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == exclude || validate_id(&name).is_err() || !entry.file_type()?.is_dir() {
+                if validate_id(&name).is_err() || !entry.file_type()?.is_dir() {
                     continue;
                 }
                 candidates.insert(name, project_tasks.clone());
@@ -2936,7 +3195,7 @@ impl Worktrees {
             for entry in entries {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == exclude || validate_id(&name).is_err() || !entry.file_type()?.is_dir() {
+                if validate_id(&name).is_err() || !entry.file_type()?.is_dir() {
                     continue;
                 }
                 candidates.entry(name).or_insert_with(|| lane_tasks.clone());
@@ -2945,19 +3204,42 @@ impl Worktrees {
         Ok(candidates.into_iter().collect())
     }
 
+    /// Single-task convenience wrapper: fetches its own ledger scan and
+    /// candidate listing, for callers outside `prune_with_ignored`'s
+    /// per-lane loop (`check_archive`, and this module's own tests) where
+    /// there is only ever one task to check and sharing a cache across
+    /// calls would not save anything.
     fn retirement_authorized(&self, task: &str, tip: &str) -> Result<bool> {
+        let recorded = recorded_task_outcomes(&self.project.join(".multiverse/routing.log"));
+        let candidates = self.retirement_candidates()?;
+        self.retirement_authorized_with(task, tip, &recorded, &candidates)
+    }
+
+    /// [`Self::retirement_authorized`]'s own logic, run against a ledger
+    /// scan and candidate listing the caller already fetched — see
+    /// `prune_with_ignored`'s `recorded_outcomes`/`retirement_candidates`,
+    /// shared across every lane in one pass instead of one fetch per lane.
+    fn retirement_authorized_with(
+        &self,
+        task: &str,
+        tip: &str,
+        recorded: &BTreeMap<String, TaskOutcome>,
+        candidates: &[(String, PathBuf)],
+    ) -> Result<bool> {
         let target_time = git(&self.project, &["show", "-s", "--format=%ct", tip], None)?
             .trim()
             .parse::<u64>()
             .map_err(|_| WorktreeError::Refused("invalid commit time".into()))?;
-        let recorded = recorded_task_outcomes(&self.project.join(".multiverse/routing.log"));
-        for (name, tasks_root) in self.retirement_candidates(task)? {
+        for (name, tasks_root) in candidates {
+            if name == task {
+                continue;
+            }
             // Python requires `role`/`status` from `routing.log`'s own
             // dispatch/result records, never the task-id spelling or the
             // task directory's own (unrecorded) status file — an
             // authorizing task's `done` must have actually been logged
             // (`critic-history-compat.md` finding 8).
-            let Some(outcome) = recorded.get(&name) else {
+            let Some(outcome) = recorded.get(name) else {
                 continue;
             };
             if !matches!(
@@ -2969,18 +3251,18 @@ impl Worktrees {
             if outcome.result_status.as_deref() != Some("done") {
                 continue;
             }
-            let result = match read_regular(&tasks_root, &Path::new(&name).join("result.md")) {
+            let result = match read_regular(tasks_root, &Path::new(name).join("result.md")) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             if result.trim().is_empty() {
                 continue;
             }
-            let retire = match read_regular(&tasks_root, &Path::new(&name).join("retire")) {
+            let retire = match read_regular(tasks_root, &Path::new(name).join("retire")) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if fs::metadata(tasks_root.join(&name).join("retire"))?
+            if fs::metadata(tasks_root.join(name).join("retire"))?
                 .modified()?
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -3326,11 +3608,19 @@ impl Worktrees {
     /// the error text; [`MergeError::ScannerMissing`] is the one case that
     /// maps to exit 3 instead, for a *required* `gitleaks` this could not
     /// even run.
+    ///
+    /// Also refuses outright, before anything else runs, when this
+    /// checkout is already mid-merge (`MERGE_HEAD` present, or unmerged
+    /// paths left over from an earlier crashed or conflicted merge); and
+    /// if this call's own `git merge --no-ff --no-edit` conflicts, it runs
+    /// `git merge --abort` before returning, so a conflicting lane never
+    /// leaves the checkout mid-merge for the next caller to trip over.
     pub fn merge(
         &self,
         task: &str,
         secrets: &SecretsScan,
     ) -> std::result::Result<MergeResult, MergeError> {
+        self.refuse_if_trunk_mid_merge()?;
         let lane = self.lane(task, false)?;
         self.registered(&lane)?;
         self.task_terminal_done(&lane, task)?;
@@ -3393,15 +3683,62 @@ impl Worktrees {
         }
 
         let _lock = lock(&self.project)?;
-        git(
+        if let Err(error) = git(
             &self.project,
             &["merge", "--no-ff", "--no-edit", &branch],
             None,
-        )?;
+        ) {
+            let conflicts = conflicting_paths(&self.project).unwrap_or_default();
+            let _ = git(&self.project, &["merge", "--abort"], None);
+            return Err(MergeError::Refused(if conflicts.is_empty() {
+                format!("merge of {task} failed and was aborted: {error}")
+            } else {
+                format!(
+                    "merge of {task} conflicted on {} and was aborted; resolve the \
+                     conflict in the lane and retry",
+                    conflicts.join(", ")
+                )
+            }));
+        }
         let sha = git(&self.project, &["rev-parse", "--verify", "HEAD"], None)?
             .trim()
             .to_string();
         Ok(MergeResult { sha, warnings })
+    }
+
+    /// Refuses before touching anything when this checkout is already
+    /// mid-merge: `MERGE_HEAD` present from an earlier `git merge` that
+    /// crashed or still needs resolving, or `git` reporting unmerged
+    /// (conflicted) paths left over from it either way. Without this,
+    /// [`Worktrees::merge`]'s own `git merge --no-ff --no-edit` would run
+    /// straight into that state and fail with an opaque passthrough error
+    /// ("you have not concluded your merge") that names no path and
+    /// leaves the stuck state exactly as unresolved as it found it.
+    fn refuse_if_trunk_mid_merge(&self) -> Result<()> {
+        let merge_head = git(
+            &self.project,
+            &["rev-parse", "--git-path", "MERGE_HEAD"],
+            None,
+        )?;
+        if self.project.join(merge_head.trim()).try_exists()? {
+            return Err(WorktreeError::Refused(format!(
+                "{proj} already has a merge in progress (MERGE_HEAD is present); \
+                 run `git -C {proj} status` to inspect it, then resolve and commit \
+                 it or run `git -C {proj} merge --abort` before retrying",
+                proj = self.project.display(),
+            )));
+        }
+        let conflicts = conflicting_paths(&self.project)?;
+        if !conflicts.is_empty() {
+            return Err(WorktreeError::Refused(format!(
+                "{proj} has unmerged paths left over from an earlier operation: \
+                 {paths}; run `git -C {proj} status` to inspect it, then resolve \
+                 or discard them before retrying",
+                proj = self.project.display(),
+                paths = conflicts.join(", "),
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3709,8 +4046,12 @@ impl LaneObserver for HerdrLaneObserver {
         Ok(())
     }
 
-    fn record_prune(&mut self, lane: &Lane) -> Result<()> {
-        record_prune_outcomes(&self.project, lane)
+    fn record_prune(
+        &mut self,
+        lane: &Lane,
+        task_records: &[crate::index::IndexedRecord],
+    ) -> Result<()> {
+        record_prune_outcomes(&self.project, lane, task_records)
     }
 }
 
@@ -3722,14 +4063,25 @@ impl LaneObserver for HerdrLaneObserver {
 /// so (`critic-engine-state.md` finding 3: this was previously a no-op, so
 /// `prune` removed lanes with no such record ever appended).
 ///
-/// Idempotent per occupant via [`has_terminal_outcome`]: a task whose
+/// Idempotent per occupant via [`has_terminal_outcome_in`]: a task whose
 /// latest dispatch already has a recorded `result` is left alone. A task
 /// with neither a recorded outcome nor a valid terminal status file
 /// refuses the whole prune rather than removing a lane no reader can later
 /// account for — [`Worktrees::terminal_statuses`] already ran immediately
 /// before this and should have refused first, so this is a backstop, not
 /// the primary gate.
-fn record_prune_outcomes(project: &Path, lane: &Lane) -> Result<()> {
+///
+/// `task_records` is [`Worktrees::task_records`]'s output, passed in rather
+/// than fetched here — [`Worktrees::prune_with_ignored`] already scans the
+/// routing log once for the whole call and shares it across every lane's
+/// `terminal_statuses` check; this used to re-scan it again per occupant on
+/// every real (non-dry-run) removal, undoing that sharing on the one path
+/// that matters most.
+fn record_prune_outcomes(
+    project: &Path,
+    lane: &Lane,
+    task_records: &[crate::index::IndexedRecord],
+) -> Result<()> {
     // Every occupant is checked before anything is appended — mirroring
     // `record_prune_outcome`'s own two passes (`worktrees.py:3346-3360`) —
     // so a lane that fails the check is not left half-logged
@@ -3737,7 +4089,7 @@ fn record_prune_outcomes(project: &Path, lane: &Lane) -> Result<()> {
     // the ledger before refusing").
     let mut to_record = Vec::new();
     for task in occupant_tasks(project, lane)? {
-        if has_terminal_outcome(project, &task) {
+        if has_terminal_outcome_in(task_records, &task) {
             continue;
         }
         let status = occupant_status_text(project, lane, &task)?;
@@ -3769,18 +4121,28 @@ fn record_prune_outcomes(project: &Path, lane: &Lane) -> Result<()> {
 
 /// Whether `task` reached a terminal outcome in its *latest* dispatch —
 /// mirrors Python's `tasks.has_terminal_outcome` (`tasks.py:564-619`).
-/// Scanned from the log's end: a `dispatch` record for `task` reached
-/// before any matching `result` means the run now occupying this task id
-/// has not finished yet, even if an earlier run's result for the same id
-/// sits further back in the log. Deliberately looser than
-/// [`recorded_task_outcomes`]'s own per-task bookkeeping, which does not
-/// reset `result_status` on a later `dispatch` and so cannot answer this
-/// question on its own.
+/// Fetches and validates the project's own routing log itself; a caller
+/// checking more than one task against the same project (`prune_with_
+/// ignored`'s per-lane loop) should fetch once via [`Worktrees::
+/// task_records`] and call [`has_terminal_outcome_in`] directly instead, so
+/// the ledger is scanned once for the whole call rather than once per task.
 fn has_terminal_outcome(project: &Path, task: &str) -> bool {
     let log = project.join(".multiverse/routing.log");
     let Ok(records) = crate::index::records(&log, crate::index::Selector::Tasks) else {
         return false;
     };
+    has_terminal_outcome_in(&records, task)
+}
+
+/// [`has_terminal_outcome`]'s own scan, run against records the caller
+/// already fetched. Scanned from the log's end: a `dispatch` record for
+/// `task` reached before any matching `result` means the run now occupying
+/// this task id has not finished yet, even if an earlier run's result for
+/// the same id sits further back in the log. Deliberately looser than
+/// [`recorded_task_outcomes`]'s own per-task bookkeeping, which does not
+/// reset `result_status` on a later `dispatch` and so cannot answer this
+/// question on its own.
+fn has_terminal_outcome_in(records: &[crate::index::IndexedRecord], task: &str) -> bool {
     for record in records.iter().rev() {
         let Ok(parsed) = record.parse() else {
             continue;
@@ -3804,6 +4166,23 @@ fn has_terminal_outcome(project: &Path, task: &str) -> bool {
     false
 }
 
+/// Whether `records` holds any `event=dispatch` line for `task`, at all —
+/// [`abandoned_before_dispatch`](Worktrees::abandoned_before_dispatch)'s own
+/// "was this ever genuinely dispatched" question, scanned over the same
+/// already-fetched ledger [`has_terminal_outcome_in`] reads. Unlike that
+/// function this does not need the log's end-to-start ordering: one
+/// `dispatch` record anywhere for `task` is enough, since a task directory
+/// existing with zero dispatch record is exactly the crash window (brief
+/// written, host died before the append) this answers `false` for.
+fn has_dispatch_record_in(records: &[crate::index::IndexedRecord], task: &str) -> bool {
+    records.iter().any(|record| {
+        record.parse().is_ok_and(|parsed| {
+            parsed.event() == "dispatch"
+                && parsed.fields.get("task").map(String::as_str) == Some(task)
+        })
+    })
+}
+
 /// What [`recorded_task_outcomes`] keeps per task: the role its most recent
 /// `event=dispatch` record named, and the status its `event=result` record
 /// (if any) recorded — mirrors `multiverse/worktrees.py:1747-1758`'s
@@ -3816,16 +4195,28 @@ struct TaskOutcome {
     result_status: Option<String>,
 }
 
-/// One pass over `routing.log`'s task-lifecycle events, keyed by task id —
-/// the same shape `mv-cli`'s `tasks.rs::gather_task_events` already reads
-/// the log with. A missing or unreadable log yields no recorded outcomes,
-/// which correctly authorizes nothing.
+/// Fetches and validates `log_path` itself, then runs
+/// [`recorded_task_outcomes_in`] over the result. A missing or unreadable
+/// log yields no recorded outcomes, which correctly authorizes nothing. A
+/// caller that already has a records fetch to share (`prune_with_ignored`'s
+/// per-lane loop, via [`Worktrees::task_records`]) should call
+/// [`recorded_task_outcomes_in`] directly instead, so the ledger is scanned
+/// once for the whole call rather than once per lane.
 fn recorded_task_outcomes(log_path: &Path) -> BTreeMap<String, TaskOutcome> {
-    let mut by_task: BTreeMap<String, TaskOutcome> = BTreeMap::new();
     let Ok(records) = crate::index::records(log_path, crate::index::Selector::Tasks) else {
-        return by_task;
+        return BTreeMap::new();
     };
-    for record in &records {
+    recorded_task_outcomes_in(&records)
+}
+
+/// One pass over already-fetched task-lifecycle records, keyed by task id —
+/// the same shape `mv-cli`'s `tasks.rs::gather_task_events` already reads
+/// the log with.
+fn recorded_task_outcomes_in(
+    records: &[crate::index::IndexedRecord],
+) -> BTreeMap<String, TaskOutcome> {
+    let mut by_task: BTreeMap<String, TaskOutcome> = BTreeMap::new();
+    for record in records {
         let Ok(parsed) = record.parse() else {
             continue;
         };
@@ -4269,7 +4660,11 @@ pub(crate) mod tests {
                 Ok(())
             }
         }
-        fn record_prune(&mut self, lane: &Lane) -> Result<()> {
+        fn record_prune(
+            &mut self,
+            lane: &Lane,
+            _task_records: &[crate::index::IndexedRecord],
+        ) -> Result<()> {
             assert!(lane.path.exists(), "outcome must precede removal");
             self.recorded += 1;
             Ok(())
@@ -6872,13 +7267,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn quarantine_copy_past_retention_is_removed_even_when_not_redundant() {
+    fn quarantine_copy_past_retention_with_a_byte_conflict_is_kept_not_destroyed() {
         let repo = TempRepo::new();
         let store = repo.store();
         let retained = quarantined_lane(&store, "owner");
-        // Diverge it from the rescued copy, same as a late write would,
-        // so it is provably *not* redundant — only its age can excuse it.
+        // Diverge it from the already-rescued copy at the same relative
+        // path, same as a late write would — this is not redundant, and
+        // rescuing it now would conflict with what is already saved under
+        // that name. Age alone must not excuse deleting it: the only copy
+        // of this specific byte string lives here and nowhere else.
         fs::write(retained.join("tasks/owner/status"), "late write\n").unwrap();
+        quarantine_old(&retained);
+        let outcomes = store.prune_quarantine(false).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0], QuarantineOutcome::Kept { .. }));
+        assert!(retained.exists());
+        assert_eq!(
+            fs::read_to_string(retained.join("tasks/owner/status")).unwrap(),
+            "late write\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.0.join(".multiverse/tasks/owner/status")).unwrap(),
+            "done\n"
+        );
+    }
+
+    #[test]
+    fn quarantine_copy_past_retention_with_no_conflict_is_rescued_then_removed() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let retained = quarantined_lane(&store, "owner");
+        // Add a file that was never part of the original rescue — the
+        // shape a late write that only *adds* something new leaves behind.
+        // It is not redundant (nothing mirrors it yet), but rescuing it
+        // conflicts with nothing, so retention age may now excuse removing
+        // this copy: what it alone held is no longer alone.
+        fs::write(retained.join("tasks/owner/late.md"), "late addition").unwrap();
         quarantine_old(&retained);
         let outcomes = store.prune_quarantine(false).unwrap();
         assert_eq!(outcomes.len(), 1);
@@ -6890,6 +7314,56 @@ pub(crate) mod tests {
             }
         ));
         assert!(!retained.exists());
+        assert_eq!(
+            fs::read_to_string(repo.0.join(".multiverse/tasks/owner/late.md")).unwrap(),
+            "late addition"
+        );
+    }
+
+    /// Proof for the crash window inside `remove_lane` itself (its own
+    /// `fs::rename` into quarantine, immediately followed by the redirect
+    /// `symlink`): stop right after the rename, as if the host died before
+    /// the symlink — and before `remove_lane`'s own `rescue_state` call
+    /// right after both, which never runs either. Nothing anywhere else
+    /// has ever seen this task's state. Reverting the rescue-before-delete
+    /// fix in `prune_quarantine` (deleting unconditionally once a copy is
+    /// merely past retention) makes the final assertion here fail: the
+    /// content would never have been rescued, so it would be gone, not
+    /// reachable, once the quarantine copy itself is removed.
+    #[test]
+    fn a_remove_lane_crash_between_rename_and_symlink_is_rescued_before_prune_deletes_it() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("owner", "HEAD").unwrap();
+        let state = lane.path.join(".multiverse/tasks/owner");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("status"), "done\n").unwrap();
+        fs::write(state.join("result.md"), "crash-only result").unwrap();
+
+        let root = repo.0.join(".multiverse/worktree-state");
+        fs::create_dir_all(&root).unwrap();
+        let quarantine = root.join("owner-crash");
+        fs::rename(lane.path.join(".multiverse"), &quarantine).unwrap();
+        quarantine_old(&quarantine);
+
+        let outcomes = store.prune_quarantine(false).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            &outcomes[0],
+            QuarantineOutcome::Removed {
+                reason: QuarantineReason::RetentionExpired,
+                ..
+            }
+        ));
+        assert!(!quarantine.exists());
+        assert_eq!(
+            fs::read_to_string(repo.0.join(".multiverse/tasks/owner/result.md")).unwrap(),
+            "crash-only result"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.0.join(".multiverse/tasks/owner/status")).unwrap(),
+            "done\n"
+        );
     }
 
     #[test]
@@ -6899,7 +7373,10 @@ pub(crate) mod tests {
         let redundant = quarantined_lane(&store, "redundant");
         fs::remove_file(redundant.join(".gitignore")).unwrap();
         let expired = quarantined_lane(&store, "expired");
-        fs::write(expired.join("tasks/expired/status"), "late write\n").unwrap();
+        // A non-conflicting addition, not a byte-diverging overwrite: dry
+        // run must predict this would be rescued cleanly (not kept for a
+        // conflict) without ever writing it.
+        fs::write(expired.join("tasks/expired/late.md"), "late addition").unwrap();
         quarantine_old(&expired);
 
         let outcomes = store.prune_quarantine(true).unwrap();
@@ -6924,6 +7401,7 @@ pub(crate) mod tests {
             fs::read_to_string(redundant.join("tasks/redundant/status")).unwrap(),
             "done\n"
         );
+        assert!(!repo.0.join(".multiverse/tasks/expired/late.md").exists());
     }
 
     /// A lane's own self-ignoring `.multiverse/.gitignore`
@@ -7065,6 +7543,74 @@ pub(crate) mod tests {
     /// of the same lanes rescued the assessment's lane first and then
     /// archived it cleanly. A bare dry-run preview and a same-flags real
     /// run must agree.
+    /// The shared candidate listing must not go stale within one pass.
+    /// The assessment lane here sorts first, so a real prune rescues its
+    /// task dir into the main checkout and removes the lane before it
+    /// reaches the builder lane. The authority must still be found there,
+    /// as it was when each lane rescanned the task directories.
+    #[test]
+    fn prune_finds_archive_authority_rescued_from_a_lane_removed_earlier_in_the_same_pass() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let assessment_id = "20261102-oracle-123456";
+        let assessment_lane = store.create(assessment_id, "HEAD").unwrap();
+        let lane = store.create("20261103-builder-abcdef", "HEAD").unwrap();
+        fs::write(lane.path.join("feature"), "unique\n").unwrap();
+        git(&lane.path, &["add", "feature"], None).unwrap();
+        git(&lane.path, &["commit", "-m", "unique feature"], None).unwrap();
+        let own_task_dir = lane.path.join(".multiverse/tasks").join(&lane.task);
+        fs::create_dir_all(&own_task_dir).unwrap();
+        fs::write(own_task_dir.join("status"), "done\n").unwrap();
+        fs::write(own_task_dir.join("result.md"), "builder findings\n").unwrap();
+        let tip = store.tip(&lane.task).unwrap();
+
+        let assessment_dir = assessment_lane
+            .path
+            .join(".multiverse/tasks")
+            .join(assessment_id);
+        fs::create_dir_all(&assessment_dir).unwrap();
+        fs::write(assessment_dir.join("result.md"), "assessed\n").unwrap();
+        fs::write(assessment_dir.join("status"), "done\n").unwrap();
+        fs::write(
+            assessment_dir.join("retire"),
+            format!("{} {tip}\n", lane.task),
+        )
+        .unwrap();
+        let later = SystemTime::now() + Duration::from_secs(10);
+        File::options()
+            .write(true)
+            .open(assessment_dir.join("retire"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-02T10:00:00+00:00\tevent=dispatch\ttask={assessment_id}\trole=oracle\n\
+                 2026-11-02T10:05:00+00:00\tevent=result\ttask={assessment_id}\tstatus=done\n"
+            ),
+        )
+        .unwrap();
+
+        let real = store.prune(&mut Observer::idle(), false, false).unwrap();
+        let assessment_real = real
+            .iter()
+            .find(|outcome| outcome_task(outcome) == assessment_id)
+            .unwrap();
+        assert!(
+            matches!(assessment_real, PruneOutcome::Removed { .. }),
+            "the assessment lane must be removed first: {real:?}"
+        );
+        let builder_real = real
+            .iter()
+            .find(|outcome| outcome_task(outcome) == lane.task)
+            .unwrap();
+        assert!(
+            matches!(builder_real, PruneOutcome::Archived { .. }),
+            "{real:?}"
+        );
+    }
+
     #[test]
     fn prune_dry_run_preview_finds_archive_authority_in_the_assessments_own_unrescued_lane() {
         let repo = TempRepo::new();
@@ -7219,6 +7765,361 @@ pub(crate) mod tests {
         );
     }
 
+    /// Rewrites `task`'s own branch reflog so its one entry — the
+    /// `branch: Created from ...` line `create`'s `git worktree add -b`
+    /// always leaves — reads as `age` old, without sleeping or touching
+    /// the lane's own files. Mirrors how other tests here backdate an
+    /// mtime (`set_modified`) to exercise a retention cutoff without
+    /// making the suite itself wait one out.
+    fn backdate_branch_reflog(repo: &Path, task: &str, age: Duration) {
+        let branch = branch_name(task).unwrap();
+        let path = repo.join(".git/logs/refs/heads").join(&branch);
+        let content = fs::read_to_string(&path).unwrap();
+        let epoch = SystemTime::now()
+            .checked_sub(age)
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let rewritten: String = content
+            .lines()
+            .map(|line| {
+                let (meta, msg) = line.split_once('\t').unwrap();
+                let mut parts: Vec<&str> = meta.split(' ').collect();
+                let len = parts.len();
+                parts[len - 2] = &epoch;
+                format!("{}\t{}\n", parts.join(" "), msg)
+            })
+            .collect();
+        fs::write(&path, rewritten).unwrap();
+    }
+
+    /// Rank-7 (card `20261117-b-437eeb`, Scout `9c0832`): a lane
+    /// `Worktrees::create` made but no `write_brief` ever followed used to
+    /// be kept forever by plain `prune` — `occupant_tasks` always
+    /// includes the lane's own task name, so the missing-status refusal
+    /// fired on every call, with no age or ancestry ever mattering
+    /// (`prune_shares_one_ledger_scan_and_candidate_listing_across_differently_shaped_lanes`'s
+    /// own "missing" lane is this same shape, fresh). A fresh lane must
+    /// still need `force` — the in-flight `create` → `write_brief` window
+    /// is real — but once it is older than `WORKTREE_STATE_RETENTION`
+    /// with no brief and no commit, `prune` must reclaim both the lane
+    /// directory and its branch on its own.
+    #[test]
+    fn an_old_never_dispatched_lane_is_reclaimable_without_force() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("orphan", "HEAD").unwrap();
+
+        // Fresh: still kept, same as any other never-dispatched lane —
+        // the in-flight `create` → `write_brief` window must stay guarded.
+        assert!(
+            matches!(&store.prune(&mut Observer::idle(), false, true).unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("missing terminal status"))
+        );
+
+        backdate_branch_reflog(
+            &repo.0,
+            "orphan",
+            WORKTREE_STATE_RETENTION + Duration::from_secs(86400),
+        );
+
+        let preview = store.prune(&mut Observer::idle(), false, true).unwrap();
+        assert!(
+            matches!(
+                &preview[0],
+                PruneOutcome::WouldRemove {
+                    branch_refusal: None,
+                    ..
+                }
+            ),
+            "{preview:?}"
+        );
+
+        let outcomes = store.prune(&mut Observer::idle(), false, false).unwrap();
+        assert!(
+            matches!(
+                &outcomes[0],
+                PruneOutcome::Removed {
+                    branch_refusal: None,
+                    ..
+                }
+            ),
+            "{outcomes:?}"
+        );
+        assert!(!lane.path.exists());
+        assert!(!git_output(
+            &repo.0,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/multiverse/orphan"
+            ],
+            None
+        )
+        .unwrap()
+        .status
+        .success());
+    }
+
+    /// The same age and missing-brief shape, but with a real commit on
+    /// the lane — rank-7's own "keeping the existing guards for any lane
+    /// with work in it". Age and a missing task directory are never
+    /// enough alone; `has_commits` must also hold.
+    #[test]
+    fn an_old_lane_with_a_real_commit_still_needs_force() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("worked", "HEAD").unwrap();
+        fs::write(lane.path.join("README.md"), "real work\n").unwrap();
+        git(&lane.path, &["commit", "-am", "real work"], None).unwrap();
+
+        backdate_branch_reflog(
+            &repo.0,
+            "worked",
+            WORKTREE_STATE_RETENTION + Duration::from_secs(86400),
+        );
+
+        assert!(
+            matches!(&store.prune(&mut Observer::idle(), false, true).unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("missing terminal status")),
+            "a real commit must still require force even once the lane is old"
+        );
+        assert!(lane.path.exists());
+    }
+
+    /// Scout 67a619 finding 2: `write_brief` (`runner.rs::start_dispatch`)
+    /// succeeds and returns before the project lock is dropped, but
+    /// `event=dispatch` is not appended to the routing log until after —
+    /// a hard kill in that exact span leaves a task directory and brief on
+    /// disk with zero routing-log trace of the dispatch that wrote them.
+    /// Before this fix, `abandoned_before_dispatch` keyed off the task
+    /// directory's existence alone and refused this shape forever (the
+    /// identical symptom rank-7/card `20261117-b-437eeb` already fixed for
+    /// the sibling "no brief at all" case, just one step later in the same
+    /// span) — only a routing-log dispatch record now counts as "genuinely
+    /// dispatched"; the directory alone does not.
+    #[test]
+    fn an_old_lane_with_a_written_brief_but_no_dispatch_record_is_reclaimable_without_force() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("briefed", "HEAD").unwrap();
+        fs::create_dir_all(lane.path.join(".multiverse/tasks/briefed")).unwrap();
+        fs::write(
+            lane.path.join(".multiverse/tasks/briefed/brief.md"),
+            "# Task\n",
+        )
+        .unwrap();
+
+        // Fresh: still kept, same in-flight-window guard as the no-brief
+        // case — a brief that landed a second ago could still be about to
+        // get its `event=dispatch` appended.
+        assert!(
+            matches!(&store.prune(&mut Observer::idle(), false, true).unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("missing terminal status"))
+        );
+
+        backdate_branch_reflog(
+            &repo.0,
+            "briefed",
+            WORKTREE_STATE_RETENTION + Duration::from_secs(86400),
+        );
+
+        let preview = store.prune(&mut Observer::idle(), false, true).unwrap();
+        assert!(
+            matches!(
+                &preview[0],
+                PruneOutcome::WouldRemove {
+                    branch_refusal: None,
+                    ..
+                }
+            ),
+            "{preview:?}"
+        );
+
+        let outcomes = store.prune(&mut Observer::idle(), false, false).unwrap();
+        assert!(
+            matches!(
+                &outcomes[0],
+                PruneOutcome::Removed {
+                    branch_refusal: None,
+                    ..
+                }
+            ),
+            "{outcomes:?}"
+        );
+        assert!(!lane.path.exists());
+    }
+
+    /// The same brief-with-no-dispatch-record shape, but with a genuine
+    /// `event=dispatch` for this task id also in the log — the fix must
+    /// not treat *every* task directory as unproven just because it
+    /// predates this change; one that really was dispatched still needs
+    /// its existing terminal-outcome guard, age or no age.
+    #[test]
+    fn an_old_lane_with_a_real_dispatch_record_still_needs_force() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("dispatched", "HEAD").unwrap();
+        fs::create_dir_all(lane.path.join(".multiverse/tasks/dispatched")).unwrap();
+        fs::write(
+            lane.path.join(".multiverse/tasks/dispatched/brief.md"),
+            "# Task\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask=dispatched\trole=fixer\tbranch=multiverse/dispatched\n",
+        )
+        .unwrap();
+
+        backdate_branch_reflog(
+            &repo.0,
+            "dispatched",
+            WORKTREE_STATE_RETENTION + Duration::from_secs(86400),
+        );
+
+        assert!(
+            matches!(&store.prune(&mut Observer::idle(), false, true).unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("missing terminal status")),
+            "a genuinely dispatched task must still require force even once its lane is old"
+        );
+        assert!(lane.path.exists());
+    }
+
+    /// `prune_orphans`'s own half of rank-7: a never-dispatched lane
+    /// whose checkout is already gone (simulated here with a direct `git
+    /// worktree remove`, bypassing `remove_lane`, so only the orphan
+    /// branch is left to reclaim) must not need a recorded terminal
+    /// outcome either, once it is old enough — the same shape
+    /// `abandoned_before_dispatch` already proves for `prune` itself.
+    #[test]
+    fn prune_orphans_reclaims_an_old_never_dispatched_orphan_branch() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("gone", "HEAD").unwrap();
+        git(
+            &repo.0,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                utf8_path(&lane.path).unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        backdate_branch_reflog(
+            &repo.0,
+            "gone",
+            WORKTREE_STATE_RETENTION + Duration::from_secs(86400),
+        );
+
+        assert_eq!(store.orphan_branches().unwrap(), vec!["gone".to_string()]);
+        let outcomes = store.prune_orphans(false).unwrap();
+        assert!(
+            matches!(&outcomes[0], BranchOutcome::Reclaimed { task } if task == "gone"),
+            "{outcomes:?}"
+        );
+        assert!(store.orphan_branches().unwrap().is_empty());
+    }
+
+    /// Card `20261117-b-18fd71` item 2: `prune_with_ignored` now fetches
+    /// the routing log's task records and the retirement-candidate
+    /// listing once per call via [`Worktrees::task_records`]/
+    /// [`Worktrees::retirement_candidates`], not once per lane. Four lanes
+    /// shaped to hit every branch that reads either input — missing
+    /// status, a log-recovered terminal outcome, an unmerged branch with
+    /// no archive authority, and an unmerged branch an assessment did
+    /// authorize — must still each reach their own, independent decision
+    /// from the one shared scan, in the same single `prune` call.
+    #[test]
+    fn prune_shares_one_ledger_scan_and_candidate_listing_across_differently_shaped_lanes() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+
+        let missing = store.create("missing", "HEAD").unwrap();
+
+        let recorded = store.create("recorded", "HEAD").unwrap();
+
+        let noauth = store.create("noauth", "HEAD").unwrap();
+        fs::write(noauth.path.join("README.md"), "noauth unique\n").unwrap();
+        git(&noauth.path, &["commit", "-am", "noauth unique"], None).unwrap();
+        let noauth_dir = repo.0.join(".multiverse/tasks/noauth");
+        fs::create_dir_all(&noauth_dir).unwrap();
+        fs::write(noauth_dir.join("status"), "done\n").unwrap();
+        fs::write(noauth_dir.join("result.md"), "noauth result\n").unwrap();
+
+        let archive = store.create("archive", "HEAD").unwrap();
+        fs::write(archive.path.join("README.md"), "archive unique\n").unwrap();
+        git(&archive.path, &["commit", "-am", "archive unique"], None).unwrap();
+        let archive_dir = repo.0.join(".multiverse/tasks/archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("status"), "done\n").unwrap();
+        fs::write(archive_dir.join("result.md"), "archive result\n").unwrap();
+        let archive_tip = store.tip("archive").unwrap();
+
+        let assessment_dir = repo.0.join(".multiverse/tasks/assess");
+        fs::create_dir_all(&assessment_dir).unwrap();
+        fs::write(assessment_dir.join("result.md"), "assessed\n").unwrap();
+        fs::write(assessment_dir.join("status"), "done\n").unwrap();
+        fs::write(
+            assessment_dir.join("retire"),
+            format!("archive {archive_tip}\n"),
+        )
+        .unwrap();
+        let later = SystemTime::now() + Duration::from_secs(10);
+        File::options()
+            .write(true)
+            .open(assessment_dir.join("retire"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n\
+             2026-11-01T00:00:00+00:00\tevent=dispatch\ttask=assess\trole=oracle\n\
+             2026-11-01T00:05:00+00:00\tevent=result\ttask=assess\tstatus=done\n",
+        )
+        .unwrap();
+
+        let outcomes = store.prune(&mut Observer::idle(), false, true).unwrap();
+        assert_eq!(outcomes.len(), 4, "{outcomes:?}");
+        let by_task: BTreeMap<&str, &PruneOutcome> = outcomes
+            .iter()
+            .map(|outcome| (outcome_task(outcome), outcome))
+            .collect();
+        assert!(
+            matches!(by_task["missing"], PruneOutcome::Kept { reason, .. } if reason.contains("missing terminal status")),
+            "{:?}",
+            by_task["missing"]
+        );
+        assert!(
+            matches!(
+                by_task["recorded"],
+                PruneOutcome::WouldRemove {
+                    branch_refusal: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            by_task["recorded"]
+        );
+        assert!(
+            matches!(by_task["noauth"], PruneOutcome::Kept { reason, .. } if reason.contains("not merged")),
+            "{:?}",
+            by_task["noauth"]
+        );
+        assert!(
+            matches!(by_task["archive"], PruneOutcome::WouldArchive { .. }),
+            "{:?}",
+            by_task["archive"]
+        );
+        for lane in [&missing, &recorded, &noauth, &archive] {
+            assert!(lane.path.exists(), "dry run must not remove {}", lane.task);
+        }
+    }
+
     /// `critic-engine-state.md` finding 3: `record_prune` used to be a
     /// no-op, so a lane with only a terminal status *file* and no routing
     /// log `event=result` was pruned with the ledger never learning the
@@ -7237,7 +8138,7 @@ pub(crate) mod tests {
         fs::write(local.join("result.md"), "result\n").unwrap();
 
         assert!(!has_terminal_outcome(&repo.0, "owner"));
-        record_prune_outcomes(&repo.0, &lane).unwrap();
+        record_prune_outcomes(&repo.0, &lane, &store.task_records()).unwrap();
         assert!(has_terminal_outcome(&repo.0, "owner"));
         let log = fs::read_to_string(repo.0.join(".multiverse/routing.log")).unwrap();
         assert!(
@@ -7247,7 +8148,7 @@ pub(crate) mod tests {
 
         // Idempotent: an occupant that already has a recorded outcome is
         // left alone, not appended a second time.
-        record_prune_outcomes(&repo.0, &lane).unwrap();
+        record_prune_outcomes(&repo.0, &lane, &store.task_records()).unwrap();
         let log_again = fs::read_to_string(repo.0.join(".multiverse/routing.log")).unwrap();
         assert_eq!(
             log, log_again,
@@ -7275,7 +8176,7 @@ pub(crate) mod tests {
         fs::write(first.join("result.md"), "result\n").unwrap();
         fs::create_dir_all(tasks.join("second")).unwrap();
 
-        let err = record_prune_outcomes(&repo.0, &lane).unwrap_err();
+        let err = record_prune_outcomes(&repo.0, &lane, &store.task_records()).unwrap_err();
         assert!(
             err.to_string().contains("no terminal status available"),
             "{err}"
@@ -7291,7 +8192,7 @@ pub(crate) mod tests {
         let repo = TempRepo::new();
         let store = repo.store();
         let lane = store.create("owner", "HEAD").unwrap();
-        let err = record_prune_outcomes(&repo.0, &lane).unwrap_err();
+        let err = record_prune_outcomes(&repo.0, &lane, &store.task_records()).unwrap_err();
         assert!(
             err.to_string().contains("no terminal status available"),
             "{err}"
@@ -7299,6 +8200,65 @@ pub(crate) mod tests {
         assert!(
             !repo.0.join(".multiverse/routing.log").exists(),
             "a refused occupant must not get a partial record"
+        );
+    }
+
+    /// `prune_with_ignored` fetches `task_records` once per call and now
+    /// hands that same slice to every lane's `observer.record_prune`
+    /// (card `20261117-b-c9349a`), instead of `record_prune_outcomes`
+    /// re-scanning the ledger per occupant. A real (non-dry-run) prune over
+    /// several lanes in one call must still record exactly the same
+    /// outcomes the old per-task scan did: leave an already-recorded
+    /// occupant's single result line untouched, and append exactly one for
+    /// an occupant that only has a terminal status file.
+    #[test]
+    fn real_prune_over_several_lanes_records_the_same_outcomes_as_a_per_task_scan() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+
+        let already_recorded = store.create("already-recorded", "HEAD").unwrap();
+        let needs_recording = store.create("needs-recording", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=already-recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let local = needs_recording
+            .path
+            .join(".multiverse/tasks/needs-recording");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join("status"), "done\n").unwrap();
+        fs::write(local.join("result.md"), "result\n").unwrap();
+
+        let before = fs::read_to_string(repo.0.join(".multiverse/routing.log")).unwrap();
+        let mut observer =
+            HerdrLaneObserver::with_herdr_binary(&repo.0, "/nonexistent/fake-herdr-unused");
+        let outcomes = store.prune(&mut observer, true, false).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, PruneOutcome::Removed { .. }),
+                "{outcome:?}"
+            );
+        }
+        assert!(!already_recorded.path.exists());
+        assert!(!needs_recording.path.exists());
+
+        let after = fs::read_to_string(repo.0.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "an occupant that already had a recorded outcome must keep its exact existing line"
+        );
+        let appended = &after[before.len()..];
+        assert_eq!(
+            appended.matches("task=needs-recording").count(),
+            1,
+            "the unrecorded occupant must get exactly one appended result line: {appended:?}"
+        );
+        assert_eq!(
+            after.matches("task=already-recorded").count(),
+            1,
+            "the already-recorded occupant's outcome must not be duplicated: {after:?}"
         );
     }
 
@@ -8139,5 +9099,102 @@ pub(crate) mod tests {
         fs::remove_file(&script).ok();
         fs::remove_file(&sentinel).ok();
         fs::remove_file(&leaf).ok();
+    }
+
+    /// Proof item (a) for the half-finished-merge fix: a `MERGE_HEAD` left
+    /// over from an earlier crashed or conflicted merge — produced here
+    /// with a raw conflicting `git merge`, independent of `merge`'s own
+    /// code — makes `merge` refuse outright, naming the stuck state and a
+    /// git command to inspect it, and changes nothing: the `MERGE_HEAD`,
+    /// the conflict markers, and `HEAD` are all exactly as it found them.
+    #[test]
+    fn merge_refuses_when_trunk_already_has_a_merge_in_progress() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        done_lane(&store, "task");
+
+        git(&repo.0, &["checkout", "-b", "other"], None).unwrap();
+        fs::write(repo.0.join("README.md"), "other\n").unwrap();
+        git(&repo.0, &["commit", "-am", "other change"], None).unwrap();
+        git(&repo.0, &["checkout", "main"], None).unwrap();
+        fs::write(repo.0.join("README.md"), "main\n").unwrap();
+        git(&repo.0, &["commit", "-am", "main change"], None).unwrap();
+        git(&repo.0, &["merge", "--no-ff", "--no-edit", "other"], None).unwrap_err();
+        assert!(
+            repo.0.join(".git/MERGE_HEAD").try_exists().unwrap(),
+            "test setup must leave a real MERGE_HEAD"
+        );
+        let conflicted = fs::read_to_string(repo.0.join("README.md")).unwrap();
+
+        let before = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
+        let secrets = secrets_scan_with(Path::new("gitleaks"));
+        let error = store.merge("task", &secrets).unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m) if m.contains("MERGE_HEAD") && m.contains("git -C")),
+            "{error}"
+        );
+        assert!(
+            repo.0.join(".git/MERGE_HEAD").try_exists().unwrap(),
+            "a pre-existing merge-in-progress state must be left exactly as found"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.0.join("README.md")).unwrap(),
+            conflicted,
+            "the refusal must not touch the conflict markers"
+        );
+        let after = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
+        assert_eq!(before, after, "the refusal must change nothing on trunk");
+
+        // Clean up by hand so `TempRepo`'s own teardown doesn't trip on it.
+        let _ = git(&repo.0, &["merge", "--abort"], None);
+    }
+
+    /// Proof item (b): a lane whose own merge genuinely conflicts is
+    /// aborted cleanly (`git merge --abort`) rather than left mid-merge,
+    /// the refusal names the conflicting path, and trunk ends up exactly
+    /// where it started — no `MERGE_HEAD`, no unmerged paths, same `HEAD`.
+    #[test]
+    fn merge_aborts_cleanly_and_reports_conflicting_paths_when_a_lane_conflicts() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("task", "HEAD").unwrap();
+        let task_dir = lane.path.join(".multiverse/tasks/task");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("status"), "done\n").unwrap();
+        fs::write(task_dir.join("result.md"), "findings\n").unwrap();
+        fs::write(lane.path.join("README.md"), "lane version\n").unwrap();
+        git(&lane.path, &["commit", "-am", "lane edits README"], None).unwrap();
+
+        fs::write(repo.0.join("README.md"), "trunk version\n").unwrap();
+        git(&repo.0, &["commit", "-am", "trunk edits README"], None).unwrap();
+
+        let before = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
+        let script = fake_scanner("exit 0");
+        let secrets = secrets_scan_with(&script);
+
+        let error = store.merge("task", &secrets).unwrap_err();
+        match &error {
+            MergeError::Refused(message) => {
+                assert!(message.contains("README.md"), "{message}");
+                assert!(message.contains("conflicted"), "{message}");
+                assert!(message.contains("aborted"), "{message}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(
+            !repo.0.join(".git/MERGE_HEAD").try_exists().unwrap(),
+            "a conflicted merge must abort cleanly, leaving no MERGE_HEAD"
+        );
+        assert!(
+            conflicting_paths(&repo.0).unwrap().is_empty(),
+            "an aborted merge must leave no unmerged paths"
+        );
+        let after = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
+        assert_eq!(
+            before, after,
+            "an aborted conflicted merge must leave main unchanged"
+        );
+
+        fs::remove_file(&script).ok();
     }
 }

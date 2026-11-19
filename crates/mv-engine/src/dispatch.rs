@@ -280,14 +280,14 @@ pub trait HaltQuery {
 ///
 /// An unreadable halt store is itself a refusal at both sites; `--force`
 /// overrides only a genuinely active halt, never a read failure.
-pub fn check_halt(halt: &dyn HaltQuery, force: bool, dry_run: bool) -> Result<(), DispatchError> {
-    if dry_run {
+pub fn check_halt(halt: &dyn HaltQuery, check: HaltCheck) -> Result<(), DispatchError> {
+    if check.dry_run {
         return Ok(());
     }
     match halt.read() {
         Ok(None) => Ok(()),
         Ok(Some(h)) => {
-            if force {
+            if check.force {
                 Ok(())
             } else {
                 Err(DispatchError::FleetHaltActive {
@@ -300,6 +300,15 @@ pub fn check_halt(halt: &dyn HaltQuery, force: bool, dry_run: bool) -> Result<()
     }
 }
 
+/// [`check_halt`]'s two flags, named so a call site can't transpose them
+/// positionally — unlike two adjacent `bool`s, a swap here means writing
+/// the wrong field name, which is visible at the call site rather than a
+/// silent behavior flip.
+pub struct HaltCheck {
+    pub force: bool,
+    pub dry_run: bool,
+}
+
 /// The second halt check site: called exactly once, after planning
 /// finishes and immediately before the runner would create a pane, in
 /// case the fleet was halted mid-plan. Never exempted by `dry_run` — a
@@ -308,7 +317,13 @@ pub fn check_halt_before_pane_creation(
     halt: &dyn HaltQuery,
     force: bool,
 ) -> Result<(), DispatchError> {
-    check_halt(halt, force, false)
+    check_halt(
+        halt,
+        HaltCheck {
+            force,
+            dry_run: false,
+        },
+    )
 }
 
 /// Fleet/project concurrency state a capacity check needs, already
@@ -592,7 +607,13 @@ pub fn plan_dispatch(
     sleeper: &mut dyn selector::Sleeper,
     now: Instant,
 ) -> Result<Selection, DispatchError> {
-    check_halt(halt, req.force, req.dry_run)?;
+    check_halt(
+        halt,
+        HaltCheck {
+            force: req.force,
+            dry_run: req.dry_run,
+        },
+    )?;
 
     // A dry run never waits on fleet capacity, matching the seat-level
     // exemption below (`dispatch.py`'s `plan`: `False` is passed for
@@ -1101,7 +1122,14 @@ mod tests {
             reason: "investigating a stuck lane".to_string(),
             since: Some("2026-11-02T12:00:00+00:00".to_string()),
         })));
-        let err = check_halt(&halt, false, false).unwrap_err();
+        let err = check_halt(
+            &halt,
+            HaltCheck {
+                force: false,
+                dry_run: false,
+            },
+        )
+        .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("dispatch refused"));
         assert!(message.contains("investigating a stuck lane"));
@@ -1119,7 +1147,14 @@ mod tests {
             reason: "investigating a stuck lane".to_string(),
             since: None,
         })));
-        let err = check_halt(&halt, false, false).unwrap_err();
+        let err = check_halt(
+            &halt,
+            HaltCheck {
+                force: false,
+                dry_run: false,
+            },
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "dispatch refused: fleet halted: investigating a stuck lane; \
@@ -1133,7 +1168,14 @@ mod tests {
             reason: "halted".to_string(),
             since: None,
         })));
-        assert!(check_halt(&halt, true, false).is_ok());
+        assert!(check_halt(
+            &halt,
+            HaltCheck {
+                force: true,
+                dry_run: false,
+            },
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1142,13 +1184,27 @@ mod tests {
             reason: "halted".to_string(),
             since: None,
         })));
-        assert!(check_halt(&halt, false, true).is_ok());
+        assert!(check_halt(
+            &halt,
+            HaltCheck {
+                force: false,
+                dry_run: true,
+            },
+        )
+        .is_ok());
     }
 
     #[test]
     fn an_unreadable_halt_store_is_itself_a_refusal() {
         let halt = FakeHalt(Err("permission denied".to_string()));
-        let err = check_halt(&halt, true, false).unwrap_err();
+        let err = check_halt(
+            &halt,
+            HaltCheck {
+                force: true,
+                dry_run: false,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DispatchError::FleetHaltUnreadable { .. }));
     }
 

@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::argv::{
-    herdr_binary, HerdrCommand, DEFAULT_TIMEOUT_SECONDS, MAX_OUTPUT_BYTES, MAX_PANE_READ_BYTES,
-};
+use crate::argv::{HerdrCommand, DEFAULT_TIMEOUT_SECONDS, MAX_OUTPUT_BYTES, MAX_PANE_READ_BYTES};
 use crate::envelope::{try_json_object, CommandResult, EXIT_OK};
 use crate::error::HerdrError;
 
@@ -289,11 +287,7 @@ fn spawn_with_retry(
 /// `CommandResult` with `protocol_error` set, so a fleet reader cannot
 /// mistake it for an empty listing but a caller can still inspect it.
 pub fn run(command: &HerdrCommand, timeout: Option<Duration>) -> Result<CommandResult, HerdrError> {
-    let is_herdr = command
-        .argv
-        .first()
-        .map(|first| *first == herdr_binary())
-        .unwrap_or(false);
+    let is_herdr = command.is_herdr;
     let timeout_budget = effective_timeout(is_herdr, timeout);
 
     let binary = command.argv.first().cloned().unwrap_or_default();
@@ -643,6 +637,31 @@ mod tests {
             assert!(!result.ok(), "reply {reply:?} should not be ok");
             assert!(result.protocol_error.is_some());
         }
+    }
+
+    /// `mv-state::worktrees::agent_list_snapshot` builds its command through
+    /// `argv::agent_list()` (so `is_herdr` is set at construction) and then
+    /// overrides `argv[0]` to a caller-pinned binary that need not match
+    /// `HERDR_BIN_PATH` (`HerdrLaneObserver::with_herdr_binary`). Before
+    /// this fix, `run()` re-derived `is_herdr` by comparing `argv[0]`
+    /// against the *current* `herdr_binary()`, so that mismatch silently
+    /// read as `is_herdr == false` — losing both the bounded default
+    /// timeout and (exercised here, since it needs no real wait) the
+    /// Herdr-envelope classification below. Reverting to that
+    /// re-derivation makes this assertion fail deterministically, with no
+    /// risk of hanging: nothing here blocks on a subprocess timeout.
+    #[test]
+    fn run_still_treats_an_overridden_argv0_as_a_herdr_call() {
+        let script = fake_herdr_script("printf 'not json'");
+        let _guard = HerdrBinPathGuard::set("/some/other/herdr-pin-that-does-not-match");
+        let mut command = agent_list();
+        command.argv[0] = script.to_string_lossy().into_owned();
+
+        let result = run(&command, None).unwrap();
+        std::fs::remove_file(&script).ok();
+
+        assert!(!result.ok());
+        assert!(result.protocol_error.is_some());
     }
 
     #[test]

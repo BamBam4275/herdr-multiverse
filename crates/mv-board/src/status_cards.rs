@@ -402,6 +402,26 @@ mod tests {
     }
 
     #[test]
+    fn last_cycle_parked_renders_a_distinct_marker_from_overdue_and_ok() {
+        // Scout 0b79b7 finding 1: every `LastCycleEntry` built in this
+        // module's own tests set `parked: false`, so the `✗ parked`
+        // branch (`last_cycle_card_lines`, distinct from the `⚠
+        // overdue`/`✓` lines) was never exercised.
+        let cycles = vec![LastCycleEntry {
+            project: "proj".into(),
+            mail_at: None,
+            reconcile_at: None,
+            backlog_at: None,
+            overdue: false,
+            parked: true,
+        }];
+        let lines = last_cycle_card_lines(&cycles, SECTION_CARD_MIN_WIDTH);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("proj  \u{2717} parked"), "{rendered:?}");
+        assert!(!rendered.contains('\u{26a0}'), "{rendered:?}");
+    }
+
+    #[test]
     fn osc_52_in_a_project_or_agent_name_does_not_reach_status_output() {
         let seats = SeatsSnapshot {
             working: Some(1),

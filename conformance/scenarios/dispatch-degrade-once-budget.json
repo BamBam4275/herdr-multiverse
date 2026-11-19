@@ -13,7 +13,7 @@
     }
   },
   "home": {
-    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\navailable = false\nunavailable_reason = \"outage a\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\navailable = false\nunavailable_reason = \"outage b\"\n\n[accounts.seat-c]\nkind = \"codex\"\nshort = \"sc\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-c}}\"\npool = \"codex:c\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nfixer = [\"seat-a\", \"seat-b\", \"seat-c\"]\n\n[roles.fixer]\nwrite_scope = \"project\"\neffort = \"low\"\non_exhausted = \"degrade_once\"\nskills = []\n\n[roles.fixer.models]\ncodex = \"gpt-test\"\n"
+    "config_toml": "[accounts.seat-a]\nkind = \"codex\"\nshort = \"sa\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-a}}\"\npool = \"codex:a\"\navailable = false\nunavailable_reason = \"outage a\"\n\n[accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-b}}\"\npool = \"codex:b\"\navailable = false\nunavailable_reason = \"outage b\"\n\n[accounts.seat-c]\nkind = \"codex\"\nshort = \"sc\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"{{DIR:codex-home-c}}\"\npool = \"codex:c\"\n\n[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n\n[projects.sandbox.chains]\nfixer = [\"seat-a\", \"seat-b\", \"seat-c\"]\n\n[roles.fixer]\nwrite_scope = \"declared\"\neffort = \"low\"\non_exhausted = \"degrade_once\"\nskills = []\n\n[roles.fixer.models]\ncodex = \"gpt-test\"\n"
   },
   "steps": [
     {

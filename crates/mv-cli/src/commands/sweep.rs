@@ -1171,7 +1171,10 @@ fn orchestrator_listed(
 /// make, but the nudge leg that runs between the snapshot and this check
 /// writes too — a stuck-resume escalation's `record_stranded_closure`
 /// (`sweep_nudges.rs:519`) appends `event=result status=failed` on a pass
-/// where all four of `report`'s counters stay zero.
+/// where all four of `report`'s counters stay zero. Card `20261117-b-b2d49a`:
+/// `cap_long_running_lanes`'s own escalation leg (`sweep_nudges.rs:814`)
+/// writes through the same `record_stranded_closure`, on the same gap, so
+/// its `failed` outcomes need the same check as `resume`'s.
 fn tasks_snapshot_needs_reread(
     report: &mv_state::tasks::SweepReport,
     nudges: &mv_engine::sweep_nudges::NudgeOutcome,
@@ -1181,6 +1184,7 @@ fn tasks_snapshot_needs_reread(
         || report.reclaimed > 0
         || !report.superseded.is_empty()
         || nudges.resume.iter().any(|r| r.failed)
+        || nudges.cap.iter().any(|r| r.failed)
 }
 
 /// Composer-hold fragments for one project's summary line (card
@@ -1323,9 +1327,23 @@ fn run_with(
     // long the host was unconscious.
     let mut sleep_minutes: i64 = 0;
     let mut hostsleep_lines = Vec::new();
+    // Critic `3c0098` finding 1: `sleep_minutes` above is this pass's own
+    // newly reported sleep (the contract `expire_awaiting` documents and
+    // needs), not the sleep that overlaps any one task's own
+    // dispatched/started-to-now window — once the hostsleep watermark
+    // advances past an interval, a later pass's own `report()` call never
+    // mentions it again, even while the task whose window it falls inside
+    // is still running. `known_sleep_intervals` recovers that durable,
+    // multi-pass record from `mv_state::hostsleep_store`'s own pending
+    // queue (never cleared by `sweep` itself) instead, and is threaded
+    // straight through to `sweep_nudges::run` below (card `20261118-b-3d717d`):
+    // each task's own discount is computed against its own window there,
+    // never collapsed into one number for the whole pass first.
+    let mut known_sleep_intervals: Vec<mv_engine::hostsleep::SleepInterval> = Vec::new();
     if let Some(hub_path) = config.projects.get("multiverse").and_then(project_path) {
         let sleep_report = mv_engine::hostsleep::report(hub_path, now, !dry_run);
         sleep_minutes = sleep_minutes_from_lines(&sleep_report.lines);
+        known_sleep_intervals = mv_engine::hostsleep::known_intervals(hub_path, &sleep_report);
         hostsleep_lines = sleep_report.lines;
     }
 
@@ -1395,8 +1413,27 @@ fn run_with(
         // order of these two groups could not be pinned to an exact
         // `converge_stale` line range.
         let nudges_apply = !dry_run && !halted;
-        let nudges =
-            mv_engine::sweep_nudges::run(path, &tasks, &config, nudges_apply, now, agents, herdr);
+        // Card `20261118-b-3d717d`: `known_sleep_intervals`'s own durable,
+        // multi-pass record is threaded straight through to `sweep_nudges::
+        // run`, not collapsed into one flat number here first. The earlier
+        // fix for critic `3c0098` finding 1 computed a single discount from
+        // this project's own OLDEST live candidate's window and applied it
+        // to every task in the pass — correct for that one candidate, but a
+        // younger lane dispatched after the same sleep had already ended
+        // got the older lane's whole discount too, over-subtracting its own
+        // elapsed time. `sweep_nudges::run`'s own `elapsed_since` now
+        // computes each task's overlap against its own window instead (see
+        // that module's doc comment) — see this task's result.md.
+        let nudges = mv_engine::sweep_nudges::run(
+            path,
+            &tasks,
+            &config,
+            nudges_apply,
+            now,
+            &known_sleep_intervals,
+            agents,
+            herdr,
+        );
         // Python's standalone stuck visibility (`cli.py:12730-12740`): printed
         // on every confirmed-stuck pass, including after the one-shot resume
         // has already fired, ahead of the acting nudge/resume/cap fragments.
@@ -4101,6 +4138,69 @@ mod tests {
     }
 
     #[test]
+    fn a_cap_escalations_failed_write_makes_the_same_passs_tasks_snapshot_see_it_recorded() {
+        // Card `20261117-b-b2d49a`: `cap_long_running_lanes`'s own
+        // escalation leg writes through the same `record_stranded_closure`
+        // `resume_stuck_lanes`'s does, on the same pass-local gap — this
+        // mirrors `tasks_snapshot_needs_reread_counts_a_stuck_resume_escalations_write`
+        // one level up, proving the reread itself (not just the boolean)
+        // turns a stale "still running" read into "already recorded".
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir_all(root.join(".multiverse")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-builder-aaaaaa\t\
+             branch=multiverse/20260101-builder-aaaaaa\trole=builder\tagent=x-buil-cl\n\
+             2026-01-01T00:05:00+00:00\tevent=started\ttask=20260101-builder-aaaaaa\tpane=w1:p1\n",
+        )
+        .unwrap();
+
+        let tasks = mv_state::tasks::sweep_tasks(&root);
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            !tasks[0].recorded,
+            "before the escalation's own write, the task must still read as running"
+        );
+
+        let failed = mv_state::tasks::record_stranded_closure(
+            &root,
+            "20260101-builder-aaaaaa",
+            mv_state::tasks::TaskStatus::Failed,
+            "runtime cap exceeded: agent idle with no result 90 minutes after the cap prompt (40m cap)",
+            Some("w1:p1"),
+        );
+        assert!(failed, "the escalation's own append must land");
+
+        let report = mv_state::tasks::SweepReport::default();
+        let nudges = mv_engine::sweep_nudges::NudgeOutcome {
+            cap: vec![mv_engine::sweep_nudges::RuntimeCap {
+                task_id: "20260101-builder-aaaaaa".to_string(),
+                pane: "w1:p1".to_string(),
+                sent: false,
+                failed: true,
+            }],
+            ..Default::default()
+        };
+
+        // Exactly `run_with`'s own ternary (sweep.rs, just above this test
+        // module): a pass that skips the reread would reuse `tasks`, whose
+        // snapshot predates the escalation's write.
+        let tasks_snapshot = if tasks_snapshot_needs_reread(&report, &nudges) {
+            mv_state::tasks::sweep_tasks(&root)
+        } else {
+            tasks.clone()
+        };
+        assert_eq!(tasks_snapshot.len(), 1);
+        assert!(
+            tasks_snapshot[0].recorded,
+            "this pass's later step must see the cap escalation's own failed write, not the pre-escalation snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
     fn a_sweep_pass_closes_a_backlog_item_linked_to_a_genuinely_done_landed_task() {
         let _state = StateDirEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -4362,7 +4462,8 @@ mod tests {
         );
         assert!(mv_state::nudge_memory::runtime_cap_already_sent(
             &project_root,
-            "20250101-fixer-aaaaaa"
+            "20250101-fixer-aaaaaa",
+            &std::collections::BTreeSet::new()
         ));
 
         let _ = std::fs::remove_dir_all(&project_root);
@@ -4409,8 +4510,160 @@ mod tests {
         assert!(herdr.prompts.is_empty(), "dry-run must never send");
         assert!(!mv_state::nudge_memory::runtime_cap_already_sent(
             &project_root,
-            "20250101-fixer-aaaaaa"
+            "20250101-fixer-aaaaaa",
+            &std::collections::BTreeSet::new()
         ));
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    // --- critic 3c0098 finding 1: whole-lane host-sleep discount -----------
+
+    fn write_sandbox_config_with_capped_seat_and_hub(
+        dir: &std::path::Path,
+        project_root: &std::path::Path,
+        hub_root: &std::path::Path,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[projects.sandbox]\npath = \"{}\"\n\n\
+                 [projects.multiverse]\npath = \"{}\"\n\n\
+                 [accounts.codex-cap]\n\
+                 kind = \"codex\"\n\
+                 config_dir_var = \"CODEX_HOME\"\n\
+                 config_dir = \"<<PLACEHOLDER: x>>\"\n\
+                 max_runtime_minutes = 40\n",
+                project_root.display(),
+                hub_root.display(),
+            ),
+        )
+        .unwrap();
+        config_path
+    }
+
+    /// `pmset -g log`'s own `<date> <time> <tz>` timestamp shape
+    /// (`mv_engine::hostsleep::parse_pmset_timestamp`'s read side),
+    /// generated from a real `OffsetDateTime` rather than a fixed literal
+    /// so the fake log always falls inside whatever window the test's own
+    /// wall-clock `now` turns out to be.
+    fn pmset_timestamp(instant: time::OffsetDateTime) -> String {
+        let instant = instant.to_offset(time::UtcOffset::UTC);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} +0000",
+            instant.year(),
+            u8::from(instant.month()),
+            instant.day(),
+            instant.hour(),
+            instant.minute(),
+            instant.second(),
+        )
+    }
+
+    /// A scripted `pmset -g log` stand-in that always prints `log` — unlike
+    /// [`write_fake_pmset`]'s always-empty script, this one lets a test
+    /// exercise [`mv_engine::hostsleep::report`]'s real parsing path
+    /// without shelling out to the real macOS-only binary.
+    fn write_fake_pmset_with_log(dir: &std::path::Path, log: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let script = dir.join("fake-pmset.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat <<'PMSETLOG'\n{log}\nPMSETLOG\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    #[test]
+    fn a_lane_asleep_through_most_of_its_window_is_never_capped_on_a_later_pass_critic_3c0098_finding_1(
+    ) {
+        let project_root = sandbox_project_root();
+        std::fs::create_dir_all(project_root.join(".multiverse")).unwrap();
+        let hub_root = project_root.join("hub");
+        std::fs::create_dir_all(hub_root.join(".multiverse")).unwrap();
+
+        let now0 = mv_core::time::now_utc();
+        let dispatched = now0 - time::Duration::minutes(490);
+        let sleep_start = dispatched + time::Duration::minutes(1);
+        let sleep_end = now0 - time::Duration::minutes(10);
+        // Seed the hostsleep watermark just before the sleep started, as
+        // if this hub had already been swept once before the host slept —
+        // the critic's own scenario ("lane started just before sleep"),
+        // not a bare first-ever run (whose 2-hour lookback would cut this
+        // 8-hour-old interval off before it was ever reported at all).
+        mv_state::hostsleep_store::write_timestamp(
+            &hub_root,
+            mv_state::hostsleep_store::STATE_FILENAME,
+            sleep_start - time::Duration::minutes(1),
+        )
+        .unwrap();
+
+        std::fs::write(
+            project_root.join(".multiverse/routing.log"),
+            format!(
+                "{d}\tevent=dispatch\ttask=20250101-fixer-aaaaaa\tbranch=main\trole=fixer\t\
+                 account=codex-cap\tagent=t1-agent\n\
+                 {d}\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n",
+                d = mv_core::time::format_seconds_utc(dispatched),
+            ),
+        )
+        .unwrap();
+        let config_path = write_sandbox_config_with_capped_seat_and_hub(
+            &project_root.join("config"),
+            &project_root,
+            &hub_root,
+        );
+        let log = format!(
+            "{}\tSleep\tstart\n{}\tWake\tDarkWake to FullWake Using AC",
+            pmset_timestamp(sleep_start),
+            pmset_timestamp(sleep_end),
+        );
+        let _pmset =
+            PmsetBinGuard::set(&write_fake_pmset_with_log(&project_root.join("bin"), &log));
+
+        let mut agents = NamedFakeAgents {
+            panes: vec![("w1:p1".to_string(), "t1-agent".to_string())],
+        };
+        let mut herdr = NudgeFake {
+            pane_text: "still working on it",
+            prompts: Vec::new(),
+        };
+
+        // Pass 1 ("first sweep after wake"): discovers and queues the ~8
+        // hours of sleep; raw elapsed minus this pass's own newly reported
+        // total leaves only a few minutes, so cap/stuck stay quiet.
+        run_with(
+            &matches(&["sweep", "--config", &config_path.to_string_lossy()]),
+            &mut agents,
+            &mut herdr,
+        )
+        .unwrap();
+        assert!(herdr.prompts.is_empty(), "pass 1 must stay quiet");
+
+        // Pass 2 ("minutes later"): the hostsleep watermark is now fresh,
+        // so this pass's own `report()` call finds nothing new. Reverting
+        // this fix feeds `sleep_minutes = 0` into the cap check here and
+        // sends `RUNTIME_CAP_PROMPT` into a still-`Working`, ordinary-text
+        // pane that the host, not an idle agent, ran long past 490
+        // minutes raw.
+        run_with(
+            &matches(&["sweep", "--config", &config_path.to_string_lossy()]),
+            &mut agents,
+            &mut herdr,
+        )
+        .unwrap();
+        assert!(
+            herdr.prompts.is_empty(),
+            "a lane the host slept through must never be capped on a later \
+             pass just because that pass's own hostsleep report came back \
+             empty"
+        );
 
         let _ = std::fs::remove_dir_all(&project_root);
     }

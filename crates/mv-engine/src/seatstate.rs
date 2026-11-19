@@ -117,7 +117,13 @@ pub fn open_count_from_payload(payload: &serde_json::Value, short: &str) -> Opti
 /// valid; `seat show` uses [`live_seat_open_counts`] (card
 /// `20261115-b-4ded07`).
 pub fn live_open_count(short: &str) -> Option<u32> {
-    let result = mv_herdr::run::run(&mv_herdr::argv::agent_list(), None).ok()?;
+    let result = mv_herdr::run::run(
+        &mv_herdr::argv::agent_list(),
+        Some(std::time::Duration::from_secs_f64(
+            mv_herdr::argv::LISTING_TIMEOUT_SECONDS,
+        )),
+    )
+    .ok()?;
     if !result.ok() {
         return None;
     }
@@ -205,7 +211,13 @@ pub fn live_seat_open_counts(
     short: &str,
     nexus_agents: &HashSet<String>,
 ) -> Option<SeatOpenCounts> {
-    let result = mv_herdr::run::run(&mv_herdr::argv::agent_list(), None).ok()?;
+    let result = mv_herdr::run::run(
+        &mv_herdr::argv::agent_list(),
+        Some(std::time::Duration::from_secs_f64(
+            mv_herdr::argv::LISTING_TIMEOUT_SECONDS,
+        )),
+    )
+    .ok()?;
     if !result.ok() {
         return None;
     }
@@ -294,6 +306,81 @@ pub fn show_human(
 mod tests {
     use super::*;
     use mv_state::seatstate_store::SeatMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Serializes this module's own `HERDR_BIN_PATH` mutations. No other
+    /// test in this crate's test binary sets that env var directly (the
+    /// rest only re-export it inside a child wrapper script), so a lock
+    /// local to this module is enough — unlike `mv-cli`, which shares one
+    /// crate-wide lock across every test module that touches it.
+    static HERDR_BIN_PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_suffix() -> u128 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        (nanos << 32) | u128::from(count)
+    }
+
+    fn fake_herdr_script(body: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mv-engine-seatstate-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Card: `live_open_count`/`live_seat_open_counts` used to pass `None`
+    /// for the timeout, inheriting `run()`'s 30s Herdr default for what is
+    /// normally a millisecond-scale listing call. A hung Herdr socket
+    /// reached this way blocked `accounts`/`board`/`seat show` for up to
+    /// 30s before failing open. Both functions now pass an explicit
+    /// [`mv_herdr::argv::LISTING_TIMEOUT_SECONDS`] (10s, matching
+    /// `dispatch.rs`'s `live_agent_statuses`); this proves that bound is
+    /// really applied for one of the two (`live_seat_open_counts` is the
+    /// identical one-line fix against the same `agent_list()` call, not
+    /// separately proven here). A fake Herdr that sleeps 25s — comfortably
+    /// longer than the 10s bound, comfortably shorter than letting a
+    /// reverted fix run out its full 30s default — lets this fail fast and
+    /// distinctly on revert rather than hang: either the call returns
+    /// (fail-open `None`) near the 10s mark, or the assertion below
+    /// catches a ~25s completion instead.
+    #[test]
+    fn live_open_count_times_out_well_before_the_30s_default() {
+        let _lock = HERDR_BIN_PATH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("HERDR_BIN_PATH").ok();
+        let script = fake_herdr_script("sleep 25");
+        std::env::set_var("HERDR_BIN_PATH", &script);
+
+        let start = Instant::now();
+        let result = live_open_count("probe-seat");
+        let elapsed = start.elapsed();
+
+        std::fs::remove_file(&script).ok();
+        match previous {
+            Some(value) => std::env::set_var("HERDR_BIN_PATH", value),
+            None => std::env::remove_var("HERDR_BIN_PATH"),
+        }
+
+        assert_eq!(result, None, "a timed-out probe must fail open to unknown");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "took {elapsed:?}; a listing call must not wait anywhere near the 30s default"
+        );
+    }
 
     #[test]
     fn seat_report_json_matches_the_wire_schema_and_escapes_names() {

@@ -1819,9 +1819,10 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         let task_id = format!("20261102-council-{name}");
+        let cwd = sandbox.0.join("writer's lane");
         let launch = runner::PreparedLaunch {
             project_root: sandbox.0.clone(),
-            cwd: sandbox.0.join("writer's lane"),
+            cwd: cwd.clone(),
             task_id: task_id.clone(),
             agent_name: format!("example-{name}"),
             role: "council".into(),
@@ -1829,7 +1830,7 @@ mod tests {
             model: "test-model".into(),
             seat: format!("seat-{name}"),
             brief: format!("council question, seat {vendor}\n"),
-            native_args: argv::native_args("test-model", "codex", None),
+            native_args: argv::native_args("test-model", "codex", None, &cwd),
             environment: vec![("CODEX_HOME".into(), config.to_string_lossy().into_owned())],
             clear_auth: vec!["OPENAI_API_KEY".into()],
             command: None,

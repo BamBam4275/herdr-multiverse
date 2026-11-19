@@ -534,19 +534,24 @@ fn availability(
 
     // 5. Seat cap vs. live open-agent count.
     if let Some(cap) = seat.cap {
+        let name = &seat.name;
         match seat.open_count {
             None => {
                 return Err(at_capacity(
                     seat,
                     format!(
-                        "at cap: open-agent count unreadable (Herdr unreachable), cap is {cap}"
+                        "at cap: open-agent count unreadable (Herdr unreachable), cap is {cap} \
+                         (`accounts limit {name} <n>` / `accounts limit {name} --off` to change it)"
                     ),
                 ))
             }
             Some(open) if open >= cap => {
                 return Err(at_capacity(
                     seat,
-                    format!("at cap: {open}/{cap} open agents"),
+                    format!(
+                        "at cap: {open}/{cap} open agents \
+                         (`accounts limit {name} <n>` / `accounts limit {name} --off` to change it)"
+                    ),
                 ))
             }
             Some(_) => {}
@@ -1440,6 +1445,39 @@ mod tests {
         assert_eq!(err.cause, Cause::AtCapacity);
     }
 
+    /// Card `20261118-b-2ff1de`: unlike `accounts`'s plain STATE column
+    /// (pinned to the Python reference by conformance scenario
+    /// `accounts-open-agent-cap`), no conformance scenario pins this
+    /// dispatch-unavailability reason text, so it names its own clearing
+    /// lever in the same inline style as the "lent off" reason above.
+    #[test]
+    fn at_cap_reason_names_the_clearing_lever() {
+        let mut s = seat("a", "pool");
+        s.cap = Some(2);
+        s.open_count = Some(2);
+        let breaker = FakeBreaker::new();
+        let err = availability(&s, ROLE, NEXUS, &breaker, "t1", None, Instant::now()).unwrap_err();
+        assert_eq!(
+            err.reason,
+            "at cap: 2/2 open agents \
+             (`accounts limit a <n>` / `accounts limit a --off` to change it)"
+        );
+    }
+
+    #[test]
+    fn unreadable_count_reason_names_the_clearing_lever() {
+        let mut s = seat("a", "pool");
+        s.cap = Some(2);
+        s.open_count = None;
+        let breaker = FakeBreaker::new();
+        let err = availability(&s, ROLE, NEXUS, &breaker, "t1", None, Instant::now()).unwrap_err();
+        assert_eq!(
+            err.reason,
+            "at cap: open-agent count unreadable (Herdr unreachable), cap is 2 \
+             (`accounts limit a <n>` / `accounts limit a --off` to change it)"
+        );
+    }
+
     #[test]
     fn unreadable_count_is_at_capacity_only_for_a_capped_seat() {
         let mut capped = seat("capped", "pool");
@@ -1851,7 +1889,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains(
-            "is at capacity (a: at cap: 1/1 open agents; b: at cap: 1/1 open agents); \
+            "is at capacity (a: at cap: 1/1 open agents \
+             (`accounts limit a <n>` / `accounts limit a --off` to change it); \
+             b: at cap: 1/1 open agents \
+             (`accounts limit b <n>` / `accounts limit b --off` to change it)); \
              retry on a later tick."
         ));
     }

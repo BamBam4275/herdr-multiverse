@@ -46,21 +46,26 @@ fn dispatch_requires_yes_before_any_side_effect() {
 /// scopes that lock to `prepare`/`validate`/`write_brief` only — pure
 /// filesystem work — and drops it before the first Herdr round trip pane
 /// placement makes (`pane layout`). A fake Herdr that pauses on exactly that
-/// call, for long enough that no amount of host load could make a single
-/// process spawn run that long, lets a concurrent `activity send` into the
-/// same project (which takes the identical lock file under
-/// `mv_state::activity`'s own "activity" name) prove the lock is already
-/// free: the proof is an ordering observation against the layout call's own
-/// start/end marker files, not a wall-clock bound, so it cannot flake under
-/// load. Before this scoping existed, the send would block until dispatch's
-/// pane layout call — and so the whole lock-holding span — had finished,
-/// meaning `layout_finished` would already exist by the time `send` returned.
+/// call — held open by a release signal this test controls, not a sleep —
+/// lets a concurrent `activity send` into the same project (which takes the
+/// identical lock file under `mv_state::activity`'s own "activity" name)
+/// prove the lock is already free: the proof is an ordering observation
+/// against the layout call's own start/end marker files, not a wall-clock
+/// bound, so it cannot flake under load. Before this scoping existed, the
+/// send would block until dispatch's pane layout call — and so the whole
+/// lock-holding span — had finished, meaning `layout_finished` would already
+/// exist by the time `send` returned. If a regression reintroduces that
+/// blocking, `send` here blocks on the lock instead of returning, so this
+/// test never reaches the point of releasing the paused layout call; that
+/// pause is itself bounded (5s, see
+/// `support::Sandbox::dispatch_background_with_slow_pane_layout`), so the
+/// paused call proceeds on its own after that bound, `layout_finished` is
+/// already present by the time the blocked `send` returns, and the
+/// assertion below fails — rather than the test hanging.
 #[test]
 fn dispatch_releases_the_project_lock_before_pane_creation() {
     let sandbox = Sandbox::new();
-    let sleep_secs = 30;
-    let dispatch =
-        sandbox.dispatch_background_with_slow_pane_layout("Map the repository", sleep_secs);
+    let dispatch = sandbox.dispatch_background_with_slow_pane_layout("Map the repository");
 
     // Let prepare/validate/write_brief — the only span that should ever
     // hold the project lock — finish before racing the slow pane layout
@@ -109,9 +114,10 @@ fn dispatch_releases_the_project_lock_before_pane_creation() {
     assert!(
         !dispatch.layout_finished.exists(),
         "activity send only completed after dispatch's pane layout call finished \
-         pausing ({sleep_secs}s) — dispatch must have still been holding \
-         routing.log.lock across that Herdr call"
+         pausing — dispatch must have still been holding routing.log.lock \
+         across that Herdr call"
     );
+    dispatch.release_pane_layout();
 
     let output = dispatch
         .child
@@ -671,6 +677,205 @@ fn close_stranded_leaves_a_live_idle_task_with_no_status_file_unrecorded() {
         "a still-live agent with no status file must never be recorded as an \
          outcome: {log}"
     );
+}
+
+/// Card `20261118-b-fde912` step 1: `tasks --reconcile`'s orphan-pane line.
+/// A live Herdr agent is an orphan only when its dispatch-time name
+/// matches this project's own lane naming (`naming::agent_name`, the same
+/// call a real dispatch mints a name through) *and* its pane has no
+/// record anywhere in this project's routing log. Splits a fresh pane and
+/// names it directly through the fake Herdr's `agent rename` (the same
+/// primitive `close_stranded_leaves_a_live_idle_task_with_no_status_file_
+/// unrecorded` above uses) rather than running a real dispatch, so the
+/// pane stays live and unrecorded with no task of its own to settle.
+fn split_pane(sandbox: &Sandbox) -> String {
+    let split = sandbox.herdr(&[
+        "pane",
+        "split",
+        "--pane",
+        "w52:p1",
+        "--direction",
+        "right",
+        "--cwd",
+        sandbox.project.to_str().unwrap(),
+        "--no-focus",
+    ]);
+    serde_json::from_slice::<serde_json::Value>(&split.stdout).unwrap()["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The exact name `naming::agent_name` would mint for a lane of
+/// `project`'s own `role`, dispatched through the sandbox's `test-seat`
+/// account (`load.rs`'s default `short`: the account name's first two
+/// lowercase characters, `"te"` for `test-seat`) — never hand-typed, so
+/// this test fails the moment the naming algorithm or the fixture's
+/// account name changes instead of silently matching the wrong thing.
+fn lane_name(project: &str, role: &str) -> String {
+    mv_engine::runner::naming::agent_name(project, role, None, "te", "").unwrap()
+}
+
+#[test]
+fn reconcile_reports_nothing_when_there_are_no_orphan_panes() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.cli(&["tasks", "--reconcile"]);
+    assert_code(&output, 0);
+    assert!(
+        !stdout(&output).contains("orphan pane"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn reconcile_reports_one_orphan_pane_for_a_live_agent_with_no_task_record() {
+    let sandbox = Sandbox::new();
+    let pane_id = split_pane(&sandbox);
+    let name = lane_name("sandbox", "buil");
+    sandbox.herdr(&["agent", "rename", &pane_id, &name]);
+
+    let output = sandbox.cli(&["tasks", "--reconcile"]);
+    assert_code(&output, 0);
+    let plain = stdout(&output);
+    let expected = format!(
+        "orphan pane {pane_id} (agent {name}): no task record — close it in Herdr if it is \
+         not yours"
+    );
+    assert_eq!(
+        plain.matches("orphan pane").count(),
+        1,
+        "exactly one orphan line: {plain}"
+    );
+    assert!(plain.contains(&expected), "{plain}");
+}
+
+#[test]
+fn reconcile_never_reports_a_live_agent_named_for_a_different_project() {
+    let sandbox = Sandbox::new();
+    let pane_id = split_pane(&sandbox);
+    // This project's own naming ("sandbox-buil-te") never collides with
+    // another project's ("recipient-buil-te") — `tasks --reconcile`
+    // (implicitly scoped to the cwd project, "sandbox") must never report
+    // a pane carrying a name minted for "recipient".
+    let name = lane_name("recipient", "buil");
+    sandbox.herdr(&["agent", "rename", &pane_id, &name]);
+
+    let output = sandbox.cli(&["tasks", "--reconcile"]);
+    assert_code(&output, 0);
+    assert!(
+        !stdout(&output).contains("orphan pane"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn reconcile_never_reports_a_recorded_lanes_pane_as_an_orphan() {
+    let sandbox = Sandbox::new();
+    let pane_id = split_pane(&sandbox);
+    let name = lane_name("sandbox", "scou");
+    sandbox.herdr(&["agent", "rename", &pane_id, &name]);
+
+    let task_id = "20261118-scout-aaaaaa";
+    fs::create_dir_all(sandbox.project.join(".multiverse/tasks").join(task_id)).unwrap();
+    fs::write(
+        sandbox.project.join(".multiverse/routing.log"),
+        format!(
+            "2026-11-18T00:00:00+00:00\tevent=dispatch\ttask={task_id}\t\
+             branch=\trole=scout\taccount=test-seat\tagent={name}\n\
+             2026-11-18T00:00:01+00:00\tevent=started\ttask={task_id}\tpane={pane_id}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox.cli(&["tasks", "--reconcile"]);
+    assert_code(&output, 0);
+    assert!(
+        !stdout(&output).contains("orphan pane"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// Card `20261118-b-c328a3` M1: `known_panes` used to union every pane a
+/// project's log ever named, forever — so once a pane was recorded for
+/// one dispatch, it stayed "known" even after Herdr recycled that same
+/// pane id for a completely different, never-dispatched lane-named agent.
+/// The check must key off (agent name, pane) as the log's *current*
+/// record, not raw pane-id membership: renaming the live occupant to a
+/// second lane-matching name, with no new routing-log line for it,
+/// simulates exactly that recycling without needing Herdr to actually
+/// reuse a numeric pane id. Revert check: restore the plain
+/// `known_panes.contains(&agent.pane_id)` membership test and this fails
+/// (no orphan line — the recorded pane still reads as "known").
+#[test]
+fn reconcile_reports_an_orphan_when_a_recorded_panes_agent_no_longer_matches() {
+    let sandbox = Sandbox::new();
+    let pane_id = split_pane(&sandbox);
+    let recorded_name = lane_name("sandbox", "buil");
+    sandbox.herdr(&["agent", "rename", &pane_id, &recorded_name]);
+
+    let task_id = "20261118-builder-aaaaaa";
+    fs::create_dir_all(sandbox.project.join(".multiverse/tasks").join(task_id)).unwrap();
+    fs::write(
+        sandbox.project.join(".multiverse/routing.log"),
+        format!(
+            "2026-11-18T00:00:00+00:00\tevent=dispatch\ttask={task_id}\t\
+             branch=\trole=builder\taccount=test-seat\tagent={recorded_name}\n\
+             2026-11-18T00:00:01+00:00\tevent=started\ttask={task_id}\tpane={pane_id}\n"
+        ),
+    )
+    .unwrap();
+
+    // Herdr recycles the same pane id for a different, never-dispatched
+    // lane-named agent (instance 2) — no routing-log line names it.
+    let recycled_name =
+        mv_engine::runner::naming::agent_name("sandbox", "buil", Some("2"), "te", "").unwrap();
+    sandbox.herdr(&["agent", "rename", &pane_id, &recycled_name]);
+
+    let output = sandbox.cli(&["tasks", "--reconcile"]);
+    assert_code(&output, 0);
+    let plain = stdout(&output);
+    let expected = format!(
+        "orphan pane {pane_id} (agent {recycled_name}): no task record — close it in Herdr if \
+         it is not yours"
+    );
+    assert_eq!(
+        plain.matches("orphan pane").count(),
+        1,
+        "exactly one orphan line: {plain}"
+    );
+    assert!(plain.contains(&expected), "{plain}");
+}
+
+/// Card `20261118-b-c328a3` M4: `project_lane_agent_names` used to
+/// hand-copy `naming::unique_agent_name`'s own collision budget and stop
+/// at instance 9 instead of sharing the constant — a tenth same-role/
+/// same-seat collision minted a live, unrecorded pane this check silently
+/// missed. Revert check: restore the literal `1..=9u32` range and this
+/// fails (no orphan line for the instance-10 name).
+#[test]
+fn reconcile_reports_an_orphan_pane_past_the_old_nine_instance_cap() {
+    let sandbox = Sandbox::new();
+    let pane_id = split_pane(&sandbox);
+    let name =
+        mv_engine::runner::naming::agent_name("sandbox", "buil", Some("10"), "te", "").unwrap();
+    sandbox.herdr(&["agent", "rename", &pane_id, &name]);
+
+    let output = sandbox.cli(&["tasks", "--reconcile"]);
+    assert_code(&output, 0);
+    let plain = stdout(&output);
+    let expected = format!(
+        "orphan pane {pane_id} (agent {name}): no task record — close it in Herdr if it is \
+         not yours"
+    );
+    assert_eq!(
+        plain.matches("orphan pane").count(),
+        1,
+        "exactly one orphan line: {plain}"
+    );
+    assert!(plain.contains(&expected), "{plain}");
 }
 
 #[test]
@@ -1524,6 +1729,69 @@ fn start_with_a_duplicated_project_name_opens_only_one_workspace() {
     assert_eq!(
         sandbox_workspaces, 1,
         "duplicate project name opened {sandbox_workspaces} workspaces for \"sandbox\": {workspaces}"
+    );
+}
+
+/// Card `20261117-b-07f239`: `[projects.<name>].autostart = false` is a
+/// read-only knob consulted only by `start --all`'s own project list.
+fn disable_autostart_for(sandbox: &Sandbox, project: &str) {
+    let config_path = sandbox.root.join("config/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let header = format!("[projects.{project}]\n");
+    assert!(config.contains(&header), "{config}");
+    let config = config.replacen(&header, &format!("{header}autostart = false\n"), 1);
+    fs::write(&config_path, &config).unwrap();
+    mv_config::load::load_config(&config_path)
+        .expect("autostart fixture must be valid under the real config schema");
+}
+
+fn workspace_is_open(sandbox: &Sandbox, label: &str) -> bool {
+    let workspaces = stdout(&sandbox.herdr(&["workspace", "list"]));
+    let workspaces: serde_json::Value = serde_json::from_str(&workspaces).unwrap();
+    workspaces["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["label"] == label)
+}
+
+#[test]
+fn start_all_skips_a_project_with_autostart_false_and_names_it() {
+    let sandbox = Sandbox::new();
+    disable_autostart_for(&sandbox, "recipient");
+
+    let output = sandbox.cli(&["start", "--all"]);
+    assert_code(&output, 0);
+    let text = stdout(&output);
+    assert!(
+        text.lines().any(|line| line.contains("recipient")
+            && line.contains("skipped")
+            && line.contains("autostart = false")),
+        "{text}"
+    );
+
+    assert!(
+        workspace_is_open(&sandbox, "sandbox"),
+        "autostart = false on recipient must not stop sandbox from starting"
+    );
+    assert!(
+        !workspace_is_open(&sandbox, "recipient"),
+        "recipient must not open under start --all once autostart = false"
+    );
+}
+
+/// `start <name>` names the project explicitly, so `autostart = false`
+/// — a flag `start --all`'s own project list consults — must not apply.
+#[test]
+fn start_named_project_still_starts_despite_autostart_false() {
+    let sandbox = Sandbox::new();
+    disable_autostart_for(&sandbox, "recipient");
+
+    let output = sandbox.cli(&["start", "recipient"]);
+    assert_code(&output, 0);
+    assert!(
+        workspace_is_open(&sandbox, "recipient"),
+        "naming recipient explicitly must still start it despite autostart = false"
     );
 }
 

@@ -102,10 +102,10 @@ CONFIG_TOML = (
     '[roles.explorer]\nwrite_scope = "none"\neffort = "low"\n'
     'on_exhausted = "degrade"\nskills = []\n\n'
     '[roles.explorer.models]\ncodex = "gpt-test"\n\n'
-    '[roles.fixer]\nwrite_scope = "any"\neffort = "high"\n'
+    '[roles.fixer]\nwrite_scope = "declared"\neffort = "high"\n'
     'on_exhausted = "degrade"\nskills = []\n\n'
     '[roles.fixer.models]\ncodex = "gpt-test"\n\n'
-    '[roles.reviewer]\nwrite_scope = "any"\neffort = "medium"\n'
+    '[roles.reviewer]\nwrite_scope = "declared"\neffort = "medium"\n'
     'on_exhausted = "degrade"\nskills = []\n\n'
     '[roles.reviewer.models]\ncodex = "gpt-test"\n'
 )

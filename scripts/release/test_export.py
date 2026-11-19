@@ -33,7 +33,8 @@ class ExportFixture(unittest.TestCase):
         (self.source / ".gitignore").write_text(".multiverse/\nevidence/\nconfig.toml\ntarget/\n")
         check = self.source / "scripts/check-private-names.sh"
         check.write_text(
-            '#!/bin/sh\nprintf "private-names\\n" >> "$CHECK_LOG"\n'
+            '#!/bin/sh\n'
+            'printf "private-names %s\\n" "$(pwd)" >> "$CHECK_LOG"\n'
             '[ "${FAIL_CHECK:-}" != private-names ]\n'
         )
         check.chmod(0o755)
@@ -69,7 +70,7 @@ class ExportFixture(unittest.TestCase):
         gitleaks.write_text(
             '#!/bin/sh\n'
             'if [ "$1" = version ]; then printf "8.30.1\\n"; exit 0; fi\n'
-            'printf "gitleaks\\n" >> "$CHECK_LOG"\n'
+            'printf "gitleaks %s\\n" "$*" >> "$CHECK_LOG"\n'
             '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
         )
         gitleaks.chmod(0o755)
@@ -169,13 +170,16 @@ class ExportTests(ExportFixture):
         gitleaks.write_text(
             '#!/bin/sh\n'
             'if [ "$1" = version ]; then printf "9.0.0\\n"; exit 0; fi\n'
-            'printf "gitleaks\\n" >> "$CHECK_LOG"\n'
+            'printf "gitleaks %s\\n" "$*" >> "$CHECK_LOG"\n'
             '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
         )
         gitleaks.chmod(0o755)
         result = self.export()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.work / "checks.log").read_text().splitlines()[-1], "gitleaks")
+        self.assertEqual(
+            (self.work / "checks.log").read_text().splitlines()[-1],
+            f"gitleaks dir {self.output} --config {self.output}/.gitleaks.toml -v",
+        )
 
     def test_uses_docker_when_local_gitleaks_absent(self):
         """With no local gitleaks binary on PATH but docker available, the
@@ -184,14 +188,19 @@ class ExportTests(ExportFixture):
         docker_dir.mkdir()
         docker = docker_dir / "docker"
         docker.write_text(
-            '#!/bin/sh\nprintf "gitleaks\\n" >> "$CHECK_LOG"\n'
+            '#!/bin/sh\n'
+            'printf "gitleaks %s\\n" "$*" >> "$CHECK_LOG"\n'
             '[ "${FAIL_CHECK:-}" != gitleaks ]\n'
         )
         docker.chmod(0o755)
         self.env["PATH"] = f"{self.tools_dir}:{docker_dir}"
         result = self.export()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.work / "checks.log").read_text().splitlines()[-1], "gitleaks")
+        self.assertEqual(
+            (self.work / "checks.log").read_text().splitlines()[-1],
+            f"gitleaks run --rm -v {self.output}:/export:ro zricethezav/gitleaks:v8.30.1 "
+            "dir /export --config /export/.gitleaks.toml -v",
+        )
 
     def test_scanner_missing_export_fails(self):
         """With neither gitleaks nor docker on PATH, the export fails
@@ -200,6 +209,51 @@ class ExportTests(ExportFixture):
         result = self.export()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("install", result.stderr.lower())
+        self.assertIn("overall: FAIL", result.stdout)
+
+    def test_leftover_changelog_fragment_refuses_export(self):
+        """A changelog.d/ fragment still tracked at HEAD -- a release that
+        skipped scripts/release/collect-changelog.sh -- refuses the export
+        instead of shipping the fragment into the public tree."""
+        (self.source / "changelog.d").mkdir()
+        (self.source / "changelog.d/README.md").write_text("fragment docs\n")
+        (self.source / "changelog.d/20261118-test.added.md").write_text("- test fragment\n")
+        self.git(self.source, "add", "-A")
+        self.git(self.source, "commit", "-q", "-m", "add uncollected fragment")
+        result = self.export()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("changelog.d", result.stderr)
+        self.assertIn("20261118-test.added.md", result.stderr)
+        self.assertIn("FAIL: changelog.d fragments collected", result.stdout)
+        self.assertIn("overall: FAIL", result.stdout)
+
+    def test_changelog_d_with_only_readme_passes(self):
+        """changelog.d/ holding only README.md -- the fully-collected
+        state -- does not trip the uncollected-fragment guard."""
+        (self.source / "changelog.d").mkdir()
+        (self.source / "changelog.d/README.md").write_text("fragment docs\n")
+        self.git(self.source, "add", "-A")
+        self.git(self.source, "commit", "-q", "-m", "changelog.d with readme only")
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS: changelog.d fragments collected", result.stdout)
+
+    def test_check_phase_modifying_a_committed_file_refuses_the_export(self):
+        """A build/test/conformance/scan step that edits an already-
+        committed file -- rather than only producing new, disposable build
+        output -- fails the export even though every individual check it
+        ran still reported success on its own."""
+        cargo = self.tools_dir / "cargo"
+        cargo.write_text(
+            '#!/bin/sh\n'
+            'printf "modified during checks\\n" > README.md\n'
+            'mkdir -p target\nprintf "artifact\\n" > target/build-output\n'
+            'exit 0\n'
+        )
+        cargo.chmod(0o755)
+        result = self.export()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL: tracked tree unchanged by checks", result.stdout)
         self.assertIn("overall: FAIL", result.stdout)
 
 
@@ -279,10 +333,25 @@ class SyncTests(ExportFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.initial_head)
         self.assertEqual(self.git(self.origin, "tag", "--list", "v0.2.0"), "")
         self.assertEqual(result.stdout.splitlines()[-1], "git push origin main v0.2.0")
-        self.assertEqual((self.work / "checks.log").read_text().splitlines(), [
+        log_lines = (self.work / "checks.log").read_text().splitlines()
+        self.assertEqual(log_lines[:3], [
             "cargo build --locked", "cargo test --workspace --locked",
-            "python3 conformance/run_all.py", "private-names", "gitleaks",
+            "python3 conformance/run_all.py",
         ])
+        self.assertEqual(len(log_lines), 5)
+        # The inner export-fresh.sh run scans a disposable mktemp directory,
+        # not self.output -- assert the private-names cwd and the gitleaks
+        # scan dir/--config agree with each other (and are not the public
+        # clone itself), so a regression that drops --config or points
+        # either check at the wrong directory would fail here.
+        private_names_line, gitleaks_line = log_lines[3], log_lines[4]
+        self.assertTrue(private_names_line.startswith("private-names "))
+        scanned_dir = private_names_line[len("private-names "):]
+        self.assertNotEqual(scanned_dir, str(self.output))
+        self.assertEqual(
+            gitleaks_line,
+            f"gitleaks dir {scanned_dir} --config {scanned_dir}/.gitleaks.toml -v",
+        )
         self.assertEqual(list(self.work.glob("multiverse-sync.*")), [])
 
     def test_dirty_clone_refused_before_export(self):
@@ -385,6 +454,24 @@ class SyncTests(ExportFixture):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("overall: FAIL", result.stdout)
                 self.assert_unchanged()
+
+    def test_check_phase_modifying_a_committed_file_keeps_clone_unchanged(self):
+        """A build/test/conformance/scan step inside the disposable inner
+        export that edits an already-committed file is refused before the
+        public clone's tracked tree is ever replaced -- the scenario
+        sync-public.sh's own `git clean` (untracked/ignored paths only)
+        cannot catch on its own."""
+        cargo = self.tools_dir / "cargo"
+        cargo.write_text(
+            '#!/bin/sh\n'
+            'printf "modified during checks\\n" > README.md\n'
+            'exit 0\n'
+        )
+        cargo.chmod(0o755)
+        result = self.sync()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("overall: FAIL", result.stdout)
+        self.assert_unchanged()
 
     def test_archive_failure_keeps_clone_unchanged(self):
         """An archive failure inside the inner export-fresh.sh run leaves

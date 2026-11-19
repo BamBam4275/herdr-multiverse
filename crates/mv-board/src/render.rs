@@ -17,7 +17,7 @@ use crate::columns::{
     render_columns_merged_with, sort_backlog, sort_backlog_placed, sort_blocked,
     sort_blocked_placed, sort_in_progress, sort_in_progress_placed, ColumnLayout,
 };
-use crate::layout::sanitize_title;
+use crate::layout::truncate;
 
 pub use crate::columns::{BoardColumn, CardsPerRow, StatusFilter};
 use crate::status_cards::{
@@ -136,7 +136,7 @@ fn render_status(health: &FleetHealth, width: usize) -> Vec<String> {
 pub fn render(snapshot: &BoardSnapshot, options: &RenderOptions) -> Vec<String> {
     let mut out = render_accounts(&snapshot.fleet_health, options.width);
     out.push(String::new());
-    out.push(sanitize_title(&snapshot.project.name));
+    out.push(truncate(&snapshot.project.name, options.width));
 
     let status = render_status(&snapshot.fleet_health, options.width);
     // Convert a whole-terminal row budget into what's left for the
@@ -211,7 +211,7 @@ pub fn render_by_project(fleet: &FleetSnapshot, options: &RenderOptions) -> Vec<
         .map(|rows| rows.saturating_sub(out.len() + status.len() + 2 * count + 2) / count.max(1));
     for project in &fleet.projects {
         out.push(String::new());
-        out.push(sanitize_title(&project.name));
+        out.push(truncate(&project.name, options.width));
         out.extend(project_columns(project, options, height));
     }
     out.extend(status);
@@ -440,6 +440,102 @@ mod tests {
             assert!(cell_width(line) <= 120, "{line:?}");
         }
         assert_eq!(project_color("alpha"), project_color("alpha"));
+    }
+
+    /// The project-name header line was once the one rendered element
+    /// `render`/`render_by_project` never clipped to width (unlike every
+    /// card/column/account line, all bounded via `layout.rs`'s
+    /// `truncate`/`pad_to`). Reverting the `truncate()` call at either
+    /// push site (render.rs:139 or :214) back to a bare `sanitize_title()`
+    /// makes this fail.
+    #[test]
+    fn long_project_name_header_stays_within_width() {
+        let long_name = "x".repeat(300);
+        for width in [40usize, 80, 200] {
+            let snapshot = BoardSnapshot {
+                project: project(&long_name, vec![]),
+                fleet_health: FleetHealth::default(),
+            };
+            let options = RenderOptions {
+                width,
+                height: None,
+                limit: 10,
+                color: false,
+                cards_per_row: CardsPerRow::Auto,
+                statuses: StatusFilter::all(),
+            };
+            let lines = render(&snapshot, &options);
+            for line in &lines {
+                assert!(cell_width(line) <= width, "width {width}: {line:?}");
+            }
+
+            let fleet = FleetSnapshot {
+                projects: vec![project(&long_name, vec![])],
+                fleet_health: FleetHealth::default(),
+            };
+            let lines = render_by_project(&fleet, &options);
+            for line in &lines {
+                assert!(cell_width(line) <= width, "width {width}: {line:?}");
+            }
+        }
+    }
+
+    /// Render-level (not primitive-level) coverage for CJK, emoji, and
+    /// combining characters in every untrusted display string the header
+    /// and cards carry: project name, task title, and account name. Runs
+    /// through `render`, the real `board`-command entry point, at the
+    /// widths the brief calls out, asserting no emitted line ever exceeds
+    /// the configured width and nothing panics.
+    #[test]
+    fn wide_unicode_project_task_and_account_names_never_overflow_render() {
+        let wide = "\u{9879}\u{76ee}\u{1F600}e\u{0301}\u{30bd}\u{30fc}\u{30c8}".repeat(20);
+        let mut dispatched = task("20261102-fixer-wide", None, Some(LiveAgentStatus::Running));
+        dispatched.title = Some(wide.clone());
+        dispatched.agent = Some(wide.clone());
+
+        let project_snapshot = project(&wide, vec![dispatched]);
+        let fleet_health = FleetHealth {
+            accounts: vec![AccountSnapshot {
+                name: wide.clone(),
+                model: wide.clone(),
+                vendor: String::new(),
+                kind: String::new(),
+                state: AccountState::Available,
+                seats_open: Some(1),
+                seats_free: Some(1),
+                seats_total: Some(2),
+                over_cap: false,
+                detail: None,
+                quota_windows: vec![],
+                tokens_24h: None,
+                as_of: None,
+            }],
+            accounts_running: None,
+            accounts_capacity: None,
+            seats: None,
+            owed_replies: vec![],
+            mail: vec![],
+            last_cycle: vec![],
+        };
+
+        for width in [40usize, 80, 200] {
+            let snapshot = BoardSnapshot {
+                project: project_snapshot.clone(),
+                fleet_health: fleet_health.clone(),
+            };
+            let options = RenderOptions {
+                width,
+                height: None,
+                limit: 10,
+                color: false,
+                cards_per_row: CardsPerRow::Auto,
+                statuses: StatusFilter::all(),
+            };
+            let lines = render(&snapshot, &options);
+            for line in &lines {
+                assert!(cell_width(line) <= width, "width {width}: {line:?}");
+            }
+        }
     }
 
     #[test]

@@ -685,9 +685,7 @@ impl LiveSource {
         let path = mv_config::load::resolve_config_path_from_env(
             args.get_one::<String>("config").map(Path::new),
         )
-        .map_err(|error| {
-            Failure::Operation(format!("could not resolve the config path: {error}"))
-        })?;
+        .map_err(|error| Failure::Config(format!("could not resolve the config path: {error}")))?;
         let config = mv_config::load::load_config(&path)
             .map_err(|error| Failure::Config(error.to_string()))?;
         let state_dir = state_dir_from_config(&path);
@@ -1333,18 +1331,29 @@ impl LiveSource {
         };
         let root = PathBuf::from(raw_path);
         let mut tasks = resolve_tasks_with(&root, agents, now, Some((&self.config, binary)));
+        let sweep_tasks = mv_state::tasks::sweep_tasks(&root);
         let stuck = if let Some(live) = agents {
             mv_engine::sweep_nudges::stuck_notes(
                 &root,
-                &mv_state::tasks::sweep_tasks(&root),
+                &sweep_tasks,
                 &agent_statuses(live),
                 &self.config,
                 now,
+                &[],
                 &mut BoardReads(binary),
             )
         } else {
             Vec::new()
         };
+        // Read once for this whole render pass, shared across every task
+        // below — never re-derived per task (the same "once per prune pass,
+        // not once per entry" discipline `mv_state::nudge_memory`'s own
+        // callers must keep, task `20261118-builder-bda758`).
+        let recorded: std::collections::BTreeSet<&str> = sweep_tasks
+            .iter()
+            .filter(|task| task.recorded)
+            .map(|task| task.task_id.as_str())
+            .collect();
         for task in &mut tasks {
             let mut notes = Vec::new();
             if let Some(note) = task.state_note.take() {
@@ -1356,7 +1365,7 @@ impl LiveSource {
             }) {
                 notes.push(note.clone());
             }
-            if mv_state::nudge_memory::finish_nudge_already_sent(&root, &task.task_id) {
+            if mv_state::nudge_memory::finish_nudge_already_sent(&root, &task.task_id, &recorded) {
                 notes.push(format!("nudged: {}", task.task_id));
             }
             task.state_note = (!notes.is_empty()).then(|| notes.join(", "));
@@ -2141,10 +2150,31 @@ fn latest_matching<'a>(
 /// that was O(tasks × log lines) and dominated a warm `board --all`.
 struct TaskEvents<'a> {
     dispatch: Option<&'a LogRecord>,
+    /// `event=pane`'s own record — written the instant the pane exists,
+    /// before `started` (`record_pane`, Scout 67a619 finding 1). The only
+    /// pane [`TaskEvents::effective_pane`] has for a task killed between
+    /// pane creation and `agent start` (card `20261118-b-c328a3` M2).
+    pane: Option<&'a LogRecord>,
     started: Option<&'a LogRecord>,
     acknowledged: Option<&'a LogRecord>,
     outcome: Option<&'a LogRecord>,
     limited_count: u32,
+}
+
+impl<'a> TaskEvents<'a> {
+    /// The pane to treat as "where this task is running": `started`'s
+    /// `pane=` field when `agent start` recorded one, else the earlier,
+    /// durable `event=pane` line — the only pane recorded for a task
+    /// killed between pane creation and `agent start` (card
+    /// `20261118-b-c328a3` M2). Every read in this module that means "the
+    /// task's live pane" goes through this one helper instead of reading
+    /// `started`/`pane` directly, so the fallback cannot drift between
+    /// call sites again (card `20261118-b-9226e1`).
+    fn effective_pane(&self) -> Option<&'a String> {
+        self.started
+            .and_then(|r| r.fields.get("pane"))
+            .or_else(|| self.pane.and_then(|r| r.fields.get("pane")))
+    }
 }
 
 fn index_task_events(records: &[LogRecord]) -> HashMap<&str, TaskEvents<'_>> {
@@ -2158,6 +2188,7 @@ fn index_task_events(records: &[LogRecord]) -> HashMap<&str, TaskEvents<'_>> {
         }
         let entry = map.entry(task_id).or_insert(TaskEvents {
             dispatch: None,
+            pane: None,
             started: None,
             acknowledged: None,
             outcome: None,
@@ -2165,6 +2196,7 @@ fn index_task_events(records: &[LogRecord]) -> HashMap<&str, TaskEvents<'_>> {
         });
         match record.event() {
             "dispatch" => entry.dispatch = Some(record),
+            "pane" => entry.pane = Some(record),
             "started" => entry.started = Some(record),
             "acknowledged" => entry.acknowledged = Some(record),
             "limit" => entry.limited_count += 1,
@@ -2321,6 +2353,25 @@ fn lane_git_probe_count() -> u32 {
     LANE_GIT_PROBES.with(std::cell::Cell::get)
 }
 
+// Counts calls into `mv_state::tasks::read_writer_status` from
+// `resolve_one_task` — same thread-local-per-test shape as
+// `LANE_GIT_PROBES` above, proving a task whose outcome is already
+// recorded never pays for the lane/main-checkout status-file probe.
+#[cfg(test)]
+thread_local! {
+    static STATUS_FILE_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_status_file_probe_count() {
+    STATUS_FILE_PROBES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn status_file_probe_count() -> u32 {
+    STATUS_FILE_PROBES.with(std::cell::Cell::get)
+}
+
 /// `git status --porcelain` for a lane's own worktree directory, mirroring
 /// `mv_state::tasks::lane_porcelain` (private to its crate, duplicated for
 /// the same reason as `is_writing_role` above). `None` when the lane
@@ -2468,7 +2519,7 @@ fn probe_task_prompt(
     if task.agent.as_deref().is_none_or(str::is_empty) {
         return;
     }
-    let Some(pane) = events.started.and_then(|event| event.fields.get("pane")) else {
+    let Some(pane) = events.effective_pane() else {
         return;
     };
     let Some(current) =
@@ -2540,10 +2591,11 @@ fn resolve_one_task(
         .and_then(|r| r.fields.get("account").cloned())
         .unwrap_or_else(|| "-".to_string());
     let recorded_agent = dispatch.and_then(|r| r.fields.get("agent").cloned());
-    let pane = events
-        .started
-        .and_then(|r| r.fields.get("pane"))
-        .filter(|p| !p.is_empty());
+    // A kill between pane creation and `agent start` leaves only the
+    // durable `event=pane` line, no `event=started` — falling back to it
+    // here is what keeps that crash window reading as a live pane instead
+    // of a lying AWAITING (card `20261118-b-c328a3` M2).
+    let pane = events.effective_pane().filter(|p| !p.is_empty());
     let matched = agents
         .and_then(|list| pane.and_then(|pane| list.iter().find(|agent| &agent.pane_id == pane)));
     let branch = dispatch.and_then(|r| r.fields.get("branch").cloned());
@@ -2554,27 +2606,52 @@ fn resolve_one_task(
     let finished_at = events
         .outcome
         .and_then(|record| mv_core::time::parse_flexible(&record.when).ok());
+    let recorded_status = events.outcome.and_then(|r| r.fields.get("status").cloned());
+
     // A writer runs in its own worktree, so its status file lands at
     // `.multiverse/worktrees/<lane_task_id>/` under the project root, not
     // in the main checkout — the log alone never says which, so both
     // locations are checked, lane first (`tasks.py`'s `resolve`). Reusing
-    // `mv_state::tasks::read_writer_status` (already `sweep`'s own lane
-    // lookup) rather than reading `tasks_dir` directly — found via
+    // `mv_state::tasks::read_writer_status_verbose` (already `sweep`'s own
+    // lane lookup, and the same reader `commands::tasks::build_rows` uses)
+    // rather than reading `tasks_dir` directly — found via
     // `conformance/diff_fuzz.py` seed 50010, which left a writing role's
     // freshly-finished task reading STALLED instead of UNRECORDED because
-    // only the main checkout's status file was ever consulted.
-    let lane_task_id = branch
-        .as_deref()
-        .and_then(|b| b.strip_prefix("multiverse/"))
-        .unwrap_or(task_id);
-    let status = mv_state::tasks::read_writer_status(
-        root,
-        task_id,
-        lane_task_id,
-        started_at.or(dispatched_at),
-    );
-
-    let recorded_status = events.outcome.and_then(|r| r.fields.get("status").cloned());
+    // only the main checkout's status file was ever consulted. The
+    // `_verbose` reader (rather than plain `read_writer_status`) keeps a
+    // garbled token distinct from silence — card `20261117-b-46b159`: the
+    // terminal-only reader collapsed both to the same `None`, so the board
+    // showed a corrupted write ("donedone") as plain RUNNING instead of
+    // flagging it the way `tasks` already does.
+    //
+    // Only reached when `recorded_status` is `None`: every branch below
+    // that fires on a `Some` (`"blocked"`'s own outcome, or the `_ =>
+    // return None` for every other recorded terminal value) never reads
+    // `status` at all, so probing the status file for an already-recorded
+    // task bought nothing but two stat/open calls per historical task —
+    // card `20261117-b-18fd71` item 1.
+    let (status, unrecognized_status) = if recorded_status.is_none() {
+        let lane_task_id = branch
+            .as_deref()
+            .and_then(|b| b.strip_prefix("multiverse/"))
+            .unwrap_or(task_id);
+        #[cfg(test)]
+        STATUS_FILE_PROBES.with(|count| count.set(count.get() + 1));
+        match mv_state::tasks::read_writer_status_verbose(
+            root,
+            mv_state::tasks::TaskRef {
+                task_id,
+                lane_task_id,
+            },
+            started_at.or(dispatched_at),
+        ) {
+            mv_state::tasks::StatusRead::Terminal(status) => (Some(status), None),
+            mv_state::tasks::StatusRead::Unrecognized(raw) => (None, Some(raw)),
+            mv_state::tasks::StatusRead::Absent => (None, None),
+        }
+    } else {
+        (None, None)
+    };
 
     let limited_count = events.limited_count;
     let acknowledged = events.acknowledged.is_some();
@@ -2620,6 +2697,19 @@ fn resolve_one_task(
             // explanation (card 20261108-b-9140f8).
             _ => return None,
         }
+    } else if let Some(raw) = unrecognized_status.as_deref() {
+        // GARBLED, always ahead of the live-pane probe below: a status
+        // file holding a token outside done/blocked/failed is never shown
+        // as merely running, no matter what Herdr reports for the pane —
+        // card `20261117-b-46b159`, consistent with `tasks`'s own
+        // `classify` (`commands/tasks.rs`).
+        live_status = Some(LiveAgentStatus::Garbled);
+        let token = mv_board::layout::truncate(raw, 80);
+        state_note = Some(format!(
+            "status file holds an unrecognized value ('{token}'): neither empty (still running) \
+             nor one of done/blocked/failed \u{2014} needs a human look, not an assumption \
+             either way. `--close-stranded` can record a terminal outcome for it."
+        ));
     } else if let Some(status) = status {
         live_status = Some(LiveAgentStatus::Unrecorded);
         // UNRECORDED: a terminal status was written, but no `event=result`
@@ -2679,11 +2769,48 @@ fn resolve_one_task(
                     "idle" | "done" | "blocked" | "unknown"
                 ) =>
             {
+                // A healthy, working agent is never "possibly frozen" on
+                // age alone — a Builder routinely runs for hours. Scout
+                // 342332 finding 4's own age-only gate here (reverted by
+                // the frozen-pane rework) flagged nearly every live lane;
+                // the real signal (idle/done with no terminal status —
+                // host-sleep's shape) lives in the arm below, where Herdr
+                // actually reports the pane not working.
                 live_status = Some(LiveAgentStatus::Running);
             }
-            (Some(_), Some(_)) => {
+            (Some(_), Some(agent)) => {
                 live_status = Some(LiveAgentStatus::Stalled);
                 state_note = Some("stalled, agent is live but not working".to_string());
+                // Frozen-pane rework (Scout 342332 finding 4, reworked):
+                // gate "possibly frozen" on a real signal, not age alone.
+                // Signal (a) — Herdr reports the agent idle/done (ready
+                // for input, not working) while no terminal status file
+                // exists — is the host-sleep shape seen on 2026-11-17: an
+                // idle prompt, no status, hours old. `blocked`/`unknown`
+                // are left as plain "stalled": `blocked` is either routed
+                // to HerdrBlocked below (when the recorded agent name
+                // matches) or genuinely ambiguous with no recorded name,
+                // and `unknown` proves nothing either way (`AgentState`'s
+                // own doc comment). Reuses `mv_board::layout::
+                // STALE_AFTER_MINUTES`, the same threshold the AWAITING
+                // stale-pane check below already applies, rather than a
+                // second number for the same kind of silence.
+                if matches!(agent.status.as_str(), "idle" | "done") {
+                    if let Some(at) = base_at {
+                        let elapsed = now - at;
+                        if elapsed > time::Duration::minutes(mv_board::layout::STALE_AFTER_MINUTES)
+                        {
+                            state_note = Some(format!(
+                                "possibly frozen: agent reports {} with no status file for {} \
+                                 \u{2014} not acted on; try `herdr agent prompt {}` or \
+                                 `dispatch --into {task_id}`",
+                                agent.status,
+                                compact_elapsed(elapsed.whole_seconds().max(0)),
+                                recorded_agent.as_deref().unwrap_or("<agent>"),
+                            ));
+                        }
+                    }
+                }
             }
             (Some(_), None) => {
                 live_status = Some(LiveAgentStatus::Awaiting);
@@ -2858,6 +2985,60 @@ mod tests {
                 None => std::env::remove_var("MULTIVERSE_CONFIG"),
             }
         }
+    }
+
+    /// [`StateDirEnvGuard`]'s twin for forcing `MULTIVERSE_CONFIG` to the
+    /// `.cargo/config.toml` sentinel rather than clearing it, so a
+    /// `--config`-less `LiveSource::load` hits the sentinel refusal
+    /// without touching cwd.
+    struct ForbiddenConfigEnvGuard {
+        _herdr: HerdrEnvGuard,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ForbiddenConfigEnvGuard {
+        fn set() -> Self {
+            let herdr = HerdrEnvGuard::unreachable();
+            let previous = std::env::var_os("MULTIVERSE_CONFIG");
+            std::env::set_var(
+                "MULTIVERSE_CONFIG",
+                mv_config::load::FORBIDDEN_LIVE_CONFIG_SENTINEL,
+            );
+            Self {
+                _herdr: herdr,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ForbiddenConfigEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("MULTIVERSE_CONFIG", value),
+                None => std::env::remove_var("MULTIVERSE_CONFIG"),
+            }
+        }
+    }
+
+    /// Scout finding `20261117-scout-9077fc`#1: `LiveSource::load` used to
+    /// map an unresolvable config path to `Failure::Operation` (exit 1),
+    /// unlike `migrate.rs`/`review_policy.rs`'s identical failure. Revert-
+    /// checked: this failed (`code 1`) while the mapping above was still
+    /// `Operation`.
+    #[test]
+    fn an_unresolvable_config_path_is_needs_config_not_operation() {
+        let _guard = ForbiddenConfigEnvGuard::set();
+        let args = crate::args::command()
+            .try_get_matches_from(["multiverse", "board"])
+            .unwrap();
+        let err = match LiveSource::load(args.subcommand_matches("board").unwrap()) {
+            Ok(_) => panic!("expected the sentinel config path to be refused"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), 3);
+        assert!(err
+            .to_string()
+            .contains("could not resolve the config path"));
     }
 
     #[test]
@@ -3350,6 +3531,7 @@ mod tests {
             lane_setup: None,
             min_slots: 0,
             max_slots: None,
+            autostart: true,
         };
         assert_eq!(scope_header(&[project]), "project: sandbox only");
     }
@@ -3364,6 +3546,7 @@ mod tests {
             lane_setup: None,
             min_slots: 0,
             max_slots: None,
+            autostart: true,
         };
         assert_eq!(
             scope_header(&[project("alpha"), project("bravo")]),
@@ -3381,6 +3564,7 @@ mod tests {
             lane_setup: None,
             min_slots: 0,
             max_slots: None,
+            autostart: true,
         };
         assert_eq!(project_short(&project), "Multi-Word");
     }
@@ -3395,6 +3579,7 @@ mod tests {
             lane_setup: None,
             min_slots: 0,
             max_slots: None,
+            autostart: true,
         };
         project.short = Some("sbx".into());
         assert_eq!(project_short(&project), "sbx");
@@ -3533,6 +3718,92 @@ mod tests {
             tasks[0].state_note.as_deref(),
             Some("pane gone, status done")
         );
+    }
+
+    /// Card `20261117-b-46b159`: `tasks` already flags an unrecognized
+    /// status token (card `20261117-b-437eeb`) as `garbled`, but the board
+    /// still read the status file through the terminal-only
+    /// `read_writer_status` and showed the same task as plain RUNNING. A
+    /// corrupted write ("donedone") must never render as running just
+    /// because the pane is still reported live and working under its own
+    /// dispatched agent name — the exact case neither `--reconcile` nor
+    /// `--close-stranded` could ever force a decision on before card
+    /// `20261117-b-437eeb`'s fix. Revert check: swap
+    /// `read_writer_status_verbose` back for `read_writer_status` in
+    /// `resolve_one_task` and this test fails (`live_status` reads
+    /// `Running`, not `Garbled`).
+    #[test]
+    fn a_garbled_status_is_never_shown_as_running_even_with_a_live_same_agent_pane() {
+        let root = temp_project("garbled-status-live-pane");
+        let task_id = "20261117-builder-abcdef";
+        let dir = task_dir(&root, task_id);
+        std::fs::write(dir.join("status"), "donedone").unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-17T00:00:00Z\tevent=dispatch\ttask={task_id}\trole=builder\tagent=sb-build-cx\n\
+                 2026-11-17T00:00:01Z\tevent=started\ttask={task_id}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = parse_live_agents(
+            r#"{"result":{"agents":[{"pane_id":"w1:p1","name":"sb-build-cx","agent_status":"working"}]}}"#,
+        )
+        .unwrap();
+
+        let tasks = resolve_tasks(&root, Some(&agents), now_utc());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].live_status, Some(LiveAgentStatus::Garbled));
+        assert!(tasks[0].outcome.is_none());
+        let note = tasks[0]
+            .state_note
+            .as_deref()
+            .expect("a garbled task always carries a note");
+        assert!(note.contains("donedone"), "note was: {note}");
+
+        let (blocked, in_progress) = mv_board::card::split_dispatched(&tasks);
+        assert_eq!(
+            blocked.len(),
+            1,
+            "garbled must read as needing a look, not running"
+        );
+        assert!(in_progress.is_empty());
+    }
+
+    /// Card `20261118-b-c328a3` M2: a kill between pane creation and
+    /// `agent start` leaves only `event=pane` recorded, no `event=
+    /// started` — but Herdr still lists that pane live under the
+    /// dispatched agent. `resolve_one_task` used to read `events.started`
+    /// alone for `pane`, so this crash-window lane fell back to AWAITING
+    /// even while the agent was live and working. The live agent's own
+    /// name deliberately does not match the dispatch's recorded
+    /// `agent=sb-build-cx`, so `legacy_owner`'s agent-name fallback
+    /// (`board_data.rs`'s own `legacy_live`, which only ever fires when
+    /// `pane.is_none()`) cannot mask a missing pane fallback and paper
+    /// over this test. Revert check: drop the `events.pane` fallback in
+    /// `resolve_one_task` and this fails (`live_status` reads `Awaiting`,
+    /// not `Running`).
+    #[test]
+    fn a_crash_window_lane_with_only_event_pane_reads_as_running_not_awaiting() {
+        let root = temp_project("crash-window-event-pane-only");
+        let task_id = "20261118-builder-abcdef";
+        std::fs::create_dir_all(root.join(".multiverse")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-18T00:00:00Z\tevent=dispatch\ttask={task_id}\trole=builder\tagent=sb-build-cx\n\
+                 2026-11-18T00:00:01Z\tevent=pane\ttask={task_id}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = parse_live_agents(
+            r#"{"result":{"agents":[{"pane_id":"w1:p1","name":"a-different-live-name","agent_status":"working"}]}}"#,
+        )
+        .unwrap();
+
+        let tasks = resolve_tasks(&root, Some(&agents), now_utc());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].live_status, Some(LiveAgentStatus::Running));
     }
 
     /// `conformance/diff_fuzz.py` seed 50010: a writing role's status file
@@ -3683,6 +3954,105 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].state_note, None);
         assert_eq!(tasks[0].live_status, Some(LiveAgentStatus::Running));
+    }
+
+    /// Frozen-pane rework (Scout 342332 finding 4): a working agent never
+    /// gets "possibly frozen" on age alone, no matter how long it runs —
+    /// the bug the original, age-only version of this change had (every
+    /// healthy multi-hour Builder lane flagged). Four hours old, still
+    /// `working`: plain RUNNING, no note, exactly as a healthy lane always
+    /// read before this feature existed.
+    #[test]
+    fn a_working_pane_four_hours_old_is_not_flagged_possibly_frozen() {
+        let root = temp_project("running-working");
+        let task_id = "20261105-scout-abcdef";
+        task_dir(&root, task_id);
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-05T00:00:00Z\tevent=dispatch\ttask={task_id}\trole=scout\tagent=sb-scout-cx\n\
+                 2026-11-05T00:00:00Z\tevent=started\ttask={task_id}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = parse_live_agents(
+            r#"{"result":{"agents":[{"pane_id":"w1:p1","name":"sb-scout-cx","agent_status":"working"}]}}"#,
+        )
+        .unwrap();
+        let four_hours_later = mv_core::time::parse_flexible("2026-11-05T04:00:00Z").unwrap();
+        let found = resolve_tasks(&root, Some(&agents), four_hours_later);
+        assert_eq!(found[0].live_status, Some(LiveAgentStatus::Running));
+        assert_eq!(found[0].state_note, None);
+    }
+
+    /// Signal (a) of the frozen-pane rework: Herdr reports the agent
+    /// idle/done (ready for input, not working) while no terminal status
+    /// file exists — the host-sleep shape seen on 2026-11-17 (idle prompt,
+    /// no status, hours old). Past the shared `STALE_AFTER_MINUTES`
+    /// threshold, this is "possibly frozen", naming the signal. Revert
+    /// check: drop the `"idle" | "done"` gate above and keep only the
+    /// elapsed check, and this test still passes — the gate must be
+    /// checked against test
+    /// `a_working_pane_four_hours_old_is_not_flagged_possibly_frozen`
+    /// instead, which would then fail (flagging a healthy working agent).
+    #[test]
+    fn an_idle_pane_four_hours_old_is_marked_possibly_frozen() {
+        let root = temp_project("idle-frozen");
+        let task_id = "20261105-scout-abcdef";
+        task_dir(&root, task_id);
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-05T00:00:00Z\tevent=dispatch\ttask={task_id}\trole=scout\tagent=sb-scout-cx\n\
+                 2026-11-05T00:00:00Z\tevent=started\ttask={task_id}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = parse_live_agents(
+            r#"{"result":{"agents":[{"pane_id":"w1:p1","name":"sb-scout-cx","agent_status":"idle"}]}}"#,
+        )
+        .unwrap();
+        let four_hours_later = mv_core::time::parse_flexible("2026-11-05T04:00:00Z").unwrap();
+        let found = resolve_tasks(&root, Some(&agents), four_hours_later);
+        assert_eq!(found[0].live_status, Some(LiveAgentStatus::Stalled));
+        assert_eq!(
+            found[0].state_note.as_deref(),
+            Some(
+                "possibly frozen: agent reports idle with no status file for 4h \u{2014} not \
+                 acted on; try `herdr agent prompt sb-scout-cx` or `dispatch --into \
+                 20261105-scout-abcdef`"
+            )
+        );
+    }
+
+    /// The threshold side of signal (a): the same idle, no-status-file
+    /// pane, but still under `STALE_AFTER_MINUTES`, is not yet "possibly
+    /// frozen" — it keeps the plain stalled note every idle/done/blocked/
+    /// unknown pane has always carried.
+    #[test]
+    fn an_idle_pane_under_the_stall_threshold_is_not_flagged_possibly_frozen() {
+        let root = temp_project("idle-fresh");
+        let task_id = "20261105-scout-abcdef";
+        task_dir(&root, task_id);
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-05T00:00:00Z\tevent=dispatch\ttask={task_id}\trole=scout\tagent=sb-scout-cx\n\
+                 2026-11-05T00:00:00Z\tevent=started\ttask={task_id}\tpane=w1:p1\n"
+            ),
+        )
+        .unwrap();
+        let agents = parse_live_agents(
+            r#"{"result":{"agents":[{"pane_id":"w1:p1","name":"sb-scout-cx","agent_status":"idle"}]}}"#,
+        )
+        .unwrap();
+        let just_under = mv_core::time::parse_flexible("2026-11-05T00:29:00Z").unwrap();
+        let found = resolve_tasks(&root, Some(&agents), just_under);
+        assert_eq!(found[0].live_status, Some(LiveAgentStatus::Stalled));
+        assert_eq!(
+            found[0].state_note.as_deref(),
+            Some("stalled, agent is live but not working")
+        );
     }
 
     #[test]
@@ -3849,11 +4219,15 @@ mod tests {
         let log = root.join(".multiverse/routing.log");
         let history = format!("2026-11-05T00:00:00Z\tevent=dispatch\ttask={task}\trole=scout\n2026-11-05T00:00:01Z\tevent=started\ttask={task}\tpane=w1:p1\n");
         std::fs::write(&log, &history).unwrap();
+        // Dispatched 2026-11-05, so against the real wall clock this pane
+        // is long past the stall threshold — but "working" is never
+        // "possibly frozen" on age alone (frozen-pane rework), so this
+        // stays plain RUNNING with no note, same as a freshly dispatched
+        // one.
         let parsed = parse_live_agents(r#"{"result":{"agents":[{"pane_id":"w1:p1","name":"reissued","agent_status":"working"}]}}"#).unwrap();
-        assert_eq!(
-            resolve_tasks(&root, Some(&parsed), now_utc())[0].state_note,
-            None
-        );
+        let found = resolve_tasks(&root, Some(&parsed), now_utc());
+        assert_eq!(found[0].live_status, Some(LiveAgentStatus::Running));
+        assert_eq!(found[0].state_note, None);
         let parsed = parse_live_agents(r#"{"result":{"agents":[{"pane_id":"w1:p2","name":"reissued","agent_status":"working"}]}}"#).unwrap();
         std::fs::write(&log, history.replace("\trole=", "\tagent=reissued\trole=")).unwrap();
         assert_eq!(
@@ -4224,6 +4598,161 @@ esac"#,
     }
 
     #[test]
+    fn last_cycle_parked_reaches_end_to_end_from_a_blocked_orchestrator_pane() {
+        // Scout 0b79b7 finding 1: `cycling_and_parked` only marks a
+        // project parked when a live `-orch-`/`-nexu-` pane for an
+        // interactive seat reports `agent_status: "blocked"` — no test
+        // ever constructed that fixture. This drives it end to end
+        // through `snapshot_with` and checks the `LastCycleEntry` it
+        // feeds to `mv_board::status_cards`.
+        let root = temp_project("board-parked");
+        let config = mv_config::load::load_config_str(
+            &format!(
+                "[accounts.seat]\nkind = 'codex'\nconfig_dir_var = 'CODEX_HOME'\nconfig_dir = {:?}\nshort = 'cx'\ninteractive = true\n[projects.demo]\npath = {:?}\n",
+                root.join("vendor").to_str().unwrap(),
+                root.to_str().unwrap()
+            ),
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        let source = live_source(config, &root.join("state"));
+        let fake = fake_board_herdr(
+            &root,
+            r#"case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"demo-orch-cx","agent_status":"blocked"}]}}' ;;
+*) exit 1 ;;
+esac"#,
+        );
+        let (_, view) = source
+            .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
+            .unwrap();
+        let BoardView::Project(snapshot) = view else {
+            panic!("one project")
+        };
+        assert_eq!(snapshot.fleet_health.last_cycle.len(), 1);
+        assert_eq!(snapshot.fleet_health.last_cycle[0].project, "demo");
+        assert!(
+            snapshot.fleet_health.last_cycle[0].parked,
+            "{:?}",
+            snapshot.fleet_health.last_cycle[0]
+        );
+    }
+
+    #[test]
+    fn codex_directory_trust_prompt_is_classified_as_a_blocking_prompt() {
+        // Scout 0b79b7 finding 2: `probe_task_prompt`'s codex "trust and
+        // continue" special case (distinct from
+        // `mv_engine::blocking_prompt::classify_prompt`) had zero test
+        // coverage. Pane text comes from
+        // `conformance/scenarios/activity-nudge-parked-trust-dialog.json`'s
+        // own `trust-banner.txt` ("Trust this folder?\n› 1. Trust and
+        // continue\n2. Cancel\n"), the project's existing captured wording
+        // for this dialog, copied into
+        // `tests/fixtures/sandbox-dialog/codex-directory-trust-prompt.txt`.
+        let root = temp_project("board-trust-prompt");
+        let task = "20000101-scout-aaaaaa";
+        task_dir(&root, task);
+        let stamp = mv_core::time::now_stamp();
+        let history = format!("{stamp}\tevent=dispatch\ttask={task}\trole=scout\taccount=seat\tagent=mv-scout-cx\n{stamp}\tevent=started\ttask={task}\tpane=w1:p1\n");
+        std::fs::write(root.join(".multiverse/routing.log"), &history).unwrap();
+        let config = mv_config::load::load_config_str(&format!("[accounts.seat]\nkind = 'codex'\nconfig_dir_var = 'CODEX_HOME'\nconfig_dir = {:?}\nshort = 'cx'\n[projects.demo]\npath = {:?}\n", root.join("vendor").to_str().unwrap(), root.to_str().unwrap()), Path::new("config.toml")).unwrap();
+        let source = live_source(config, &root.join("state"));
+        std::fs::write(
+            root.join("pane-text"),
+            include_str!(
+                "../../../../tests/fixtures/sandbox-dialog/codex-directory-trust-prompt.txt"
+            ),
+        )
+        .unwrap();
+        let fake = fake_board_herdr(
+            &root,
+            r#"cd "$(dirname "$0")" || exit 1
+case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"mv-scout-cx","agent_status":"idle"}]}}' ;;
+'agent read') printf '%s\n' "$3" >> reads; cat pane-text ;;
+*) exit 1 ;;
+esac"#,
+        );
+        let (_, view) = source
+            .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
+            .unwrap();
+        let BoardView::Project(snapshot) = view else {
+            panic!("one project")
+        };
+        let (blocked, progress) = mv_board::card::split_dispatched(&snapshot.project.tasks);
+        assert_eq!(blocked.len(), 1);
+        assert!(progress.is_empty());
+        assert!(
+            blocked[0]
+                .status_text
+                .as_deref()
+                .unwrap()
+                .contains("blocked on prompt: codex_directory_trust_prompt"),
+            "{:?}",
+            blocked[0].status_text
+        );
+    }
+
+    /// Card `20261118-b-9226e1`: `probe_task_prompt` used to read
+    /// `events.started` alone for `pane` (unlike `resolve_one_task`, which
+    /// already fell back to `events.pane` for card `20261118-b-c328a3` M2)
+    /// — so a task killed between pane creation and `agent start` (only
+    /// `event=pane` in the log, no `event=started`) read as live/stalled
+    /// (via `resolve_one_task`'s own fallback) but the blocking-prompt
+    /// probe silently never ran. Same fixture as
+    /// `codex_directory_trust_prompt_is_classified_as_a_blocking_prompt`,
+    /// but with `event=pane` instead of `event=started`. Revert check:
+    /// read `events.started.and_then(|event| event.fields.get("pane"))`
+    /// directly at the top of `probe_task_prompt` instead of
+    /// `events.effective_pane()`, and this fails (no `blocked_on_prompt`
+    /// text — the probe returns early on a missing pane).
+    #[test]
+    fn probe_task_prompt_falls_back_to_the_pane_event_when_started_never_landed() {
+        let root = temp_project("board-trust-prompt-pane-event");
+        let task = "20000101-scout-aaaaaa";
+        task_dir(&root, task);
+        let stamp = mv_core::time::now_stamp();
+        let history = format!("{stamp}\tevent=dispatch\ttask={task}\trole=scout\taccount=seat\tagent=mv-scout-cx\n{stamp}\tevent=pane\ttask={task}\tpane=w1:p1\n");
+        std::fs::write(root.join(".multiverse/routing.log"), &history).unwrap();
+        let config = mv_config::load::load_config_str(&format!("[accounts.seat]\nkind = 'codex'\nconfig_dir_var = 'CODEX_HOME'\nconfig_dir = {:?}\nshort = 'cx'\n[projects.demo]\npath = {:?}\n", root.join("vendor").to_str().unwrap(), root.to_str().unwrap()), Path::new("config.toml")).unwrap();
+        let source = live_source(config, &root.join("state"));
+        std::fs::write(
+            root.join("pane-text"),
+            include_str!(
+                "../../../../tests/fixtures/sandbox-dialog/codex-directory-trust-prompt.txt"
+            ),
+        )
+        .unwrap();
+        let fake = fake_board_herdr(
+            &root,
+            r#"cd "$(dirname "$0")" || exit 1
+case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"mv-scout-cx","agent_status":"idle"}]}}' ;;
+'agent read') printf '%s\n' "$3" >> reads; cat pane-text ;;
+*) exit 1 ;;
+esac"#,
+        );
+        let (_, view) = source
+            .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
+            .unwrap();
+        let BoardView::Project(snapshot) = view else {
+            panic!("one project")
+        };
+        let (blocked, progress) = mv_board::card::split_dispatched(&snapshot.project.tasks);
+        assert_eq!(blocked.len(), 1);
+        assert!(progress.is_empty());
+        assert!(
+            blocked[0]
+                .status_text
+                .as_deref()
+                .unwrap()
+                .contains("blocked on prompt: codex_directory_trust_prompt"),
+            "{:?}",
+            blocked[0].status_text
+        );
+    }
+
+    #[test]
     fn row38_stuck_requires_two_passes_and_nudged_reads_existing_memory() {
         let root = temp_project("board-stuck");
         let task = "20000101-scout-aaaaaa";
@@ -4234,7 +4763,12 @@ esac"#,
         let config = mv_config::load::load_config_str(&format!("[accounts.seat]\nkind = 'codex'\nconfig_dir_var = 'CODEX_HOME'\nconfig_dir = {:?}\nshort = 'cx'\n[projects.demo]\npath = {:?}\n", root.join("vendor").to_str().unwrap(), root.to_str().unwrap()), Path::new("config.toml")).unwrap();
         let source = live_source(config, &root.join("state"));
         let now = now_utc();
-        assert!(mv_state::nudge_memory::claim_finish_nudge(&root, task, now));
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            task,
+            &std::collections::BTreeSet::new(),
+            now
+        ));
         std::fs::write(root.join("pane-text"), "Reconnecting: connection lost").unwrap();
         let fake = fake_board_herdr(
             &root,
@@ -4458,6 +4992,44 @@ cat "$(dirname "$0")/pane-text""#,
             lane_git_probe_count(),
             1,
             "only the unsettled lane should spawn git"
+        );
+    }
+
+    /// Card `20261117-b-18fd71` item 1: a task whose outcome is already
+    /// recorded (`event=result`) must cost zero `read_writer_status`
+    /// probes — the recorded status alone decides its fate (`"blocked"`
+    /// stays, every other value drops the task), so the lane/main-checkout
+    /// status-file read below it in `resolve_one_task` is dead work. Only
+    /// the one task with no `event=result` yet may be probed. Same fixture
+    /// shape as `recorded_done_lanes_cost_no_live_git_probe`, instrumented
+    /// at the status-file read instead of the git spawn.
+    #[test]
+    fn recorded_outcomes_cost_no_status_file_probe() {
+        let root = temp_project("recorded-outcome-no-status-probe");
+        let mut log = String::new();
+        for (n, outcome) in ["done", "failed", "blocked"].into_iter().enumerate() {
+            let task_id = format!("20261102-builder-recorded{n}");
+            task_dir(&root, &task_id);
+            log.push_str(&format!(
+                "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={task_id}\trole=builder\taccount=seat-a\n\
+                 2026-11-02T00:05:00+00:00\tevent=result\ttask={task_id}\tstatus={outcome}\n"
+            ));
+        }
+        let unsettled_id = "20261102-builder-unsettled";
+        let dir = task_dir(&root, unsettled_id);
+        std::fs::write(dir.join("status"), "done").unwrap();
+        log.push_str(&format!(
+            "2026-11-02T00:00:00+00:00\tevent=dispatch\ttask={unsettled_id}\trole=builder\taccount=seat-a\n"
+        ));
+        std::fs::write(root.join(".multiverse/routing.log"), log).unwrap();
+
+        reset_status_file_probe_count();
+        let tasks = resolve_tasks(&root, None, now_utc());
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        assert_eq!(
+            status_file_probe_count(),
+            1,
+            "only the unsettled task should read a status file"
         );
     }
 

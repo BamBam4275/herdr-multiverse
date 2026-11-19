@@ -9,6 +9,463 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-19
+
+### Added
+
+- CLI: `workers` and `accounts usage` gained `--json`, emitting one line
+  of machine-readable JSON instead of the text table(s) — alphabetical
+  keys, `null` where the text shows "unknown"/`\u{2014}`, and no change to
+  the existing plain-text output. See `docs/parity.md`'s `workers`/
+  `accounts usage` sections for the exact shapes.
+- Config: `[projects.<name>]` gained a read-only `autostart` boolean
+  (default `true`, no writer sets it). `multiverse start --all` now skips
+  a project with `autostart = false`, printing one line naming the
+  project it skipped; `multiverse start <name>` still starts that project
+  when named explicitly. A non-boolean value is a load-time configuration
+  error (exit code 3).
+- CLI/board: a STALLED task (`tasks`'s listing and the board's cards) —
+  Herdr reports the agent idle/done (ready for input, not working) while
+  no terminal status file exists, the host-sleep shape of an idle prompt
+  with no status, hours old — past the shared 30-minute
+  `mv_board::layout::STALE_AFTER_MINUTES` stall threshold is now noted
+  "possibly frozen", naming the signal and `herdr agent prompt <agent>`/
+  `dispatch --into <task>` as the next step. A healthy RUNNING task
+  (agent reported `working`) is never flagged on age alone, however long
+  it runs; an earlier version of this change gated on age alone and
+  flagged nearly every long-running, healthy lane — reworked to require
+  this real signal instead. Nothing is sent or acted on automatically,
+  and `blocked`/`unknown` keep their existing plain "stalled" note
+  unconditionally.
+- Release: `changelog.d/` now holds one `CHANGELOG.md` fragment per lane
+  (`<task-or-slug>.<section>.md`, matching the Keep a Changelog headings
+  already used in `[Unreleased]`) instead of every lane hand-editing
+  `CHANGELOG.md`'s `[Unreleased]` section directly, which conflicted on
+  32 of the last 48 non-merge commits. `scripts/release/collect-changelog.sh`
+  (`--dry-run` prints the would-be section) merges fragments into the
+  existing `[Unreleased]` text in stable, filename order and deletes the
+  fragments it consumes; an unrecognized section name is refused naming
+  the accepted set. See `changelog.d/README.md`.
+- CLI: `tasks --reconcile` now reports a live Herdr agent whose name
+  matches the current project's own lane naming but whose pane has no
+  record in that project's routing log — `orphan pane <pane> (agent
+  <name>): no task record — close it in Herdr if it is not yours`.
+  Report-only: nothing is closed, prompted, or written, and the line is
+  printed only when such an agent exists, so every existing scenario's
+  output is unaffected.
+- CLI: `accounts` now surfaces sweep's own cap/resume escalation evidence
+  under a pool with any from the last 7 days — `⚠ N sweep escalation(s)
+  since <TIMESTAMP>, latest: <path>` — read-only, printed only when `N > 0`
+  so every existing `accounts` listing stays byte-identical. No automatic
+  breaker trip; an operator still decides by hand.
+
+### Changed
+
+- Release: `scripts/release/export-fresh.sh` now records the exported
+  tree's committed-file status and tree hash right after its one commit,
+  and compares both again after the build/test/conformance/scan phase,
+  refusing the export (and, through it, `sync-public.sh`) if any of that
+  phase modified an already-committed file rather than only producing new,
+  disposable build output. The `gitleaks`/`check-private-names.sh` test
+  fixtures in `scripts/release/test_export.py` now also log the cwd/
+  arguments they were invoked with, so a regression that scans the wrong
+  directory or drops `--config` fails the suite instead of passing quietly.
+- State: a routing-log append's index update no longer rescans the whole
+  log to decide whether its fast path is safe. It now trusts the sidecar
+  index file's own identity (size and modification time) instead of
+  re-decoding or re-scanning it, so the cost stays flat as history grows
+  instead of scaling with the log's current size. Measured on a 250k/500k-
+  record fixture: about 601/985 ms per append before this change versus
+  about 15/20 ms per append after.
+- State: `append_versioned`'s own sequence-number assignment no longer
+  scans the whole routing log on every call to find the current high-water
+  seq. It now reuses the sidecar index's cached high-water mark through the
+  same cheap, identity-validated read, falling back to the full scan only
+  when that trust can't be established (a missing/stale index, a torn
+  tail). Measured on a 250k/500k-record fixture: about 342/698 ms per
+  `append_versioned` call before this change versus about 16/20 ms after.
+- CLI: `worktrees <path> --prune` no longer re-reads and re-validates the
+  whole routing log, nor re-walks every task directory, once per lane it
+  considers. Both the ledger scan behind a missing status file and the
+  project-wide retirement-candidate listing behind an unmerged branch's
+  archive-authority check are now fetched once per `--prune` run and
+  shared across every lane, instead of once per lane. Decisions are
+  unchanged; only the repeated work is gone, so the cost no longer grows
+  with lanes times history length.
+- State: a real (non-dry-run) `--prune`'s removal path no longer re-scans
+  the routing ledger once per occupant task to decide whether its outcome
+  is already recorded; it now reuses the same ledger records the rest of
+  the prune call already fetched once. Recorded outcomes are unchanged.
+  Measured on a 16-lane/250k-record fixture: about 34,823 ms per real
+  prune before this change versus about 24,656 ms after.
+- CI: the required `cargo test` command (`AGENTS.md` and `.github/workflows/ci.yml`'s
+  `test` job) now runs with `--no-fail-fast`, so one failing test binary no
+  longer silently drops every binary scheduled after it.
+- `scripts/test_plugin.py` now discovers and runs `scripts/release/test_collect_changelog.py`,
+  so the `CHANGELOG.md` fragment collector is covered by a required check.
+- Docs: `docs/migrating-from-python.md` Step 4 now covers the rest of
+  `mv-config`'s load-time checks, not just the retired-role-key refusal —
+  `kind`/`write_scope` and an explicitly written account `vendor` must be
+  in a fixed set (exit code 3; a `pool`-derived vendor is not checked),
+  an unrecognized `effort`/`review_effort` is a load-time warning rather
+  than a refusal, and `[activity]`/`[mail]` now warn on an unknown key.
+  Each gets the exact message shape, the accepted values, and the fix.
+
+### Fixed
+
+- CLI: `backlog show`/`backlog answer` no longer panic if another process
+  (a sweep tick, another seat's `done`/`reopen`) mutates the backlog
+  between resolving a token to its item id and re-reading the item by that
+  id — the two reads used to be independent, and an ordinary concurrent
+  write in between could make the second one come up empty, hitting a raw
+  `.expect()` panic. Both commands now resolve the token and fetch the
+  item from a single read, and the few lines that could still disagree on
+  reuse fail with a clean, retryable error instead of panicking.
+- `mv-config`: `[activity]` and `[mail]` now warn on an unknown key (a
+  typo'd `piars` for `pairs`, say) the same way every other section
+  does — they previously had no unknown-key checking at all, so a typo
+  loaded silently with that section's pairs left empty and no warning.
+  An explicitly written account `vendor` is now validated against the
+  same closed set (`claude`, `codex`, `grok`, `chatgpt`, `local`) `kind`
+  already was, naming the bad value and suggesting the closest accepted
+  one on a mismatch (exit code 3) instead of letting a typo or mis-cased
+  value (`vendor = "Grok"`) silently miss every vendor-gated check
+  downstream (Critic's same-vendor exclusion, quota gating, `accounts`
+  usage detail). `vendor`'s default, derived from `pool`'s prefix, is
+  left unchecked, since `pool` is free-form grouping that need not
+  resemble a vendor name.
+- `mv-engine`/CLI: `multiverse sweep` now discounts the same host-sleep
+  total it already subtracts for `expire_awaiting` when it decides whether
+  a RUNNING lane's pane looks stuck, is past its `max_runtime_minutes`
+  cap, or is still inside its startup grace — `sweep_nudges::run` never
+  received `sleep_minutes` before, so a lane the Mac slept through for
+  more than `STUCK_AFTER_MINUTES` (30) or its account's runtime cap used
+  to get a false `STUCK_RESUME_PROMPT`/`RUNTIME_CAP_PROMPT` on wake, and a
+  lane still showing the same connection-loss banner after that false
+  resume could be recorded `failed` even though it was healthy and only
+  long-asleep. `sweep_nudges::run`/`nudge_idle_lanes_to_finish`/
+  `resume_stuck_lanes`/`cap_long_running_lanes`/`stuck_notes`/
+  `submit_unsubmitted_composers` all now take `sleep_minutes: i64`,
+  subtracted from the raw wall-clock gap and floored at zero before any
+  comparison, the same way `expire_awaiting` already floors its own
+  lease-vs-sleep subtraction; `commands::sweep` passes its own host-wide
+  `hostsleep::report()` total through, and the one other caller
+  (`board_data`'s read-only `stuck_notes` display) passes `0`, unchanged
+  from before this parameter existed.
+- `mv-state`: `prune_quarantine` no longer deletes a `worktree-state/`
+  quarantine copy of a lane's `.multiverse` just because it is past the
+  retention window — it now rescues the copy into the project's own live
+  `.multiverse/` first (refusing only on a genuine byte conflict, which
+  keeps the copy instead). This closes the window where `remove_lane`'s
+  own rename-into-quarantine, followed by its redirect symlink, is not
+  atomic: a crash between those two steps used to leave a copy that had
+  never been rescued anywhere, which the next `--prune --deep` could then
+  silently and permanently delete once `WORKTREE_STATE_RETENTION` (14
+  days) passed.
+- CLI/state: `tasks --reconcile` (and the same implicit reconcile a plain
+  `tasks` listing already runs) used to silently refuse a `done` status
+  file with no usable `result.md` behind it — empty, or never written at
+  all — leaving the task `unrecorded` and flagged "need a look" forever,
+  with no command able to clear it short of hand-editing the task
+  directory, even though the listing's own note claimed `--reconcile`
+  would fix it. `is_tasks_reconcile_candidate` now treats that case as a
+  candidate too; `reconcile_project` records it with `status=done` (the
+  status file's own literal claim, same as every other reconciliation)
+  tagged `state=done-without-result` instead of the ordinary `reconciled`,
+  so the missing-evidence fact stays visible in `routing.log` while the
+  task itself becomes clearable. Sweep's own unattended automatic
+  reconcile leg is unchanged and still skips this case outright.
+- `mv-board`: the project-name header line (`render`/`render_by_project`)
+  is now clipped to the configured width, the same way every card,
+  column, and account line already is. A project name longer than the
+  terminal, or one made of wide/CJK/emoji characters whose summed cell
+  width exceeds it, used to print that one line wider than everything
+  else on the board; it now truncates with `"…"` like the rest of the
+  renderer.
+- `mv-state`: `notify::flush` no longer re-delivers a record it already
+  pushed earlier in the same batch. The claim file a flush renames the
+  outbox to used to keep every record of the batch on disk, unchanged,
+  until the whole replay finished; if a later record's own re-enqueue then
+  failed and `flush` returned early, the claim was left behind (as
+  designed, for stale-claim recovery) still holding the already-delivered
+  record, so a subsequent stale-claim reclaim handed it back to be pushed
+  a second time. The claim is now rewritten to drop each record's own copy
+  the moment that record is settled (delivered, re-queued into the
+  outbox, or dropped as stale/unknown), so only what is still genuinely
+  outstanding remains in a claim an error leaves behind.
+- CLI: `backlog list` now resolves `.` and relative/absolute project paths
+  the same way `dispatch`'s own project argument does, instead of only
+  matching a literal `[projects.<name>]` key. `backlog list .` used to
+  fail with "unknown project(s): ." even from inside a configured
+  project's own directory; it, a relative path, and an absolute path all
+  now resolve to that project, falling back to the existing "unknown
+  project(s)" message (unchanged text and exit code) only when neither a
+  literal name nor a path resolves.
+- CLI: `activity nudge` and `tasks`'s own `--projects`/positional project
+  arguments now resolve `.` and relative/absolute paths the same way,
+  reusing `backlog list`'s own resolver instead of a bare
+  `[projects.<name>]` key check. Each used to refuse `.` and paths with
+  "no such project: ..."; an unknown name still gets that same message
+  and exit code, unchanged.
+- `mv-state`: `activity reply` and `activity close` no longer have a
+  window where two concurrent calls against the same open ask could both
+  succeed. `reply` previously checked whether the ask was still open with
+  no lock held at all, so two racing replies could both see it as open and
+  both send an answer into the asker's log; `close_ask` locked only its
+  own append and never re-checked for an existing close record first, so
+  two racing closes (or a close racing a reply) could both append one.
+  `reply` now holds both the holder's and the asker's project lock for the
+  whole check-then-send-then-close span — acquired in the fleet's
+  established hub-first-then-alphabetical order so two projects replying
+  to each other's asks at once can't deadlock on opposite lock orders —
+  and `close_ask` now re-checks for an existing close record inside its
+  own lock before appending. A second call against an already-resolved
+  ask now gets the existing "ask not open" refusal instead of landing a
+  duplicate answer or close.
+- `mv-herdr`: a `HerdrCommand` now carries whether it is a Herdr call
+  (`is_herdr`) as a flag set once at construction by every builder,
+  instead of `run()` re-deriving it by comparing `argv[0]` against the
+  *current* `HERDR_BIN_PATH` resolution. A command built normally and
+  then pinned to an explicit binary afterward (`mv-state::worktrees::
+  agent_list_snapshot`, used by `HerdrLaneObserver::with_herdr_binary`)
+  used to lose the mark the moment that pinned binary didn't match
+  `HERDR_BIN_PATH`, which silently dropped the bounded default subprocess
+  timeout entirely — a hung Herdr reached this way could block forever
+  instead of surfacing a typed timeout error. `accounts`/`board`/
+  `backlog`'s own `agent list` probes (`accounts::snapshot_stranded_panes`,
+  `backlog::dispatched_caller_name`, `seatstate::live_open_count`,
+  `seatstate::live_seat_open_counts`) also no longer inherit the 30s
+  Herdr default for what is normally a millisecond-scale listing call:
+  each now passes an explicit 10s timeout (the new `mv_herdr::argv::
+  LISTING_TIMEOUT_SECONDS`, matching the bound `dispatch.rs`'s
+  `live_agent_statuses` already used for the same call).
+- CLI: an unresolvable config path (the config-path-resolution step, not
+  the file-missing/malformed-content step, which already needed this
+  exit code) now exits 3 (`NEEDS_CONFIG`) instead of 1, matching the
+  documented exit-code contract and `config migrate`/`review-policy`'s
+  existing behavior for the identical failure. Affects every command
+  that shares `commands::load_config` (`projects`, `workers`, `inspect`,
+  `directives`, `start`, `stop`, `add`, `check`, `lifecycle`, `new`,
+  `result`, `backlog`, `activity`, `tasks`, and others), `doctor`/`halt`
+  (via `resolve_config_path`), `board` (via `LiveSource::load`), and
+  `seat show` (via `show_with_count`). `accounts limit`/`lend`/`prefer`
+  against an unknown seat now also exits 3 instead of 1, matching
+  `accounts usage --detail`'s identical "name not in config" lookup in
+  the same file.
+- CLI: `add`/`new --yes` now write `config.toml`'s new `[projects.<name>]`
+  block through the same temp-file-plus-rename, fsync-before-rename write
+  `mv-config`'s migrator already uses for the live config, instead of a
+  plain in-place append. A crash partway through used to be able to leave
+  `config.toml` holding a truncated, unparseable block; now the live file
+  is always either the untouched original or the fully appended result.
+  The file's own permission mode is preserved across the rewrite, and
+  a `config.toml` that is a symlink stays a symlink, with the new block
+  written into its target.
+- CLI/Engine: a dispatched Codex lane now launches with `-C <worktree>`,
+  pinning its working root to the lane `prepare` already created instead
+  of relying solely on the pane's shell `cd`. Codex has no flag that
+  restricts what it can *read* — only this root-pin and an explicit
+  "stay inside your worktree" constraint in the dispatched brief, added
+  for every Codex-kind seat — so this narrows deliberate re-rooting
+  rather than enforcing a read boundary.
+- `mv-config`: `[accounts.<name>]`'s `kind` and `[roles.<key>]`'s
+  `write_scope` are now validated against the values the rest of the
+  codebase actually compares them to (`kind`: `claude`, `codex`, `grok`,
+  `local`; `write_scope`: `none`, `declared`) instead of accepting any
+  string. A typo'd or mis-cased value used to load cleanly and then
+  silently take the wrong branch downstream — `write_scope = "None"`
+  skipped the write-deny rules a reader role relies on, and a mis-cased
+  `kind` skipped its vendor-specific safety checks — with no warning
+  that anything was wrong. Both are now a load-time config error (exit
+  code 3) naming the bad value, the accepted set, and a "did you mean"
+  suggestion when the value is a close typo; neither is silently
+  corrected. **This can reject a config that loaded (silently wrong)
+  before.**
+- CLI: `council`'s per-seat report no longer drops a councillor that the
+  convene-time recheck (a cap or availability check run again under the
+  fleet lock immediately before starting) newly skips after it was
+  already printed in the roster. That seat now prints with its skip
+  reason. As with a seat skipped while seating, the council still
+  proceeds when the remaining seats are quorate, and refuses (exit 1)
+  only below quorum.
+- `worktrees --merge` now refuses outright, before touching anything,
+  when the project checkout is already mid-merge — `MERGE_HEAD` present
+  or unmerged paths left over from an earlier crashed or conflicted
+  `git merge --no-ff`, which nothing previously detected — naming the
+  stuck state and a `git` command to inspect it (exit 1). And when its
+  own merge attempt conflicts, it now runs `git merge --abort` and
+  reports the conflicting paths instead of leaving the checkout
+  mid-merge for the next `--merge` to trip over with an opaque
+  passthrough error.
+- Engine: `resume_stuck_lanes` no longer spends a stuck lane's one-shot
+  resume claim when the resume send itself fails (the pane's own agent
+  was no longer there to receive it, or the fresh re-check otherwise came
+  back false). The claim used to be written to disk before the send was
+  attempted and left that way regardless of outcome, so a failed send
+  permanently stuck the task with a claim that could never record a
+  pane/fingerprint — excluding it forever from both a retried resume and
+  the escalate-to-`failed` safety net this mechanism exists to guarantee.
+  A failed send now releases the claim so a later pass can retry it;
+  a successful send still spends it exactly as before.
+- Engine: `cap_long_running_lanes` now has the same escalation follow-up
+  `resume_stuck_lanes` already has: a lane still running
+  `STUCK_AFTER_MINUTES` (30) past its own `max_runtime_minutes` cap, after
+  its one-shot cap prompt was already sent, is now recorded `failed`
+  through the same `mv_state::tasks::record_stranded_closure`/breaker-
+  evidence pair the stuck-resume escalation uses, instead of getting one
+  spent, unconsumed prompt and zero further automated signal ever again.
+  A cap-prompt send that never actually goes out (the pane's own agent
+  was no longer there to receive it) also no longer spends the one-shot
+  claim — it releases the same way the stuck-resume claim does, so a
+  later pass can still claim and retry it. Time past the cap plus grace is
+  never enough on its own, though: real configs set caps as low as 40
+  minutes, and healthy agents routinely run longer, so a lane still
+  `Working` escalates only once its pane also shows the same
+  connection-loss banner `resume_stuck_lanes`'s own stuck detection
+  requires in that state; one no longer `Working` at all (idle/done, no
+  terminal status file) needs no further pane-text match. Breaker evidence
+  is written, and linked into the recorded outcome, only when that same
+  pane text also classifies as a vendor/account error the breaker already
+  recognises — never for a plain timeout, which proves nothing about the
+  account and must not feed its breaker or risk stopping dispatch to a
+  healthy one.
+- `mv-state`: `worktrees <path> --prune` (and `--prune-orphans`) no longer
+  keep a lane forever when its branch was created but no brief was ever
+  written for it — a host dying between `Worktrees::create` returning and
+  `write_brief` starting, still under the single project lock. Every
+  occupant task's own name is always checked against a terminal status,
+  including the lane's own, so this empty lane previously needed `--force`
+  with no automatic reclaim path, regardless of age. Once such a lane (no
+  brief, no commit past its recorded cut point) is older than the
+  existing 14-day retention this module already waits out before
+  reclaiming other abandoned state, `prune` now removes the lane and its
+  branch on its own; a fresh one, or one with any real work, still needs
+  `force` exactly as before.
+- `mv-state`/CLI: a status file holding a garbled, unrecognized token (a
+  truncated or otherwise corrupted write, e.g. `donedone`) used to read
+  exactly like a never-written one — `read_status`'s `None` collapses
+  both — so a task whose pane Herdr still reported live under its own
+  dispatched agent name was excluded from both `tasks --reconcile`
+  (needs a recognized status) and `tasks --close-stranded` (the pane
+  still reads as occupied), with nothing able to ever force a terminal
+  recording for it. `tasks` now shows such a task as `garbled`, flagged
+  and naming the (sanitized) bad token, instead of `running`; and
+  `tasks --close-stranded --yes` can now record a `blocked` outcome for
+  it (state `unrecognized-status-token`), independent of what the live
+  pane reports, since a garbled write is itself the evidence something
+  went wrong.
+- `mv-config`: `roles.<key>.effort` and `review_policy.review_effort`
+  outside `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — the values
+  multiverse has seen accepted; the vendor CLI is the authority — now get
+  a load-time warning naming the bad value, the `models` kind(s) using
+  it, and the known values; the config still loads and the value is
+  still passed through verbatim to whichever vendor CLI (`claude`,
+  `codex`, `grok`) a seat runs. An empty string remains a load-time error
+  (exit code 3). A typo'd value used to load cleanly and only fail later
+  as a live seat-launch error; it was briefly a load-time error of its
+  own, but the vendors accept different sets this repo cannot state as
+  one closed list (Claude Code and codex accept `xhigh`; codex also
+  accepts `minimal` but not `max`), so a hard error would have broken a
+  working config on a vendor-CLI upgrade.
+- `mv-engine`: `sweep`'s nudge/resume/cap pass now discounts each lane's
+  own host-sleep overlap individually, instead of computing one flat
+  discount per pass from the oldest running candidate and applying it to
+  every lane. A lane dispatched after a host sleep had already ended could
+  previously have its own, much smaller elapsed time wrongly zeroed out by
+  an older lane's whole sleep gap, delaying a legitimate stuck/cap
+  detection for it by however long the older lane's sleep lasted.
+- `board`: a task whose status file holds an unrecognized token (e.g. a
+  truncated `donedone`) now shows as `garbled`, needing a human look,
+  instead of plain RUNNING — matching `tasks`'s own `garbled` row. The
+  board reads the status file through `read_writer_status_verbose` the
+  same way `tasks` already does, instead of the terminal-only reader that
+  collapsed a corrupted write to the same `None` a never-written file
+  reads as.
+- Release: `export-fresh.sh` now refuses to export if `changelog.d/` still
+  holds an uncollected fragment, and the publishing checklist's version-bump
+  step now runs `collect-changelog.sh` before moving `[Unreleased]`.
+- `mv-state`: `finish-nudge-memory.json`, `runtime-cap-memory.json`, and
+  `stuck-resume-memory.json` now prune a claim on every read once its task
+  has a recorded terminal outcome in the project's routing log, or once the
+  claim has sat unrecorded for 14 days (the same retention
+  `WORKTREE_STATE_RETENTION` already gives an abandoned worktree-state
+  copy), so these claim files no longer grow by one entry per dispatched
+  task for a project's lifetime without re-arming a still-running lane's
+  one-shot nudge/resume/cap prompt, or dropping a stuck-resume claim's
+  recorded pane/fingerprint, the moment that lane runs past a day.
+- `mv-engine`/`mv-cli`: `sweep`'s nudge/resume/cap pass no longer mistreats
+  a healthy lane the host slept through, and no longer leaves a frozen
+  lane with no further signal. The host-sleep discount now accumulates
+  across sweep passes (from the durable pending-sleep record, not only
+  the pass that first discovered it), so a lane is never capped on the
+  pass right after a hostsleep watermark advances past the interval that
+  covered it. `resume_stuck_lanes` and `cap_long_running_lanes` now see
+  each other's claims within one `sweep` pass, so a lane can get at most
+  one canned prompt per pass. A successful resume send now arms the
+  escalate-to-`failed` safety net for an idle/done pane the same as it
+  already did for a still-`Working` one. A resume or cap send that keeps
+  failing (a Herdr outage) now stops retrying after a bounded number of
+  consecutive failures and lets the existing escalation path run instead
+  of retrying forever.
+- Dispatch's at-cap selection reason (distinct from `accounts`'s
+  Python-pinned STATE column) now names its clearing lever
+  (`accounts limit <seat> <n>` / `accounts limit <seat> --off`), matching
+  the adjacent "lent off" reason's own inline convention.
+- `accounts usage`'s FENCED suffix for a manually-fenced Grok seat with no
+  automatic reset now names the pool and gives the same `accounts reset` fix
+  instruction `accounts`'s plain listing already gives for the identical
+  case, instead of a generic message that omitted both.
+- `tasks`/board: a crash-window lane recorded only as `event=pane` (no
+  `event=started` yet) now classifies RUNNING/STALLED like any other live
+  pane, instead of a lying AWAITING.
+- `tasks --reconcile`'s orphan-pane report now keys on (pane, agent name)
+  as the routing log's *current* record, not raw pane-id membership — a
+  pane Herdr recycles for a different, never-dispatched agent after the
+  one that was recorded for it is now reported as an orphan, and the
+  check's own lane-name enumeration now shares its instance budget with
+  `naming::unique_agent_name` instead of a hand-copied, truncated range.
+- `accounts`'s sweep-escalation evidence count no longer follows a
+  symlinked `.multiverse/evidence` directory or a symlinked file inside
+  one.
+- `sweep`: a runtime-cap escalation's `record_stranded_closure` write (like
+  the stuck-resume escalation's before it) now also forces this pass's
+  `tasks_snapshot` to re-read the routing log, so a cap escalation's own
+  just-recorded failure is never acted on through a stale in-memory snapshot.
+- `sweep`'s nudge-eligibility gate (`base_running_candidate` in
+  `crates/mv-engine/src/sweep_nudges.rs`) now also refuses a task whose
+  status file holds an unrecognized/garbled token, so a garbled-status
+  lane is never finish-nudged, stuck-probed, resumed, or runtime-capped —
+  it is left for `tasks --close-stranded`'s own human-reviewed reconcile,
+  the same way it already was for a readable terminal status file.
+- Dispatch: a hard kill between pane creation and the prompt landing no
+  longer leaves `close_stranded` free to fabricate a terminal status onto a
+  pane Herdr still reports live — the pane id is now appended to the
+  routing log (`event=pane`) the instant it exists. A hard kill between
+  writing a task's brief and logging its dispatch no longer blocks `prune`
+  from reclaiming the lane without `--force` once it is old enough.
+- `tasks`/board: a crash-window lane recorded only as `event=pane` (no
+  `event=started` yet) now gets the "possibly frozen" stalled note and the
+  blocking-prompt probe too, not just the RUNNING/STALLED row state — both
+  used to read `started_pane` directly and silently no-op for that lane.
+  Every such read in `tasks.rs` and `board_data.rs` now goes through one
+  `effective_pane` helper so the fallback cannot drift between call sites
+  again.
+
+### Security
+
+- `bootstrap-plugin.sh`'s release-archive install path now clamps the
+  extracted `multiverse` binary to mode `0755` instead of only adding
+  the execute bit, so a release archive whose packed member carries
+  group- or other-write stays writable only by its owner after install.
+- Dispatch writes each task's `brief.md` mode 0o600 instead of 0o644,
+  matching every other state file. Its directory was already owner-only,
+  so this is defense in depth rather than a fix for a reachable leak.
+- CLI: `scratch read` now redacts credential-shaped text in the printed
+  pane output, after the existing control-sequence sanitizing pass,
+  matching every other pane-text-derived consumer (dispatched subprocess
+  logs, an agent's own report text). A scratch pane is a live agent
+  terminal and can echo a secret.
+
 ## [0.1.9] - 2026-11-17
 
 ### Fixed
@@ -828,6 +1285,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.10]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.10
 [0.1.9]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.9
 [0.1.8]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.8
 [0.1.6]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.6

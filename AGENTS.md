@@ -27,7 +27,7 @@ Build with `cargo build --workspace --locked`. Run from the repository root:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
+cargo test --workspace --all-features --locked --no-fail-fast
 python3 conformance/run_all.py
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo deny check
@@ -68,7 +68,10 @@ Use one scoped Conventional Commit per assigned task (`fix:`, `feat:`,
 `docs:`, `chore:`, etc.). Include `Task: <task-id>` on its own line in the
 body when working a dispatched task. Commit before reporting completion;
 never merge, push, or publish without task authorization. Include what
-changed, its evidence, and any verification gap in the task result.
+changed, its evidence, and any verification gap in the task result. Add a
+`CHANGELOG.md` entry as a `changelog.d/<task-or-slug>.<section>.md`
+fragment (see `changelog.d/README.md`) instead of editing `[Unreleased]`
+directly, so parallel lanes stop conflicting there.
 
 The project is dual licensed under MIT OR Apache-2.0; retain both license
 files and use the contribution terms in `CONTRIBUTING.md`. Do not commit

@@ -212,6 +212,10 @@ def load_tests(loader, tests, _pattern):
     tests.addTests(loader.discover(str(tests_dir), pattern="test_bootstrap.py"))
     # Keep private-name regressions (git-grep ERE validity) in the plugin boundary check.
     tests.addTests(loader.discover(str(tests_dir), pattern="test_private_names.py"))
+    # Keep changelog-fragment-collector regressions in the plugin boundary check.
+    tests.addTests(
+        loader.discover(str(REPO / "scripts/release"), pattern="test_collect_changelog.py")
+    )
     # test_release.py imports BootstrapTests into its own module namespace, so
     # a plain loader.discover(pattern="test_release.py") would also re-collect
     # and re-run every test_bootstrap.py test added above, under the same

@@ -28,7 +28,11 @@ pub trait AccountsSource {
     ) -> Result<Vec<String>, Failure>;
     fn reset(&self, pool: &str) -> Result<Vec<String>, Failure>;
     fn limit(&self, seat: &str, cap: Option<u32>) -> Result<(), Failure>;
-    fn usage(&self, detail: Option<&str>) -> Result<Vec<String>, Failure>;
+    /// `json`: emit a single already-serialized JSON line instead of the
+    /// human lines below — same convention `commands::presence`/`health`
+    /// use for their own `--json` flag, so callers' `for line in ... {
+    /// println!("{line}") }` loop stays unchanged either way.
+    fn usage(&self, detail: Option<&str>, json: bool) -> Result<Vec<String>, Failure>;
     fn lend(&self, seat: &str, lend: bool) -> Result<(), Failure>;
     fn prefer(&self, seat: Option<&str>, clear: bool) -> Result<(), Failure>;
 }
@@ -59,7 +63,7 @@ impl AccountsSource for Unconfigured {
     fn limit(&self, _seat: &str, _cap: Option<u32>) -> Result<(), Failure> {
         Err(unconfigured())
     }
-    fn usage(&self, _detail: Option<&str>) -> Result<Vec<String>, Failure> {
+    fn usage(&self, _detail: Option<&str>, _json: bool) -> Result<Vec<String>, Failure> {
         Err(unconfigured())
     }
     fn lend(&self, _seat: &str, _lend: bool) -> Result<(), Failure> {
@@ -111,7 +115,10 @@ impl LiveConfig {
     }
 
     /// Resolves a `seat` argument by its config name or its `short` code,
-    /// the same lookup `commands::seat`'s `show` uses.
+    /// the same lookup `commands::seat`'s `show` uses. An unknown name is
+    /// a needs-config exit (`AccountSelection`), matching `usage_detail`'s
+    /// identical "name not in config" lookup below — Scout finding
+    /// `20261117-scout-9077fc`#3.
     fn seat_name(&self, seat: &str) -> Result<&str, Failure> {
         self.config
             .accounts
@@ -123,12 +130,14 @@ impl LiveConfig {
                     .find(|account| account.short == seat)
             })
             .map(|account| account.name.as_str())
-            .ok_or_else(|| Failure::Operation(format!("unknown seat {seat:?}")))
+            .ok_or_else(|| Failure::AccountSelection(format!("unknown seat {seat:?}")))
     }
 
     /// `accounts usage --detail ACCOUNT` (`cli.py:9316-9358`): lookup by
     /// configured name, grok-only tables, unknown name is needs-config.
-    fn usage_detail(&self, name: &str) -> Result<Vec<String>, Failure> {
+    /// `json`: [`render_usage_detail_json`] instead of the human tables
+    /// below.
+    fn usage_detail(&self, name: &str, json: bool) -> Result<Vec<String>, Failure> {
         let account = self.config.accounts.get(name).ok_or_else(|| {
             let known = if self.config.accounts.is_empty() {
                 "(none configured)".to_owned()
@@ -141,6 +150,9 @@ impl LiveConfig {
                 "unknown account {name:?}; configured accounts: {known}"
             ))
         })?;
+        if json {
+            return Ok(vec![render_usage_detail_json(account)]);
+        }
         if account.vendor != "grok" {
             return Ok(vec![format!(
                 "{} is a {:?} seat — only grok has a per-day/per-project detail source today \
@@ -204,6 +216,213 @@ impl LiveConfig {
     }
 }
 
+/// One account's row in the bare `accounts usage` listing (no `--detail`)
+/// — computed once, rendered as text or `--json`, mirroring
+/// `mv_engine::health::PaneProblem`'s shared-compute, dual-render split.
+struct UsageRow {
+    account: String,
+    /// The joined gauge/grok pieces shown after the account name, or
+    /// `None` for "unknown" (no usage source produced anything).
+    usage: Option<String>,
+    /// [`grok_breaker_suffix`]'s own text with its leading `" · "`
+    /// stripped, or `None` when there is none.
+    status: Option<String>,
+    /// The WARN line's trailing message (session-volume warning), if any.
+    warn: Option<String>,
+}
+
+impl LiveConfig {
+    /// The structured form of [`AccountsSource::usage`]'s bare (no
+    /// `--detail`) listing — the same gauge/grok-summary/breaker-suffix
+    /// computation the text table has always used, kept exactly once so
+    /// `render_usage_text`/`render_usage_json` cannot drift apart.
+    fn usage_rows(&self) -> Vec<UsageRow> {
+        let mut accounts: Vec<_> = self.config.accounts.values().collect();
+        accounts.sort_by(|a, b| a.name.cmp(&b.name));
+        accounts
+            .into_iter()
+            .map(|account| {
+                let read_only =
+                    std::env::var("MULTIVERSE_READ_ONLY").is_ok_and(|value| value == "1");
+                let gauge = if matches!(account.vendor.as_str(), "grok" | "claude") {
+                    mv_state::gauge::load(&self.state_dir).remove(&account.pool)
+                } else if matches!(account.vendor.as_str(), "codex" | "chatgpt") {
+                    account.config_dir.value().and_then(|dir| {
+                        let reading = if read_only {
+                            limits::read_codex_usage(Path::new(dir))
+                        } else {
+                            limits::read_and_record_codex_usage(
+                                Path::new(dir),
+                                &self.state_dir,
+                                &account.pool,
+                            )
+                        }?;
+                        Some(GaugeEntry {
+                            percent_left: Some(reading.primary_percent_left),
+                            label: Some("primary window".into()),
+                            ..Default::default()
+                        })
+                    })
+                } else {
+                    None
+                };
+                let grok_summary = (account.vendor == "grok")
+                    .then(|| account.config_dir.value())
+                    .flatten()
+                    .and_then(|home| mv_engine::grok_usage::summarize(Path::new(home)));
+                let status = if account.vendor == "grok" {
+                    grok_breaker_suffix(&self.state_dir, &account.pool)
+                        .strip_prefix(" · ")
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
+
+                let mut pieces = Vec::new();
+                if let Some(gauge) = gauge.as_ref() {
+                    if account.vendor == "claude" {
+                        if let Some(piece) = format_claude_usage_piece(gauge) {
+                            pieces.push(piece);
+                        }
+                    } else if let Some(left) = gauge.percent_left {
+                        let mut piece = format!("{}% left", display_percent(left));
+                        if let Some(label) = gauge.label.as_ref().filter(|label| !label.is_empty())
+                        {
+                            piece.push_str(&format!(" · {label}"));
+                        }
+                        pieces.push(piece);
+                    }
+                }
+                if let Some(summary) = grok_summary.as_ref() {
+                    pieces.push(format_grok_usage_summary(summary));
+                }
+
+                let usage = (!pieces.is_empty()).then(|| pieces.join(" · "));
+                let warn = grok_summary.as_ref().and_then(|summary| {
+                    (summary.last_24h.sessions > u64::from(account.usage_warn_sessions_per_day))
+                        .then(|| {
+                            format!(
+                                "{} sessions in 24h exceeds usage_warn_sessions_per_day={}",
+                                summary.last_24h.sessions, account.usage_warn_sessions_per_day
+                            )
+                        })
+                });
+
+                UsageRow {
+                    account: account.name.clone(),
+                    usage,
+                    status,
+                    warn,
+                }
+            })
+            .collect()
+    }
+}
+
+/// [`UsageRow`] rendered as `accounts usage`'s historical plain-text
+/// table — byte-identical to the pre-`--json` output.
+fn render_usage_text(rows: &[UsageRow]) -> Vec<String> {
+    let mut lines = vec![format!("{:<18} USAGE", "ACCOUNT")];
+    for row in rows {
+        let suffix = row
+            .status
+            .as_deref()
+            .map(|status| format!(" · {status}"))
+            .unwrap_or_default();
+        match &row.usage {
+            Some(usage) => lines.push(format!("{:<18} {usage}{suffix}", row.account)),
+            None => lines.push(format!("{:<18} unknown{suffix}", row.account)),
+        }
+        if let Some(warn) = &row.warn {
+            lines.push(format!("{:<18} WARN: {warn}", ""));
+        }
+    }
+    lines
+}
+
+/// [`UsageRow`] rendered as one line of JSON: an array of flat objects,
+/// alphabetical keys, matching `mv_engine::health::problems_json`'s own
+/// shape convention (one object per listed row, `null` for "no data").
+fn render_usage_json(rows: &[UsageRow]) -> String {
+    let items: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{{\"account\": {}, \"status\": {}, \"usage\": {}, \"warn\": {}}}",
+                super::workers::json_escape(&row.account),
+                row.status
+                    .as_deref()
+                    .map_or_else(|| "null".to_owned(), super::workers::json_escape),
+                row.usage
+                    .as_deref()
+                    .map_or_else(|| "null".to_owned(), super::workers::json_escape),
+                row.warn
+                    .as_deref()
+                    .map_or_else(|| "null".to_owned(), super::workers::json_escape),
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// `accounts usage --detail ACCOUNT --json`: one JSON object with the
+/// per-day/per-project tables as typed arrays straight from
+/// `mv_engine::grok_usage::UsageDetail` (field names unchanged: `day`/
+/// `sessions`/`estimated_tokens`, `project`/`sessions`/`estimated_tokens`)
+/// — `by_day`/`by_project` are `null` together with a `reason` naming why
+/// (`"unsupported_vendor"` or `"no_sessions"`), never a partial pair.
+fn render_usage_detail_json(account: &Account) -> String {
+    let no_detail = |reason: &str| {
+        format!(
+            "{{\"account\": {}, \"by_day\": null, \"by_project\": null, \"reason\": {}, \"vendor\": {}}}",
+            super::workers::json_escape(&account.name),
+            super::workers::json_escape(reason),
+            super::workers::json_escape(&account.vendor),
+        )
+    };
+    if account.vendor != "grok" {
+        return no_detail("unsupported_vendor");
+    }
+    let detail = account
+        .config_dir
+        .value()
+        .and_then(|home| mv_engine::grok_usage::detail(Path::new(home)));
+    let Some(detail) = detail else {
+        return no_detail("no_sessions");
+    };
+    let by_day: Vec<String> = detail
+        .by_day
+        .iter()
+        .map(|day| {
+            format!(
+                "{{\"day\": {}, \"estimated_tokens\": {}, \"sessions\": {}}}",
+                super::workers::json_escape(&day.day),
+                day.estimated_tokens,
+                day.sessions
+            )
+        })
+        .collect();
+    let by_project: Vec<String> = detail
+        .by_project
+        .iter()
+        .map(|project| {
+            format!(
+                "{{\"estimated_tokens\": {}, \"project\": {}, \"sessions\": {}}}",
+                project.estimated_tokens,
+                super::workers::json_escape(&project.project),
+                project.sessions
+            )
+        })
+        .collect();
+    format!(
+        "{{\"account\": {}, \"by_day\": [{}], \"by_project\": [{}], \"reason\": null, \"vendor\": {}}}",
+        super::workers::json_escape(&account.name),
+        by_day.join(", "),
+        by_project.join(", "),
+        super::workers::json_escape(&account.vendor),
+    )
+}
+
 /// Every configured project's resolved path — [`seatstate::
 /// nexus_agent_names`]'s own fleet scope, matching `commands::dispatch`'s
 /// `is_nexus_role` exclusion (card `20261115-b-234610`): a project still on
@@ -246,6 +465,13 @@ impl AccountsSource for LiveConfig {
         // `commands::dispatch`'s `is_nexus_role` already applies — resolved
         // once per listing from the routing log, not per account.
         let nexus_agents = seatstate::nexus_agent_names(&project_roots(&self.config));
+        // Sweep's cap/resume escalation (`breaker::write_evidence`, called
+        // from `sweep_nudges.rs`) writes into whichever project it was
+        // sweeping, so a pool's evidence can land under any configured
+        // project — the same scope `nexus_agents` above already reads.
+        let project_root_bufs = project_roots(&self.config);
+        let evidence_roots: Vec<&Path> = project_root_bufs.iter().map(PathBuf::as_path).collect();
+        let now = mv_core::time::now_utc();
 
         for account in accounts {
             if !read_only {
@@ -276,6 +502,18 @@ impl AccountsSource for LiveConfig {
                 account.config_dir_var,
                 account.config_dir.as_raw()
             ));
+
+            // Evidence only, never an automatic trip (card
+            // `20261118-b-75220a` step 1) — an operator decides by hand.
+            if let Some(evidence) = breaker::recent_evidence(&evidence_roots, &account.pool, now) {
+                lines.push(format!(
+                    "{:<18} ⚠ {} sweep escalation(s) since {}, latest: {}",
+                    "",
+                    evidence.count,
+                    mv_core::time::format_seconds_utc(evidence.earliest_at),
+                    evidence.latest_path.display(),
+                ));
+            }
 
             if let Some(entry) = gauges.get(&account.pool) {
                 for detail in quota_lines(entry) {
@@ -391,84 +629,18 @@ impl AccountsSource for LiveConfig {
         Ok(lines)
     }
 
-    fn usage(&self, detail: Option<&str>) -> Result<Vec<String>, Failure> {
+    /// `json`: [`render_usage_json`] instead of [`render_usage_text`],
+    /// both built from the same [`LiveConfig::usage_rows`] computation.
+    fn usage(&self, detail: Option<&str>, json: bool) -> Result<Vec<String>, Failure> {
         if let Some(name) = detail {
-            return self.usage_detail(name);
+            return self.usage_detail(name, json);
         }
-        let mut lines = vec![format!("{:<18} USAGE", "ACCOUNT")];
-        let mut accounts: Vec<_> = self.config.accounts.values().collect();
-        accounts.sort_by(|a, b| a.name.cmp(&b.name));
-        for account in accounts {
-            let read_only = std::env::var("MULTIVERSE_READ_ONLY").is_ok_and(|value| value == "1");
-            let gauge = if matches!(account.vendor.as_str(), "grok" | "claude") {
-                mv_state::gauge::load(&self.state_dir).remove(&account.pool)
-            } else if matches!(account.vendor.as_str(), "codex" | "chatgpt") {
-                account.config_dir.value().and_then(|dir| {
-                    let reading = if read_only {
-                        limits::read_codex_usage(Path::new(dir))
-                    } else {
-                        limits::read_and_record_codex_usage(
-                            Path::new(dir),
-                            &self.state_dir,
-                            &account.pool,
-                        )
-                    }?;
-                    Some(GaugeEntry {
-                        percent_left: Some(reading.primary_percent_left),
-                        label: Some("primary window".into()),
-                        ..Default::default()
-                    })
-                })
-            } else {
-                None
-            };
-            let grok_summary = (account.vendor == "grok")
-                .then(|| account.config_dir.value())
-                .flatten()
-                .and_then(|home| mv_engine::grok_usage::summarize(Path::new(home)));
-            let suffix = if account.vendor == "grok" {
-                grok_breaker_suffix(&self.state_dir, &account.pool)
-            } else {
-                String::new()
-            };
-
-            let mut pieces = Vec::new();
-            if let Some(gauge) = gauge.as_ref() {
-                if account.vendor == "claude" {
-                    if let Some(piece) = format_claude_usage_piece(gauge) {
-                        pieces.push(piece);
-                    }
-                } else if let Some(left) = gauge.percent_left {
-                    let mut piece = format!("{}% left", display_percent(left));
-                    if let Some(label) = gauge.label.as_ref().filter(|label| !label.is_empty()) {
-                        piece.push_str(&format!(" · {label}"));
-                    }
-                    pieces.push(piece);
-                }
-            }
-            if let Some(summary) = grok_summary.as_ref() {
-                pieces.push(format_grok_usage_summary(summary));
-            }
-
-            if pieces.is_empty() {
-                lines.push(format!("{:<18} unknown{suffix}", account.name));
-            } else {
-                lines.push(format!(
-                    "{:<18} {}{suffix}",
-                    account.name,
-                    pieces.join(" · ")
-                ));
-            }
-            if let Some(summary) = grok_summary.as_ref() {
-                if summary.last_24h.sessions > u64::from(account.usage_warn_sessions_per_day) {
-                    lines.push(format!(
-                        "{:<18} WARN: {} sessions in 24h exceeds usage_warn_sessions_per_day={}",
-                        "", summary.last_24h.sessions, account.usage_warn_sessions_per_day
-                    ));
-                }
-            }
-        }
-        Ok(lines)
+        let rows = self.usage_rows();
+        Ok(if json {
+            vec![render_usage_json(&rows)]
+        } else {
+            render_usage_text(&rows)
+        })
     }
 
     fn limit(&self, seat: &str, cap: Option<u32>) -> Result<(), Failure> {
@@ -621,6 +793,9 @@ pub(crate) fn account_state(
                 );
             }
             Some(open) if open >= cap => {
+                // Pinned by conformance (`accounts-open-agent-cap`): the
+                // Python reference prints exactly this, so the fix lever
+                // stays out of the STATE column.
                 return format!("at cap: {open}/{cap} open agents");
             }
             Some(_) => {}
@@ -777,6 +952,10 @@ fn format_grok_usage_summary(summary: &mv_engine::grok_usage::UsageSummary) -> S
 }
 
 /// `cli.py` `_grok_breaker_suffix`: `" · FENCED — ..."` on the usage line.
+///
+/// Scout `67a619`#5: the manual-fence/no-automatic-reset case names the
+/// pool and gives the same fix instruction `breaker::describe` gives in
+/// the plain `accounts` listing, rather than diverging from it.
 fn grok_breaker_suffix(state_dir: &Path, pool: &str) -> String {
     let status = breaker::pool_status(state_dir, pool);
     if !status.open {
@@ -789,7 +968,10 @@ fn grok_breaker_suffix(state_dir: &Path, pool: &str) -> String {
     };
     let mut detail = match status.reset_at {
         Some(reset) if reset.year() == breaker::NO_AUTOMATIC_RESET_YEAR => {
-            "breaker open, no automatic reset".to_owned()
+            format!(
+                "breaker open for pool '{pool}': no automatic reset — a human has to \
+                 resolve this and run `accounts reset`"
+            )
         }
         Some(reset) => format!(
             "breaker open, resets {}",
@@ -979,8 +1161,12 @@ fn reset_confirmation(pool: &str, status: &breaker::BreakerStatus) -> Vec<String
 /// no-op Python takes when `listing.ok` is false. Returns
 /// `{project}:{pane}` labels, sorted, for the exemption line.
 fn snapshot_stranded_panes(config: &Config, pool: &str) -> Vec<String> {
-    let Ok(listing) = mv_engine::mv_herdr::run::run(&mv_engine::mv_herdr::argv::agent_list(), None)
-    else {
+    let Ok(listing) = mv_engine::mv_herdr::run::run(
+        &mv_engine::mv_herdr::argv::agent_list(),
+        Some(std::time::Duration::from_secs_f64(
+            mv_engine::mv_herdr::argv::LISTING_TIMEOUT_SECONDS,
+        )),
+    ) else {
         return Vec::new();
     };
     if !listing.ok() {
@@ -1127,7 +1313,10 @@ fn run_with(args: &ArgMatches, source: &dyn AccountsSource) -> Result<(), Failur
             source.limit(seat, cap)
         }
         "usage" => {
-            for line in source.usage(sub.get_one::<String>("detail").map(String::as_str))? {
+            for line in source.usage(
+                sub.get_one::<String>("detail").map(String::as_str),
+                sub.get_flag("json"),
+            )? {
                 println!("{line}");
             }
             Ok(())
@@ -1189,7 +1378,7 @@ mod tests {
             *self.limited.borrow_mut() = Some((seat.into(), cap));
             Ok(())
         }
-        fn usage(&self, _detail: Option<&str>) -> Result<Vec<String>, Failure> {
+        fn usage(&self, _detail: Option<&str>, _json: bool) -> Result<Vec<String>, Failure> {
             Ok(vec!["seat-a: 42% used".into()])
         }
         fn lend(&self, seat: &str, lend: bool) -> Result<(), Failure> {
@@ -1336,7 +1525,7 @@ mod tests {
         // `ACCOUNT            USAGE` then `<name>              unknown`.
         let dir = tempfile::tempdir().unwrap();
         let live = two_seat_live_config(dir.path());
-        let lines = live.usage(None).unwrap();
+        let lines = live.usage(None, false).unwrap();
         assert_eq!(lines[0], format!("{:<18} USAGE", "ACCOUNT"));
         assert!(
             lines.iter().any(|line| line.ends_with(" unknown")),
@@ -1366,7 +1555,7 @@ mod tests {
         })
         .unwrap();
         assert!(live
-            .usage(None)
+            .usage(None, false)
             .unwrap()
             .iter()
             .any(|line| line.contains("42% left · daily window")));
@@ -1392,7 +1581,7 @@ mod tests {
             );
         })
         .unwrap();
-        let lines = live.usage(None).unwrap();
+        let lines = live.usage(None, false).unwrap();
         assert!(
             lines
                 .iter()
@@ -1435,7 +1624,7 @@ mod tests {
             grok_home.to_string_lossy().into_owned(),
         );
         account.usage_warn_sessions_per_day = 0;
-        let lines = live.usage(None).unwrap();
+        let lines = live.usage(None, false).unwrap();
         assert!(
             lines.iter().any(|line| {
                 line.contains("24h: 1 session") && line.contains("tokens (estimate)")
@@ -1450,8 +1639,10 @@ mod tests {
         );
     }
 
-    /// Row #41 remainder: Grok open breaker suffix uses FENCED / FENCED
-    /// (manual), not `breaker::describe`'s pool-prefixed listing text.
+    /// Scout `67a619`#5: the Grok open-breaker suffix uses FENCED / FENCED
+    /// (manual), but for the no-automatic-reset case must still name the
+    /// pool and give the same fix instruction `breaker::describe`'s
+    /// pool-prefixed listing text gives — not diverge from it.
     #[test]
     fn usage_grok_fenced_suffix_names_manual_fence() {
         let dir = tempfile::tempdir().unwrap();
@@ -1459,22 +1650,27 @@ mod tests {
         live.config.accounts.get_mut("scout-2").unwrap().vendor = "grok".into();
         let pool = live.config.accounts["scout-2"].pool.clone();
         breaker::manual_trip(dir.path(), &pool, "grok", Some("budget"), None).unwrap();
-        let lines = live.usage(None).unwrap();
+        let lines = live.usage(None, false).unwrap();
         let line = lines
             .iter()
             .find(|line| line.starts_with("scout-2 "))
             .cloned()
             .unwrap();
         assert!(line.contains("FENCED (manual)"), "{line}");
-        assert!(line.contains("breaker open, no automatic reset"), "{line}");
-        assert!(!line.contains("breaker open for pool"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "breaker open for pool '{pool}': no automatic reset"
+            )),
+            "{line}"
+        );
+        assert!(line.contains("run `accounts reset`"), "{line}");
     }
 
     #[test]
     fn usage_detail_unknown_account_is_needs_config() {
         let dir = tempfile::tempdir().unwrap();
         let live = two_seat_live_config(dir.path());
-        let err = live.usage(Some("no-such-account")).unwrap_err();
+        let err = live.usage(Some("no-such-account"), false).unwrap_err();
         assert_eq!(err.code(), 3);
         assert!(err.to_string().contains("unknown account"));
     }
@@ -1483,8 +1679,213 @@ mod tests {
     fn usage_detail_refuses_a_non_grok_account() {
         let dir = tempfile::tempdir().unwrap();
         let live = two_seat_live_config(dir.path());
-        let lines = live.usage(Some("scout-1")).unwrap();
+        let lines = live.usage(Some("scout-1"), false).unwrap();
         assert!(lines.iter().any(|l| l.contains("only grok")), "{lines:?}");
+    }
+
+    fn json_escape(value: &str) -> String {
+        crate::commands::workers::json_escape(value)
+    }
+
+    /// Proof for Scout finding `20261117-scout-c950ad`#4: bare `accounts
+    /// usage --json` carries the same per-account data the text table
+    /// does — one object per row, every documented key present, `null`
+    /// where the text shows "unknown"/no suffix/no WARN line.
+    #[test]
+    fn usage_json_includes_every_key_and_matches_the_text_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = two_seat_live_config(dir.path());
+        live.config.accounts.get_mut("scout-1").unwrap().vendor = "claude".into();
+        let pool = live.config.accounts["scout-1"].pool.clone();
+        mv_state::gauge::with_locked(dir.path(), |map| {
+            map.insert(
+                pool,
+                GaugeEntry {
+                    percent_left: Some(42.0),
+                    resets_at: Some("2026-11-05T12:00:00Z".into()),
+                    label: Some("session".into()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+        let lines = live.usage(None, true).unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "--json must print exactly one line: {lines:?}"
+        );
+        let json = &lines[0];
+        assert!(
+            !json.contains('\n'),
+            "json output must be a single line: {json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(json).expect("valid json");
+        let rows = value.as_array().expect("top-level array");
+        assert_eq!(rows.len(), 2, "{json}");
+
+        let scout1 = rows
+            .iter()
+            .find(|row| row["account"] == "scout-1")
+            .expect("scout-1 row");
+        for key in ["account", "status", "usage", "warn"] {
+            assert!(scout1.get(key).is_some(), "missing key {key:?}: {json}");
+        }
+        assert!(
+            scout1["usage"]
+                .as_str()
+                .is_some_and(|usage| usage.contains("58% used")),
+            "{json}"
+        );
+        assert_eq!(scout1["status"], serde_json::Value::Null);
+        assert_eq!(scout1["warn"], serde_json::Value::Null);
+
+        let scout2 = rows
+            .iter()
+            .find(|row| row["account"] == "scout-2")
+            .expect("scout-2 row");
+        assert_eq!(scout2["usage"], serde_json::Value::Null, "{json}");
+        assert_eq!(scout2["status"], serde_json::Value::Null);
+        assert_eq!(scout2["warn"], serde_json::Value::Null);
+    }
+
+    /// Same fixture `usage_grok_fenced_suffix_names_manual_fence` text
+    /// checks, through `--json`'s `status` field instead of the suffix
+    /// appended to the text line.
+    #[test]
+    fn usage_json_reports_the_fenced_status_separately_from_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = two_seat_live_config(dir.path());
+        live.config.accounts.get_mut("scout-2").unwrap().vendor = "grok".into();
+        let pool = live.config.accounts["scout-2"].pool.clone();
+        breaker::manual_trip(dir.path(), &pool, "grok", Some("budget"), None).unwrap();
+        let lines = live.usage(None, true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let scout2 = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["account"] == "scout-2")
+            .expect("scout-2 row");
+        let status = scout2["status"].as_str().expect("status present");
+        assert!(status.contains("FENCED (manual)"), "{status}");
+        assert!(
+            status.contains(&format!(
+                "breaker open for pool '{pool}': no automatic reset"
+            )),
+            "{status}"
+        );
+        assert!(
+            !status.starts_with(" ·"),
+            "leading separator must be stripped: {status:?}"
+        );
+    }
+
+    /// `accounts usage --detail ACCOUNT --json` for a non-grok seat: no
+    /// table source exists, so `by_day`/`by_project` stay `null` together
+    /// with a `reason` naming why — never a partial pair.
+    #[test]
+    fn usage_detail_json_reports_unsupported_vendor_for_a_non_grok_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = two_seat_live_config(dir.path());
+        live.config.accounts.get_mut("scout-1").unwrap().vendor = "claude".into();
+        let lines = live.usage(Some("scout-1"), true).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(value["account"], "scout-1");
+        assert_eq!(value["vendor"], "claude");
+        assert_eq!(value["by_day"], serde_json::Value::Null);
+        assert_eq!(value["by_project"], serde_json::Value::Null);
+        assert_eq!(value["reason"], "unsupported_vendor");
+    }
+
+    /// A grok seat with no sessions in the window: still `null`/`null`,
+    /// with `reason` naming the other "no table" case.
+    #[test]
+    fn usage_detail_json_reports_no_sessions_for_a_grok_account_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = two_seat_live_config(dir.path());
+        live.config.accounts.get_mut("scout-2").unwrap().vendor = "grok".into();
+        let lines = live.usage(Some("scout-2"), true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(value["account"], "scout-2");
+        assert_eq!(value["vendor"], "grok");
+        assert_eq!(value["by_day"], serde_json::Value::Null);
+        assert_eq!(value["by_project"], serde_json::Value::Null);
+        assert_eq!(value["reason"], "no_sessions");
+    }
+
+    /// Same grok-session fixture `usage_appends_grok_session_estimate_and_
+    /// warn` builds for the text table, read back through `--detail
+    /// --json`'s typed `by_day`/`by_project` arrays — field names taken
+    /// straight from `mv_engine::grok_usage::{DailyUsage,ProjectUsage}`.
+    #[test]
+    fn usage_detail_json_reports_day_and_project_tables_for_a_grok_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let grok_home = dir.path().join("grok");
+        let session = mv_engine::grok_usage::session_dir(&grok_home, "/home/dev/Code/demo", "s1");
+        std::fs::create_dir_all(&session).unwrap();
+        let created = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            session.join("summary.json"),
+            format!(r#"{{"cwd":"/home/dev/Code/demo","created_at":"{created}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("events.jsonl"),
+            "{\"type\":\"loop_started\"}\n",
+        )
+        .unwrap();
+        std::fs::write(session.join("chat_history.jsonl"), "xxxxxxxx").unwrap();
+
+        let mut live = two_seat_live_config(dir.path());
+        let account = live.config.accounts.get_mut("scout-2").unwrap();
+        account.vendor = "grok".into();
+        account.config_dir = mv_config::placeholder::MaybePlaceholder::parse(
+            grok_home.to_string_lossy().into_owned(),
+        );
+
+        let lines = live.usage(Some("scout-2"), true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(value["reason"], serde_json::Value::Null);
+        let by_day = value["by_day"].as_array().expect("by_day array");
+        assert_eq!(by_day.len(), 1, "{by_day:?}");
+        for key in ["day", "estimated_tokens", "sessions"] {
+            assert!(by_day[0].get(key).is_some(), "missing by_day key {key:?}");
+        }
+        assert_eq!(by_day[0]["sessions"], 1);
+        let by_project = value["by_project"].as_array().expect("by_project array");
+        assert_eq!(by_project.len(), 1, "{by_project:?}");
+        for key in ["estimated_tokens", "project", "sessions"] {
+            assert!(
+                by_project[0].get(key).is_some(),
+                "missing by_project key {key:?}"
+            );
+        }
+        assert_eq!(by_project[0]["project"], "demo");
+    }
+
+    #[test]
+    fn usage_json_escapes_quotes_and_backslashes() {
+        assert_eq!(json_escape("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    /// Scout finding `20261117-scout-9077fc`#3: `limit`/`lend`/`prefer`'s
+    /// shared `seat_name` lookup used to map an unknown seat to
+    /// `Failure::Operation` (exit 1), unlike `usage_detail`'s identical
+    /// "name not in config" lookup in this same file, which already used
+    /// `Failure::Config`/`AccountSelection` (exit 3). Revert-checked: this
+    /// failed (`code 1`) while `seat_name`'s mapping was still `Operation`.
+    #[test]
+    fn limit_with_an_unknown_seat_is_account_selection_not_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = two_seat_live_config(dir.path());
+        let err = live.limit("ghost-seat", None).unwrap_err();
+        assert_eq!(err.code(), 3);
+        assert!(err.to_string().contains("unknown seat"));
     }
 
     fn two_seat_live_config(state_dir: &Path) -> LiveConfig {
@@ -2290,5 +2691,112 @@ path = {:?}
             .join(".multiverse")
             .join(nudge_memory::STRANDED_TRIP_MEMORY_FILENAME)
             .exists());
+    }
+
+    /// One account on `pool`, with a real (non-placeholder) project path —
+    /// evidence lives under `project/.multiverse/evidence`, so the listing
+    /// needs a resolvable project root to find it at all.
+    fn live_config_with_project(state_dir: &Path, project: &Path, pool: &str) -> LiveConfig {
+        let content = format!(
+            r#"
+[accounts.seat-a]
+kind = "codex"
+config_dir_var = "CODEX_HOME"
+config_dir = "<<PLACEHOLDER: path>>"
+pool = "{pool}"
+
+[projects.sandbox]
+path = {:?}
+"#,
+            project.to_str().unwrap()
+        );
+        let config =
+            load::load_config_str(&content, Path::new("config.toml")).expect("valid fixture");
+        LiveConfig {
+            config,
+            state_dir: state_dir.to_path_buf(),
+        }
+    }
+
+    /// Card `20261118-b-75220a` step 1: zero evidence must leave the
+    /// listing's output exactly as it already reads (conformance pins it).
+    #[test]
+    fn list_prints_no_evidence_line_with_zero_evidence_files() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let live = live_config_with_project(state_dir.path(), project.path(), "codex:solo");
+
+        let lines = live.list().unwrap();
+        assert!(!lines.iter().any(|l| l.contains("sweep escalation")));
+    }
+
+    #[test]
+    fn list_surfaces_recent_sweep_escalation_evidence_for_the_matching_pool_only() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let live = live_config_with_project(state_dir.path(), project.path(), "codex:solo");
+        let now = mv_core::time::now_utc();
+        let latest = breaker::write_evidence(
+            project.path(),
+            "codex:solo",
+            now - time::Duration::hours(2),
+            "first",
+        )
+        .unwrap();
+        breaker::write_evidence(
+            project.path(),
+            "codex:solo",
+            now - time::Duration::days(1),
+            "second",
+        )
+        .unwrap();
+        // A different pool's own evidence must not show up under this
+        // account, and must not count toward its total.
+        breaker::write_evidence(
+            project.path(),
+            "codex:other",
+            now - time::Duration::hours(1),
+            "unrelated pool",
+        )
+        .unwrap();
+
+        let lines = live.list().unwrap();
+        let warn = lines
+            .iter()
+            .find(|l| l.contains("sweep escalation"))
+            .unwrap_or_else(|| panic!("no evidence line in {lines:?}"));
+        assert!(warn.contains("2 sweep escalation(s) since"), "{warn}");
+        assert!(warn.contains(&latest.display().to_string()), "{warn}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("sweep escalation"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    /// Only evidence from the last 7 days counts (`breaker::
+    /// EVIDENCE_WINDOW`) — an 8-day-old file must not surface at all.
+    #[test]
+    fn list_does_not_count_evidence_older_than_the_evidence_window() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let live = live_config_with_project(state_dir.path(), project.path(), "codex:solo");
+        let now = mv_core::time::now_utc();
+        breaker::write_evidence(
+            project.path(),
+            "codex:solo",
+            now - time::Duration::days(8),
+            "stale",
+        )
+        .unwrap();
+
+        let lines = live.list().unwrap();
+        assert!(
+            !lines.iter().any(|l| l.contains("sweep escalation")),
+            "{lines:?}"
+        );
     }
 }

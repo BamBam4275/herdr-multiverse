@@ -39,17 +39,20 @@
 //! reuses the listing snapshot; reclamation still requires a fresh idle/done
 //! observation with the exact dispatched name before a pane can close.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
+use mv_config::roles::Role;
 use mv_engine::breaker::{self, BreakerKind};
 use mv_engine::limits;
 use mv_engine::mv_herdr::envelope::AgentState;
+use mv_engine::runner::naming;
 use mv_state::activity::{self, ProjectLog as ActivityLog};
 use mv_state::index::{records as index_records, Selector};
 use mv_state::tasks::{
-    read_writer_status, AgentPanes, HerdrAgents, LiveAgentStatus, ReconcileRequest, TaskStatus,
+    read_writer_status_verbose, AgentPanes, HerdrAgents, LiveAgentStatus, ReconcileRequest,
+    StatusRead, TaskRef, TaskStatus,
 };
 use time::OffsetDateTime;
 
@@ -66,9 +69,9 @@ const STATE_WIDTH: usize = 11;
 
 /// Everything this reader keeps from one task's `routing.log` history.
 /// `role`/`account` come from the most recent `dispatch` record (ported
-/// from the old `latest_dispatch` helper this replaces); `started_pane`
-/// and `result_status`/`result_line` are `None` until their event is
-/// seen, exactly like a task that never got that far.
+/// from the old `latest_dispatch` helper this replaces); `started_pane`,
+/// `pane_event_pane`, and `result_status`/`result_line` are `None` until
+/// their event is seen, exactly like a task that never got that far.
 #[derive(Debug, Default, Clone)]
 struct TaskEvents {
     role: String,
@@ -78,6 +81,12 @@ struct TaskEvents {
     dispatched_at: Option<OffsetDateTime>,
     started_at: Option<OffsetDateTime>,
     started_pane: Option<String>,
+    /// `event=pane`'s own `pane=` field — written the instant the pane
+    /// exists, before `started_pane` (`record_pane`, Scout 67a619 finding
+    /// 1). The only pane this reader has for a task killed between pane
+    /// creation and `agent start` (card `20261118-b-c328a3` M2) — see
+    /// [`TaskEvents::effective_pane`]'s fallback.
+    pane_event_pane: Option<String>,
     result_status: Option<String>,
     /// 1-indexed line in `routing.log`, shown as `#<N>` next to a
     /// `recorded` task so a human can jump straight to the record. Stale
@@ -85,6 +94,22 @@ struct TaskEvents {
     result_line: Option<usize>,
     corrected: bool,
     acknowledged: Vec<usize>,
+}
+
+impl TaskEvents {
+    /// The pane to treat as "where this task is running": `started_pane`
+    /// when `agent start` recorded one, else the earlier, durable
+    /// `event=pane` line — the only pane recorded for a task killed
+    /// between pane creation and `agent start` (card `20261118-b-c328a3`
+    /// M2). Every direct `started_pane` read in this module that means
+    /// "the task's live pane" goes through this one helper instead, so
+    /// the fallback cannot drift between call sites again (card
+    /// `20261118-b-9226e1`).
+    fn effective_pane(&self) -> Option<&str> {
+        self.started_pane
+            .as_deref()
+            .or(self.pane_event_pane.as_deref())
+    }
 }
 
 /// One pass over `routing.log`'s task-lifecycle events
@@ -139,12 +164,17 @@ fn gather_task_events(root: &Path) -> (HashMap<String, TaskEvents>, Vec<String>)
                         dispatched_at: mv_core::time::parse_flexible(&parsed.when).ok(),
                         started_at: None,
                         started_pane: None,
+                        pane_event_pane: None,
                         result_status: None,
                         result_line: None,
                         corrected: false,
                         acknowledged: Vec::new(),
                     },
                 );
+            }
+            "pane" => {
+                let entry = by_task.entry(task_id).or_default();
+                entry.pane_event_pane = parsed.fields.get("pane").cloned();
             }
             "started" => {
                 let entry = by_task.entry(task_id).or_default();
@@ -228,9 +258,17 @@ fn display_row(row: &Row) -> (String, Option<String>) {
 /// and `stalled` (flagged) when explicitly not working; anything else is
 /// `awaiting` (flagged) — uncertain, not dead, because the result (if
 /// any) is sitting unread in a pane this reader never had a way to check.
+///
+/// A fifth outcome, `garbled` (flagged), always wins over `running`/
+/// `stalled`/`awaiting`: a status file holding a token outside
+/// `done`/`blocked`/`failed` is never shown as merely running, no matter
+/// what the live pane reports — card `20261117-b-437eeb`. `--close-stranded`
+/// can record a terminal outcome for it (see `is_garbled_status_candidate`
+/// in `mv_state::tasks`).
 fn classify(
     events: Option<&TaskEvents>,
     file_status: Option<TaskStatus>,
+    unrecognized_status: Option<&str>,
     live: Option<&[LiveAgentStatus]>,
 ) -> (&'static str, String, bool, Option<String>) {
     if let Some(events) = events {
@@ -247,7 +285,21 @@ fn classify(
             return ("recorded", suffix, flagged, None);
         }
     }
-    let started_pane = events.and_then(|events| events.started_pane.as_deref());
+    if let Some(raw) = unrecognized_status {
+        let token = mv_board::layout::truncate(raw, 80);
+        let note = format!(
+            "status file holds an unrecognized value ('{token}'): neither empty (still running) \
+             nor one of done/blocked/failed — needs a human look, not an assumption either way. \
+             `--close-stranded` can record a terminal outcome for it."
+        );
+        return ("garbled", DASH.to_string(), true, Some(note));
+    }
+    // A kill between pane creation and `agent start` leaves only
+    // `event=pane` (`started_pane` is `None`), but Herdr still lists
+    // that pane live under the dispatched agent — falling back to it
+    // here is what keeps that crash window classifying running/stalled
+    // instead of a lying "awaiting" (card `20261118-b-c328a3` M2).
+    let started_pane = events.and_then(TaskEvents::effective_pane);
     let pane_is_live = live.is_some_and(|agents| {
         started_pane.is_some_and(|pane| agents.iter().any(|agent| agent.pane_id == pane))
     });
@@ -594,6 +646,31 @@ pub fn run(args: &ArgMatches) -> Result<(), Failure> {
     run_with(args, &mut HerdrAgents)
 }
 
+/// Resolves `tasks`'s requested project tokens the same way `backlog
+/// list`'s own tokens resolve (`backlog::resolve_named_project`): a literal
+/// `[projects.<name>]` key first, else `.`, a relative path, or an
+/// absolute path resolved against `cwd` (card `20261117-b-486a55` — `tasks`
+/// used to require an exact config key, with no path handling at all, so
+/// `tasks .` failed with "no such project: ." even from inside a
+/// configured project's own directory). Returns the resolved
+/// [`mv_config::load::Project`] for every token that resolves, and every
+/// token that resolves to nothing, in request order.
+fn resolve_requested_projects<'a>(
+    config: &mv_config::load::Config,
+    cwd: Option<&Path>,
+    requested: &'a [String],
+) -> (Vec<mv_config::load::Project>, Vec<&'a String>) {
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut unknown = Vec::new();
+    for name in requested {
+        match super::backlog::resolve_named_project(config, cwd, name) {
+            Some(project) => resolved.push(project),
+            None => unknown.push(name),
+        }
+    }
+    (resolved, unknown)
+}
+
 /// `run`'s own body, with the one live seam (`--reconcile`'s pane-liveness
 /// check) injected — mirrors `sweep::run_with`'s split for the same reason:
 /// a test can hand this a scripted [`AgentPanes`] instead of `HerdrAgents`,
@@ -622,11 +699,8 @@ fn run_with(args: &ArgMatches, agents: &mut impl AgentPanes) -> Result<(), Failu
 
     if !named.is_empty() {
         let config = super::load_config(args)?;
-        let unknown: Vec<&str> = named
-            .iter()
-            .filter(|name| !config.projects.contains_key(*name))
-            .map(String::as_str)
-            .collect();
+        let cwd = std::env::current_dir().ok();
+        let (resolved, unknown) = resolve_requested_projects(&config, cwd.as_deref(), &named);
         if !unknown.is_empty() {
             let mut known: Vec<&str> = config.projects.keys().map(String::as_str).collect();
             known.sort_unstable();
@@ -635,27 +709,31 @@ fn run_with(args: &ArgMatches, agents: &mut impl AgentPanes) -> Result<(), Failu
             } else {
                 known.join(", ")
             };
+            let unknown = unknown
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(Failure::Config(format!(
-                "no such project: {}; configured: {known} (see `multiverse projects`)",
-                unknown.join(", ")
+                "no such project: {unknown}; configured: {known} (see `multiverse projects`)"
             )));
         }
-        if args.get_one::<String>("task").is_some() && named.len() != 1 {
+        let names: Vec<String> = resolved.iter().map(|p| p.name.clone()).collect();
+        if args.get_one::<String>("task").is_some() && names.len() != 1 {
             return Err(Failure::Config(format!(
                 "--task reconciles one task in one project; name exactly one (got {}: {}).",
-                named.len(),
-                named.join(", ")
+                names.len(),
+                names.join(", ")
             )));
         }
         if reconcile && !read_only_mode(args) {
-            sync_seat_outages_if_hub_in_scope(&config, &named, args);
+            sync_seat_outages_if_hub_in_scope(&config, &names, args);
         }
-        for name in &named {
-            let project = config.projects.get(name).expect("unknown names refused");
+        for project in &resolved {
             match project_path(project) {
-                Some(root) => list(root, Some(name), args, agents, Some(&config))?,
+                Some(root) => list(root, Some(&project.name), args, agents, Some(&config))?,
                 None => {
-                    println!("\n{name}");
+                    println!("\n{}", project.name);
                     println!("    (path not yet configured)");
                 }
             }
@@ -885,15 +963,31 @@ fn build_rows(
                     .unwrap_or(task_id.as_str())
             })
             .unwrap_or(task_id);
-        let file_status = read_writer_status(
+        let since = events.and_then(|e| e.started_at.or(e.dispatched_at));
+        let (file_status, unrecognized_status) = match read_writer_status_verbose(
             root,
-            task_id,
-            lane_id,
-            events.and_then(|e| e.started_at.or(e.dispatched_at)),
-        );
+            TaskRef {
+                task_id,
+                lane_task_id: lane_id,
+            },
+            since,
+        ) {
+            StatusRead::Terminal(status) => (Some(status), None),
+            StatusRead::Unrecognized(raw) => (None, Some(raw)),
+            StatusRead::Absent => (None, None),
+        };
 
-        let (state, suffix, flagged, mut note) = classify(events, file_status, live);
+        let (state, suffix, flagged, mut note) =
+            classify(events, file_status, unrecognized_status.as_deref(), live);
         if state == "running" {
+            // A healthy, working agent (or one Herdr can't currently be
+            // asked about at all — the `live.is_none()` case `classify`
+            // also routes here) is never "possibly frozen" on age alone —
+            // a Builder routinely runs for hours. Scout 342332 finding
+            // 4's own age-only gate here (reverted: frozen-pane rework)
+            // flagged nearly every healthy lane. The real signal lives in
+            // the `stalled` branch below, where Herdr actually reports the
+            // pane idle/done — not working.
             if let Some(events) = events {
                 let elapsed = events
                     .dispatched_at
@@ -902,6 +996,47 @@ fn build_rows(
                     .map(mv_state::tasks::format_elapsed)
                     .unwrap_or_else(|| "unknown".into());
                 note = Some(format!("dispatched {elapsed} ago, still running as {} — and still spending. Nothing here will stop it.", python_repr(&events.agent)));
+            }
+        } else if state == "stalled" {
+            // Frozen-pane rework (Scout 342332 finding 4, reworked): gate
+            // "possibly frozen" on a real signal, not age alone. Signal
+            // (a) — Herdr reports the agent idle/done (ready for input,
+            // not working) while no terminal status file exists — is the
+            // host-sleep shape seen on 2026-11-17: an idle prompt, no
+            // status, hours old. `blocked`/`unknown` keep `classify`'s
+            // plain stalled note unconditionally: `blocked` is ambiguous
+            // without more context and `unknown` proves nothing either
+            // way (`AgentState`'s own doc comment). Reuses
+            // `mv_board::layout::STALE_AFTER_MINUTES`, the same threshold
+            // `board_data`'s stale-pane check already applies, rather
+            // than a second number for the same kind of silence.
+            if let Some(events) = events {
+                let status = live.and_then(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| Some(agent.pane_id.as_str()) == events.effective_pane())
+                        .and_then(|agent| agent.status)
+                });
+                if let Some(status) = status.filter(|status| status.is_ready_for_input()) {
+                    let dispatched_elapsed = events
+                        .dispatched_at
+                        .map(|stamp| mv_core::time::now_utc() - stamp)
+                        .filter(|elapsed| !elapsed.is_negative());
+                    if dispatched_elapsed.is_some_and(|elapsed| {
+                        elapsed > time::Duration::minutes(mv_board::layout::STALE_AFTER_MINUTES)
+                    }) {
+                        let elapsed = dispatched_elapsed
+                            .map(mv_state::tasks::format_elapsed)
+                            .unwrap_or_else(|| "unknown".into());
+                        note = Some(format!(
+                            "possibly frozen: agent reports {} with no status file for \
+                             {elapsed} \u{2014} not acted on; try `herdr agent prompt {}` or \
+                             `dispatch --into {task_id}`.",
+                            status.as_str(),
+                            events.agent,
+                        ));
+                    }
+                }
             }
         }
         if flagged {
@@ -1053,7 +1188,15 @@ fn list(
     }
     if !read_only {
         if explicit_reconcile {
-            reconcile_and_report(root, &rows, args, agents, config, live.as_deref());
+            reconcile_and_report(
+                root,
+                project_name,
+                &rows,
+                args,
+                agents,
+                config,
+                live.as_deref(),
+            );
         }
         if args.get_flag("close-stranded") {
             close_stranded_and_report(root, &rows, args, agents, live.as_deref());
@@ -1306,6 +1449,7 @@ fn reclaim_pane_is_safe(
 
 fn reconcile_and_report(
     root: &Path,
+    project_name: Option<&str>,
     rows: &[Row],
     args: &ArgMatches,
     agents: &mut impl AgentPanes,
@@ -1346,6 +1490,133 @@ fn reconcile_and_report(
         println!(
             "  recorded {} outcome(s) that were finished but unlogged",
             outcome.recorded.len()
+        );
+    }
+    report_orphan_panes(root, project_name, config, live);
+}
+
+/// Current role codes a live agent's dispatch-time name could carry —
+/// duplicated from `dispatch::role_short` (private to that file, and
+/// outside this task's write scope) rather than shared, since both are
+/// nine-arm matches on the same nine [`Role`] variants and neither is
+/// likely to drift without the other noticing in review.
+fn lane_role_short(role: Role) -> &'static str {
+    match role {
+        Role::Nexus => "nexu",
+        Role::Scout => "scou",
+        Role::Builder => "buil",
+        Role::Archivist => "arch",
+        Role::Critic => "crit",
+        Role::Seer => "seer",
+        Role::Council => "coun",
+        Role::Artisan => "arti",
+        Role::Watcher => "watc",
+    }
+}
+
+/// Every Herdr agent name `naming::agent_name` could mint for one of
+/// `project_name`'s own dispatched lanes — current role/seat codes only,
+/// instance 1 through [`naming::MAX_NAME_INSTANCE`], the same budget
+/// `naming::unique_agent_name` retries against: a hand-copied, truncated
+/// range here once stopped at instance 9 and silently missed a collision
+/// past it (card `20261118-b-c328a3` M4). [`Role::Nexus`] is skipped even
+/// when a chain names it:
+/// Nexus's own pane is never dispatched through `routing.log` the way a
+/// task's lane is, so it is not a "lane" this orphan check is about.
+///
+/// Returns an empty set — never a panic or a guess — when `config` is
+/// absent or does not know `project_name`; every caller already treats
+/// that as "nothing to report" (`tasks --reconcile`'s orphan-pane line,
+/// card `20261118-b-fde912`).
+fn project_lane_agent_names(
+    project_name: &str,
+    config: Option<&mv_config::load::Config>,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(config) = config else {
+        return names;
+    };
+    let Some(project) = config.projects.get(project_name) else {
+        return names;
+    };
+    let short = project.short.as_deref().unwrap_or("");
+    for (role, chain) in &project.chains {
+        if *role == Role::Nexus {
+            continue;
+        }
+        for account_name in chain {
+            let Some(account) = config.accounts.get(account_name) else {
+                continue;
+            };
+            for instance in 1..=naming::MAX_NAME_INSTANCE {
+                let suffix = instance.to_string();
+                let instance_arg = (instance > 1).then_some(suffix.as_str());
+                if let Ok(name) = naming::agent_name(
+                    &project.name,
+                    lane_role_short(*role),
+                    instance_arg,
+                    &account.short,
+                    short,
+                ) {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// `--reconcile`'s orphan-pane line (card `20261118-b-fde912` step 1,
+/// report-only): a live Herdr agent whose name matches `project_name`'s
+/// own lane naming but whose pane [`mv_state::tasks::current_pane_agents`]
+/// either has no current record of, or currently records for a different
+/// agent name. Printed, never acted on — no close, no prompt, no write —
+/// one line per orphan, nothing when there are none, so every existing
+/// conformance scenario's output stays byte-identical (PARITY FIRST: this
+/// is new Rust-only reporting with no Python reference, and the one way
+/// to keep it from leaking into scenarios that never meant to exercise it
+/// is to stay silent until there is something real to say).
+///
+/// Checking the agent name along with the pane, not just the pane id by
+/// itself, is what catches a pane Herdr recycles for a different,
+/// never-dispatched agent after the one this project's log recorded for
+/// it is gone — a plain pane-id membership test (the old `known_panes`)
+/// kept reading that pane as "known" forever once any dispatch round had
+/// ever named it (card `20261118-b-c328a3` M1).
+fn report_orphan_panes(
+    root: &Path,
+    project_name: Option<&str>,
+    config: Option<&mv_config::load::Config>,
+    live: Option<&[LiveAgentStatus]>,
+) {
+    let (Some(project_name), Some(live)) = (project_name, live) else {
+        return;
+    };
+    let lane_names = project_lane_agent_names(project_name, config);
+    if lane_names.is_empty() {
+        return;
+    }
+    let current_panes = mv_state::tasks::current_pane_agents(root);
+    let mut orphans: Vec<&LiveAgentStatus> = live
+        .iter()
+        .filter(|agent| {
+            agent
+                .name
+                .as_deref()
+                .is_some_and(|name| lane_names.contains(name))
+                && !current_panes
+                    .get(&agent.pane_id)
+                    .zip(agent.name.as_ref())
+                    .is_some_and(|(recorded, name)| recorded.contains(name))
+        })
+        .collect();
+    orphans.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+    for orphan in orphans {
+        println!(
+            "  orphan pane {} (agent {}): no task record — close it in Herdr if it is not \
+             yours",
+            orphan.pane_id,
+            orphan.name.as_deref().unwrap_or("")
         );
     }
 }
@@ -1447,7 +1718,7 @@ fn probe_blocking_prompt(
     let Some(events) = events.get(&row.task_id) else {
         return;
     };
-    let Some(pane) = events.started_pane.as_deref() else {
+    let Some(pane) = events.effective_pane() else {
         return;
     };
     if events.agent.is_empty() {
@@ -1624,14 +1895,14 @@ fn sync_seat_outages(config: &mv_config::load::Config, hub_root: &Path) -> Resul
             ids.sort_unstable();
             ids.join(",")
         });
-        let _ = activity::broadcast(
-            mv_state::activity::HUB_PROJECT_NAME,
-            &body,
-            false,
-            &recipients,
-            &msg_id,
-            &mv_core::redact::redact,
-        );
+        let _ = activity::broadcast(activity::BroadcastRequest {
+            from_project: mv_state::activity::HUB_PROJECT_NAME,
+            body: &body,
+            ask: false,
+            recipients: &recipients,
+            msg_id: &msg_id,
+            redact: &mv_core::redact::redact,
+        });
     }
     for (id, reason) in &skipped {
         let _ = id;
@@ -1744,8 +2015,37 @@ mod tests {
             name: None,
             status: None,
         }];
-        assert_eq!(classify(Some(&events), None, Some(&live)).0, "running");
-        assert_eq!(classify(Some(&events), None, Some(&[])).0, "awaiting");
+        assert_eq!(
+            classify(Some(&events), None, None, Some(&live)).0,
+            "running"
+        );
+        assert_eq!(classify(Some(&events), None, None, Some(&[])).0, "awaiting");
+    }
+
+    /// Card `20261118-b-c328a3` M2: a kill between pane creation and
+    /// `agent start` leaves only `event=pane` recorded (`started_pane` is
+    /// `None`), but Herdr still lists the pane live under the dispatched
+    /// agent. `classify` must read `pane_event_pane` the same way
+    /// `started_pane` — a live, working agent on that pane reads as
+    /// `running`, not the old lying `awaiting`. Revert check: drop the
+    /// `.or(events.pane_event_pane.as_deref())` fallback in `classify` and
+    /// this fails (`awaiting`, not `running`).
+    #[test]
+    fn classify_falls_back_to_the_pane_event_when_started_never_landed() {
+        let events = TaskEvents {
+            pane_event_pane: Some("w1:p1".into()),
+            ..TaskEvents::default()
+        };
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: None,
+            status: Some(AgentState::Working),
+        }];
+        assert_eq!(
+            classify(Some(&events), None, None, Some(&live)).0,
+            "running"
+        );
+        assert_eq!(classify(Some(&events), None, None, Some(&[])).0, "awaiting");
     }
 
     #[test]
@@ -1772,7 +2072,7 @@ mod tests {
                 name: None,
                 status: Some(status),
             }];
-            let (state, suffix, flagged, note) = classify(Some(&events), None, Some(&live));
+            let (state, suffix, flagged, note) = classify(Some(&events), None, None, Some(&live));
             assert_eq!(state, "stalled", "{}", status.as_str());
             assert_eq!(suffix, DASH);
             assert!(flagged);
@@ -1786,7 +2086,7 @@ mod tests {
             status: Some(AgentState::Working),
         }];
         assert_eq!(
-            classify(Some(&events), None, Some(&live)),
+            classify(Some(&events), None, None, Some(&live)),
             ("running", DASH.into(), true, None)
         );
     }
@@ -2009,16 +2309,19 @@ mod tests {
             .unwrap();
     }
 
-    /// Serializes the one test below that must change the real process
-    /// cwd to exercise `current_project_root()`'s raw ancestor walk
-    /// end-to-end — no other test in this crate changes cwd or depends on
-    /// an unmodified one (every other call into `current_project`/
-    /// `current_project_root` either names its project explicitly, fails
-    /// before project resolution, or pins an explicit `root` straight into
-    /// `list`/`build_rows`), so the only hazard this guards against is two
-    /// such tests racing each other. Restores the previous cwd on drop,
-    /// even on panic, mirroring `worktrees::herdr_env`'s process-global
-    /// lock for the same kind of ambient state.
+    /// Serializes the tests below that must change the real process cwd —
+    /// one to exercise `current_project_root()`'s raw ancestor walk
+    /// end-to-end, another (`tasks_dot_lists_the_cwd_project`, card
+    /// `20261117-b-486a55`) to exercise `.` resolving against cwd through
+    /// `resolve_requested_projects`. No other test in this crate changes
+    /// cwd or depends on an unmodified one (every other call into
+    /// `current_project`/`current_project_root` either names its project
+    /// explicitly, fails before project resolution, or pins an explicit
+    /// `root` straight into `list`/`build_rows`), so the only hazard this
+    /// guards against is two such tests racing each other. Restores the
+    /// previous cwd on drop, even on panic, mirroring
+    /// `worktrees::herdr_env`'s process-global lock for the same kind of
+    /// ambient state.
     struct CwdGuard {
         previous: PathBuf,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -2677,6 +2980,50 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_records_a_done_task_with_no_result_md_and_it_stops_needing_a_look() {
+        // Scout `20261117-scout-9c0832` rank 2: before this fix,
+        // `is_tasks_reconcile_candidate` silently refused a `done` status
+        // with no usable `result.md`, so the row stayed `unrecorded`/
+        // flagged "* need a look" forever — even though `classify`'s own
+        // note claimed `--reconcile` would fix it. No command could ever
+        // clear it short of hand-editing the task directory.
+        let root = temp_dir("reconcile-done-without-result");
+        write_dispatch_log(&root, "20261101-explorer-ffffff");
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20261101-explorer-ffffff")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/tasks/20261101-explorer-ffffff/status"),
+            "done",
+        )
+        .unwrap();
+        // Deliberately no result.md at all.
+
+        let before = matches(&["tasks"]);
+        let (_, needs_look_before) = build_rows(&root, &before, Some(&[]), None);
+        assert_eq!(
+            needs_look_before, 1,
+            "an unrecorded done task with no result.md starts out flagged"
+        );
+
+        let args = matches(&["tasks", "--reconcile"]);
+        assert!(list(&root, None, &args, &mut FakeAgents::new(&[]), None).is_ok());
+
+        let log = std::fs::read_to_string(root.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            log.contains(
+                "event=result\ttask=20261101-explorer-ffffff\tstatus=done\tstate=done-without-result"
+            ),
+            "the done-but-no-result task must be recorded, carrying that annotation: {log:?}"
+        );
+
+        let after = matches(&["tasks"]);
+        let (_, needs_look_after) = build_rows(&root, &after, Some(&[]), None);
+        assert_eq!(
+            needs_look_after, 0,
+            "once --reconcile has recorded it, the task must no longer need a look"
+        );
+    }
+
+    #[test]
     fn reconcile_with_read_only_never_writes() {
         let root = temp_dir("reconcile-read-only");
         write_dispatch_log(&root, "20261101-explorer-bbbbbb");
@@ -3130,11 +3477,46 @@ mod tests {
         let (state, suffix, flagged, note) = classify(
             events.get("20250101-fixer-aaaaaa"),
             Some(TaskStatus::Done),
+            None,
             Some(&[]),
         );
         assert_eq!(state, "recorded");
         assert_eq!(suffix, "done #3");
         assert!(!flagged);
+        assert!(note.is_none());
+    }
+
+    /// Card `20261118-b-c328a3` M2: the same crash window
+    /// `close_stranded_leaves_a_live_pane_alone_when_only_event_pane_was_recorded`
+    /// (`mv_state::tasks`) covers for `close_stranded` — a kill between
+    /// pane creation and `agent start` leaves only `event=pane`, no
+    /// `event=started` — must also classify `running`, not `awaiting`, in
+    /// this listing's own `gather_task_events`/`classify` pipeline.
+    /// Revert check: drop the `"pane"` arm in `gather_task_events` (or its
+    /// fallback in `classify`) and this fails (`awaiting`, not `running`).
+    #[test]
+    fn a_pane_only_dispatch_classifies_running_not_awaiting() {
+        let root = temp_dir("pane-only-classifies-running");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-paneonl\t\
+             branch=multiverse/20260101-fixer-paneonl\trole=fixer\tagent=agent-a\n\
+             2026-01-01T00:00:30+00:00\tevent=pane\ttask=20260101-fixer-paneonl\tpane=w1:p1\n",
+        );
+        let (events, _order) = gather_task_events(&root);
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: Some("agent-a".into()),
+            status: Some(AgentState::Working),
+        }];
+        let (state, _suffix, flagged, note) = classify(
+            events.get("20260101-fixer-paneonl"),
+            None,
+            None,
+            Some(&live),
+        );
+        assert_eq!(state, "running");
+        assert!(flagged);
         assert!(note.is_none());
     }
 
@@ -3156,6 +3538,7 @@ mod tests {
         let (state, suffix, flagged, note) = classify(
             events.get("20250101-fixer-aaaaaa"),
             Some(TaskStatus::Done),
+            None,
             Some(&[]),
         );
         assert_eq!(state, "recorded");
@@ -3206,6 +3589,139 @@ mod tests {
         assert_eq!(rows[0].note.as_deref(), Some("dispatched 2 min ago, still running as '' — and still spending. Nothing here will stop it."));
     }
 
+    /// Frozen-pane rework (Scout 342332 finding 4): a healthy *working*
+    /// agent is never "possibly frozen" on age alone, however long it
+    /// runs — the bug the original, age-only version of this change had
+    /// (every healthy multi-hour Builder lane flagged). Four hours old,
+    /// still `working`: plain RUNNING note, unchanged.
+    #[test]
+    fn a_working_row_four_hours_old_is_not_flagged_possibly_frozen() {
+        let root = temp_dir("running-working");
+        let stamp =
+            mv_core::time::format_seconds_utc(mv_core::time::now_utc() - time::Duration::hours(4));
+        write(&root.join(".multiverse/routing.log"), &format!(
+            "{stamp}\tevent=dispatch\ttask=20250101-fixer-aaaaaa\trole=builder\tagent=sb-buil-cx\n{stamp}\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n"));
+        let args = matches(&["tasks"]);
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: None,
+            status: Some(AgentState::Working),
+        }];
+        let (rows, count) = build_rows(&root, &args, Some(&live), None);
+        assert_eq!(rows[0].state, "running");
+        assert_eq!(count, 1);
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some(
+                "dispatched 4 hr ago, still running as 'sb-buil-cx' — and still spending. \
+                 Nothing here will stop it."
+            )
+        );
+    }
+
+    /// Signal (a) of the frozen-pane rework: Herdr reports the agent
+    /// idle/done (ready for input, not working) while no terminal status
+    /// file exists — the host-sleep shape seen on 2026-11-17 (idle
+    /// prompt, no status, hours old). Past the shared stall threshold,
+    /// this is "possibly frozen", naming the signal. Revert check: drop
+    /// the `is_ready_for_input()` gate above and keep only the elapsed
+    /// check, and this test still passes — the gate must be checked
+    /// against `a_working_row_four_hours_old_is_not_flagged_possibly_frozen`
+    /// instead, which would then fail.
+    #[test]
+    fn an_idle_row_four_hours_old_is_marked_possibly_frozen() {
+        let root = temp_dir("stalled-idle-frozen");
+        let stamp =
+            mv_core::time::format_seconds_utc(mv_core::time::now_utc() - time::Duration::hours(4));
+        write(&root.join(".multiverse/routing.log"), &format!(
+            "{stamp}\tevent=dispatch\ttask=20250101-fixer-aaaaaa\trole=builder\tagent=sb-buil-cx\n{stamp}\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n"));
+        let args = matches(&["tasks"]);
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: None,
+            status: Some(AgentState::Idle),
+        }];
+        let (rows, count) = build_rows(&root, &args, Some(&live), None);
+        assert_eq!(rows[0].state, "stalled");
+        assert_eq!(count, 1);
+        assert!(rows[0].flagged);
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some(
+                "possibly frozen: agent reports idle with no status file for 4 hr \u{2014} not \
+                 acted on; try `herdr agent prompt sb-buil-cx` or `dispatch --into \
+                 20250101-fixer-aaaaaa`."
+            )
+        );
+    }
+
+    /// Card `20261118-b-9226e1`: the same frozen-pane note, but for a task
+    /// killed between pane creation and `agent start` — `routing.log`
+    /// holds only `event=pane`, never `event=started`, so `started_pane`
+    /// is `None` and the note builder must fall back to
+    /// `TaskEvents::effective_pane` the same way `classify` already does.
+    /// Revert check: read `events.started_pane.as_deref()` directly in the
+    /// "stalled" branch's live-status lookup instead of
+    /// `events.effective_pane()`, and this fails — no live agent ever
+    /// matches `None`, so the note stays the plain `classify` stalled note
+    /// instead of "possibly frozen".
+    #[test]
+    fn an_idle_row_four_hours_old_via_pane_event_only_is_marked_possibly_frozen() {
+        let root = temp_dir("stalled-idle-frozen-pane-event");
+        let stamp =
+            mv_core::time::format_seconds_utc(mv_core::time::now_utc() - time::Duration::hours(4));
+        write(&root.join(".multiverse/routing.log"), &format!(
+            "{stamp}\tevent=dispatch\ttask=20250101-fixer-aaaaaa\trole=builder\tagent=sb-buil-cx\n{stamp}\tevent=pane\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n"));
+        let args = matches(&["tasks"]);
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: None,
+            status: Some(AgentState::Idle),
+        }];
+        let (rows, count) = build_rows(&root, &args, Some(&live), None);
+        assert_eq!(rows[0].state, "stalled");
+        assert_eq!(count, 1);
+        assert!(rows[0].flagged);
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some(
+                "possibly frozen: agent reports idle with no status file for 4 hr \u{2014} not \
+                 acted on; try `herdr agent prompt sb-buil-cx` or `dispatch --into \
+                 20250101-fixer-aaaaaa`."
+            )
+        );
+    }
+
+    /// The threshold side of signal (a): the same idle, no-status-file
+    /// pane, but still under the stall threshold, is not yet "possibly
+    /// frozen" — it keeps `classify`'s plain stalled note, same as every
+    /// idle/done/blocked/unknown pane always has.
+    #[test]
+    fn an_idle_row_under_the_stall_threshold_is_not_flagged_possibly_frozen() {
+        let root = temp_dir("stalled-idle-fresh");
+        let stamp = mv_core::time::format_seconds_utc(
+            mv_core::time::now_utc() - time::Duration::minutes(2),
+        );
+        write(&root.join(".multiverse/routing.log"), &format!(
+            "{stamp}\tevent=dispatch\ttask=20250101-fixer-aaaaaa\trole=builder\tagent=sb-buil-cx\n{stamp}\tevent=started\ttask=20250101-fixer-aaaaaa\tpane=w1:p1\n"));
+        let args = matches(&["tasks"]);
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: None,
+            status: Some(AgentState::Idle),
+        }];
+        let (rows, count) = build_rows(&root, &args, Some(&live), None);
+        assert_eq!(rows[0].state, "stalled");
+        assert_eq!(count, 1);
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some(
+                "live in pane 'w1:p1' but agent is live but not working (idle): not dead and \
+                 not still spending — go look at the pane."
+            )
+        );
+    }
+
     #[test]
     fn a_settled_unrecorded_task_uses_the_python_finished_note() {
         let events = TaskEvents {
@@ -3218,7 +3734,8 @@ mod tests {
                 name: None,
                 status: Some(status),
             }];
-            let (_, _, _, note) = classify(Some(&events), Some(TaskStatus::Done), Some(&live));
+            let (_, _, _, note) =
+                classify(Some(&events), Some(TaskStatus::Done), None, Some(&live));
             assert_eq!(
                 note.as_deref(),
                 Some("finished as 'done' after its dispatch gave up. `--reconcile` records it.")
@@ -3301,7 +3818,7 @@ mod tests {
             ..Default::default()
         };
         let (state, suffix, flagged, note) =
-            classify(Some(&events), Some(TaskStatus::Done), Some(&[]));
+            classify(Some(&events), Some(TaskStatus::Done), None, Some(&[]));
         assert_eq!(state, "unrecorded");
         assert_eq!(suffix, "done");
         assert!(flagged);
@@ -3318,7 +3835,7 @@ mod tests {
             started_pane: Some("w1:p3".into()),
             ..Default::default()
         };
-        let (state, suffix, flagged, note) = classify(Some(&events), None, Some(&[]));
+        let (state, suffix, flagged, note) = classify(Some(&events), None, None, Some(&[]));
         assert_eq!(state, "awaiting");
         assert_eq!(suffix, DASH);
         assert!(flagged);
@@ -3334,7 +3851,7 @@ mod tests {
             account: "old-seat".into(),
             ..Default::default()
         };
-        let (state, suffix, flagged, note) = classify(Some(&events), None, Some(&[]));
+        let (state, suffix, flagged, note) = classify(Some(&events), None, None, Some(&[]));
         assert_eq!(state, "awaiting");
         assert_eq!(suffix, DASH);
         assert!(flagged);
@@ -3354,7 +3871,7 @@ mod tests {
             ..Default::default()
         };
         let live = live_ids(&["w1:p1"]);
-        let (state, suffix, flagged, note) = classify(Some(&events), None, Some(&live));
+        let (state, suffix, flagged, note) = classify(Some(&events), None, None, Some(&live));
         assert_eq!(state, "running");
         assert_eq!(suffix, DASH);
         assert!(flagged);
@@ -3369,7 +3886,7 @@ mod tests {
             started_pane: Some("w1:p1".into()),
             ..Default::default()
         };
-        let (state, suffix, flagged, note) = classify(Some(&events), None, None);
+        let (state, suffix, flagged, note) = classify(Some(&events), None, None, None);
         assert_eq!(state, "running");
         assert_eq!(suffix, DASH);
         assert!(flagged);
@@ -3461,6 +3978,43 @@ mod tests {
     }
 
     #[test]
+    fn a_garbled_status_token_is_never_shown_as_running_even_with_a_live_pane() {
+        // Card 20261117-b-437eeb (Scout 9c0832 rank 5): a corrupted status
+        // write ("donedone") must never render the same as "running" just
+        // because Herdr still reports the pane live and working — that is
+        // exactly the case this listing most needs to flag, since neither
+        // `--reconcile` nor (pre-fix) `--close-stranded` could ever force
+        // a terminal recording for it.
+        let root = temp_dir("list-garbled-status");
+        write(
+            &root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-fixer-garbld\t\
+             branch=multiverse/20260101-fixer-garbld\trole=fixer\n\
+             2026-01-01T00:01:00+00:00\tevent=started\ttask=20260101-fixer-garbld\tpane=w1:p1\n",
+        );
+        write(
+            &root.join(".multiverse/tasks/20260101-fixer-garbld/status"),
+            "donedone",
+        );
+        let live = [LiveAgentStatus {
+            pane_id: "w1:p1".into(),
+            name: None,
+            status: Some(AgentState::Working),
+        }];
+        let args = matches(&["tasks", "--no-reconcile"]);
+        let (rows, needs_look) = build_rows(&root, &args, Some(&live), None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "garbled");
+        assert!(rows[0].flagged);
+        assert_eq!(needs_look, 1);
+        let note = rows[0]
+            .note
+            .as_deref()
+            .expect("a garbled row always has a note");
+        assert!(note.contains("donedone"), "note was: {note}");
+    }
+
+    #[test]
     fn named_unknown_project_is_a_config_error() {
         let dir = temp_dir("named-unknown");
         let project = dir.join("project");
@@ -3473,6 +4027,105 @@ mod tests {
         assert!(message.contains("no such project: nope"));
         assert!(message.contains("configured: sandbox"));
         assert!(message.contains("see `multiverse projects`"));
+    }
+
+    /// Two configured projects, `a` and `b`, each a real directory under
+    /// `dir` so a path token has something on disk to resolve against —
+    /// mirrors `backlog`'s own `two_project_config` test fixture.
+    fn two_project_config(dir: &Path) -> (mv_config::load::Config, PathBuf, PathBuf) {
+        let project_a = dir.join("project-a");
+        let project_b = dir.join("project-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        let toml = format!(
+            "[projects.a]\npath = \"{}\"\n[projects.b]\npath = \"{}\"\n",
+            project_a.display(),
+            project_b.display(),
+        );
+        let config = mv_config::load::load_config_str(&toml, &dir.join("config.toml")).unwrap();
+        (config, project_a, project_b)
+    }
+
+    #[test]
+    fn resolve_requested_projects_matches_a_literal_configured_name() {
+        let dir = temp_dir("resolve-requested-literal");
+        let (config, _a, _b) = two_project_config(&dir);
+        let requested = vec!["a".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, None, &requested);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "a");
+        assert!(unknown.is_empty());
+    }
+
+    /// Card `20261117-b-486a55`: `tasks .` used to fail with "no such
+    /// project: ." because this lookup was a bare `contains_key` match
+    /// with no path handling at all — the revert check for this task ran
+    /// with `resolve_requested_projects` stubbed back down to that bare
+    /// check, and this test failed exactly as expected before the real
+    /// fix was restored.
+    #[test]
+    fn resolve_requested_projects_resolves_dot_to_the_cwd_project() {
+        let dir = temp_dir("resolve-requested-dot");
+        let (config, project_a, _b) = two_project_config(&dir);
+        let requested = vec![".".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&project_a), &requested);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "a");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn resolve_requested_projects_resolves_a_relative_path() {
+        let dir = temp_dir("resolve-requested-relative");
+        let (config, _a, _b) = two_project_config(&dir);
+        let requested = vec!["project-b".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&dir), &requested);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "b");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn resolve_requested_projects_resolves_an_absolute_path() {
+        let dir = temp_dir("resolve-requested-absolute");
+        let (config, project_a, _b) = two_project_config(&dir);
+        let requested = vec![project_a.display().to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&dir), &requested);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "a");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn resolve_requested_projects_reports_an_unknown_token() {
+        let dir = temp_dir("resolve-requested-unknown");
+        let (config, _a, _b) = two_project_config(&dir);
+        let requested = vec!["no-such-project".to_string()];
+        let (resolved, unknown) = resolve_requested_projects(&config, Some(&dir), &requested);
+        assert!(resolved.is_empty());
+        assert_eq!(unknown, vec![&requested[0]]);
+    }
+
+    /// End-to-end through `run_with` itself (not just the resolver): `tasks
+    /// .` from inside a configured project's own directory must list that
+    /// project, the same as naming it literally would. Uses [`CwdGuard`]
+    /// like `bare_tasks_in_a_sandboxed_nested_lane_never_writes_the_real_
+    /// project_it_sits_inside` above — two tests in this file now change
+    /// cwd, and both go through the same process-global lock.
+    #[test]
+    fn tasks_dot_lists_the_cwd_project() {
+        let dir = temp_dir("tasks-dot-lists-cwd-project");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        seed_unrecorded_done(&project, "20261101-explorer-cccccc");
+        let config = write_config(&dir, &project, "sandbox");
+        let guard = CwdGuard::set(&project);
+        let args = matches_cfg(&["tasks", ".", "--reconcile"], &config);
+        let result = run_with(&args, &mut FakeAgents::new(&[]));
+        drop(guard);
+        assert!(result.is_ok(), "{:?}", result.err());
+        let log = std::fs::read_to_string(project.join(".multiverse/routing.log")).unwrap();
+        assert!(log.contains("state=reconciled"), "{log}");
     }
 
     #[test]
@@ -3740,6 +4393,52 @@ mod tests {
             .append(
                 "2026-11-01T00:01:00+00:00\tevent=started\ttask=20261101-fixer-llllll\tpane=w1:p1",
             )
+            .unwrap();
+        let config_path = dir.join("config.toml");
+        write(
+            &config_path,
+            &minimal_config(&format!(
+                "[projects.sandbox]\npath = {:?}\n\n[projects.sandbox.chains]\nscout = [\"seat\"]\n",
+                project.to_str().unwrap()
+            )),
+        );
+        let args = matches_cfg(&["tasks", "sandbox", "--no-reconcile"], &config_path);
+        let config = super::super::load_config(&args).unwrap();
+        let rolling = "exceeded retry limit, last status: 429 Too Many Requests";
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_status("w1:p1", AgentState::Idle)
+            .with_visible("w1:p1", rolling);
+        assert!(list(&project, Some("sandbox"), &args, &mut agents, Some(&config)).is_ok());
+        let log = std::fs::read_to_string(project.join(".multiverse/routing.log")).unwrap();
+        assert!(
+            log.contains("event=limit\ttask=20261101-fixer-llllll\trule="),
+            "expected event=limit: {log:?}"
+        );
+    }
+
+    /// Card `20261118-b-9226e1`: the same probe, but for a task killed
+    /// between pane creation and `agent start` — `routing.log` holds only
+    /// `event=pane`, never `event=started`. `probe_blocking_prompt` must
+    /// fall back to `TaskEvents::effective_pane` the same way `classify`
+    /// does, or it reads `None` and returns before ever looking at the
+    /// pane. Revert check: read `events.started_pane.as_deref()` directly
+    /// at the top of `probe_blocking_prompt` instead of
+    /// `events.effective_pane()`, and this fails — the probe returns
+    /// early and no `event=limit` is ever recorded.
+    #[test]
+    fn blocking_prompt_reads_the_pane_event_pane_when_started_never_landed() {
+        let _state = StateDirEnvGuard::new();
+        let dir = temp_dir("blocking-prompt-pane-event");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        mv_state::log::ProjectLog::new(&project)
+            .append(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask=20261101-fixer-llllll\t\
+                 branch=\trole=fixer\taccount=seat\tagent=codex-1",
+            )
+            .unwrap();
+        mv_state::log::ProjectLog::new(&project)
+            .append("2026-11-01T00:00:30+00:00\tevent=pane\ttask=20261101-fixer-llllll\tpane=w1:p1")
             .unwrap();
         let config_path = dir.join("config.toml");
         write(

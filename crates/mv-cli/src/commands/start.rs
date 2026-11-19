@@ -1505,7 +1505,9 @@ fn batch_summary(
 /// each requested project's workspace (or every configured one) and, when
 /// an interactive seat exists, seed its Nexus pane. With no projects named
 /// and no `--all`, prints each configured project's open/not-open status
-/// instead of starting anything.
+/// instead of starting anything. `--all` skips a project whose
+/// `[projects.<name>].autostart` is `false`, printing one line naming it;
+/// naming that project explicitly (`start <name>`) still starts it.
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -1578,7 +1580,19 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let wanted: Vec<String> = if all {
         let mut names: Vec<String> = config.projects.keys().cloned().collect();
         names.sort();
+        // A project with `autostart = false` is skipped only here — naming
+        // it on the command line still starts it, same as any other
+        // project (the `else` branch below never consults this field).
         names
+            .into_iter()
+            .filter(|name| {
+                let keep = config.projects[name].autostart;
+                if !keep {
+                    println!("  {name:<20} skipped — autostart = false");
+                }
+                keep
+            })
+            .collect()
     } else {
         // Dedupe, preserving the first occurrence's position: `fleet` below is
         // a single snapshot taken once, before the per-project loop, and

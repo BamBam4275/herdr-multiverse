@@ -22,3 +22,4 @@ config.local.toml
 *.swp
 
 # Do not ignore Cargo.lock (this is a binary) or committed assets.
+__pycache__/

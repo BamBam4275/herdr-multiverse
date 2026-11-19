@@ -446,6 +446,14 @@ fn print_quarantine_outcomes(worktrees: &Worktrees, dry_run: bool) -> Result<(),
 /// this checkout's `HEAD` the way a raw `git merge` always could. Reads
 /// `[secrets_scan]` from the resolved fleet config; every other `worktrees`
 /// mode needs no config at all, so this is the one branch that loads one.
+///
+/// [`Worktrees::merge`] itself now also refuses outright (same exit 1 as
+/// every other refusal) when this checkout is already mid-merge —
+/// `MERGE_HEAD` present or unmerged paths left over from an earlier
+/// crashed or conflicted merge — naming the state and a `git` command to
+/// inspect it, and cleanly `git merge --abort`s a lane merge that itself
+/// conflicts rather than leaving the checkout mid-merge for the next
+/// caller to trip over.
 fn merge(worktrees: &Worktrees, args: &ArgMatches, task: &str) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -1016,6 +1024,71 @@ mod tests {
         let error = run(sub).unwrap_err();
         assert_eq!(error.code(), crate::exit::NEEDS_CONFIG);
         assert!(error.to_string().contains("install"), "{error}");
+    }
+
+    /// Proof item: `--merge` refuses outright through the CLI boundary
+    /// when the project checkout is already mid-merge (`MERGE_HEAD`
+    /// present, left over here by a raw conflicting `git merge`,
+    /// independent of `--merge`'s own code), naming the stuck state and
+    /// exiting 1 like any other refusal — and leaves that state, and
+    /// `HEAD`, exactly as it found them.
+    #[test]
+    fn cli_merge_refuses_when_trunk_is_mid_merge_and_leaves_it_unchanged() {
+        let repo = TempRepo::new();
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let task = "20261101-fixer-abcdef";
+        done_lane(&worktrees, task);
+
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(&repo.0)
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        assert!(git(&["checkout", "-b", "other"]).success());
+        std::fs::write(repo.0.join("README.md"), "other\n").unwrap();
+        assert!(git(&["commit", "-am", "other change"]).success());
+        assert!(git(&["checkout", "main"]).success());
+        std::fs::write(repo.0.join("README.md"), "main\n").unwrap();
+        assert!(git(&["commit", "-am", "main change"]).success());
+        assert!(!git(&["merge", "--no-ff", "--no-edit", "other"]).success());
+        assert!(
+            repo.0.join(".git/MERGE_HEAD").is_file(),
+            "test setup must leave a real MERGE_HEAD"
+        );
+
+        let script = fake_scanner("exit 0");
+        let config_path = repo.0.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[secrets_scan]\ngitleaks = \"{}\"\n", script.display()),
+        )
+        .unwrap();
+
+        let path = repo.0.to_str().unwrap();
+        let matches = crate::args::command()
+            .try_get_matches_from([
+                "multiverse",
+                "worktrees",
+                path,
+                "--merge",
+                task,
+                "--config",
+                config_path.to_str().unwrap(),
+            ])
+            .unwrap();
+        let (_, sub) = matches.subcommand().unwrap();
+        let error = run(sub).unwrap_err();
+        assert_eq!(error.code(), crate::exit::ERROR);
+        assert!(error.to_string().contains("MERGE_HEAD"), "{error}");
+        assert!(
+            repo.0.join(".git/MERGE_HEAD").is_file(),
+            "a refused merge must leave the pre-existing merge-in-progress state untouched"
+        );
+
+        // Clean up by hand so `TempRepo`'s own teardown doesn't trip on it.
+        git(&["merge", "--abort"]);
     }
 
     /// Proof item 1: a kept lane names the lingering pid without `--reap`,

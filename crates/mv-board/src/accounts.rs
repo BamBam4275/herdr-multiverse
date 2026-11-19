@@ -401,6 +401,45 @@ mod tests {
     }
 
     #[test]
+    fn account_state_line_renders_each_non_available_state_including_seats_full() {
+        let mut at_cap = account("claude");
+        at_cap.state = AccountState::AtCap;
+        let lines = render_account_cards(&[at_cap], 80);
+        assert!(
+            lines.iter().any(|l| l.contains("◐ SEATS FULL 2/4")),
+            "{lines:?}"
+        );
+
+        let mut fenced = account("claude");
+        fenced.state = AccountState::Fenced;
+        let lines = render_account_cards(&[fenced], 80);
+        assert!(lines.iter().any(|l| l.contains("✗ FENCED")), "{lines:?}");
+
+        let mut draining = account("claude");
+        draining.state = AccountState::Draining;
+        let lines = render_account_cards(&[draining], 80);
+        assert!(lines.iter().any(|l| l.contains("◔ DRAINING")), "{lines:?}");
+
+        let mut half_open = account("claude");
+        half_open.state = AccountState::HalfOpen;
+        let lines = render_account_cards(&[half_open], 80);
+        assert!(lines.iter().any(|l| l.contains("◐ HALF-OPEN")), "{lines:?}");
+    }
+
+    #[test]
+    fn an_over_cap_account_shows_the_warning_suffix_on_its_seats_line() {
+        let mut claude = account("claude");
+        claude.over_cap = true;
+        let lines = render_account_cards(&[claude], 80);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("seats 2/4 free 2 ⚠ over cap")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn osc_52_in_an_account_name_or_detail_does_not_reach_output() {
         let mut claude = account("claude");
         claude.name = "claude\u{1b}]52;c;EVIL\u{07}".into();

@@ -1,0 +1,27 @@
+{
+  "id": "directives-refuses-unmatched-project",
+  "description": "`directives show <name>` (cli.py's cmd_directives, via `commands::directives::run`) refuses outright when every positional project token fails to match a configured project by name or path (`select_projects` in `directives.rs` returns empty) — distinct from the tty refusal (`directives-set-refuses-noninteractive.json`) and the clean read/no-file case (`directives-show-reads-standing-directive.json`). `show` is used here rather than `set` so the refusal under test is reached directly, without first tripping `set`'s own interactive-terminal check.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["directives", "show", "ghost"],
+      "transcript": [],
+      "expect": {
+        "exit": 1,
+        "stderr": "directives: no matching project\n"
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}
