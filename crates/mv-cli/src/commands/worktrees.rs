@@ -341,29 +341,42 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
             println!("    {verb} build-dir ({bytes} bytes)");
         }
         // Card `20261116-b-891676`: on 0.1.9 a lane's build-dir that could
-        // not be found or proven safe to delete stayed without a word.
+        // not be found or proven safe to delete stayed without a word. Card
+        // `20261119-b-087c6c`: only a hash dir this lane actually resolved
+        // is "kept" — the sweep below passes that one over. A miss names
+        // no hash dir, so the sweep may still free one it proves orphaned
+        // on its own, and that is not a dir this line kept.
         if let PruneOutcome::Kept {
             build_dir_kept: Some(reason),
+            build_dir,
             ..
         }
         | PruneOutcome::WouldRemove {
             build_dir_kept: Some(reason),
+            build_dir,
             ..
         }
         | PruneOutcome::WouldArchive {
             build_dir_kept: Some(reason),
+            build_dir,
             ..
         }
         | PruneOutcome::Removed {
             build_dir_kept: Some(reason),
+            build_dir,
             ..
         }
         | PruneOutcome::Archived {
             build_dir_kept: Some(reason),
+            build_dir,
             ..
         } = outcome
         {
-            println!("    kept build-dir — {reason}");
+            if build_dir.is_some() {
+                println!("    kept build-dir — {reason}");
+            } else {
+                println!("    build-dir unresolved — {reason}");
+            }
         }
         match outcome {
             PruneOutcome::Kept { .. } => kept += 1,

@@ -5,7 +5,7 @@
 //! recorded and its tip is reachable from HEAD; forced unrecorded removal
 //! retains the branch.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -1358,20 +1358,99 @@ fn is_build_evidence(path: &Path) -> bool {
         && !path.components().any(|c| c.as_os_str() == ".fingerprint")
 }
 
+/// Every path a cargo dep-info (`.d`) file's `content` names, in order:
+/// each whitespace-separated token on each non-comment line, with
+/// rustc's own `\ ` space escape undone and a rule's trailing `:`
+/// dropped. `#` lines (`# env-dep:…`, `# checksum:…`) carry values, not
+/// paths, and are skipped whole (card `20261119-b-087c6c`): read as
+/// tokens, an env-dep value that merely mentions a path could be mistaken
+/// for that path's own build evidence.
+fn dep_info_paths(content: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in content.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut token = String::new();
+        let mut chars = line.chars();
+        loop {
+            let next = chars.next();
+            match next {
+                Some('\\') if chars.as_str().starts_with(' ') => {
+                    token.push(' ');
+                    chars.next();
+                    continue;
+                }
+                Some(ch) if !ch.is_ascii_whitespace() => {
+                    token.push(ch);
+                    continue;
+                }
+                _ => {}
+            }
+            let path = token.trim_end_matches(':');
+            if !path.is_empty() {
+                paths.push(path.to_owned());
+            }
+            token.clear();
+            if next.is_none() {
+                break;
+            }
+        }
+    }
+    paths
+}
+
+/// `content`'s own workspace evidence (see `dep_info_paths`): every
+/// absolute path it names that is neither a cargo registry/git-checkout
+/// source (see `is_cargo_cache_source`) nor under the shared build root
+/// itself (see `is_shared_build_root_path`), then every relative one —
+/// cargo hands rustc a workspace member's own sources relative to the
+/// workspace root (`crates/mv-core/src/lib.rs`), so a relative path is a
+/// source of whichever workspace this hash dir belongs to. The one filter
+/// both the per-lane lookup (`dir_names_marker`) and the orphan sweep
+/// (`scan_orphan_evidence`) read through, so neither can match evidence
+/// the other would have discarded (card `20261119-b-087c6c`).
+fn workspace_evidence(
+    content: &str,
+    cargo_home: Option<&Path>,
+    shared_root: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut absolute = Vec::new();
+    let mut relative = Vec::new();
+    for token in dep_info_paths(content) {
+        let path = PathBuf::from(token);
+        if !path.is_absolute() {
+            relative.push(path);
+        } else if !is_cargo_cache_source(&path, cargo_home)
+            && !is_shared_build_root_path(&path, shared_root)
+        {
+            absolute.push(path);
+        }
+    }
+    (absolute, relative)
+}
+
 /// Walks `dir` read-only, depth-first, for a build-evidence file (see
-/// `is_build_evidence`) naming a path under `marker` on one of its own
-/// lines — never one that also names a path under `exclude`, when given,
-/// on that same line (used only so a search for the main checkout's own
-/// hash dir never matches a lane nested under it: see
-/// `find_main_checkout_build_dir`). Bounded by the whole-scan `budget`'s
-/// own deadline and by `per_dir`'s own file cap, scoped to this one `dir`
-/// alone (see `PerDirFileBudget`); either exhausting first reads as
-/// `false`, the same as a genuine not-found — a scan that ran out of
-/// budget must never be read as "nothing here to protect."
+/// `is_build_evidence`) whose own workspace evidence (see
+/// `workspace_evidence`, read with `cargo_home` and `shared_root`) names a
+/// whole path under `marker` — never one also under `exclude`, when given
+/// (used only so a search for the main checkout's own hash dir never
+/// matches a lane nested under it: see `find_main_checkout_build_dir`).
+/// Matched path by path, component-wise, never as a raw substring of a
+/// line (card `20261119-b-087c6c`): another hash dir's `.d` file that
+/// merely mentions this lane's path — an env-dep value, a path that only
+/// embeds it — must never read as this lane's own build-dir. Bounded by
+/// the whole-scan `budget`'s own deadline and by `per_dir`'s own file
+/// cap, scoped to this one `dir` alone (see `PerDirFileBudget`); either
+/// exhausting first reads as `false`, the same as a genuine not-found — a
+/// scan that ran out of budget must never be read as "nothing here to
+/// protect."
 fn dir_names_marker(
     dir: &Path,
-    marker: &str,
-    exclude: Option<&str>,
+    marker: &Path,
+    exclude: Option<&Path>,
+    cargo_home: Option<&Path>,
+    shared_root: &Path,
     budget: &mut BuildDirScanBudget,
     per_dir: &mut PerDirFileBudget,
 ) -> bool {
@@ -1392,7 +1471,15 @@ fn dir_names_marker(
             continue;
         }
         if file_type.is_dir() {
-            if dir_names_marker(&entry, marker, exclude, budget, per_dir) {
+            if dir_names_marker(
+                &entry,
+                marker,
+                exclude,
+                cargo_home,
+                shared_root,
+                budget,
+                per_dir,
+            ) {
                 return true;
             }
             continue;
@@ -1404,9 +1491,10 @@ fn dir_names_marker(
         let Ok(content) = fs::read_to_string(&entry) else {
             continue;
         };
-        let matched = content
-            .lines()
-            .any(|line| line.contains(marker) && !exclude.is_some_and(|excl| line.contains(excl)));
+        let (absolute, _) = workspace_evidence(&content, cargo_home, Some(shared_root));
+        let matched = absolute.iter().any(|path| {
+            path.starts_with(marker) && !exclude.is_some_and(|excl| path.starts_with(excl))
+        });
         if matched {
             return true;
         }
@@ -1477,9 +1565,9 @@ fn hash_dir_candidates(shared_root: &Path) -> Vec<PathBuf> {
 fn find_build_dir_evidence(
     shared_root: &Path,
     marker: &Path,
-    exclude: Option<&str>,
+    exclude: Option<&Path>,
 ) -> BuildDirLookup {
-    let marker = format!("{}/", marker.display());
+    let cargo_home = cargo_cache_home();
     let candidates = hash_dir_candidates(shared_root);
     let total = candidates.len();
     let mut budget = BuildDirScanBudget::for_candidates(total);
@@ -1491,7 +1579,15 @@ fn find_build_dir_evidence(
             };
         }
         let mut per_dir = PerDirFileBudget::new();
-        if dir_names_marker(&candidate, &marker, exclude, &mut budget, &mut per_dir) {
+        if dir_names_marker(
+            &candidate,
+            marker,
+            exclude,
+            cargo_home.as_deref(),
+            shared_root,
+            &mut budget,
+            &mut per_dir,
+        ) {
             return BuildDirLookup::Found(candidate);
         }
         if budget.exhausted() || per_dir.exhausted() {
@@ -1553,8 +1649,8 @@ pub fn find_build_dir(shared_root: &Path, workspace_root: &Path) -> Option<PathB
 /// `mv_engine::hostdisk`'s own orphaned-bytes notice, which needs the same
 /// project-vs-lane distinction `prune` itself relies on.
 pub fn find_main_checkout_build_dir(shared_root: &Path, project_root: &Path) -> Option<PathBuf> {
-    let worktrees_prefix = format!("{}/.multiverse/worktrees/", project_root.display());
-    find_build_dir_evidence(shared_root, project_root, Some(&worktrees_prefix)).found()
+    let worktrees = project_root.join(".multiverse/worktrees");
+    find_build_dir_evidence(shared_root, project_root, Some(&worktrees)).found()
 }
 
 /// `find_build_dir`'s own two safety properties, checked explicitly here
@@ -1581,32 +1677,42 @@ fn guard_build_dir_candidate(
 
 /// `lane_path`'s own cargo build-dir, when it is provably safe to delete —
 /// found read-only under `shared_root` (see `find_build_dir`) and checked
-/// against `guard_build_dir_candidate`. `Err` carries the one-line reason
-/// for anything this cannot prove: no matching hash dir, the scan's own
-/// budget running out first, or either guard. `--prune` prints it as the
-/// reason it kept the lane's build-dir (card `20261116-b-891676`).
+/// against `guard_build_dir_candidate`. `Err` is a `BuildDirReclaim::kept`
+/// carrying the one-line reason for anything this cannot prove: no
+/// matching hash dir, the scan's own budget running out first, or either
+/// guard. `--prune` prints it as the reason it kept the lane's build-dir
+/// (card `20261116-b-891676`). A guard refusal keeps the hash dir it
+/// refused on `path`, so this same run's orphan sweep passes it over too;
+/// a miss resolved none. No reason names the shared root or a hash dir
+/// under it (card `20261119-b-087c6c`): that is a machine path under the
+/// operator's home, and the `--prune` output it lands in is shared.
 fn scoped_lane_build_dir(
     shared_root: &Path,
     main_checkout_dir: Option<&Path>,
     lane_path: &Path,
-) -> std::result::Result<PathBuf, String> {
-    let root = shared_root.display();
+) -> std::result::Result<PathBuf, BuildDirReclaim> {
     let candidate = match find_build_dir_evidence(shared_root, lane_path, None) {
         BuildDirLookup::Found(candidate) => candidate,
         BuildDirLookup::NotFound => {
-            return Err(format!(
-                "no hash dir under {root} names this lane in its dep-info"
+            return Err(BuildDirReclaim::kept(
+                "no shared-build hash dir names this lane in its dep-info".into(),
+                None,
             ))
         }
         BuildDirLookup::Inconclusive { unread } => {
-            return Err(format!(
-                "scan budget ran out before {unread} hash dir(s) under {root} were read in full"
+            return Err(BuildDirReclaim::kept(
+                format!(
+                    "scan budget ran out before {unread} shared-build hash dir(s) were read in full"
+                ),
+                None,
             ))
         }
     };
-    let shown = candidate.display().to_string();
-    guard_build_dir_candidate(candidate, shared_root, main_checkout_dir).ok_or_else(|| {
-        format!("{shown} is the shared root itself or the main checkout's own build-dir")
+    guard_build_dir_candidate(candidate.clone(), shared_root, main_checkout_dir).ok_or_else(|| {
+        BuildDirReclaim::kept(
+            "its hash dir is the shared root itself or the main checkout's own build-dir".into(),
+            Some(candidate),
+        )
     })
 }
 
@@ -1618,17 +1724,17 @@ struct BuildDirReclaim {
     freed: Option<u64>,
     /// See `scoped_lane_build_dir`'s own `Err`, plus a failed delete.
     kept: Option<String>,
-    /// The resolved hash dir `freed` (or a failed delete's `kept`)
-    /// describes; `None` when none was resolved or it measured empty.
+    /// The resolved hash dir `freed` or `kept` describes; `None` when none
+    /// was resolved or it measured empty.
     path: Option<PathBuf>,
 }
 
 impl BuildDirReclaim {
-    fn kept(reason: String) -> Self {
+    fn kept(reason: String, path: Option<PathBuf>) -> Self {
         Self {
             freed: None,
             kept: Some(reason),
-            path: None,
+            path,
         }
     }
 
@@ -1642,10 +1748,10 @@ impl BuildDirReclaim {
         }
         if !dry_run {
             if let Err(error) = deep_prune_remove(dir, root) {
-                return Self {
-                    path: Some(dir.to_path_buf()),
-                    ..Self::kept(format!("removing {} failed: {error}", dir.display()))
-                };
+                return Self::kept(
+                    format!("removing its hash dir failed: {error}"),
+                    Some(dir.to_path_buf()),
+                );
             }
         }
         Self {
@@ -1667,7 +1773,7 @@ impl BuildDirReclaim {
         };
         match scoped_lane_build_dir(root, main_dir.as_deref(), lane_path) {
             Ok(dir) => Self::free(root, &dir, dry_run),
-            Err(reason) => Self::kept(reason),
+            Err(kept) => kept,
         }
     }
 }
@@ -1726,18 +1832,78 @@ fn names_an_existing_workspace(file_path: &Path) -> bool {
 /// exists, and `cut_short` if the scan's own bounded budget ran out before
 /// every evidence file was read. `cut_short` must gate the final verdict
 /// separately from `saw_dead`: a dead line seen before the budget ran out
-/// says nothing about the evidence this scan never reached.
+/// says nothing about the evidence this scan never reached. `dead` and
+/// `relative` keep every vanished absolute path and every relative source
+/// seen, for `workspace_root_may_survive`'s own final check.
 #[derive(Default)]
 struct OrphanVerdict {
     saw_live: bool,
     saw_dead: bool,
     cut_short: bool,
+    dead: BTreeSet<PathBuf>,
+    relative: BTreeSet<PathBuf>,
+}
+
+/// Whether `dir` could still be the root of the workspace a hash dir's
+/// relative sources belong to: it is a directory holding a `Cargo.toml`,
+/// or one of `relative` resolves under it. Anything this cannot read
+/// counts as "could be" — the caller deletes on `false` alone.
+fn may_be_workspace_root(dir: &Path, relative: &BTreeSet<PathBuf>) -> bool {
+    match fs::metadata(dir) {
+        Ok(info) if info.is_dir() => {}
+        Ok(_) => return false,
+        Err(error) => {
+            return !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            )
+        }
+    }
+    std::iter::once(Path::new("Cargo.toml"))
+        .chain(relative.iter().map(PathBuf::as_path))
+        .any(|entry| match dir.join(entry).try_exists() {
+            Ok(found) => found,
+            Err(error) => error.kind() != io::ErrorKind::NotADirectory,
+        })
+}
+
+/// Whether a hash dir whose every absolute workspace path has vanished
+/// (`verdict.dead`) may still belong to a live workspace through its
+/// relative sources (`verdict.relative`) — card `20261119-b-087c6c`. One
+/// hash dir is one workspace (`{workspace-path-hash}`), and cargo names
+/// that workspace's own member sources relative to its root
+/// (`crates/mv-core/src/lib.rs`), keeping absolute paths only for inputs
+/// like an `include_str!` file. A vanished absolute path therefore says
+/// only that *that file* is gone, not the workspace: the root is some
+/// ancestor of it, and which one the evidence never says. So every
+/// still-existing ancestor of every vanished path is a candidate root, and
+/// the workspace counts as gone only when no candidate holds a
+/// `Cargo.toml` or any of the relative sources (see
+/// `may_be_workspace_root`). A hash dir with no relative sources at all
+/// keeps the prior rule unchanged: its absolute paths are its sources.
+fn workspace_root_may_survive(verdict: &OrphanVerdict) -> bool {
+    if verdict.relative.is_empty() {
+        return false;
+    }
+    let mut checked: HashSet<&Path> = HashSet::new();
+    for path in &verdict.dead {
+        for ancestor in path.ancestors().skip(1) {
+            if !checked.insert(ancestor) {
+                break;
+            }
+            if may_be_workspace_root(ancestor, &verdict.relative) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Walks `dir` read-only, depth-first, for every build-evidence file (see
-/// `is_build_evidence`), classifying each non-whitespace, absolute-looking
-/// token on each line (never a cargo registry/git-checkout source — see
-/// `is_cargo_cache_source`) against `names_an_existing_workspace`. Stops
+/// `is_build_evidence`), classifying each absolute path its own workspace
+/// evidence names (see `workspace_evidence`) against
+/// `names_an_existing_workspace`, and keeping every relative one for
+/// `workspace_root_may_survive`. Stops
 /// the instant `verdict.saw_live` is set — no further evidence can change a
 /// hash dir this proves still live — and marks `verdict.cut_short` rather
 /// than guessing once either the whole-scan `budget`'s deadline or `dir`'s
@@ -1786,19 +1952,15 @@ fn scan_orphan_evidence(
         let Ok(content) = fs::read_to_string(&entry) else {
             continue;
         };
-        for token in content.split_ascii_whitespace() {
-            let candidate = Path::new(token.trim_end_matches(':'));
-            if !candidate.is_absolute()
-                || is_cargo_cache_source(candidate, cargo_home)
-                || is_shared_build_root_path(candidate, shared_root)
-            {
-                continue;
-            }
-            if names_an_existing_workspace(candidate) {
+        let (absolute, relative) = workspace_evidence(&content, cargo_home, shared_root);
+        verdict.relative.extend(relative);
+        for candidate in absolute {
+            if names_an_existing_workspace(&candidate) {
                 verdict.saw_live = true;
                 return;
             }
             verdict.saw_dead = true;
+            verdict.dead.insert(candidate);
         }
     }
 }
@@ -1807,9 +1969,11 @@ fn scan_orphan_evidence(
 /// `hash_dir_candidates`) is safe to reclaim: its own build evidence names
 /// at least one workspace root, and every one it names has vanished (card
 /// `20261115-b-673528`). `false` the moment any line names a still-existing
-/// workspace root, there is no readable (non-registry) evidence at all, or
-/// the scan was cut short before finishing — a scan this inconclusive must
-/// never license a delete. `per_dir` bounds this one dir's own evidence
+/// workspace root, there is no readable (non-registry) evidence at all,
+/// the scan was cut short before finishing, or its relative sources leave
+/// a still-existing directory that could be the workspace's root (see
+/// `workspace_root_may_survive`) — a scan this inconclusive must never
+/// license a delete. `per_dir` bounds this one dir's own evidence
 /// read, independent of every other candidate `budget`'s whole-scan
 /// deadline also spans (card `20261116-b-891676`).
 fn hash_dir_is_orphaned(
@@ -1821,7 +1985,10 @@ fn hash_dir_is_orphaned(
 ) -> bool {
     let mut verdict = OrphanVerdict::default();
     scan_orphan_evidence(dir, cargo_home, shared_root, budget, per_dir, &mut verdict);
-    verdict.saw_dead && !verdict.saw_live && !verdict.cut_short
+    verdict.saw_dead
+        && !verdict.saw_live
+        && !verdict.cut_short
+        && !workspace_root_may_survive(&verdict)
 }
 
 impl Worktrees {
@@ -2655,7 +2822,7 @@ impl Worktrees {
                 let build_dir = match build_dir {
                     None => BuildDirReclaim::default(),
                     Some((root, Ok(dir))) => BuildDirReclaim::free(&root, &dir, measure_only),
-                    Some((_, Err(reason))) => BuildDirReclaim::kept(reason),
+                    Some((_, Err(kept))) => kept,
                 };
                 outcomes.push(if archiving {
                     PruneOutcome::Archived {
@@ -7153,6 +7320,192 @@ pub(crate) mod tests {
         assert!(!hash_dir_path.exists());
     }
 
+    /// Critic `5a1612`'s High (card `20261119-b-087c6c`): the same real
+    /// layout, but the workspace stays and only its `include_str!` input —
+    /// the one absolute workspace path cargo wrote — is deleted. Its
+    /// members' own dep-info names `crates/…` relative to the workspace
+    /// root, so the vanished prompt never proved the workspace gone; on
+    /// 0.1.11 the sweep read only that absolute path and deleted a live
+    /// workspace's build. Kept both when the workspace root holds its
+    /// `Cargo.toml` and, separately, when only its relative sources
+    /// resolve.
+    #[test]
+    fn prune_orphaned_build_dirs_keeps_a_live_real_layout_whose_only_absolute_input_vanished() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        let store = repo.store();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+
+        type MarkLive = fn(&Path);
+        let live_marker: [(&str, MarkLive); 2] = [
+            ("Cargo.toml", |workspace| {
+                fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            }),
+            ("relative sources", |workspace| {
+                for member in ["mv-core", "mv-engine"] {
+                    let src = workspace.join(format!("crates/{member}/src"));
+                    fs::create_dir_all(&src).unwrap();
+                    fs::write(src.join("lib.rs"), "").unwrap();
+                }
+            }),
+        ];
+        for (label, mark_live) in live_marker {
+            let workspace = std::env::temp_dir().join(format!(
+                "mv-live-real-layout-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+            let hash_dir_path = shared_root.join("02/7179bbe4c308d8");
+            write_real_build_dir_layout(&hash_dir_path, &workspace, &cargo_home.dir);
+            mark_live(&workspace);
+            fs::remove_file(workspace.join("prompts/role-builder.md")).unwrap();
+
+            let outcomes = store.prune_orphaned_build_dirs(false).unwrap();
+            let workspace_existed = workspace.exists();
+            fs::remove_dir_all(&workspace).unwrap();
+            assert!(workspace_existed);
+            assert!(outcomes.is_empty(), "{label}: {outcomes:?}");
+            assert!(
+                hash_dir_path.exists(),
+                "{label}: a live workspace's build-dir must be kept"
+            );
+            fs::remove_dir_all(&hash_dir_path).unwrap();
+        }
+    }
+
+    /// Critic `5a1612`'s Medium (card `20261119-b-087c6c`): a lane whose
+    /// dep-info spells its path another way (here through a symlink, as
+    /// `/var` vs `/private/var` does on macOS) misses the per-lane lookup,
+    /// and the 0.1.11 sweep then freed that same live lane's build-dir in
+    /// the same run — `kept build-dir` followed by `freed`. The miss's own
+    /// reason names no machine path, carries no hash dir, and the sweep now
+    /// keeps the dir: the lane still holds its `Cargo.toml`.
+    #[test]
+    fn prune_never_reports_a_lane_build_dir_kept_while_the_sweep_frees_it() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        fs::write(repo.0.join("Cargo.toml"), "[workspace]\n").unwrap();
+        git(&repo.0, &["add", "Cargo.toml"], None).unwrap();
+        git(&repo.0, &["commit", "-m", "workspace"], None).unwrap();
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let spelled = std::env::temp_dir().join(format!(
+            "mv-lane-spelling-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        std::os::unix::fs::symlink(&lane.path, &spelled).unwrap();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let lane_hash_dir = shared_root.join("02/7179bbe4c308d8");
+        write_real_build_dir_layout(&lane_hash_dir, &spelled, &cargo_home.dir);
+        fs::remove_file(lane.path.join("prompts/role-builder.md")).unwrap();
+
+        let outcomes = store.prune(&mut Observer::idle(), true, true).unwrap();
+        let reported: Vec<PathBuf> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                PruneOutcome::Kept { build_dir, .. }
+                | PruneOutcome::WouldRemove { build_dir, .. }
+                | PruneOutcome::WouldArchive { build_dir, .. }
+                | PruneOutcome::Removed { build_dir, .. }
+                | PruneOutcome::Archived { build_dir, .. } => build_dir.clone(),
+            })
+            .collect();
+        let swept = store
+            .prune_orphaned_build_dirs_skipping(false, &reported)
+            .unwrap();
+        fs::remove_file(&spelled).unwrap();
+        assert!(swept.is_empty(), "{swept:?}");
+        assert!(
+            lane_hash_dir.exists(),
+            "a live lane's build-dir must survive the sweep"
+        );
+        match &outcomes[0] {
+            PruneOutcome::WouldRemove {
+                build_dir_freed: None,
+                build_dir_kept: Some(reason),
+                build_dir: None,
+                ..
+            } => assert!(
+                !reason.contains(&shared_root.display().to_string()),
+                "reason was: {reason}"
+            ),
+            other => panic!("expected WouldRemove with a kept reason, got {other:?}"),
+        }
+    }
+
+    /// Critic `5a1612`'s Low (card `20261119-b-087c6c`): the per-lane
+    /// lookup matched any `.d` line containing `{lane}/` as a raw
+    /// substring, so another hash dir sorted first whose dep-info only
+    /// *mentions* the lane — an env-dep value, a path that embeds it —
+    /// resolved as the lane's own build-dir, the one `--prune --yes`
+    /// deletes. It now matches whole paths, filtered the way the sweep
+    /// filters them.
+    #[test]
+    fn find_build_dir_ignores_dep_info_that_only_mentions_the_lane() {
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let root = std::env::temp_dir().join(format!(
+            "mv-lane-mention-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let lane = root.join("lane");
+        let shared_root = root.join("shared-build");
+        let mentions = hash_dir(&shared_root, "02", "1");
+        fs::create_dir_all(mentions.join("debug/deps")).unwrap();
+        fs::write(
+            mentions.join("debug/deps/other.d"),
+            format!(
+                "{out}: /mirror{lane}/src/lib.rs\n\n/mirror{lane}/src/lib.rs:\n\n# env-dep:LANE_DIR={lane}/src\n",
+                out = mentions.join("debug/deps/libother.rmeta").display(),
+                lane = lane.display()
+            ),
+        )
+        .unwrap();
+        let owns = hash_dir(&shared_root, "03", "1");
+        write_build_evidence(&owns, &[&lane]);
+
+        let found = find_build_dir(&shared_root, &lane);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(found, Some(owns));
+    }
+
+    /// `dep_info_paths` reads rustc's own dep-info shape: rule targets and
+    /// prerequisites alike, `\ `-escaped spaces kept inside one path, and
+    /// `#` lines skipped whole.
+    #[test]
+    fn dep_info_paths_unescapes_spaces_and_skips_comment_lines() {
+        let content = "/b/out.rmeta: crates/a/src/lib.rs /w/My\\ Project/x.md\n\n\
+                       crates/a/src/lib.rs:\n/w/My\\ Project/x.md:\n\n\
+                       # env-dep:HOME=/w/home\n";
+        assert_eq!(
+            dep_info_paths(content),
+            [
+                "/b/out.rmeta",
+                "crates/a/src/lib.rs",
+                "/w/My Project/x.md",
+                "crates/a/src/lib.rs",
+                "/w/My Project/x.md",
+            ]
+        );
+    }
+
     /// A lane whose build-dir `--prune` cannot find or cannot prove safe
     /// now says so (card `20261116-b-891676`): a lane that never built
     /// reports the complete miss, and a lane whose dep-info sits behind
@@ -7183,7 +7536,12 @@ pub(crate) mod tests {
                 build_dir_freed: None,
                 build_dir_kept: Some(reason),
                 ..
-            } => assert!(reason.contains("no hash dir under"), "reason was: {reason}"),
+            } => {
+                assert_eq!(
+                    reason, "no shared-build hash dir names this lane in its dep-info",
+                    "a kept reason never names a machine path"
+                );
+            }
             other => panic!("expected WouldRemove with a kept reason, got {other:?}"),
         }
 

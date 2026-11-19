@@ -9,6 +9,24 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-11-19
+
+### Fixed
+
+- `worktrees --prune --yes` could delete a live workspace's shared-build
+  hash dir. Cargo names a workspace's member sources relative to its root
+  and keeps absolute paths only for inputs such as an `include_str!` file;
+  the orphan sweep read only the absolute ones, so renaming or deleting
+  that one file made a live workspace look gone. The sweep now counts
+  relative sources: a hash dir is freed only when no still-existing
+  ancestor of its vanished paths holds a `Cargo.toml` or any of those
+  sources. The per-lane lookup now matches whole dep-info paths with the
+  sweep's own filters, never a line that merely mentions the lane, and
+  skips `#` comment lines. A lane whose hash dir was not found now prints
+  `build-dir unresolved — <reason>` instead of `kept build-dir`, since the
+  sweep may still free a dir it proves orphaned on its own; neither line
+  names the shared build root's path any more.
+
 ## [0.1.12] - 2026-11-19
 
 ### Fixed
@@ -1323,6 +1341,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.13]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.13
 [0.1.12]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.12
 [0.1.11]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.11
 [0.1.10]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.10

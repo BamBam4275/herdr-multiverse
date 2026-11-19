@@ -2057,9 +2057,14 @@ fn lane_with_build_dir(sandbox: &Sandbox) -> PathBuf {
         .root
         .join("cargo-home/shared-build/3b/00000000000013");
     fs::create_dir_all(build_dir.join("debug/deps")).unwrap();
+    // rustc's dep-info escapes each space in a path as `\ `; the sandbox
+    // project path has spaces (card `20261119-b-087c6c`).
     fs::write(
         build_dir.join("debug/deps/fixture.d"),
-        format!("{}/src/lib.rs\n", lane.path.display()),
+        format!(
+            "{}/src/lib.rs\n",
+            lane.path.display().to_string().replace(' ', "\\ ")
+        ),
     )
     .unwrap();
     fs::write(build_dir.join("debug/deps/artifact"), vec![0u8; 4096]).unwrap();
