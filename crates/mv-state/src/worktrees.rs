@@ -782,6 +782,9 @@ pub enum PruneOutcome {
         /// under `dry_run`, would free — under the same eligibility as
         /// `target_freed`: see `Worktrees::kept_build_dir_bytes`.
         build_dir_freed: Option<u64>,
+        /// Why that same build-dir was left in place even though this lane
+        /// qualified for its reclaim — see `BuildDirReclaim::kept`.
+        build_dir_kept: Option<String>,
     },
     WouldRemove {
         task: String,
@@ -791,10 +794,14 @@ pub enum PruneOutcome {
         /// per-lane build-dir namespacing configured, or the lane's
         /// build-dir cannot be resolved or proven safe to delete.
         build_dir_freed: Option<u64>,
+        /// Why `build_dir_freed` is `None` although this workspace does
+        /// namespace build-dirs per lane — see `BuildDirReclaim::kept`.
+        build_dir_kept: Option<String>,
     },
     WouldArchive {
         task: String,
         build_dir_freed: Option<u64>,
+        build_dir_kept: Option<String>,
     },
     Removed {
         task: String,
@@ -804,6 +811,7 @@ pub enum PruneOutcome {
         /// Bytes this lane's own cargo build-dir actually freed. `None`
         /// under the same conditions as `WouldRemove`'s own field.
         build_dir_freed: Option<u64>,
+        build_dir_kept: Option<String>,
     },
     Archived {
         task: String,
@@ -811,6 +819,7 @@ pub enum PruneOutcome {
         retained_state: Option<PathBuf>,
         rescued: Vec<PathBuf>,
         build_dir_freed: Option<u64>,
+        build_dir_kept: Option<String>,
     },
 }
 
@@ -1285,7 +1294,10 @@ impl BuildDirScanBudget {
 /// fingerprint count (dozens to a few hundred files for a multi-crate
 /// workspace, almost always naming the workspace itself in the first few
 /// read) and far below the "thousands" a pathological or long-lived hash
-/// dir can accumulate — enough for a live dir to prove itself live (one
+/// dir can accumulate. That count holds only because `is_build_evidence`
+/// skips `.fingerprint/`: with it, a real lane's hash dir held 1703
+/// candidate files, not a few hundred (card `20261116-b-891676`, 0.1.9
+/// observation). That is enough for a live dir to prove itself live (one
 /// matching line ends that dir's scan immediately) without reading
 /// anywhere near its full evidence set, and small enough that a dir with
 /// no usable evidence at all can never consume more than a sliver of a
@@ -1313,14 +1325,25 @@ impl PerDirFileBudget {
 }
 
 /// A file this scan treats as evidence of which workspace a cargo
-/// build-dir hash belongs to: a dep-info (`.d`) file, or anything inside a
-/// `.fingerprint` directory — the two places cargo's own build output
-/// names absolute source paths. Never a compiled artifact (`.rlib`, `.o`,
-/// a linked binary): those carry no path text worth reading, only cost to
+/// build-dir hash belongs to: a dep-info (`.d`) file outside
+/// `.fingerprint/` — the one place cargo's own build output names
+/// absolute source paths. Never a compiled artifact (`.rlib`, `.o`, a
+/// linked binary): those carry no path text worth reading, only cost to
 /// open.
+///
+/// Never anything under `.fingerprint/` either (card `20261116-b-891676`,
+/// 0.1.9 observation): cargo's fingerprint files hold hashes, JSON with
+/// relative paths, and its own re-encoded copy of the `.d` files it
+/// already keeps in `deps/` — on a real lane build-dir, none of them name
+/// an absolute workspace path. They are also most of the hash dir by count
+/// (1375 of 1703 candidate files on the lane that 0.1.9 left behind), and
+/// `.fingerprint` sorts ahead of `build/` and `deps/`. Counting them used
+/// up `PerDirFileBudget` before the scan reached the one `deps/*.d` file
+/// that named the lane, so the lane's build-dir was never found and never
+/// freed.
 fn is_build_evidence(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "d")
-        || path.components().any(|c| c.as_os_str() == ".fingerprint")
+        && !path.components().any(|c| c.as_os_str() == ".fingerprint")
 }
 
 /// Walks `dir` read-only, depth-first, for a build-evidence file (see
@@ -1443,20 +1466,55 @@ fn find_build_dir_evidence(
     shared_root: &Path,
     marker: &Path,
     exclude: Option<&str>,
-) -> Option<PathBuf> {
+) -> BuildDirLookup {
     let marker = format!("{}/", marker.display());
     let candidates = hash_dir_candidates(shared_root);
-    let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
-    for candidate in candidates {
+    let total = candidates.len();
+    let mut budget = BuildDirScanBudget::for_candidates(total);
+    let mut unread = 0;
+    for (index, candidate) in candidates.into_iter().enumerate() {
         if budget.exhausted() {
-            return None;
+            return BuildDirLookup::Inconclusive {
+                unread: unread + total - index,
+            };
         }
         let mut per_dir = PerDirFileBudget::new();
         if dir_names_marker(&candidate, &marker, exclude, &mut budget, &mut per_dir) {
-            return Some(candidate);
+            return BuildDirLookup::Found(candidate);
+        }
+        if budget.exhausted() || per_dir.exhausted() {
+            unread += 1;
         }
     }
-    None
+    if unread > 0 {
+        BuildDirLookup::Inconclusive { unread }
+    } else {
+        BuildDirLookup::NotFound
+    }
+}
+
+/// What one `find_build_dir_evidence` scan concluded. A miss is split in
+/// two so `scoped_lane_build_dir` can say which one kept a lane's
+/// build-dir (card `20261116-b-891676`): on 0.1.9, a budget-starved scan
+/// looked exactly like "no build-dir here" and `--prune` said nothing.
+enum BuildDirLookup {
+    Found(PathBuf),
+    /// Every candidate was read in full and none names the workspace.
+    NotFound,
+    /// None matched, but `unread` candidates ran out of scan budget before
+    /// being read in full, so one of them may still be the workspace's.
+    Inconclusive {
+        unread: usize,
+    },
+}
+
+impl BuildDirLookup {
+    fn found(self) -> Option<PathBuf> {
+        match self {
+            Self::Found(dir) => Some(dir),
+            Self::NotFound | Self::Inconclusive { .. } => None,
+        }
+    }
 }
 
 /// The one full workspace hash directory under `shared_root` (see
@@ -1472,7 +1530,7 @@ fn find_build_dir_evidence(
 /// calls, which also applies the delete-safety guards this bare
 /// resolution does not.
 pub fn find_build_dir(shared_root: &Path, workspace_root: &Path) -> Option<PathBuf> {
-    find_build_dir_evidence(shared_root, workspace_root, None)
+    find_build_dir_evidence(shared_root, workspace_root, None).found()
 }
 
 /// `project_root`'s own build-dir hash, excluding any match that is also
@@ -1484,7 +1542,7 @@ pub fn find_build_dir(shared_root: &Path, workspace_root: &Path) -> Option<PathB
 /// project-vs-lane distinction `prune` itself relies on.
 pub fn find_main_checkout_build_dir(shared_root: &Path, project_root: &Path) -> Option<PathBuf> {
     let worktrees_prefix = format!("{}/.multiverse/worktrees/", project_root.display());
-    find_build_dir_evidence(shared_root, project_root, Some(&worktrees_prefix))
+    find_build_dir_evidence(shared_root, project_root, Some(&worktrees_prefix)).found()
 }
 
 /// `find_build_dir`'s own two safety properties, checked explicitly here
@@ -1511,16 +1569,87 @@ fn guard_build_dir_candidate(
 
 /// `lane_path`'s own cargo build-dir, when it is provably safe to delete —
 /// found read-only under `shared_root` (see `find_build_dir`) and checked
-/// against `guard_build_dir_candidate`. `None` for anything this cannot
-/// prove: no matching hash dir, the scan's own budget running out first,
-/// or either guard.
+/// against `guard_build_dir_candidate`. `Err` carries the one-line reason
+/// for anything this cannot prove: no matching hash dir, the scan's own
+/// budget running out first, or either guard. `--prune` prints it as the
+/// reason it kept the lane's build-dir (card `20261116-b-891676`).
 fn scoped_lane_build_dir(
     shared_root: &Path,
     main_checkout_dir: Option<&Path>,
     lane_path: &Path,
-) -> Option<PathBuf> {
-    let candidate = find_build_dir(shared_root, lane_path)?;
-    guard_build_dir_candidate(candidate, shared_root, main_checkout_dir)
+) -> std::result::Result<PathBuf, String> {
+    let root = shared_root.display();
+    let candidate = match find_build_dir_evidence(shared_root, lane_path, None) {
+        BuildDirLookup::Found(candidate) => candidate,
+        BuildDirLookup::NotFound => {
+            return Err(format!(
+                "no hash dir under {root} names this lane in its dep-info"
+            ))
+        }
+        BuildDirLookup::Inconclusive { unread } => {
+            return Err(format!(
+                "scan budget ran out before {unread} hash dir(s) under {root} were read in full"
+            ))
+        }
+    };
+    let shown = candidate.display().to_string();
+    guard_build_dir_candidate(candidate, shared_root, main_checkout_dir).ok_or_else(|| {
+        format!("{shown} is the shared root itself or the main checkout's own build-dir")
+    })
+}
+
+/// The bytes freed, or the reason a lane's build-dir stayed: at most one
+/// of the two is set, and neither when there was nothing to reclaim (no
+/// per-lane namespacing, a lane not yet eligible, or an empty dir).
+#[derive(Debug, Default)]
+struct BuildDirReclaim {
+    freed: Option<u64>,
+    /// See `scoped_lane_build_dir`'s own `Err`, plus a failed delete.
+    kept: Option<String>,
+}
+
+impl BuildDirReclaim {
+    fn kept(reason: String) -> Self {
+        Self {
+            freed: None,
+            kept: Some(reason),
+        }
+    }
+
+    /// Measures `dir` and, unless `dry_run`, deletes it — confined to
+    /// `root` (see `deep_prune_remove`). A failed delete is reported as
+    /// kept rather than as freed bytes that are still on disk.
+    fn free(root: &Path, dir: &Path, dry_run: bool) -> Self {
+        let size = deep_prune_size(dir);
+        if size == 0 {
+            return Self::default();
+        }
+        if !dry_run {
+            if let Err(error) = deep_prune_remove(dir, root) {
+                return Self::kept(format!("removing {} failed: {error}", dir.display()));
+            }
+        }
+        Self {
+            freed: Some(size),
+            kept: None,
+        }
+    }
+
+    /// `lane_path`'s own build-dir under `build_scope` (see
+    /// `Worktrees::prune_with_ignored`), resolved and freed in one step.
+    fn resolve_and_free(
+        build_scope: Option<&(PathBuf, Option<PathBuf>)>,
+        lane_path: &Path,
+        dry_run: bool,
+    ) -> Self {
+        let Some((root, main_dir)) = build_scope else {
+            return Self::default();
+        };
+        match scoped_lane_build_dir(root, main_dir.as_deref(), lane_path) {
+            Ok(dir) => Self::free(root, &dir, dry_run),
+            Err(reason) => Self::kept(reason),
+        }
+    }
 }
 
 /// `path` sits under `cargo_home`'s own registry or git-checkout trees —
@@ -2303,14 +2432,17 @@ impl Worktrees {
     /// that is settled and clean, keeping the rest. Equivalent to
     /// [`Self::prune_with_ignored`] with `allow_ignored: false` — a
     /// non-disposable ignored file still blocks removal unless a caller
-    /// explicitly opts into discarding it via that method instead.
+    /// explicitly opts into discarding it via that method instead — and
+    /// with `free_caches: true`, so a qualifying lane's own `target/` and
+    /// build-dir are still freed exactly as before card
+    /// `20261119-b-73759c` gave the CLI a way to withhold that.
     pub fn prune(
         &self,
         observer: &mut impl LaneObserver,
         force: bool,
         dry_run: bool,
     ) -> Result<Vec<PruneOutcome>> {
-        self.prune_with_ignored(observer, force, dry_run, false)
+        self.prune_with_ignored(observer, force, dry_run, false, true)
     }
 
     /// Explicit confirmation permits discarding ignored data. It never bypasses
@@ -2318,13 +2450,23 @@ impl Worktrees {
     /// The confirmation is carried through the final removal recheck too.
     /// A lane this keeps still loses its own lane-root `target/` when the
     /// lane qualifies — see `Self::kept_target_bytes`.
+    ///
+    /// `free_caches` false (card `20261119-b-73759c`: `worktrees --prune`
+    /// without `--yes`) still removes or archives each eligible lane, but
+    /// only measures — never deletes — that lane-root `target/` and every
+    /// lane's own shared-cache build-dir, reporting the same bytes a
+    /// `dry_run` would. `dry_run` true never deletes either, regardless.
     pub fn prune_with_ignored(
         &self,
         observer: &mut impl LaneObserver,
         force: bool,
         dry_run: bool,
         allow_ignored: bool,
+        free_caches: bool,
     ) -> Result<Vec<PruneOutcome>> {
+        // The one switch every cache free below reads: a real removal
+        // never implies permission to delete a build cache on its own.
+        let measure_only = dry_run || !free_caches;
         // Read-only preview does not even create a lock file.
         let _lock = if dry_run {
             None
@@ -2410,11 +2552,11 @@ impl Worktrees {
             let archiving = match check {
                 Err(error) => {
                     let target_freed =
-                        self.kept_target_bytes(&lane, pane_clear, dry_run, &task_records);
-                    let build_dir_freed = self.kept_build_dir_bytes(
+                        self.kept_target_bytes(&lane, pane_clear, measure_only, &task_records);
+                    let build_dir = self.kept_build_dir_bytes(
                         &lane,
                         pane_clear,
-                        dry_run,
+                        measure_only,
                         build_scope.as_ref(),
                         &task_records,
                     );
@@ -2422,24 +2564,21 @@ impl Worktrees {
                         task: lane.task,
                         reason: error.to_string(),
                         target_freed,
-                        build_dir_freed,
+                        build_dir_freed: build_dir.freed,
+                        build_dir_kept: build_dir.kept,
                     });
                     continue;
                 }
                 Ok(archiving) => archiving,
             };
             if dry_run {
-                let build_dir_freed = build_scope
-                    .as_ref()
-                    .and_then(|(root, main_dir)| {
-                        scoped_lane_build_dir(root, main_dir.as_deref(), &lane.path)
-                    })
-                    .map(|dir| deep_prune_size(&dir))
-                    .filter(|&size| size > 0);
+                let build_dir =
+                    BuildDirReclaim::resolve_and_free(build_scope.as_ref(), &lane.path, true);
                 outcomes.push(if archiving {
                     PruneOutcome::WouldArchive {
                         task: lane.task,
-                        build_dir_freed,
+                        build_dir_freed: build_dir.freed,
+                        build_dir_kept: build_dir.kept,
                     }
                 } else {
                     let branch_refusal = self
@@ -2455,7 +2594,8 @@ impl Worktrees {
                     PruneOutcome::WouldRemove {
                         task: lane.task,
                         branch_refusal,
-                        build_dir_freed,
+                        build_dir_freed: build_dir.freed,
+                        build_dir_kept: build_dir.kept,
                     }
                 });
             } else {
@@ -2477,9 +2617,11 @@ impl Worktrees {
                 // only its single `rescue()` call the same way.
                 let mut rescued = self.rescue_state(&lane.path.join(".multiverse"))?;
                 rescued.sort();
-                let build_dir = build_scope.as_ref().and_then(|(root, main_dir)| {
-                    scoped_lane_build_dir(root, main_dir.as_deref(), &lane.path)
-                        .map(|dir| (root.clone(), dir))
+                let build_dir = build_scope.as_ref().map(|(root, main_dir)| {
+                    (
+                        root.clone(),
+                        scoped_lane_build_dir(root, main_dir.as_deref(), &lane.path),
+                    )
                 });
                 let retained_state = self.remove_lane(&lane, archiving, allow_ignored)?;
                 // That lane's task dirs now live in the main checkout (the
@@ -2487,21 +2629,19 @@ impl Worktrees {
                 // shared listing would point a later lane's authority check
                 // at a path that is gone. Re-list only after a real removal.
                 retirement_candidates = self.retirement_candidates()?;
-                let build_dir_freed = build_dir.and_then(|(root, dir)| {
-                    let size = deep_prune_size(&dir);
-                    if size == 0 {
-                        return None;
-                    }
-                    let _ = deep_prune_remove(&dir, &root);
-                    Some(size)
-                });
+                let build_dir = match build_dir {
+                    None => BuildDirReclaim::default(),
+                    Some((root, Ok(dir))) => BuildDirReclaim::free(&root, &dir, measure_only),
+                    Some((_, Err(reason))) => BuildDirReclaim::kept(reason),
+                };
                 outcomes.push(if archiving {
                     PruneOutcome::Archived {
                         tip: self.archive_locked(&lane.task)?,
                         task: lane.task,
                         retained_state,
                         rescued,
-                        build_dir_freed,
+                        build_dir_freed: build_dir.freed,
+                        build_dir_kept: build_dir.kept,
                     }
                 } else {
                     let branch_refusal = if has_terminal_outcome_in(&task_records, &lane.task)
@@ -2516,7 +2656,8 @@ impl Worktrees {
                         branch_refusal,
                         retained_state,
                         rescued,
-                        build_dir_freed,
+                        build_dir_freed: build_dir.freed,
+                        build_dir_kept: build_dir.kept,
                     }
                 });
             }
@@ -2590,7 +2731,8 @@ impl Worktrees {
     /// itself — see `scoped_lane_build_dir` for why it is safe to delete
     /// and `deep_prune_remove`'s own `root` parameter for why `build_scope`
     /// must name the shared root, not `lane.path`, as the confinement
-    /// boundary.
+    /// boundary. A lane not yet eligible gets neither bytes nor a kept
+    /// reason: the lane itself is kept, and its own reason already says why.
     fn kept_build_dir_bytes(
         &self,
         lane: &Lane,
@@ -2598,29 +2740,20 @@ impl Worktrees {
         dry_run: bool,
         build_scope: Option<&(PathBuf, Option<PathBuf>)>,
         task_records: &[crate::index::IndexedRecord],
-    ) -> Option<u64> {
+    ) -> BuildDirReclaim {
         if !pane_clear {
-            return None;
+            return BuildDirReclaim::default();
         }
         if self
             .terminal_statuses(lane, false, false, false, task_records)
             .is_err()
         {
-            return None;
+            return BuildDirReclaim::default();
         }
         if has_process_cwd(&lane.path).unwrap_or(true) {
-            return None;
+            return BuildDirReclaim::default();
         }
-        let (root, main_dir) = build_scope?;
-        let dir = scoped_lane_build_dir(root, main_dir.as_deref(), &lane.path)?;
-        let size = deep_prune_size(&dir);
-        if size == 0 {
-            return None;
-        }
-        if !dry_run {
-            let _ = deep_prune_remove(&dir, root);
-        }
-        Some(size)
+        BuildDirReclaim::resolve_and_free(build_scope, &lane.path, dry_run)
     }
 
     fn remove_lane(
@@ -5817,6 +5950,77 @@ pub(crate) mod tests {
         );
     }
 
+    /// Card `20261119-b-73759c`: without the CLI's `--yes`
+    /// (`free_caches: false`) a real prune still removes the lane, but its
+    /// build-dir is only measured — the same bytes a dry run reports — and
+    /// stays on disk.
+    #[test]
+    fn prune_without_free_caches_removes_the_lane_but_keeps_its_build_dir() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let lane_hash_dir = hash_dir(&shared_root, "2a", "1");
+        write_build_evidence(&lane_hash_dir, &[&lane.path]);
+        let lane_build_size = deep_prune_size(&lane_hash_dir);
+
+        let real = store
+            .prune_with_ignored(&mut Observer::idle(), true, false, false, false)
+            .unwrap();
+        match &real[0] {
+            PruneOutcome::Removed {
+                build_dir_freed, ..
+            } => assert_eq!(*build_dir_freed, Some(lane_build_size)),
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        assert!(!lane.path.exists(), "the lane itself is still removed");
+        assert!(
+            lane_hash_dir.exists(),
+            "an unconfirmed prune must not delete the build-dir"
+        );
+    }
+
+    /// Card `20261119-b-73759c`'s twin for a kept lane's lane-root
+    /// `target/`: reported, never deleted, without `free_caches`.
+    #[test]
+    fn prune_without_free_caches_keeps_a_kept_lanes_target() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("owner", "HEAD").unwrap();
+        let task_dir = lane.path.join(".multiverse/tasks/owner");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("status"), "done\n").unwrap();
+        fs::write(task_dir.join("result.md"), "findings\n").unwrap();
+        let target = lane.path.join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join("debug/build-artifact"), vec![0u8; 4096]).unwrap();
+        let target_size = deep_prune_size(&target);
+        fs::write(lane.path.join("README.md"), "dirty").unwrap();
+
+        let outcomes = store
+            .prune_with_ignored(&mut Observer::idle(), false, false, false, false)
+            .unwrap();
+        match &outcomes[0] {
+            PruneOutcome::Kept { target_freed, .. } => {
+                assert_eq!(*target_freed, Some(target_size))
+            }
+            other => panic!("expected Kept, got {other:?}"),
+        }
+        assert!(target.exists(), "target/ must survive an unconfirmed prune");
+    }
+
     /// The same eligibility `kept_target_bytes` already uses (finished,
     /// idle, pane clear) also frees a kept lane's own cargo build-dir —
     /// card `20261115-b-47f043` extends `--prune`'s existing lane-root
@@ -6710,6 +6914,260 @@ pub(crate) mod tests {
         }
     }
 
+    /// A hash dir laid out the way cargo really writes one, mirroring the
+    /// lane 0.1.9 left behind (card `20261116-b-891676`): `CACHEDIR.TAG`
+    /// and `tmp/` next to `debug/`, a `debug/.fingerprint/` tree of 1376
+    /// files that name no absolute path (hashes and cargo's own relative
+    /// JSON), a build-script dep-info under `build/`, a registry dep's
+    /// dep-info, workspace members' dep-info with the *relative* source
+    /// paths cargo gives rustc for them, and one `mv_engine` dep-info whose
+    /// `include_str!` inputs are the only absolute `workspace` paths. Every
+    /// file sorts so that `.fingerprint/` is read first, as it is on disk.
+    /// The named `prompts/` files are created under `workspace` so they
+    /// exist exactly as long as the workspace does.
+    fn write_real_build_dir_layout(hash_dir: &Path, workspace: &Path, cargo_home: &Path) {
+        let debug = hash_dir.join("debug");
+        fs::create_dir_all(hash_dir.join("tmp")).unwrap();
+        fs::write(
+            hash_dir.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        for i in 0..344 {
+            let unit = debug.join(format!(".fingerprint/pkg{i:03}-{i:016x}"));
+            fs::create_dir_all(&unit).unwrap();
+            fs::write(unit.join(format!("dep-lib-pkg{i:03}")), [0u8, 1, 2, 0xff]).unwrap();
+            fs::write(
+                unit.join("invoked.timestamp"),
+                "This file has an mtime of when this was started.",
+            )
+            .unwrap();
+            fs::write(unit.join(format!("lib-pkg{i:03}")), format!("{i:016x}")).unwrap();
+            fs::write(
+                unit.join(format!("lib-pkg{i:03}.json")),
+                format!(r#"{{"rustc":1,"path":{i},"local":[{{"CheckDepInfo":{{"dep_info":"debug/.fingerprint/pkg{i:03}-{i:016x}/dep-lib-pkg{i:03}"}}}}]}}"#),
+            )
+            .unwrap();
+        }
+        let out = |name: &str| debug.join(format!("deps/{name}")).display().to_string();
+        let script = debug.join("build/serde-0123456789abcdef");
+        fs::create_dir_all(&script).unwrap();
+        let registry = cargo_home.join("registry/src/index.crates.io-0000000000000000/serde-1.0.0");
+        fs::write(
+            script.join("build_script_build-0123456789abcdef.d"),
+            format!("{}: {}/build.rs\n", script.display(), registry.display()),
+        )
+        .unwrap();
+        fs::create_dir_all(debug.join("deps")).unwrap();
+        fs::write(
+            debug.join("deps/serde-0123456789abcdef.d"),
+            format!(
+                "{}: {}/src/lib.rs\n",
+                out("libserde.rmeta"),
+                registry.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            debug.join("deps/mv_core-0123456789abcdef.d"),
+            format!(
+                "{}: crates/mv-core/src/lib.rs\n\ncrates/mv-core/src/lib.rs:\n",
+                out("libmv_core.rmeta")
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join("prompts")).unwrap();
+        let prompt = workspace.join("prompts/role-builder.md");
+        fs::write(&prompt, "builder\n").unwrap();
+        fs::write(
+            debug.join("deps/mv_engine-0123456789abcdef.d"),
+            format!(
+                "{}: crates/mv-engine/src/lib.rs {prompt}\n\ncrates/mv-engine/src/lib.rs:\n{prompt}:\n\n# env-dep:CARGO_PKG_NAME=mv-engine\n",
+                out("libmv_engine.rmeta"),
+                prompt = prompt.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Card `20261116-b-891676`, observed on installed 0.1.9: `--prune
+    /// --yes` removed a merged lane and printed nothing about its
+    /// build-dir, which stayed. The home config sets an un-namespaced
+    /// `build-dir`, the repo config overrides it with
+    /// `{workspace-path-hash}`, and the lane's own hash dir sorts first
+    /// (`02/…`). Its `.fingerprint/` tree used up the whole
+    /// `PerDirFileBudget` before the scan reached the one `deps/*.d` file
+    /// naming the lane, so both the per-lane reclaim and the orphan sweep
+    /// gave up without a word. Runs the same `prune` then
+    /// `prune_orphaned_build_dirs` sequence the CLI does.
+    #[test]
+    fn prune_frees_a_lane_build_dir_behind_a_real_fingerprint_tree() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let cargo_home = CargoHomeEnvGuard::new();
+        fs::write(
+            cargo_home.dir.join("config.toml"),
+            "[build]\nbuild-dir = \"{cargo-cache-home}/shared-build\"\n",
+        )
+        .unwrap();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        // Tracked, so the lane checks it out clean and the layout below
+        // rewrites it with identical content.
+        fs::create_dir_all(repo.0.join("prompts")).unwrap();
+        fs::write(repo.0.join("prompts/role-builder.md"), "builder\n").unwrap();
+        git(&repo.0, &["add", "prompts"], None).unwrap();
+        git(&repo.0, &["commit", "-m", "prompts"], None).unwrap();
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        assert_eq!(shared_root, cargo_home.dir.join("shared-build"));
+        let legacy = shared_root.join("debug/deps");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("legacy.d"),
+            format!("{}/prompts/role-builder.md\n", lane.path.display()),
+        )
+        .unwrap();
+        let lane_hash_dir = shared_root.join("02/7179bbe4c308d8");
+        write_real_build_dir_layout(&lane_hash_dir, &lane.path, &cargo_home.dir);
+        let main_hash_dir = shared_root.join("4b/be360cdd949358");
+        write_real_build_dir_layout(&main_hash_dir, &repo.0, &cargo_home.dir);
+        let lane_build_size = deep_prune_size(&lane_hash_dir);
+
+        let outcomes = store.prune(&mut Observer::idle(), true, false).unwrap();
+        match &outcomes[0] {
+            PruneOutcome::Removed {
+                build_dir_freed,
+                build_dir_kept,
+                ..
+            } => {
+                assert_eq!(*build_dir_kept, None);
+                assert_eq!(*build_dir_freed, Some(lane_build_size));
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        assert!(!lane.path.exists(), "the lane itself must be removed");
+        assert!(
+            !lane_hash_dir.exists(),
+            "the lane's build-dir must be freed by the same prune that removed the lane"
+        );
+        assert!(store.prune_orphaned_build_dirs(false).unwrap().is_empty());
+        assert!(
+            main_hash_dir.exists(),
+            "the main checkout's build-dir must survive"
+        );
+        assert!(
+            legacy.exists(),
+            "the legacy un-namespaced tree must survive"
+        );
+    }
+
+    /// The orphan sweep's half of the same 0.1.9 layout: a workspace
+    /// removed outside `--prune` leaves a real-shaped hash dir whose only
+    /// absolute evidence sits behind a 1376-file `.fingerprint/` tree. It
+    /// must be reclaimed, not kept as a scan cut short.
+    #[test]
+    fn prune_orphaned_build_dirs_reclaims_a_real_layout_behind_its_fingerprint_tree() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let vanished = std::env::temp_dir().join(format!(
+            "mv-vanished-lane-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let hash_dir_path = shared_root.join("02/7179bbe4c308d8");
+        write_real_build_dir_layout(&hash_dir_path, &vanished, &cargo_home.dir);
+        let size = deep_prune_size(&hash_dir_path);
+
+        assert!(
+            store.prune_orphaned_build_dirs(true).unwrap().is_empty(),
+            "a live workspace's hash dir must be kept"
+        );
+        fs::remove_dir_all(&vanished).unwrap();
+        let outcomes = store.prune_orphaned_build_dirs(false).unwrap();
+        assert_eq!(
+            outcomes,
+            vec![OrphanedBuildDir {
+                path: hash_dir_path.clone(),
+                bytes: size,
+            }]
+        );
+        assert!(!hash_dir_path.exists());
+    }
+
+    /// A lane whose build-dir `--prune` cannot find or cannot prove safe
+    /// now says so (card `20261116-b-891676`): a lane that never built
+    /// reports the complete miss, and a lane whose dep-info sits behind
+    /// more than `PerDirFileBudget::FILE_BUDGET` other `.d` files reports
+    /// the scan running out — never a silent `None`.
+    #[test]
+    fn prune_reports_why_it_kept_a_lanes_build_dir() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        fs::create_dir_all(&shared_root).unwrap();
+
+        match &store.prune(&mut Observer::idle(), true, true).unwrap()[0] {
+            PruneOutcome::WouldRemove {
+                build_dir_freed: None,
+                build_dir_kept: Some(reason),
+                ..
+            } => assert!(reason.contains("no hash dir under"), "reason was: {reason}"),
+            other => panic!("expected WouldRemove with a kept reason, got {other:?}"),
+        }
+
+        let lane_hash_dir = hash_dir(&shared_root, "02", "1");
+        write_junk_evidence_files(&lane_hash_dir, PerDirFileBudget::FILE_BUDGET + 1);
+        fs::write(
+            lane_hash_dir.join("debug/deps/zzz.d"),
+            format!("{}/src/lib.rs\n", lane.path.display()),
+        )
+        .unwrap();
+        match &store.prune(&mut Observer::idle(), true, true).unwrap()[0] {
+            PruneOutcome::WouldRemove {
+                build_dir_freed: None,
+                build_dir_kept: Some(reason),
+                ..
+            } => assert!(
+                reason.contains("scan budget ran out"),
+                "reason was: {reason}"
+            ),
+            other => panic!("expected WouldRemove with a kept reason, got {other:?}"),
+        }
+        assert!(lane_hash_dir.exists());
+    }
+
     /// Nexus mutated `hash_dir_is_orphaned` to ignore `verdict.cut_short`
     /// entirely (`verdict.saw_dead && !verdict.saw_live`), and every
     /// existing test still passed — none of them ever exhausted the
@@ -6815,7 +7273,7 @@ pub(crate) mod tests {
         git(&lane.path, &["commit", "-am", "unique"], None).unwrap();
         let tip = store.tip("owner").unwrap();
         let outcomes = store
-            .prune_with_ignored(&mut Observer::idle(), true, false, true)
+            .prune_with_ignored(&mut Observer::idle(), true, false, true, true)
             .unwrap();
         assert!(
             matches!(&outcomes[0], PruneOutcome::Kept { reason, .. } if reason.contains("not merged"))
@@ -6832,6 +7290,7 @@ pub(crate) mod tests {
                 true,
                 false,
                 true,
+                true,
             )
             .unwrap();
         assert!(
@@ -6842,7 +7301,7 @@ pub(crate) mod tests {
             .current_dir(&lane.path)
             .spawn()
             .unwrap();
-        let outcomes = store.prune_with_ignored(&mut Observer::idle(), true, false, true);
+        let outcomes = store.prune_with_ignored(&mut Observer::idle(), true, false, true, true);
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(
@@ -7060,6 +7519,7 @@ pub(crate) mod tests {
                 task: "owner".into(),
                 branch_refusal: None,
                 build_dir_freed: None,
+                build_dir_kept: None,
             }]
         );
         assert_eq!(observer.recorded, 0);

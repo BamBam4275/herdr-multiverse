@@ -899,7 +899,7 @@ Rust about: Inspect, prune, rescue, restore, or merge task worktrees
 | `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--prune`, end a kept lane's own lingering host process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; never with `--force`, and `--dry-run` previews "would reap" and signals nothing. |
 | `--rescue` | flag | flag |  |
 | `--restore` | TASK_ID | TASK_ID |  |
-| `--yes` | flag | flag |  |
+| `--yes` | flag | flag | With `--prune`, Rust also requires `--yes` (or `--force`) before deleting any Rust-only cache — a lane's `target/` and shared-cache build-dir, the orphaned shared-build sweep, and `--deep`'s `.multiverse/worktree-state/` quarantine removals (card `20261119-b-73759c`); without it each is reported exactly as `--dry-run` reports it ("would free ..."). Lane removal, archiving, branch reclaim and `--deep`'s task/scratch sweep keep Python's plain-`--prune` behavior. |
 
 ### `config`
 

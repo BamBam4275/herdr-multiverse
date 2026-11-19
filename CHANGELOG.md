@@ -9,6 +9,34 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-19
+
+### Fixed
+
+- CLI: `worktrees <path> --prune` without `--yes` (or `--force`) no longer
+  deletes any Rust-only build cache: a lane's `target/` and shared-cache
+  build-dir, the orphaned shared-build sweep, and `--deep`'s
+  `.multiverse/worktree-state/` quarantine removals are now each reported
+  exactly as `--dry-run` reports them ("would free ..." / "would remove")
+  and deleted only with `--yes`. Lane removal, archiving, branch reclaim
+  and `--deep`'s task/scratch sweep keep their Python-parity behavior
+  (card `20261119-b-73759c`).
+- CLI: the `sweep` disk warning for lane `target/` bytes now suggests
+  `multiverse worktrees <root> --prune --yes`; since prune frees lane
+  `target/` and shared-build caches only under `--yes`, the old
+  `--prune` hint reported "would free" and freed nothing.
+- `worktrees --prune` now frees a just-removed lane's per-worktree cargo
+  build-dir again (card `20261116-b-891676`, seen on 0.1.9). A real
+  build-dir holds over a thousand `.fingerprint/` files that sort ahead of
+  `deps/`, and none of them name an absolute path, but the scan counted
+  them as evidence. They used up its 500-file per-dir budget before it
+  reached the one dep-info file naming the lane, so both the per-lane
+  reclaim and the orphan sweep kept the dir without saying so. The scan now
+  reads only `.d` dep-info. When `--prune` still keeps a lane's build-dir,
+  it prints one `kept build-dir — <reason>` line: no hash dir names the
+  lane, the scan ran out of budget, a delete guard refused, or the delete
+  failed.
+
 ## [0.1.10] - 2026-11-19
 
 ### Added
@@ -1285,6 +1313,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.11]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.11
 [0.1.10]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.10
 [0.1.9]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.9
 [0.1.8]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.8

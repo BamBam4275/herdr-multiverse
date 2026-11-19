@@ -22,6 +22,16 @@
 //! that same root whose own evidence names only workspace roots gone from
 //! disk (card `20261115-b-673528`) — independent of which lanes this
 //! project's own state still lists — reporting the same bytes-freed line.
+//! Card `20261119-b-73759c`: every one of those Rust-only cache frees — a
+//! lane's `target/` and build-dir, the orphaned shared-build sweep, and
+//! `--deep`'s `.multiverse/worktree-state/` quarantine removals — needs
+//! the same `--yes` (or `--force`) confirmation ignored-file disposal does;
+//! without it each is measured and reported exactly as `--dry-run`
+//! reports it ("would free ..."). The deletions plain `--prune` has always
+//! made with Python parity — lane removal/archive, branch reclaim, and
+//! `--deep`'s own task/scratch sweep (pinned by the
+//! `worktrees-deep-prune-keeps-audit-and-sweeps-finished-lane-scratch`
+//! conformance scenario) — are unchanged.
 //! `--dry-run`
 //! previews cleanup paths and byte totals without deleting them; with
 //! `--prune` its removable set matches what `--yes` would remove, and with
@@ -162,6 +172,10 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     let dry_run = args.get_flag("dry-run");
     let reap = args.get_flag("reap");
     let confirm_ignored = force || args.get_flag("yes");
+    // Card `20261119-b-73759c`: every Rust-only cache deletion below is
+    // gated on that same confirmation; without it a real `--prune` reports
+    // each one exactly as `--dry-run` would, deleting none.
+    let preview_caches = dry_run || !confirm_ignored;
 
     for ignored in worktrees.ignored_entries().map_err(fail)? {
         println!("  {}: ignored: not a lane", ignored.display());
@@ -187,7 +201,13 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
 
     let mut observer = HerdrLaneObserver::new(worktrees.project());
     let mut outcomes = worktrees
-        .prune_with_ignored(&mut observer, force, dry_run, confirm_ignored)
+        .prune_with_ignored(
+            &mut observer,
+            force,
+            dry_run,
+            confirm_ignored,
+            confirm_ignored,
+        )
         .map_err(fail)?;
 
     // Card `20261115-b-9815fe`: the lane-exit reaper. Report-only by
@@ -227,9 +247,13 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
         // simply absent from this second outcome set; only a reaped
         // task's own entry is spliced back into `outcomes` below.
         let mut follow_up_observer = HerdrLaneObserver::new(worktrees.project());
-        if let Ok(follow_up) =
-            worktrees.prune_with_ignored(&mut follow_up_observer, force, dry_run, confirm_ignored)
-        {
+        if let Ok(follow_up) = worktrees.prune_with_ignored(
+            &mut follow_up_observer,
+            force,
+            dry_run,
+            confirm_ignored,
+            confirm_ignored,
+        ) {
             for outcome in follow_up {
                 let task = outcome_task(&outcome).to_string();
                 if reaped_tasks.contains(&task) {
@@ -279,7 +303,11 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
             ..
         } = outcome
         {
-            let verb = if dry_run { "would free" } else { "freed" };
+            let verb = if preview_caches {
+                "would free"
+            } else {
+                "freed"
+            };
             println!("    {verb} target/ ({bytes} bytes)");
         }
         if let PruneOutcome::Kept {
@@ -303,8 +331,37 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
             ..
         } = outcome
         {
-            let verb = if dry_run { "would free" } else { "freed" };
+            let verb = if preview_caches {
+                "would free"
+            } else {
+                "freed"
+            };
             println!("    {verb} build-dir ({bytes} bytes)");
+        }
+        // Card `20261116-b-891676`: on 0.1.9 a lane's build-dir that could
+        // not be found or proven safe to delete stayed without a word.
+        if let PruneOutcome::Kept {
+            build_dir_kept: Some(reason),
+            ..
+        }
+        | PruneOutcome::WouldRemove {
+            build_dir_kept: Some(reason),
+            ..
+        }
+        | PruneOutcome::WouldArchive {
+            build_dir_kept: Some(reason),
+            ..
+        }
+        | PruneOutcome::Removed {
+            build_dir_kept: Some(reason),
+            ..
+        }
+        | PruneOutcome::Archived {
+            build_dir_kept: Some(reason),
+            ..
+        } = outcome
+        {
+            println!("    kept build-dir — {reason}");
         }
         match outcome {
             PruneOutcome::Kept { .. } => kept += 1,
@@ -343,10 +400,16 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     // evidence names only vanished workspace roots, independent of which
     // lanes this project's own `lanes()` still lists — reported the same
     // way a lane's own `build_dir_freed` already is.
-    let orphaned_build_dirs = worktrees.prune_orphaned_build_dirs(dry_run).map_err(fail)?;
+    let orphaned_build_dirs = worktrees
+        .prune_orphaned_build_dirs(preview_caches)
+        .map_err(fail)?;
     for build_dir in &orphaned_build_dirs {
         println!("  cargo shared-build {}", build_dir.path.display());
-        let verb = if dry_run { "would free" } else { "freed" };
+        let verb = if preview_caches {
+            "would free"
+        } else {
+            "freed"
+        };
         println!("    {verb} build-dir ({} bytes)", build_dir.bytes);
     }
     let lanes = outcomes.len();
@@ -372,7 +435,7 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
         worktrees
             .deep_prune(&found, dry_run, &mut std::io::stdout().lock())
             .map_err(fail)?;
-        print_quarantine_outcomes(worktrees, dry_run)?;
+        print_quarantine_outcomes(worktrees, preview_caches)?;
     }
     Ok(())
 }

@@ -327,7 +327,7 @@ fn worktree_target_lines(config: &Config, deadline: Instant) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!(
-            "disk: {} .multiverse/worktrees target {} — {top} — multiverse worktrees {root} --prune",
+            "disk: {} .multiverse/worktrees target {} — {top} — multiverse worktrees {root} --prune --yes",
             project.name,
             human_size(total),
         ));
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(
             line,
             &format!(
-                "disk: demo .multiverse/worktrees target 400.0K — lane-a (300.0K), lane-b (100.0K) — multiverse worktrees {} --prune",
+                "disk: demo .multiverse/worktrees target 400.0K — lane-a (300.0K), lane-b (100.0K) — multiverse worktrees {} --prune --yes",
                 dir.path().join("demo").display()
             )
         );

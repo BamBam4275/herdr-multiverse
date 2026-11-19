@@ -1984,6 +1984,89 @@ fn worktrees_prune_confirmation_allows_ignored_files_but_never_tracked_changes()
     }
 }
 
+/// Card `20261119-b-73759c`: `worktrees --prune` without `--yes` used to
+/// delete an orphaned shared-build hash dir anyway, since that sweep read
+/// only `--dry-run`. Every combination short of a real `--yes` now leaves
+/// it on disk and reports it as `--dry-run` would ("would free").
+#[test]
+fn worktrees_prune_frees_an_orphaned_build_dir_only_with_yes() {
+    let sandbox = Sandbox::new();
+    let cargo_home = sandbox.root.join("cargo-home");
+    fs::create_dir_all(sandbox.project.join(".cargo")).unwrap();
+    fs::write(
+        sandbox.project.join(".cargo/config.toml"),
+        "[build]\nbuild-dir = \"{cargo-cache-home}/shared-build/{workspace-path-hash}\"\n",
+    )
+    .unwrap();
+    // A dead workspace's own dep-info, under the real two-level
+    // `<bucket>/<leaf>` hash-dir shape, naming only a path now gone.
+    let vanished = sandbox.root.join("vanished-workspace");
+    let orphan = cargo_home.join("shared-build/2a/00000000000009");
+    fs::create_dir_all(orphan.join("debug/deps")).unwrap();
+    fs::write(
+        orphan.join("debug/deps/fixture.d"),
+        format!("{}/src/lib.rs\n", vanished.display()),
+    )
+    .unwrap();
+    fs::write(orphan.join("debug/deps/artifact"), vec![0u8; 4096]).unwrap();
+    let path = sandbox.project.to_str().unwrap();
+    let prune = |extra: &[&str]| {
+        sandbox
+            .command(env!("CARGO_BIN_EXE_multiverse"))
+            .env("CARGO_HOME", &cargo_home)
+            .args(["worktrees", path, "--prune"])
+            .args(extra)
+            .output()
+            .expect("run built multiverse binary")
+    };
+
+    for extra in [&[][..], &["--dry-run"], &["--dry-run", "--yes"]] {
+        let output = prune(extra);
+        assert_code(&output, 0);
+        let out = stdout(&output);
+        assert!(out.contains("would free build-dir ("), "{extra:?}: {out}");
+        assert!(!out.contains("    freed "), "{extra:?}: {out}");
+        assert!(orphan.exists(), "{extra:?} must not delete the build-dir");
+    }
+
+    let confirmed = prune(&["--yes"]);
+    assert_code(&confirmed, 0);
+    let out = stdout(&confirmed);
+    assert!(out.contains("    freed build-dir ("), "{out}");
+    assert!(!orphan.exists(), "--prune --yes must delete the build-dir");
+}
+
+/// Card `20261119-b-73759c`'s `--deep` half: a redundant
+/// `.multiverse/worktree-state/` quarantine copy is only previewed
+/// ("would remove") by `--prune --deep` without `--yes`.
+#[test]
+fn worktrees_prune_deep_removes_a_quarantine_copy_only_with_yes() {
+    let sandbox = Sandbox::new();
+    let state = sandbox.project.join(".multiverse");
+    let copy = state.join("worktree-state/20260101-builder-aaaaaa");
+    for root in [&state, &copy] {
+        fs::create_dir_all(root.join("tasks/20260101-builder-aaaaaa")).unwrap();
+        fs::write(root.join("tasks/20260101-builder-aaaaaa/status"), "done\n").unwrap();
+    }
+    let path = sandbox.project.to_str().unwrap();
+
+    let unconfirmed = sandbox.cli(&["worktrees", path, "--prune", "--deep"]);
+    assert_code(&unconfirmed, 0);
+    let out = stdout(&unconfirmed);
+    assert!(
+        out.contains("deep would remove .multiverse/worktree-state/20260101-builder-aaaaaa"),
+        "{out}"
+    );
+    assert!(out.contains("quarantine cleanup: would free"), "{out}");
+    assert!(copy.exists(), "--deep without --yes must keep the copy");
+
+    let confirmed = sandbox.cli(&["worktrees", path, "--prune", "--deep", "--yes"]);
+    assert_code(&confirmed, 0);
+    let out = stdout(&confirmed);
+    assert!(out.contains("quarantine cleanup: freed"), "{out}");
+    assert!(!copy.exists(), "--deep --yes must remove the copy");
+}
+
 #[test]
 fn backlog_uses_configured_project_from_subdirectories_and_lanes() {
     let sandbox = Sandbox::new();
