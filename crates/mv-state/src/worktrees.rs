@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -1556,6 +1557,92 @@ fn hash_dir_candidates(shared_root: &Path) -> Vec<PathBuf> {
     frontier
 }
 
+/// cargo's own `{workspace-path-hash}` expansion for the workspace whose
+/// root manifest is `manifest` (card `20261119-b-4ec912`), as the relative
+/// `HASH_COMPONENT_LENS` path it names under a shared build root
+/// (`02/7179bbe4c308d8`). Mirrors cargo's `GlobalContext::build_dir`:
+/// `short_hash` of the canonical manifest path — the path's own `Hash`
+/// fed to `rustc_stable_hash::StableSipHasher128`, `Hasher::finish`'s u64
+/// written as little-endian hex — split after its first two digits.
+/// `manifest` must already be canonical (see
+/// `canonical_workspace_manifest`); this never touches the filesystem.
+fn workspace_path_hash(manifest: &Path) -> PathBuf {
+    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+    manifest.hash(&mut hasher);
+    let hex: String = Hasher::finish(&hasher)
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let (bucket, leaf) = hex.split_at(HASH_COMPONENT_LENS[0]);
+    Path::new(bucket).join(leaf)
+}
+
+/// `workspace_root`'s own `Cargo.toml`, canonicalized the way cargo
+/// canonicalizes it before hashing — or, once that workspace is gone (a
+/// lane an earlier `--prune` removed), its nearest still-existing
+/// ancestor canonicalized with the vanished remainder joined back on: the
+/// same path cargo saw while the workspace still existed, provided
+/// nothing under that ancestor was itself a symlink.
+fn canonical_workspace_manifest(workspace_root: &Path) -> PathBuf {
+    let manifest = workspace_root.join("Cargo.toml");
+    for ancestor in manifest.ancestors() {
+        let Ok(real) = fs::canonicalize(ancestor) else {
+            continue;
+        };
+        if let Ok(rest) = manifest.strip_prefix(ancestor) {
+            return if rest.as_os_str().is_empty() {
+                real
+            } else {
+                real.join(rest)
+            };
+        }
+    }
+    manifest
+}
+
+/// The one hash dir under `shared_root` cargo would build `workspace_root`
+/// into (see `workspace_path_hash`) — computed, never scanned for, so it
+/// costs nothing however many hash dirs the shared root holds. Says
+/// nothing about whether that dir exists or what it holds; every caller
+/// still proves it from the dir's own dep-info before freeing it.
+fn computed_hash_dir(shared_root: &Path, workspace_root: &Path) -> PathBuf {
+    shared_root.join(workspace_path_hash(&canonical_workspace_manifest(
+        workspace_root,
+    )))
+}
+
+/// Whether `dir` (a lane's `computed_hash_dir`, the lane at `lane_path`
+/// already gone) holds a vanished lane's build and nothing else's: its own
+/// workspace evidence, read in full, names at least one path under
+/// `lane_path` and no absolute path outside it — so neither a live
+/// workspace nor any other vanished one (card `20261119-b-4ec912`).
+/// Relative sources do not count against it: the hash itself already
+/// names the one workspace those belong to. Read through
+/// `scan_orphan_evidence`, so a scan cut short is never a proof.
+fn hash_dir_names_only_lane(
+    dir: &Path,
+    lane_path: &Path,
+    cargo_home: Option<&Path>,
+    shared_root: &Path,
+    budget: &mut BuildDirScanBudget,
+) -> bool {
+    let mut verdict = OrphanVerdict::default();
+    let mut per_dir = PerDirFileBudget::new();
+    scan_orphan_evidence(
+        dir,
+        cargo_home,
+        Some(shared_root),
+        budget,
+        &mut per_dir,
+        &mut verdict,
+    );
+    verdict.saw_dead
+        && !verdict.saw_live
+        && !verdict.cut_short
+        && verdict.dead.iter().all(|path| path.starts_with(lane_path))
+}
+
 /// Sizes its own whole-scan `BuildDirScanBudget` off the full candidate
 /// list up front (`BuildDirScanBudget::for_candidates`), then decides each
 /// one off a fresh `PerDirFileBudget` — so a big hash dir sorted early
@@ -1567,10 +1654,27 @@ fn find_build_dir_evidence(
     marker: &Path,
     exclude: Option<&Path>,
 ) -> BuildDirLookup {
+    find_build_dir_evidence_within(
+        shared_root,
+        marker,
+        exclude,
+        BuildDirScanBudget::for_candidates,
+    )
+}
+
+/// `find_build_dir_evidence` with its whole-scan budget sized by
+/// `scan_budget` rather than always `BuildDirScanBudget::for_candidates`,
+/// so a test can starve the scan outright.
+fn find_build_dir_evidence_within(
+    shared_root: &Path,
+    marker: &Path,
+    exclude: Option<&Path>,
+    scan_budget: fn(usize) -> BuildDirScanBudget,
+) -> BuildDirLookup {
     let cargo_home = cargo_cache_home();
     let candidates = hash_dir_candidates(shared_root);
     let total = candidates.len();
-    let mut budget = BuildDirScanBudget::for_candidates(total);
+    let mut budget = scan_budget(total);
     let mut unread = 0;
     for (index, candidate) in candidates.into_iter().enumerate() {
         if budget.exhausted() {
@@ -1686,12 +1790,68 @@ fn guard_build_dir_candidate(
 /// a miss resolved none. No reason names the shared root or a hash dir
 /// under it (card `20261119-b-087c6c`): that is a machine path under the
 /// operator's home, and the `--prune` output it lands in is shared.
+///
+/// Card `20261119-b-4ec912`: the lane's own `computed_hash_dir` is the
+/// first candidate, proven by its own dep-info naming the lane — one dir,
+/// read under its own fresh budgets, so a shared root too big or a host
+/// too loaded for the full scan below no longer leaves the lane's
+/// build-dir behind. The scan runs only when that computed dir does not
+/// exist (a lane built under another `build-dir`, or reached through
+/// another spelling of its path); one that exists but cannot be proven is
+/// kept, never traded for some other dir the scan might match.
 fn scoped_lane_build_dir(
     shared_root: &Path,
     main_checkout_dir: Option<&Path>,
     lane_path: &Path,
 ) -> std::result::Result<PathBuf, BuildDirReclaim> {
-    let candidate = match find_build_dir_evidence(shared_root, lane_path, None) {
+    scoped_lane_build_dir_within(
+        shared_root,
+        main_checkout_dir,
+        lane_path,
+        BuildDirScanBudget::for_candidates,
+    )
+}
+
+/// `scoped_lane_build_dir` with the fallback scan's whole-scan budget
+/// sized by `scan_budget` (see `find_build_dir_evidence_within`).
+fn scoped_lane_build_dir_within(
+    shared_root: &Path,
+    main_checkout_dir: Option<&Path>,
+    lane_path: &Path,
+    scan_budget: fn(usize) -> BuildDirScanBudget,
+) -> std::result::Result<PathBuf, BuildDirReclaim> {
+    let computed = computed_hash_dir(shared_root, lane_path);
+    let lookup = match fs::symlink_metadata(&computed) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            find_build_dir_evidence_within(shared_root, lane_path, None, scan_budget)
+        }
+        Ok(info) if info.is_dir() => {
+            let cargo_home = cargo_cache_home();
+            if !dir_names_marker(
+                &computed,
+                lane_path,
+                None,
+                cargo_home.as_deref(),
+                shared_root,
+                &mut BuildDirScanBudget::for_candidates(1),
+                &mut PerDirFileBudget::new(),
+            ) {
+                return Err(BuildDirReclaim::kept(
+                    "its computed shared-build hash dir does not name this lane in its dep-info"
+                        .into(),
+                    Some(computed),
+                ));
+            }
+            BuildDirLookup::Found(computed)
+        }
+        _ => {
+            return Err(BuildDirReclaim::kept(
+                "its computed shared-build hash dir is not a plain directory".into(),
+                Some(computed),
+            ))
+        }
+    };
+    let candidate = match lookup {
         BuildDirLookup::Found(candidate) => candidate,
         BuildDirLookup::NotFound => {
             return Err(BuildDirReclaim::kept(
@@ -3299,10 +3459,22 @@ impl Worktrees {
             Some(lock(&self.project)?)
         };
         let cargo_home = cargo_cache_home();
-        let mut candidates = hash_dir_candidates(&shared_root);
-        candidates.retain(|candidate| !skip.contains(candidate));
-        let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
         let mut outcomes = Vec::new();
+        let mut handled = skip.to_vec();
+        for dir in self.vanished_lane_build_dirs(&shared_root, cargo_home.as_deref(), skip) {
+            handled.push(dir.clone());
+            let bytes = deep_prune_size(&dir);
+            if bytes == 0 {
+                continue;
+            }
+            if !dry_run {
+                let _ = deep_prune_remove(&dir, &shared_root);
+            }
+            outcomes.push(OrphanedBuildDir { path: dir, bytes });
+        }
+        let mut candidates = hash_dir_candidates(&shared_root);
+        candidates.retain(|candidate| !handled.contains(candidate));
+        let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
         for candidate in candidates {
             if budget.exhausted() {
                 break;
@@ -3330,6 +3502,57 @@ impl Worktrees {
             });
         }
         Ok(outcomes)
+    }
+
+    /// Card `20261119-b-4ec912`: the `computed_hash_dir` of every lane this
+    /// project's routing log records a task for whose worktree path no
+    /// longer exists — a lane an earlier run removed, or one removed
+    /// outside `--prune` — that `hash_dir_names_only_lane` proves held that
+    /// vanished lane's build and nothing else's. The generic sweep below
+    /// can never free these: a lane is nested inside the main checkout,
+    /// whose own `Cargo.toml` and member sources keep the lane's relative
+    /// sources reading as possibly live (`workspace_root_may_survive`).
+    /// Identity here comes from the hash instead, so that rule is not
+    /// loosened for any dir this does not compute. Never `skip`, never the
+    /// main checkout's own computed dir, never a task id `validate_id`
+    /// refuses (it becomes a path component).
+    fn vanished_lane_build_dirs(
+        &self,
+        shared_root: &Path,
+        cargo_home: Option<&Path>,
+        skip: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        let tasks: BTreeSet<String> = self
+            .task_records()
+            .iter()
+            .filter_map(|record| record.parse().ok()?.fields.get("task").cloned())
+            .filter(|task| validate_id(task).is_ok())
+            .collect();
+        let main_dir = computed_hash_dir(shared_root, &self.project);
+        let worktrees = self.project.join(".multiverse/worktrees");
+        let mut candidates = Vec::new();
+        for task in tasks {
+            let lane_path = worktrees.join(&task);
+            match fs::symlink_metadata(&lane_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => continue,
+            }
+            let dir = computed_hash_dir(shared_root, &lane_path);
+            if dir == main_dir || skip.contains(&dir) {
+                continue;
+            }
+            if fs::symlink_metadata(&dir).is_ok_and(|info| info.is_dir()) {
+                candidates.push((lane_path, dir));
+            }
+        }
+        let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
+        candidates
+            .into_iter()
+            .filter(|(lane_path, dir)| {
+                hash_dir_names_only_lane(dir, lane_path, cargo_home, shared_root, &mut budget)
+            })
+            .map(|(_, dir)| dir)
+            .collect()
     }
 
     /// Every `multiverse/<task>` branch this project's git has, that is
@@ -7484,6 +7707,247 @@ pub(crate) mod tests {
         let found = find_build_dir(&shared_root, &lane);
         fs::remove_dir_all(&root).unwrap();
         assert_eq!(found, Some(owns));
+    }
+
+    /// `workspace_path_hash` is cargo's own `{workspace-path-hash}` (card
+    /// `20261119-b-4ec912`). The hasher vector is `rustc-stable-hash`'s own
+    /// `test_hash_usize` (`[12037165114281468837, 3094087741167521712]`),
+    /// read through the same `Hasher::finish` halves-combining cargo's
+    /// `short_hash` reads. The `/private/tmp` manifest was cross-checked
+    /// once against a real `cargo build`/`cargo metadata` of a tiny
+    /// workspace there (`build_directory` `…/sb/84/49e87fc242ff5b`); the
+    /// `/work` one is a neutral stand-in for a lane path, computed here.
+    #[test]
+    fn workspace_path_hash_matches_cargo() {
+        let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+        0xABCD_EF01_usize.hash(&mut hasher);
+        assert_eq!(
+            Hasher::finish(&hasher),
+            12037165114281468837_u64
+                .wrapping_mul(3)
+                .wrapping_add(3094087741167521712)
+        );
+        for (manifest, expected) in [
+            (
+                "/private/tmp/mv-hash-xcheck/ws/Cargo.toml",
+                "84/49e87fc242ff5b",
+            ),
+            (
+                "/work/project/.multiverse/worktrees/20261119-builder-4f2684/Cargo.toml",
+                "a3/5b99de94ab95ff",
+            ),
+        ] {
+            assert_eq!(
+                workspace_path_hash(Path::new(manifest)),
+                PathBuf::from(expected),
+                "{manifest}"
+            );
+        }
+    }
+
+    /// A vanished workspace's manifest canonicalizes through its nearest
+    /// still-existing ancestor, so a lane removed in an earlier run still
+    /// computes the hash dir cargo built it into while it existed.
+    #[test]
+    fn computed_hash_dir_is_the_same_before_and_after_the_workspace_vanishes() {
+        let root = std::env::temp_dir().join(format!(
+            "mv-computed-vanish-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let lane = root.join("worktrees/lane");
+        write_workspace_marker(&lane);
+        let shared_root = Path::new("/shared-build");
+        let before = computed_hash_dir(shared_root, &lane);
+        let canonical = fs::canonicalize(lane.join("Cargo.toml")).unwrap();
+        fs::remove_dir_all(root.join("worktrees")).unwrap();
+        let after = computed_hash_dir(shared_root, &lane);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before, shared_root.join(workspace_path_hash(&canonical)));
+    }
+
+    /// Card `20261119-b-4ec912`, observed on 0.1.13 under host load ~20-30:
+    /// the per-lane lookup printed "scan budget ran out" and kept a merged
+    /// lane's 2 GB build-dir. The lane's own computed hash dir is now found
+    /// without the scan at all — here with a scan budget already spent,
+    /// which on its own leaves the scan inconclusive. A computed dir that
+    /// exists but does not name the lane is kept, never traded for a scan.
+    #[test]
+    fn scoped_lane_build_dir_resolves_the_computed_hash_dir_with_a_zero_scan_budget() {
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "mv-computed-hash-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+        let lane = root.join("lane");
+        write_workspace_marker(&lane);
+        let shared_root = root.join("shared-build");
+        let other = hash_dir(&shared_root, "00", "1");
+        write_build_evidence(&other, &[&root.join("other")]);
+        let computed = computed_hash_dir(&shared_root, &lane);
+        write_build_evidence(&computed, &[&lane]);
+        let spent: fn(usize) -> BuildDirScanBudget = |_| BuildDirScanBudget {
+            deadline: Instant::now(),
+        };
+
+        let scan = find_build_dir_evidence_within(&shared_root, &lane, None, spent);
+        let resolved = scoped_lane_build_dir_within(&shared_root, None, &lane, spent);
+        write_build_evidence(&computed, &[&root.join("other")]);
+        let unproven = scoped_lane_build_dir_within(&shared_root, None, &lane, spent);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(matches!(scan, BuildDirLookup::Inconclusive { .. }));
+        assert_eq!(resolved.ok(), Some(computed.clone()));
+        match unproven {
+            Err(BuildDirReclaim {
+                freed: None,
+                kept: Some(reason),
+                path: Some(path),
+            }) => {
+                assert_eq!(path, computed);
+                assert!(reason.contains("does not name this lane"), "{reason}");
+            }
+            other => panic!("expected a kept computed dir, got {other:?}"),
+        }
+    }
+
+    /// A repo laid out like this one: the main checkout holds `Cargo.toml`
+    /// and the member sources a lane's dep-info names relative to its root,
+    /// plus the `prompts/` file `write_real_build_dir_layout` names
+    /// absolutely (tracked, so a lane checks it out clean).
+    fn commit_nested_workspace(repo: &TempRepo) {
+        fs::write(repo.0.join("Cargo.toml"), "[workspace]\n").unwrap();
+        for member in ["mv-core", "mv-engine"] {
+            let src = repo.0.join(format!("crates/{member}/src"));
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("lib.rs"), "").unwrap();
+        }
+        fs::create_dir_all(repo.0.join("prompts")).unwrap();
+        fs::write(repo.0.join("prompts/role-builder.md"), "builder\n").unwrap();
+        git(&repo.0, &["add", "."], None).unwrap();
+        git(&repo.0, &["commit", "-m", "workspace"], None).unwrap();
+    }
+
+    /// Card `20261119-b-4ec912`: plain `--prune` (no `--yes`) removes a
+    /// lane but only measures its build-dir, and that run's own sweep
+    /// passes it over (card `20261119-b-c3f9f5`). Nested in the main
+    /// checkout, the lane's relative sources then always read as possibly
+    /// live to the generic sweep, so no later run freed it. The next run
+    /// now frees it through the lane's computed hash dir, whose dep-info
+    /// names only the vanished lane.
+    #[test]
+    fn prune_orphaned_build_dirs_frees_an_earlier_removed_lanes_computed_hash_dir() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        commit_nested_workspace(&repo);
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let lane_hash_dir = computed_hash_dir(&shared_root, &lane.path);
+        write_real_build_dir_layout(&lane_hash_dir, &lane.path, &cargo_home.dir);
+        let main_hash_dir = computed_hash_dir(&shared_root, &repo.0);
+        write_real_build_dir_layout(&main_hash_dir, &repo.0, &cargo_home.dir);
+        let size = deep_prune_size(&lane_hash_dir);
+
+        let outcomes = store
+            .prune_with_ignored(&mut Observer::idle(), true, false, false, false)
+            .unwrap();
+        let reported = match &outcomes[0] {
+            PruneOutcome::Removed {
+                build_dir_freed: Some(freed),
+                build_dir: Some(dir),
+                ..
+            } => {
+                assert_eq!(*freed, size);
+                dir.clone()
+            }
+            other => panic!("expected Removed with a measured build-dir, got {other:?}"),
+        };
+        assert_eq!(reported, lane_hash_dir);
+        assert!(!lane.path.exists(), "the lane itself must be removed");
+        assert!(store
+            .prune_orphaned_build_dirs_skipping(false, &[reported])
+            .unwrap()
+            .is_empty());
+        assert!(lane_hash_dir.exists(), "a measure-only run keeps it");
+
+        let expected = vec![OrphanedBuildDir {
+            path: lane_hash_dir.clone(),
+            bytes: size,
+        }];
+        assert_eq!(store.prune_orphaned_build_dirs(true).unwrap(), expected);
+        assert!(lane_hash_dir.exists(), "a preview never deletes");
+        assert_eq!(store.prune_orphaned_build_dirs(false).unwrap(), expected);
+        assert!(!lane_hash_dir.exists(), "the next run frees it");
+        assert!(
+            main_hash_dir.exists(),
+            "the main checkout's build-dir must survive"
+        );
+    }
+
+    /// Card `20261119-b-4ec912`: a removed lane's computed hash dir whose
+    /// dep-info also names a still-existing workspace is kept — the hash
+    /// proves only where cargo would build the lane, not that nothing else
+    /// was ever built there — while the same dir naming only the lane is
+    /// freed.
+    #[test]
+    fn prune_orphaned_build_dirs_keeps_a_computed_hash_dir_that_also_names_a_live_workspace() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        commit_nested_workspace(&repo);
+
+        let store = repo.store();
+        let lane = store.create("recorded", "HEAD").unwrap();
+        fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            "2026-11-01T00:00:00+00:00\tevent=result\ttask=recorded\tstatus=done\n",
+        )
+        .unwrap();
+        let outcomes = store.prune(&mut Observer::idle(), true, false).unwrap();
+        assert!(matches!(&outcomes[0], PruneOutcome::Removed { .. }));
+        assert!(!lane.path.exists());
+
+        let live = std::env::temp_dir().join(format!(
+            "mv-live-workspace-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        write_workspace_marker(&live);
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let lane_hash_dir = computed_hash_dir(&shared_root, &lane.path);
+        write_build_evidence(&lane_hash_dir, &[&lane.path, &live]);
+
+        let kept = store.prune_orphaned_build_dirs(false).unwrap();
+        let kept_dir = lane_hash_dir.exists();
+        write_build_evidence(&lane_hash_dir, &[&lane.path]);
+        let freed = store.prune_orphaned_build_dirs(false).unwrap();
+        fs::remove_dir_all(&live).unwrap();
+
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(kept_dir, "a dir naming a live workspace must be kept");
+        assert_eq!(freed.len(), 1, "{freed:?}");
+        assert_eq!(freed[0].path, lane_hash_dir);
+        assert!(!lane_hash_dir.exists());
     }
 
     /// `dep_info_paths` reads rustc's own dep-info shape: rule targets and

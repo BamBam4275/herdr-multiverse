@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "mv-board"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "crc32fast",
  "crossterm",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "mv-cli"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "mv-config"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "dirs",
  "mv-core",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "mv-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "crc32fast",
  "fancy-regex 0.20.1",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "mv-engine"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "mv-config",
  "mv-core",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "mv-herdr"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "mv-core",
  "serde",
@@ -1000,13 +1000,14 @@ dependencies = [
 
 [[package]]
 name = "mv-state"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "crc32fast",
  "mv-config",
  "mv-core",
  "mv-herdr",
  "regex",
+ "rustc-stable-hash",
  "rustix",
  "serde",
  "serde_json",
@@ -1499,6 +1500,12 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rustc-stable-hash"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 
 [[package]]
 name = "rustc_version"

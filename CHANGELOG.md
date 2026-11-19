@@ -9,6 +9,20 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-11-19
+
+### Fixed
+
+- `worktrees --prune`: a lane's shared-build hash dir is now found by
+  computing cargo's own `{workspace-path-hash}` for the lane's path, proven
+  by that one dir's dep-info naming the lane, before falling back to the
+  bounded scan — so a loaded host no longer keeps a removed lane's build-dir
+  with "scan budget ran out". The orphan sweep also frees the computed hash
+  dir of a lane an earlier run removed (a task in the routing log whose
+  worktree is gone) once its dep-info names only that vanished lane; a dir
+  that also names any existing workspace is still kept. Adds a pinned
+  `rustc-stable-hash` dependency (MIT OR Apache-2.0, the hasher cargo uses).
+
 ## [0.1.14] - 2026-11-19
 
 ### Fixed
@@ -1364,6 +1378,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.15]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.15
 [0.1.14]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.14
 [0.1.13]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.13
 [0.1.12]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.12
