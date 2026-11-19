@@ -785,6 +785,9 @@ pub enum PruneOutcome {
         /// Why that same build-dir was left in place even though this lane
         /// qualified for its reclaim — see `BuildDirReclaim::kept`.
         build_dir_kept: Option<String>,
+        /// The hash dir `build_dir_freed`/`build_dir_kept` describes, when
+        /// one was resolved — see `BuildDirReclaim::path`.
+        build_dir: Option<PathBuf>,
     },
     WouldRemove {
         task: String,
@@ -797,11 +800,14 @@ pub enum PruneOutcome {
         /// Why `build_dir_freed` is `None` although this workspace does
         /// namespace build-dirs per lane — see `BuildDirReclaim::kept`.
         build_dir_kept: Option<String>,
+        /// The hash dir those two fields describe — see `Kept`'s own.
+        build_dir: Option<PathBuf>,
     },
     WouldArchive {
         task: String,
         build_dir_freed: Option<u64>,
         build_dir_kept: Option<String>,
+        build_dir: Option<PathBuf>,
     },
     Removed {
         task: String,
@@ -812,6 +818,11 @@ pub enum PruneOutcome {
         /// under the same conditions as `WouldRemove`'s own field.
         build_dir_freed: Option<u64>,
         build_dir_kept: Option<String>,
+        /// The hash dir those two fields describe. Under a measure-only
+        /// pass it is still on disk with its workspace root now gone, so
+        /// `prune_orphaned_build_dirs_skipping` must be told to pass it
+        /// over (card `20261119-b-c3f9f5`).
+        build_dir: Option<PathBuf>,
     },
     Archived {
         task: String,
@@ -820,6 +831,7 @@ pub enum PruneOutcome {
         rescued: Vec<PathBuf>,
         build_dir_freed: Option<u64>,
         build_dir_kept: Option<String>,
+        build_dir: Option<PathBuf>,
     },
 }
 
@@ -1606,6 +1618,9 @@ struct BuildDirReclaim {
     freed: Option<u64>,
     /// See `scoped_lane_build_dir`'s own `Err`, plus a failed delete.
     kept: Option<String>,
+    /// The resolved hash dir `freed` (or a failed delete's `kept`)
+    /// describes; `None` when none was resolved or it measured empty.
+    path: Option<PathBuf>,
 }
 
 impl BuildDirReclaim {
@@ -1613,6 +1628,7 @@ impl BuildDirReclaim {
         Self {
             freed: None,
             kept: Some(reason),
+            path: None,
         }
     }
 
@@ -1626,12 +1642,16 @@ impl BuildDirReclaim {
         }
         if !dry_run {
             if let Err(error) = deep_prune_remove(dir, root) {
-                return Self::kept(format!("removing {} failed: {error}", dir.display()));
+                return Self {
+                    path: Some(dir.to_path_buf()),
+                    ..Self::kept(format!("removing {} failed: {error}", dir.display()))
+                };
             }
         }
         Self {
             freed: Some(size),
             kept: None,
+            path: Some(dir.to_path_buf()),
         }
     }
 
@@ -2566,6 +2586,7 @@ impl Worktrees {
                         target_freed,
                         build_dir_freed: build_dir.freed,
                         build_dir_kept: build_dir.kept,
+                        build_dir: build_dir.path,
                     });
                     continue;
                 }
@@ -2579,6 +2600,7 @@ impl Worktrees {
                         task: lane.task,
                         build_dir_freed: build_dir.freed,
                         build_dir_kept: build_dir.kept,
+                        build_dir: build_dir.path,
                     }
                 } else {
                     let branch_refusal = self
@@ -2596,6 +2618,7 @@ impl Worktrees {
                         branch_refusal,
                         build_dir_freed: build_dir.freed,
                         build_dir_kept: build_dir.kept,
+                        build_dir: build_dir.path,
                     }
                 });
             } else {
@@ -2642,6 +2665,7 @@ impl Worktrees {
                         rescued,
                         build_dir_freed: build_dir.freed,
                         build_dir_kept: build_dir.kept,
+                        build_dir: build_dir.path,
                     }
                 } else {
                     let branch_refusal = if has_terminal_outcome_in(&task_records, &lane.task)
@@ -2658,6 +2682,7 @@ impl Worktrees {
                         rescued,
                         build_dir_freed: build_dir.freed,
                         build_dir_kept: build_dir.kept,
+                        build_dir: build_dir.path,
                     }
                 });
             }
@@ -3084,6 +3109,20 @@ impl Worktrees {
     /// every hash dir (card `20261116-b-891676`) let big dirs sorted first
     /// starve the small vanished ones after them.
     pub fn prune_orphaned_build_dirs(&self, dry_run: bool) -> Result<Vec<OrphanedBuildDir>> {
+        self.prune_orphaned_build_dirs_skipping(dry_run, &[])
+    }
+
+    /// [`Self::prune_orphaned_build_dirs`], passing over every hash dir in
+    /// `skip` untouched and unreported: the `PruneOutcome::build_dir` of
+    /// each lane this same run already reported (card
+    /// `20261119-b-c3f9f5`). A measure-only pass removes a lane but leaves
+    /// its build-dir in place, now naming only a vanished workspace root,
+    /// so without this the sweep reported those same bytes a second time.
+    pub fn prune_orphaned_build_dirs_skipping(
+        &self,
+        dry_run: bool,
+        skip: &[PathBuf],
+    ) -> Result<Vec<OrphanedBuildDir>> {
         let Some(shared_root) = shared_build_root(&self.project) else {
             return Ok(Vec::new());
         };
@@ -3093,7 +3132,8 @@ impl Worktrees {
             Some(lock(&self.project)?)
         };
         let cargo_home = cargo_cache_home();
-        let candidates = hash_dir_candidates(&shared_root);
+        let mut candidates = hash_dir_candidates(&shared_root);
+        candidates.retain(|candidate| !skip.contains(candidate));
         let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
         let mut outcomes = Vec::new();
         for candidate in candidates {
@@ -7520,6 +7560,7 @@ pub(crate) mod tests {
                 branch_refusal: None,
                 build_dir_freed: None,
                 build_dir_kept: None,
+                build_dir: None,
             }]
         );
         assert_eq!(observer.recorded, 0);

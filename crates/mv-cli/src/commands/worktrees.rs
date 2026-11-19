@@ -21,7 +21,9 @@
 //! own. `--prune` also reclaims every *other* shared-build hash dir under
 //! that same root whose own evidence names only workspace roots gone from
 //! disk (card `20261115-b-673528`) — independent of which lanes this
-//! project's own state still lists — reporting the same bytes-freed line.
+//! project's own state still lists — reporting the same bytes-freed line,
+//! but never for a hash dir a lane in that same run already reported
+//! (card `20261119-b-c3f9f5`).
 //! Card `20261119-b-73759c`: every one of those Rust-only cache frees — a
 //! lane's `target/` and build-dir, the orphaned shared-build sweep, and
 //! `--deep`'s `.multiverse/worktree-state/` quarantine removals — needs
@@ -399,9 +401,22 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     // Card `20261115-b-673528`: every shared-build hash dir whose own
     // evidence names only vanished workspace roots, independent of which
     // lanes this project's own `lanes()` still lists — reported the same
-    // way a lane's own `build_dir_freed` already is.
+    // way a lane's own `build_dir_freed` already is. Card
+    // `20261119-b-c3f9f5`: never a hash dir a lane above already reported
+    // (freed, would free, or kept) — plain `--prune` removes a lane but
+    // only measures its build-dir, which then reads as orphaned here.
+    let reported_build_dirs: Vec<PathBuf> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            PruneOutcome::Kept { build_dir, .. }
+            | PruneOutcome::WouldRemove { build_dir, .. }
+            | PruneOutcome::WouldArchive { build_dir, .. }
+            | PruneOutcome::Removed { build_dir, .. }
+            | PruneOutcome::Archived { build_dir, .. } => build_dir.clone(),
+        })
+        .collect();
     let orphaned_build_dirs = worktrees
-        .prune_orphaned_build_dirs(preview_caches)
+        .prune_orphaned_build_dirs_skipping(preview_caches, &reported_build_dirs)
         .map_err(fail)?;
     for build_dir in &orphaned_build_dirs {
         println!("  cargo shared-build {}", build_dir.path.display());

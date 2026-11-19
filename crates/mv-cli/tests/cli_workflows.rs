@@ -2036,6 +2036,78 @@ fn worktrees_prune_frees_an_orphaned_build_dir_only_with_yes() {
     assert!(!orphan.exists(), "--prune --yes must delete the build-dir");
 }
 
+/// A sandbox whose one merged, finished lane has its own shared-build hash
+/// dir under `<root>/cargo-home`; returns that hash dir.
+fn lane_with_build_dir(sandbox: &Sandbox) -> PathBuf {
+    let task = sandbox.seed_task();
+    fs::write(sandbox.project.join(".gitignore"), ".multiverse/\n").unwrap();
+    fs::create_dir_all(sandbox.project.join(".cargo")).unwrap();
+    fs::write(
+        sandbox.project.join(".cargo/config.toml"),
+        "[build]\nbuild-dir = \"{cargo-cache-home}/shared-build/{workspace-path-hash}\"\n",
+    )
+    .unwrap();
+    worktree_git(sandbox, &["add", ".gitignore", ".cargo/config.toml"]);
+    worktree_git(sandbox, &["commit", "-m", "shared build-dir fixture"]);
+    let lane = mv_state::worktrees::Worktrees::new(&sandbox.project)
+        .unwrap()
+        .create(task, "HEAD")
+        .unwrap();
+    let build_dir = sandbox
+        .root
+        .join("cargo-home/shared-build/3b/00000000000013");
+    fs::create_dir_all(build_dir.join("debug/deps")).unwrap();
+    fs::write(
+        build_dir.join("debug/deps/fixture.d"),
+        format!("{}/src/lib.rs\n", lane.path.display()),
+    )
+    .unwrap();
+    fs::write(build_dir.join("debug/deps/artifact"), vec![0u8; 4096]).unwrap();
+    build_dir
+}
+
+/// Card `20261119-b-c3f9f5`: plain `--prune` removes an eligible lane but
+/// only measures its build-dir, and the orphaned shared-build sweep in the
+/// same run used to report that same hash dir a second time. Each hash dir
+/// is now reported once per run, and `--yes` still frees it exactly once.
+#[test]
+fn worktrees_prune_reports_a_removed_lanes_build_dir_once_per_run() {
+    let prune = |sandbox: &Sandbox, extra: &[&str]| {
+        let output = sandbox
+            .command(env!("CARGO_BIN_EXE_multiverse"))
+            .env("CARGO_HOME", sandbox.root.join("cargo-home"))
+            .args(["worktrees", sandbox.project.to_str().unwrap(), "--prune"])
+            .args(extra)
+            .output()
+            .expect("run built multiverse binary");
+        assert_code(&output, 0);
+        stdout(&output)
+    };
+
+    let sandbox = Sandbox::new();
+    let build_dir = lane_with_build_dir(&sandbox);
+    let out = prune(&sandbox, &[]);
+    assert!(out.contains("    removed"), "{out}");
+    assert_eq!(out.matches("build-dir (").count(), 1, "{out}");
+    assert!(out.contains("    would free build-dir ("), "{out}");
+    assert!(!out.contains("cargo shared-build"), "{out}");
+    assert!(build_dir.exists(), "plain --prune must not delete it");
+    // The lane is gone now, so only the sweep still sees the hash dir.
+    let out = prune(&sandbox, &["--yes"]);
+    assert_eq!(out.matches("build-dir (").count(), 1, "{out}");
+    assert!(out.contains("    freed build-dir ("), "{out}");
+    assert!(!build_dir.exists(), "--prune --yes must delete it");
+
+    let sandbox = Sandbox::new();
+    let build_dir = lane_with_build_dir(&sandbox);
+    let out = prune(&sandbox, &["--yes"]);
+    assert!(out.contains("    removed"), "{out}");
+    assert_eq!(out.matches("build-dir (").count(), 1, "{out}");
+    assert!(out.contains("    freed build-dir ("), "{out}");
+    assert!(!out.contains("cargo shared-build"), "{out}");
+    assert!(!build_dir.exists(), "--prune --yes must delete it");
+}
+
 /// Card `20261119-b-73759c`'s `--deep` half: a redundant
 /// `.multiverse/worktree-state/` quarantine copy is only previewed
 /// ("would remove") by `--prune --deep` without `--yes`.

@@ -9,6 +9,16 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-19
+
+### Fixed
+
+- CLI: `worktrees --prune` without `--yes` no longer reports a just-removed
+  lane's shared-cache build-dir twice — once for the lane, then again from
+  the orphaned shared-build sweep in the same run. Each hash dir is now
+  reported at most once per run; `--yes` and `--dry-run` output is
+  unchanged.
+
 ## [0.1.11] - 2026-11-19
 
 ### Fixed
@@ -1313,6 +1323,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.12]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.12
 [0.1.11]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.11
 [0.1.10]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.10
 [0.1.9]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.9
