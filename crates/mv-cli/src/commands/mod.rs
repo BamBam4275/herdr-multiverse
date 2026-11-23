@@ -27,6 +27,7 @@ mod inspect;
 mod lifecycle;
 mod new;
 mod notify;
+mod onboard;
 mod presence;
 mod projects;
 mod result;
@@ -448,6 +449,7 @@ pub fn run(matches: &ArgMatches) -> Result<(), Failure> {
         "stop" => stop::run(args),
         "add" => add::run(args),
         "new" => new::run(args),
+        "onboard" => onboard::run(args),
         "tasks" => tasks::run(args),
         "board" => board::run(args),
         "council" => council::run_default(args),

@@ -198,7 +198,7 @@ fn last_cycle_card_lines(cycles: &[LastCycleEntry], width: usize) -> Vec<String>
     let mut lines: Vec<String> = Vec::new();
     if !narrow && !cycles.is_empty() {
         lines.push(
-            "mail = last inbox read · reconcile/backlog = last sweep · ⚠ = overdue".to_string(),
+            "mail/reconcile/backlog (? never, 0s just now) · ⚠ overdue · warn=overdue".to_string(),
         );
     }
     for c in cycles {
@@ -399,6 +399,10 @@ mod tests {
             assert!(rendered.contains("NEXUS LAST PASS"), "{rendered:?}");
             assert!(!rendered.to_lowercase().contains("orch"), "{rendered:?}");
         }
+        let wide = last_cycle_card_lines(&cycles, 80).join("\n");
+        assert!(wide.contains("warn=overdue"), "{wide:?}");
+        assert!(wide.contains("? never"), "{wide:?}");
+        assert!(wide.contains("0s just now"), "{wide:?}");
     }
 
     #[test]

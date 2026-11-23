@@ -1599,6 +1599,8 @@ impl Default for DashboardTab {
 pub struct Board {
     pub refresh_seconds: u32,
     pub dashboard_tab: DashboardTab,
+    /// Force board SGR on (`--color always`), including inside a Herdr pane.
+    pub color: bool,
     /// Whether `dashboard_tab` was written explicitly in `[board]`,
     /// as opposed to falling back to [`DashboardTab::default`]. Python
     /// (`config.py:2482-2503`) only validates `dashboard_tab` project
@@ -1612,12 +1614,13 @@ impl Default for Board {
         Self {
             refresh_seconds: 300,
             dashboard_tab: DashboardTab::default(),
+            color: false,
             dashboard_tab_explicit: false,
         }
     }
 }
 
-const BOARD_KEYS: &[&str] = &["refresh_seconds", "dashboard_tab"];
+const BOARD_KEYS: &[&str] = &["refresh_seconds", "dashboard_tab", "color"];
 
 fn parse_board(value: &Value, warnings: &mut Vec<String>) -> Result<Board, ConfigError> {
     let scope = "board";
@@ -1627,6 +1630,7 @@ fn parse_board(value: &Value, warnings: &mut Vec<String>) -> Result<Board, Confi
     let defaults = Board::default();
     let refresh_seconds =
         u32_with_default(table, scope, "refresh_seconds", 1, defaults.refresh_seconds)?;
+    let color = bool_with_default(table, scope, "color", false)?;
     let dashboard_tab_explicit = table.get("dashboard_tab").is_some();
     let dashboard_tab = match table.get("dashboard_tab") {
         None => defaults.dashboard_tab,
@@ -1648,6 +1652,7 @@ fn parse_board(value: &Value, warnings: &mut Vec<String>) -> Result<Board, Confi
     Ok(Board {
         refresh_seconds,
         dashboard_tab,
+        color,
         dashboard_tab_explicit,
     })
 }
@@ -2372,6 +2377,43 @@ mod tests {
             err.message().contains("board.dashboard_tab")
                 && err.message().contains("\"nonexistent\""),
             "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn board_color_true_loads_and_a_non_boolean_is_refused() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("example-project");
+        fs::create_dir_all(&project_root).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let enabled = minimal_config(&project_root).replacen(
+            "[board]\ndashboard_tab = false",
+            "[board]\ndashboard_tab = false\ncolor = true",
+            1,
+        );
+        let config = load_config_str(&enabled, &config_path).unwrap();
+        assert!(config.board.color);
+        assert!(
+            config.warnings.iter().all(|w| !w.contains("color")),
+            "{:?}",
+            config.warnings
+        );
+
+        let defaulted = load_config_str(&minimal_config(&project_root), &config_path).unwrap();
+        assert!(!defaulted.board.color);
+
+        let refused = minimal_config(&project_root).replacen(
+            "[board]\ndashboard_tab = false",
+            "[board]\ndashboard_tab = false\ncolor = \"always\"",
+            1,
+        );
+        let err = load_config_str(&refused, &config_path).unwrap_err();
+        assert!(err.message().contains("color"), "{}", err.message());
+        assert!(
+            err.message().contains("must be a boolean"),
+            "{}",
             err.message()
         );
     }
@@ -3532,6 +3574,7 @@ allowlist = "security/.gitleaks.toml"
             config.board.dashboard_tab,
             DashboardTab::Projects(Vec::new())
         );
+        assert!(!config.board.color);
     }
 
     #[test]

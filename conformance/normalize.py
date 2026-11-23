@@ -47,10 +47,12 @@ _PID_RE = re.compile(r"\bpid=\d+\b")
 _AS_OF_CLOCK_RE = re.compile(r"\bas of \d{1,2}:\d{2}\b")
 # Compact board clocks and the spelled-out tasks/workers AGE column.
 # Boundaries exclude durations embedded in identifiers, paths or decimals.
+# ASCII (`TERM=dumb` / `NO_COLOR`) maps `─`→`-` and `·`→`.` one cell each
+# (`mv_board::layout::to_ascii_plain`); fold those clocks the same way.
 _ELAPSED = r"\d+(?: (?:sec|min|hr)|(?:d\d+h|h\d+m)|[smhdwy])"
 _ELAPSED_RE = re.compile(r"(?<![\w./+-])" + _ELAPSED + r"(?![\w./+-])")
 _RESETS_IN_RE = re.compile(r"\bresets in " + _ELAPSED + r"(?![\w./+-])")
-_CARD_CLOCK_RE = re.compile(r"(─+ )?\b\d{1,2}:\d{2} · \d+[mhdwy]\b")
+_CARD_CLOCK_RE = re.compile(r"((?:─+|-+) )?\b\d{1,2}:\d{2} [·.] \d+[mhdwy]\b")
 
 # `multiverse doctor`'s first checklist line names the interpreter actually
 # running it (`sys.version_info`), which is a fact about the host, not about
@@ -102,10 +104,12 @@ class PathMap:
 def _card_clock(match: re.Match[str]) -> str:
     """Fold one board card's `HH:MM · elapsed` clock, rebalancing its
     leading rail (if any) to keep the card's rendered width."""
-    replacement = "<TIME> · <ELAPSED>"
+    sep = " . " if " . " in match.group(0) else " · "
+    replacement = f"<TIME>{sep}<ELAPSED>"
     rail = match.group(1)
     if rail:
-        return "─" * max(1, len(match.group(0)) - len(replacement) - 1) + " " + replacement
+        dash = "-" if "-" in rail else "─"
+        return dash * max(1, len(match.group(0)) - len(replacement) - 1) + " " + replacement
     return replacement
 
 
@@ -123,7 +127,7 @@ def normalize_elapsed(text: str) -> str:
         return "<ELAPSED>"
 
     text = _CARD_CLOCK_RE.sub(_card_clock, text)
-    return re.sub("(" + _ELAPSED_RE.pattern + r")( {2,}(?=│))?", replace, text)
+    return re.sub("(" + _ELAPSED_RE.pattern + r")( {2,}(?=[│|]))?", replace, text)
 
 
 def normalize_text(text: str, paths: PathMap) -> str:

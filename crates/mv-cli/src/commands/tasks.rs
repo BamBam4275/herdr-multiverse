@@ -59,6 +59,7 @@ use time::OffsetDateTime;
 use crate::exit::{Failure, UNKNOWN};
 
 use super::current_project_root;
+use super::dispatch::ReclaimShellCheck;
 use super::doctor::{project_path, state_dir_from_config};
 
 const DASH: &str = "\u{2014}";
@@ -576,6 +577,24 @@ fn supersede(args: &ArgMatches) -> Result<(), Failure> {
         println!("  recorded the correction for {task}@line {supersedes_ord}.");
     } else {
         println!("  already recorded; nothing written for {task}@line {supersedes_ord}.");
+    }
+    // Card 20261122-b-40cb46: a correction to `done` also brings the lane's
+    // own status file into line with the routing log, when the worktree
+    // the task ran in (its own, or the one a `dispatch --into` round
+    // adopted) still exists — so nothing that still reads that file sees
+    // the pre-correction verdict. Idempotent, so a repeat of an
+    // already-recorded correction repairs a file a hand edit left behind.
+    if status == "done" {
+        match mv_state::worktrees::rewrite_lane_status(&root, &task, &status) {
+            Ok(Some(path)) => println!("  rewrote {} to done.", path.display()),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(Failure::Operation(format!(
+                    "recorded the correction for {task}@line {supersedes_ord}, but could not \
+                     rewrite its lane status file: {error}"
+                )))
+            }
+        }
     }
     Ok(())
 }
@@ -1202,7 +1221,7 @@ fn list(
             close_stranded_and_report(root, &rows, args, agents, live.as_deref());
         }
         if args.get_flag("reclaimable") {
-            reclaimable_and_report(root, args, agents, live.as_deref());
+            reclaimable_and_report(root, args, agents, config, live.as_deref());
         }
     }
     // Python `cmd_tasks` (`cli.py:7662-7663`) prints `open backlog:` after
@@ -1285,17 +1304,31 @@ fn close_stranded_and_report(
 /// is still idle/done under the same agent; WORKING/BLOCKED/unknown fail
 /// closed (`cli.py:7583-7616` / `_reclaim_pane_confirmation`).
 ///
-/// Card `20261115-b-9815fe`: `--reap` is checked only after a candidate's
+/// Card `20261115-b-9815fe`: the reap is checked only after a candidate's
 /// own pane is actually confirmed `"closed"` this pass — never for `"NOT
 /// closed"`, where the pane safety check itself refused, and the process
 /// this lane still shows may belong to an occupant this run never
 /// confirmed gone. Without `--yes` nothing closes, so every candidate's
 /// own lingering process is previewed as "would reap" there, the same
-/// shape `--prune --reap --dry-run` already uses.
+/// shape `--prune --reap --dry-run` already uses. Card
+/// `20261122-b-78bcf9`: `--yes` alone now reaps a just-closed lane's
+/// leftovers (closing the pane is what made them leftovers), and `--reap`
+/// also covers a stale entry whose pane was already gone.
+///
+/// Card `20261122-b-4ad223`: a candidate on a Claude seat whose pane
+/// footer still shows a running background shell is printed `kept …
+/// waiting-on-shell` and never closed, `--yes` or not — a recorded lane
+/// can still have its own suite running. A Claude pane whose text cannot
+/// be read is kept too. `mv_state::tasks::reclaimable_panes` cannot apply
+/// this itself (mv-state sits below the mv-engine classifier), so the
+/// candidates are filtered here, by the same
+/// [`super::dispatch::reclaim_shell_check`] the pre-dispatch reclaim uses.
+/// `config` of `None` (no loadable config) skips the check.
 fn reclaimable_and_report(
     root: &Path,
     args: &ArgMatches,
     agents: &mut impl AgentPanes,
+    config: Option<&mv_config::load::Config>,
     live: Option<&[LiveAgentStatus]>,
 ) {
     if live.is_none() {
@@ -1306,22 +1339,58 @@ fn reclaimable_and_report(
     let mut observed = ObservedAgents::new(agents, live);
     let (candidates, stale) = mv_state::tasks::reclaimable_panes(root, &mut observed);
 
-    let confirmed = if apply && !candidates.is_empty() {
-        agents.list_checked()
-    } else {
-        None
-    };
-    let lane_tasks = if reap {
+    // Card `20261122-b-78bcf9`: every candidate's lane is now checked for
+    // leftovers once its pane closes (or, without `--yes`, previewed), so
+    // the task snapshot is needed whenever there is any candidate at all.
+    let lane_tasks = if reap || !candidates.is_empty() {
         mv_state::tasks::sweep_tasks(root)
     } else {
         Vec::new()
     };
-    let ancestors = if reap {
+    let shell_checks: Vec<ReclaimShellCheck> = candidates
+        .iter()
+        .map(|candidate| match config {
+            Some(config) => {
+                super::dispatch::reclaim_shell_check(config, &lane_tasks, candidate, agents)
+            }
+            None => ReclaimShellCheck::Clear,
+        })
+        .collect();
+    let closable = shell_checks
+        .iter()
+        .filter(|check| **check == ReclaimShellCheck::Clear)
+        .count();
+
+    let confirmed = if apply && closable > 0 {
+        agents.list_checked()
+    } else {
+        None
+    };
+    let ancestors = if reap || !candidates.is_empty() {
         mv_engine::dockerreport::own_ancestor_pids()
     } else {
         Vec::new()
     };
-    for candidate in &candidates {
+    for (candidate, shell_check) in candidates.iter().zip(&shell_checks) {
+        let kept_because = match shell_check {
+            ReclaimShellCheck::Clear => None,
+            ReclaimShellCheck::WaitingOnShell => {
+                Some("waiting-on-shell: a background shell is still running")
+            }
+            ReclaimShellCheck::Unreadable => {
+                Some("pane could not be read to rule out a running background shell")
+            }
+        };
+        if let Some(reason) = kept_because {
+            println!(
+                "  kept {} ({}, agent={}, pane={}) — {reason}",
+                candidate.task_id,
+                display_role(&candidate.role),
+                python_repr(candidate.agent.as_deref().unwrap_or("")),
+                python_repr(&candidate.pane)
+            );
+            continue;
+        }
         let verb = if !apply {
             "would close"
         } else if reclaim_pane_is_safe(candidate, confirmed.as_deref())
@@ -1348,13 +1417,20 @@ fn reclaimable_and_report(
                  even with --yes"
             );
         }
-        if reap && (verb == "closed" || !apply) {
-            for note in reap_lane_notes(root, &lane_tasks, &candidate.task_id, apply, &ancestors) {
+        if verb == "closed" || !apply {
+            for note in reap_lane_notes(
+                root,
+                &lane_tasks,
+                &candidate.task_id,
+                apply,
+                reap,
+                &ancestors,
+            ) {
                 println!("{note}");
             }
         }
     }
-    if !candidates.is_empty() && !apply {
+    if closable > 0 && !apply {
         println!("  dry run: nothing was closed. Add --yes to close these panes.");
     }
 
@@ -1375,22 +1451,48 @@ fn reclaimable_and_report(
                     &candidate.pane,
                 );
             }
+            // Card `20261122-b-78bcf9`: a pane already gone is the same dead
+            // lane a close just made — `--reap` lists (and with `--yes`
+            // ends) its leftovers too, where it used to skip the lane.
+            if reap {
+                for note in reap_lane_notes(
+                    root,
+                    &lane_tasks,
+                    &candidate.task_id,
+                    apply,
+                    true,
+                    &ancestors,
+                ) {
+                    println!("  {note}");
+                }
+            }
         }
     }
 }
 
-/// `candidate`'s own lane's lingering host processes, under `--reap`: the
+/// `candidate`'s own lane's lingering host processes: the
 /// `20261115-b-9815fe` reaper's one call site in this file. `tasks` is a
 /// snapshot already read once by the caller — `sweep_tasks` reads the
-/// whole routing log, so this stays one read per `--reclaimable --reap`
-/// pass, not one per candidate. `apply` gates signaling exactly the way
+/// whole routing log, so this stays one read per `--reclaimable` pass, not
+/// one per candidate. `apply` gates signaling exactly the way
 /// `verb == "closed"`/`!apply` already gate calling this at all: `true`
 /// reaps for real, `false` only previews "would reap".
+///
+/// Card `20261122-b-78bcf9`: the caller only reaches this once the lane's
+/// pane is closed (or, previewing, would be) or already gone, so the lane
+/// is dead and [`super::worktrees::leftover_protected`]'s short list
+/// applies — a `zsh -c` left behind is ended like the `tail -f` beside it.
+/// `--yes` reaps after its own close whether or not `--reap` was given;
+/// `explicit` (`--reap`) only decides whether a failed process probe is
+/// worth a warning line, so a plain `--reclaimable` prints nothing new
+/// unless the lane really holds a leftover. A lane with no worktree on disk
+/// is never probed at all.
 fn reap_lane_notes(
     root: &Path,
     tasks: &[mv_state::tasks::SweepTask],
     task_id: &str,
     apply: bool,
+    explicit: bool,
     ancestors: &[u32],
 ) -> Vec<String> {
     let Some(task) = tasks.iter().find(|task| task.task_id == task_id) else {
@@ -1399,19 +1501,30 @@ fn reap_lane_notes(
     let lane_path = root
         .join(".multiverse/worktrees")
         .join(mv_state::tasks::lane_task_id(task));
+    if !lane_path.is_dir() {
+        return Vec::new();
+    }
     let Some(snapshot) = mv_engine::dockerreport::process_cwds() else {
-        return vec!["      warning: process-cwd probe unknown".to_string()];
+        return if explicit {
+            vec!["      warning: process-cwd probe unknown".to_string()]
+        } else {
+            Vec::new()
+        };
     };
     let mut notes = Vec::new();
     for process in mv_engine::dockerreport::processes_under(&lane_path, &snapshot) {
         let label = mv_engine::dockerreport::process_label(&process);
-        if mv_engine::dockerreport::protected(&process, ancestors) {
+        if super::worktrees::leftover_protected(&process, ancestors) {
             notes.push(format!(
                 "      lane process {label} (protected, never reaped)"
             ));
         } else if apply {
             notes.push(format!("      reaping {label}"));
-            mv_engine::dockerreport::reap(&process, mv_engine::dockerreport::DEFAULT_REAP_GRACE);
+            let outcome = super::worktrees::end_leftover(&process);
+            notes.push(format!(
+                "        {}",
+                super::worktrees::reap_outcome_text(outcome)
+            ));
         } else {
             notes.push(format!("      would reap {label}"));
         }
@@ -1948,6 +2061,7 @@ mod tests {
     use super::*;
     use crate::args::command;
     use crate::commands::worktrees::herdr_env::HerdrEnvGuard;
+    use crate::commands::worktrees::lane_child::LaneChild;
     use mv_state::tasks::LiveAgent;
 
     /// Card `20261114-b-74029b`: `probe_blocking_prompt` (this file's own
@@ -2567,6 +2681,64 @@ mod tests {
             after,
             "the same correction twice appends once"
         );
+    }
+
+    /// Card 20261122-b-40cb46: `--supersede --status done --yes` also
+    /// rewrites the task's status file in the worktree it ran in — here an
+    /// adopted `dispatch --into` round, whose own id has no worktree — and
+    /// a dry run leaves that file alone.
+    #[test]
+    fn supersede_to_done_rewrites_the_lane_status_file() {
+        let dir = temp_dir("supersede-rewrites-lane");
+        let project = dir.join("project");
+        let owner = "20261101-builder-aaaaaa";
+        let adopted = "20261101-builder-bbbbbb";
+        let status_path = project
+            .join(".multiverse/worktrees")
+            .join(owner)
+            .join(".multiverse/tasks")
+            .join(adopted)
+            .join("status");
+        std::fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        std::fs::write(&status_path, "blocked\n").unwrap();
+        let log = mv_state::log::ProjectLog::new(&project);
+        log.append(&format!(
+            "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={adopted}\trole=builder\t\
+             branch=multiverse/{owner}"
+        ))
+        .unwrap();
+        log.append(&format!(
+            "2026-11-01T00:10:00+00:00\tevent=result\ttask={adopted}\tstatus=blocked\t\
+             state=reconciled\trevisions=0"
+        ))
+        .unwrap();
+        let config = write_config(&dir, &project, "sandbox");
+        let words = |yes: bool| {
+            let mut words = vec![
+                "tasks",
+                "sandbox",
+                "--supersede",
+                adopted,
+                "--supersedes",
+                "2",
+                "--status",
+                "done",
+                "--state",
+                "verified",
+                "--reason",
+                "the nexus re-ran the checks",
+            ];
+            if yes {
+                words.push("--yes");
+            }
+            matches_cfg(&words, &config)
+        };
+
+        run(&words(false)).unwrap();
+        assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "blocked\n");
+
+        run(&words(true)).unwrap();
+        assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "done\n");
     }
 
     #[test]
@@ -3225,11 +3397,7 @@ mod tests {
             "done\n",
         );
         let lane = init_clean_lane(&root.join(".multiverse/worktrees").join(task_id));
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(&lane)
-            .spawn()
-            .unwrap();
+        let mut child = LaneChild::sleep_in(&lane);
 
         let args = matches(&["tasks", "--reclaimable", "--reap"]);
         let mut agents = FakeAgents::new(&["w1:p1"]);
@@ -3242,12 +3410,9 @@ mod tests {
             "--reap without --yes must never close the pane"
         );
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.not_signalled(),
             "--reap without --yes must never signal the lane process"
         );
-
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 
     /// Proof item: after a successful close, `--reap` ends that lane's own
@@ -3273,11 +3438,7 @@ mod tests {
             "done\n",
         );
         let lane = init_clean_lane(&root.join(".multiverse/worktrees").join(task_id));
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(&lane)
-            .spawn()
-            .unwrap();
+        let mut child = LaneChild::sleep_in(&lane);
 
         let args = matches(&["tasks", "--reclaimable", "--yes", "--reap"]);
         let mut agents = FakeAgents::new(&["w1:p1"])
@@ -3289,8 +3450,119 @@ mod tests {
             agents.list().is_empty(),
             "a live, recorded, clean-lane pane must still be closed"
         );
-        let status = child.wait().unwrap();
-        assert!(!status.success(), "{status:?}");
+        assert!(
+            child.signalled_within(30).is_some(),
+            "--reap --yes must signal the lane process"
+        );
+    }
+
+    /// Whether this host's process cwd probe can see `pid` with its cwd in
+    /// `lane` — `false`, after printing why, where it cannot (a sandbox
+    /// hiding `lsof`/`/proc`), so a test needing it skips rather than fails.
+    fn probe_sees(lane: &Path, pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let seen = mv_engine::dockerreport::process_cwds().is_some_and(|processes| {
+                mv_engine::dockerreport::processes_under(lane, &processes)
+                    .iter()
+                    .any(|process| process.pid == pid)
+            });
+            if seen {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("skipped: this host's process cwd probe cannot see spawned pid {pid}");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn recorded_done_lane(root: &Path, task_id: &str) -> PathBuf {
+        mv_state::log::ProjectLog::new(root)
+            .append(&format!(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={task_id}\t\
+                 branch=multiverse/{task_id}\trole=fixer"
+            ))
+            .unwrap();
+        mv_state::log::ProjectLog::new(root)
+            .append(&format!(
+                "2026-11-01T00:01:00+00:00\tevent=result\ttask={task_id}\tstatus=done\t\
+                 state=done\trevisions=0\tpane=w1:p1"
+            ))
+            .unwrap();
+        write(
+            &root.join(".multiverse/tasks").join(task_id).join("status"),
+            "done\n",
+        );
+        init_clean_lane(&root.join(".multiverse/worktrees").join(task_id))
+    }
+
+    /// Card `20261122-b-78bcf9`: `--reclaimable --yes` with no `--reap`
+    /// still ends the lane's leftover once it has closed that lane's pane
+    /// — the `tail -f` a Claude lane leaves behind used to outlive the
+    /// close and block `--merge`.
+    #[test]
+    fn reclaimable_yes_without_reap_ends_the_lane_leftover_after_the_close() {
+        let root = temp_dir("reclaimable-yes-leftover");
+        let task_id = "20261101-fixer-hhhhhh";
+        let lane = recorded_done_lane(&root, task_id);
+        let mut child = LaneChild::sleep_in(&lane);
+        if !probe_sees(&lane, child.id()) {
+            return;
+        }
+
+        let args = matches(&["tasks", "--reclaimable", "--yes"]);
+        let mut agents = FakeAgents::new(&["w1:p1"])
+            .with_status("w1:p1", AgentState::Idle)
+            .with_label("w1:p1", &format!("fixer · {task_id}"))
+            .with_cwd("w1:p1", lane.clone());
+        assert!(list(&root, None, &args, &mut agents, None).is_ok());
+        assert!(agents.list().is_empty(), "the pane must still be closed");
+        assert!(
+            child.signalled_within(30).is_some(),
+            "--reclaimable --yes must end the closed lane's leftover"
+        );
+    }
+
+    /// Card `20261122-b-78bcf9`: without `--yes` nothing closes and the
+    /// leftover is only ever previewed, `--reap` or not.
+    #[test]
+    fn reclaimable_without_yes_never_signals_a_leftover() {
+        let root = temp_dir("reclaimable-no-yes-leftover");
+        let task_id = "20261101-fixer-iiiiii";
+        let lane = recorded_done_lane(&root, task_id);
+        let mut child = LaneChild::sleep_in(&lane);
+
+        let args = matches(&["tasks", "--reclaimable"]);
+        let mut agents = FakeAgents::new(&["w1:p1"]);
+        assert!(list(&root, None, &args, &mut agents, None).is_ok());
+        assert!(
+            child.not_signalled(),
+            "a preview must never signal the lane's leftover"
+        );
+    }
+
+    /// Card `20261122-b-78bcf9`: a recorded lane whose pane is already gone
+    /// lands in "stale bookkeeping", which `--reap` used to skip entirely;
+    /// `--reap --yes` now ends its leftover there too.
+    #[test]
+    fn reclaimable_reap_yes_ends_a_stale_lane_leftover() {
+        let root = temp_dir("reclaimable-stale-leftover");
+        let task_id = "20261101-fixer-jjjjjj";
+        let lane = recorded_done_lane(&root, task_id);
+        let mut child = LaneChild::sleep_in(&lane);
+        if !probe_sees(&lane, child.id()) {
+            return;
+        }
+
+        let args = matches(&["tasks", "--reclaimable", "--reap", "--yes"]);
+        let mut agents = FakeAgents::new(&["w9:p9"]);
+        assert!(list(&root, None, &args, &mut agents, None).is_ok());
+        assert!(
+            child.signalled_within(30).is_some(),
+            "--reap --yes must end a stale lane's leftover"
+        );
     }
 
     fn write(path: &Path, text: &str) {
@@ -4328,6 +4600,56 @@ mod tests {
             agents.panes.is_empty(),
             "a pane still hosting the task's own dispatched agent must still be closed"
         );
+    }
+
+    /// Card `20261122-b-4ad223` / `20261122-b-e98304`: a recorded, clean
+    /// Claude lane whose pane is live and done but whose footer still
+    /// shows a running background shell is kept, never closed, even with
+    /// `--yes`; the same pane with the footer segment gone is closed as
+    /// before. Revert check: make `reclaimable_and_report`'s
+    /// `shell_checks` always `Clear` and the first pane closes.
+    #[test]
+    fn reclaimable_keeps_a_claude_pane_still_waiting_on_its_shell() {
+        let shell_footer = include_str!(
+            "../../../../tests/fixtures/stall-cause/claude-shell-still-running-idle.txt"
+        );
+        for (footer, closes) in [
+            (shell_footer.to_string(), false),
+            (shell_footer.replace(" · 1 shell", ""), true),
+        ] {
+            let root = temp_dir("reclaim-waiting-on-shell");
+            mv_state::log::ProjectLog::new(&root)
+                .append(
+                    "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask=20261122-builder-333333\t\
+                     branch=main\trole=builder\tagent=x-buil-cl\taccount=claude-a",
+                )
+                .unwrap();
+            mv_state::log::ProjectLog::new(&root)
+                .append(
+                    "2026-11-01T00:01:00+00:00\tevent=result\ttask=20261122-builder-333333\t\
+                     status=done\tstate=done\trevisions=0\tpane=w1:p1",
+                )
+                .unwrap();
+            let toml = format!(
+                "[accounts.claude-a]\nkind = \"claude\"\nshort = \"cl\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"/tmp\"\npool = \"claude:a\"\n\
+                 [projects.x]\npath = \"{}\"\n",
+                root.display()
+            );
+            let config =
+                mv_config::load::load_config_str(&toml, &root.join("config.toml")).unwrap();
+            let mut agents = FakeAgents::new(&["w1:p1"])
+                .with_status("w1:p1", AgentState::Done)
+                .with_label("w1:p1", "builder · 20261122-builder-333333")
+                .with_visible("w1:p1", &footer);
+            agents.panes[0].name = Some("x-buil-cl".into());
+            let args = matches(&["tasks", "--no-reconcile", "--reclaimable", "--yes"]);
+            list(&root, None, &args, &mut agents, Some(&config)).unwrap();
+            assert_eq!(
+                agents.panes.is_empty(),
+                closes,
+                "footer {footer:?}: a pane still running its shell must be kept"
+            );
+        }
     }
 
     #[test]

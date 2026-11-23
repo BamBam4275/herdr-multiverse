@@ -1,0 +1,30 @@
+{
+  "id": "onboard-dry-run-writes-nothing",
+  "description": "`multiverse onboard --non-interactive --dry-run --config <path>` prints the first-run plan (seats, model tiers, cheat sheet) and writes nothing — the config path is under the sandbox project so expect_tree can prove the tree is unchanged. `--project` is omitted so add is not attempted.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": { "README.md": "hi\n" }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": ["onboard", "--non-interactive", "--dry-run", "--config", "{{PROJECT:sandbox}}/config.toml"],
+      "transcript": [],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "Dry-run: config not written.",
+          "Day-one cheat sheet"
+        ]
+      }
+    }
+  ],
+  "expect_tree": [
+    { "root": "sandbox", "unchanged": true }
+  ]
+}

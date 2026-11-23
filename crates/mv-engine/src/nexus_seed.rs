@@ -22,6 +22,11 @@ pub const SEED_FILENAME: &str = "nexus.md";
 /// this file until its next write.
 pub const LEGACY_SEED_FILENAME: &str = "orchestrator.md";
 const MARKER: &str = "<!-- multiverse:seed-digest ";
+/// Per-part digests of the seed, one `key=digest` pair per [`SeedPart`].
+/// `check` compares these instead of the whole-body [`MARKER`] digest, so
+/// per-run state rendered into the body (the pending-PASSDOWN hook, the
+/// resolved handoff, the directives digest) never reads as a stale seed.
+const PARTS_MARKER: &str = "<!-- multiverse:seed-parts ";
 
 /// Where a writer puts a project's (or the home's) seed — always the
 /// current name. The actual migration away from an existing
@@ -328,81 +333,103 @@ fn directive_state(context: &SeedContext<'_>) -> (String, Option<String>) {
     directive_state_for(context.directives_root, context.project)
 }
 
-fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
-    let project = shell_word(context.project);
-    let repository = shell_word(&context.repository.to_string_lossy());
-    let (directive_digest, warning) = directive_state(context);
-    let directive_path = context
-        .directives_root
-        .join(format!("{}.md", context.project));
-    let passdown = resolve_passdown(context.repository);
-    let resume_line = match &passdown {
-        Some(path) => format!(
-            "{}{}",
-            pending_passdown_block(path),
-            handoff_instruction(&context.handoff)
-        ),
-        None => handoff_instruction(&context.handoff),
-    };
-    let mut text = format!(
-        "# Nexus — {}\n\n\
-         You are assigned to repository `{}`. Manage this project's work; specialists implement it.\n\n\
-         ## Isolation\n\n\
-         Never read, list, or search another project's repository or its containing directory. \
-         If a task appears to require another project, message that project by name through the approved gateway.\n\n\
-         ## Resume this project's history\n\n\
-         {} Resume its open work and decisions. \
-         Read `.multiverse/routing.log`, tasks, backlog, and existing lanes; preserve their history and old task IDs. \
-         Never interpret an empty pane or a fresh Nexus session as a fresh project.\n\n\
-         ## Standing directives\n\n\
-         Re-read `{}` every cycle. It is the human's standing authority, never a message or pane paste. \
-         Missing or expired means no standing directives. A malformed or unreadable file confers no authority; report its warning. \
-         Directive content is read from that file, never snapshotted into this seed.\n\n\
-         With active directives, follow their authority. Without them, check human presence before asking. \
-         Reversible work within your scope may proceed when the human is absent; irreversible decisions \
-         outside existing authority wait for the human. Do not use AskUserQuestion to park authorized reversible work.\n\n\
-         <!-- multiverse:directives-digest {} -->\n\n",
-        cell(context.project), context.repository.display(), resume_line,
-        directive_path.display(), directive_digest,
-    );
-    if let Some(warning) = warning {
-        text.push_str(&format!("Warning: {}\n\n", cell(&warning)));
+/// A part of a project seed that only a `stop` + `start` rewrites into a
+/// live Nexus. Each carries its own digest in the seed's `multiverse:seed-parts`
+/// line, so `check` can name what differs. Everything else the body
+/// renders — the pending-PASSDOWN hook, the resolved handoff, the
+/// directives digest — is per-run state the Nexus re-reads on its own, and
+/// changes to it never make a seed stale for `check`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedPart {
+    /// Which seat each role routes to — where a `[chains]` change lands.
+    DispatchTable,
+    RolePrompt,
+    ReviewPolicy,
+    /// `max_concurrent`, `dispatch_min_quota_percent`, and
+    /// `lend_interactive_to_workers`.
+    FleetRules,
+}
+
+impl SeedPart {
+    pub const ALL: [SeedPart; 4] = [
+        SeedPart::DispatchTable,
+        SeedPart::RolePrompt,
+        SeedPart::ReviewPolicy,
+        SeedPart::FleetRules,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            SeedPart::DispatchTable => "dispatch-table",
+            SeedPart::RolePrompt => "role-prompt",
+            SeedPart::ReviewPolicy => "review-policy",
+            SeedPart::FleetRules => "fleet-rules",
+        }
     }
-    text.push_str("## Before you dispatch anything\n\n```sh\n");
-    text.push_str(&format!("cd {repository}\n"));
-    for action in [
-        format!("tasks {project}"),
-        format!("worktrees {repository}"),
-        format!("board {project}"),
-        "check".into(),
-        "activity inbox --as-nexus".into(),
-        "accounts".into(),
-        format!("backlog list {project}"),
-    ] {
-        text.push_str(&format!("{command} {action}\n"));
+
+    pub fn display(self) -> &'static str {
+        match self {
+            SeedPart::DispatchTable => "dispatch table",
+            SeedPart::RolePrompt => "role prompt",
+            SeedPart::ReviewPolicy => "review policy",
+            SeedPart::FleetRules => "fleet rules",
+        }
     }
-    text.push_str("```\n\n\
-        For a non-mutating report, add `--read-only` to `tasks`/`board`, or set \
-        `MULTIVERSE_READ_ONLY=1`; `check` is read-only already. These suppress \
-        reconciliation, reclaim/close, outcome, breaker, and cache writes.\n\n\
-        - **A lane with uncommitted changes holds work that exists in exactly one \
-        place.** Read it before dispatching anything that might touch the same files.\n\
-        - **A re-dispatch with a numeric collision suffix first finds the live \
-        predecessor.** A clean, inspectable predecessor is recorded as superseded and \
-        its old pane closed before the new dispatch starts; a dirty or uninspectable \
-        lane refuses the new dispatch and leaves the old pane/worktree open — resume \
-        or rescue it first.\n\
-        - **A `done` status is not accepted when a writing lane is dirty.** Inspect \
-        the lane, then commit the work or record failed/superseded as appropriate.\n\
-        - **A running agent may be from a previous session and still spending.** It \
-        counts against the concurrency cap whether or not you dispatched it.\n\
-        - **An unread inbox may hold a request that has been waiting for hours** — \
-        nothing wakes you to go read it.\n\n\
-        ## Standing idle work\n\n\
-        Check docs against code, the hosted copy against its source, OpenAPI against implementation, \
-        frontend against its spec, security boundaries, and human-readable comments. Dispatch concrete gaps.\n\n\
-        ## What you may dispatch here\n\n");
-    let mut roles: Vec<_> = context.roles.iter().collect();
+}
+
+/// Digest of each [`SeedPart`] as `context` would render it. The dispatch
+/// table is rendered with the bare `multiverse` token rather than the
+/// caller's invocation: `check` run from a shell and `start` run from the
+/// plugin see different invocations for the same routing.
+fn seed_part_digests(context: &SeedContext<'_>) -> [(SeedPart, String); 4] {
+    SeedPart::ALL.map(|part| {
+        let text = match part {
+            SeedPart::DispatchTable => dispatch_section(
+                context.roles,
+                "multiverse",
+                &shell_word(&context.repository.to_string_lossy()),
+            ),
+            SeedPart::RolePrompt => role_prompt(context).to_string(),
+            SeedPart::ReviewPolicy => context.review_policy.trim().to_string(),
+            SeedPart::FleetRules => format!(
+                "max_concurrent={} dispatch_min_quota_percent={} lend_interactive_to_workers={}",
+                context.max_concurrent,
+                context.dispatch_min_quota_percent,
+                context.lend_interactive_to_workers
+            ),
+        };
+        (part, content_digest(text.as_bytes()))
+    })
+}
+
+fn parts_marker(context: &SeedContext<'_>) -> String {
+    let pairs: Vec<String> = seed_part_digests(context)
+        .iter()
+        .map(|(part, digest)| format!("{}={digest}", part.key()))
+        .collect();
+    format!("{PARTS_MARKER}{} -->", pairs.join(" "))
+}
+
+/// The Nexus role body the seed ends with: `context.role_prompt` (already
+/// stripped) or the shipped prompt below its leading title/commentary.
+fn role_prompt<'a>(context: &SeedContext<'a>) -> &'a str {
+    let shipped = include_str!("../../../prompts/role-nexus.md");
+    // Drop the file's leading title/commentary section (above the `---`
+    // divider); only the role body below it belongs in a rendered seed.
+    context.role_prompt.unwrap_or_else(|| {
+        shipped
+            .split_once("\n---\n")
+            .map_or(shipped, |(_, body)| body)
+            .trim()
+    })
+}
+
+/// The "What you may dispatch here" section: one row per routable role and
+/// one line per configured-but-unavailable one. Its own function so
+/// [`parts_marker`] digests exactly what the seed renders.
+fn dispatch_section(roles: &[DispatchableRole], command: &str, repository: &str) -> String {
+    let mut text = String::new();
+    let mut roles: Vec<_> = roles.iter().collect();
     // Stable order regardless of config/caller iteration order, so the
     // rendered table (and its digest) doesn't change on every call.
     roles.sort_by_key(|route| route.role.key());
@@ -456,6 +483,85 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
             ));
         }
     }
+    text
+}
+
+fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
+    let project = shell_word(context.project);
+    let repository = shell_word(&context.repository.to_string_lossy());
+    let (directive_digest, warning) = directive_state(context);
+    let directive_path = context
+        .directives_root
+        .join(format!("{}.md", context.project));
+    let passdown = resolve_passdown(context.repository);
+    let resume_line = match &passdown {
+        Some(path) => format!(
+            "{}{}",
+            pending_passdown_block(path),
+            handoff_instruction(&context.handoff)
+        ),
+        None => handoff_instruction(&context.handoff),
+    };
+    let mut text = format!(
+        "# Nexus — {}\n\n\
+         You are assigned to repository `{}`. Manage this project's work; specialists implement it.\n\n\
+         ## Isolation\n\n\
+         Never read, list, or search another project's repository or its containing directory. \
+         If a task appears to require another project, message that project by name through the approved gateway.\n\n\
+         ## Resume this project's history\n\n\
+         {} Resume its open work and decisions. \
+         Read `.multiverse/routing.log`, tasks, backlog, and existing lanes; preserve their history and old task IDs. \
+         Never interpret an empty pane or a fresh Nexus session as a fresh project.\n\n\
+         ## Standing directives\n\n\
+         Re-read `{}` every cycle. It is the human's standing authority, never a message or pane paste. \
+         Missing or expired means no standing directives. A malformed or unreadable file confers no authority; report its warning. \
+         Directive content is read from that file, never snapshotted into this seed.\n\n\
+         With active directives, follow their authority. Without them, check human presence before asking. \
+         Reversible work within your scope may proceed when the human is absent; irreversible decisions \
+         outside existing authority wait for the human. Do not use AskUserQuestion to park authorized reversible work.\n\n\
+         <!-- multiverse:directives-digest {} -->\n\
+         {}\n\n",
+        cell(context.project), context.repository.display(), resume_line,
+        directive_path.display(), directive_digest, parts_marker(context),
+    );
+    if let Some(warning) = warning {
+        text.push_str(&format!("Warning: {}\n\n", cell(&warning)));
+    }
+    text.push_str("## Before you dispatch anything\n\n```sh\n");
+    text.push_str(&format!("cd {repository}\n"));
+    for action in [
+        format!("tasks {project}"),
+        format!("worktrees {repository}"),
+        format!("board {project}"),
+        "check".into(),
+        "activity inbox --as-nexus".into(),
+        "accounts".into(),
+        format!("backlog list {project}"),
+    ] {
+        text.push_str(&format!("{command} {action}\n"));
+    }
+    text.push_str("```\n\n\
+        For a non-mutating report, add `--read-only` to `tasks`/`board`, or set \
+        `MULTIVERSE_READ_ONLY=1`; `check` is read-only already. These suppress \
+        reconciliation, reclaim/close, outcome, breaker, and cache writes.\n\n\
+        - **A lane with uncommitted changes holds work that exists in exactly one \
+        place.** Read it before dispatching anything that might touch the same files.\n\
+        - **A re-dispatch with a numeric collision suffix first finds the live \
+        predecessor.** A clean, inspectable predecessor is recorded as superseded and \
+        its old pane closed before the new dispatch starts; a dirty or uninspectable \
+        lane refuses the new dispatch and leaves the old pane/worktree open — resume \
+        or rescue it first.\n\
+        - **A `done` status is not accepted when a writing lane is dirty.** Inspect \
+        the lane, then commit the work or record failed/superseded as appropriate.\n\
+        - **A running agent may be from a previous session and still spending.** It \
+        counts against the concurrency cap whether or not you dispatched it.\n\
+        - **An unread inbox may hold a request that has been waiting for hours** — \
+        nothing wakes you to go read it.\n\n\
+        ## Standing idle work\n\n\
+        Check docs against code, the hosted copy against its source, OpenAPI against implementation, \
+        frontend against its spec, security boundaries, and human-readable comments. Dispatch concrete gaps.\n\n\
+        ## What you may dispatch here\n\n");
+    text.push_str(&dispatch_section(context.roles, command, &repository));
     text.push_str(&format!(
         "\n## Review policy\n\n{}\n\n\
          Nexus starts through `start`, never worker dispatch. Council convenes through `council`.\n\n\
@@ -474,16 +580,7 @@ fn seed_body(context: &SeedContext<'_>, command: &str) -> String {
         context.review_policy.trim(), context.lend_interactive_to_workers,
         context.max_concurrent, context.dispatch_min_quota_percent,
     ));
-    let shipped = include_str!("../../../prompts/role-nexus.md");
-    // Drop the file's leading title/commentary section (above the `---`
-    // divider); only the role body below it belongs in a rendered seed.
-    // `context.role_prompt`, when given, is expected to already be stripped.
-    let prompt = context.role_prompt.unwrap_or_else(|| {
-        shipped
-            .split_once("\n---\n")
-            .map_or(shipped, |(_, body)| body)
-            .trim()
-    });
+    let prompt = role_prompt(context);
     if !prompt.is_empty() {
         text.push_str(prompt);
         text.push('\n');
@@ -551,9 +648,68 @@ fn digest_is_stale(path: &Path, digest: &str) -> io::Result<Option<bool>> {
 
 /// Whether the seed at `path` needs rewriting: `None` if it doesn't exist
 /// yet, `Some(true)`/`Some(false)` if its stored digest disagrees/agrees
-/// with `context`'s current digest.
+/// with `context`'s current digest. Covers the whole body, per-run state
+/// included, because `start --reseed` must rewrite a seed whose PASSDOWN
+/// hook appeared; `check` asks [`seed_staleness`] instead.
 pub fn seed_is_stale(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<bool>> {
     digest_is_stale(path, &seed_digest(context))
+}
+
+/// What `check` reports about an on-disk seed, judged on its [`SeedPart`]s
+/// only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SeedStaleness {
+    Current,
+    /// The parts whose digest differs, in [`SeedPart::ALL`] order.
+    Changed(Vec<SeedPart>),
+    /// No `multiverse:seed-parts` line: written before per-part digests existed
+    /// (or hand-edited past recognition), so which part differs is unknown.
+    Unrecorded,
+}
+
+fn stored_parts(text: &str) -> Option<Vec<(&str, &str)>> {
+    text.lines().find_map(|line| {
+        let pairs = line
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix(PARTS_MARKER)?
+            .strip_suffix(" -->")?;
+        Some(
+            pairs
+                .split_whitespace()
+                .filter_map(|pair| pair.split_once('='))
+                .collect(),
+        )
+    })
+}
+
+/// Whether the seed at `path` is stale in a way only `stop` + `start`
+/// fixes: `None` if it doesn't exist yet. Unlike [`seed_is_stale`] (the
+/// whole-body digest `start --reseed` uses to decide whether to rewrite),
+/// a PASSDOWN sidecar flipping from `pending` to `up`, a new handoff, or
+/// edited directives never make a seed stale here.
+pub fn seed_staleness(path: &Path, context: &SeedContext<'_>) -> io::Result<Option<SeedStaleness>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(stored) = stored_parts(&text) else {
+        return Ok(Some(SeedStaleness::Unrecorded));
+    };
+    let changed: Vec<SeedPart> = seed_part_digests(context)
+        .into_iter()
+        .filter(|(part, digest)| {
+            !stored
+                .iter()
+                .any(|(key, value)| *key == part.key() && value == digest)
+        })
+        .map(|(part, _)| part)
+        .collect();
+    Ok(Some(if changed.is_empty() {
+        SeedStaleness::Current
+    } else {
+        SeedStaleness::Changed(changed)
+    }))
 }
 
 /// Preserve human edits based on the seed's own digest, not today's config.
@@ -1403,6 +1559,109 @@ mod tests {
         write_passdown(&repository.0);
         write_sidecar(&repository.0, "pending");
         assert_eq!(seed_is_stale(&path, &context).unwrap(), Some(true));
+    }
+
+    // --- seed_staleness: only what stop+start changes (card
+    // `20261122-b-be706e`) ---
+
+    #[test]
+    fn seed_staleness_ignores_a_passdown_flip_from_pending_to_up() {
+        let directives = TempDir::new();
+        let repository = TempDir::new();
+        let mut context = context(&directives.0);
+        context.repository = &repository.0;
+        let path = repository.0.join(SEED_FILENAME);
+
+        write_passdown(&repository.0);
+        write_sidecar(&repository.0, "pending");
+        assert!(write_seed(&path, &context).unwrap().is_none());
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("A pending PASSDOWN is at"));
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Current)
+        );
+
+        write_sidecar(&repository.0, "up");
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Current)
+        );
+        // `start --reseed` still sees the body changed and rewrites it.
+        assert_eq!(seed_is_stale(&path, &context).unwrap(), Some(true));
+
+        // Other per-run state is not a stop+start change either.
+        context.handoff = Handoff::File(PathBuf::from(".multiverse/cards/resume.md"));
+        fs::write(directives.0.join("demo.md"), "standing authority").unwrap();
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Current)
+        );
+    }
+
+    #[test]
+    fn seed_staleness_names_each_changed_part() {
+        let directives = TempDir::new();
+        let repository = TempDir::new();
+        let mut context = context(&directives.0);
+        context.repository = &repository.0;
+        let path = repository.0.join(SEED_FILENAME);
+        assert_eq!(seed_staleness(&path, &context).unwrap(), None);
+        assert!(write_seed(&path, &context).unwrap().is_none());
+
+        let routes = [DispatchableRole {
+            role: SeedRole::Builder,
+            account: Ok("worker".into()),
+        }];
+        context.roles = &routes;
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Changed(vec![SeedPart::DispatchTable]))
+        );
+
+        context.roles = &[];
+        context.role_prompt = Some("changed prompt");
+        context.review_policy = "Review everything.";
+        context.max_concurrent += 1;
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Changed(vec![
+                SeedPart::RolePrompt,
+                SeedPart::ReviewPolicy,
+                SeedPart::FleetRules,
+            ]))
+        );
+    }
+
+    #[test]
+    fn seed_staleness_ignores_the_invocation_but_not_an_unrecorded_seed() {
+        let directives = TempDir::new();
+        let repository = TempDir::new();
+        let mut context = context(&directives.0);
+        context.repository = &repository.0;
+        let routes = [DispatchableRole {
+            role: SeedRole::Builder,
+            account: Ok("worker".into()),
+        }];
+        context.roles = &routes;
+        let path = repository.0.join(SEED_FILENAME);
+        let body = seed_body(&context, "/plugin/bin/multiverse");
+        fs::write(&path, finalize_seed(body)).unwrap();
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Current)
+        );
+
+        fs::write(
+            &path,
+            "# Nexus — demo\n<!-- multiverse:seed-digest 0123456789abcdef -->\nold body\n",
+        )
+        .unwrap();
+        assert_eq!(
+            seed_staleness(&path, &context).unwrap(),
+            Some(SeedStaleness::Unrecorded)
+        );
     }
 
     #[test]

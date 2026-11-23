@@ -8,7 +8,14 @@
 //! failures.json`/`runtime-cap-send-failures.json` (critic `3c0098`
 //! finding 4, task `20261118-builder-6b9075`: consecutive-failed-send
 //! counts bounding how long a send outage retries before the
-//! resume/cap claim is left spent to arm its own escalation leg instead).
+//! resume/cap claim is left spent to arm its own escalation leg instead),
+//! and the Rust-only stall-wake pair (card `20261122-b-3acaeb`):
+//! `stall-wake-memory.json`, the one-shot claim for a Claude lane whose
+//! background job finished without waking it, and `idle-pane-memory.json`,
+//! the per-pane fingerprint-plus-first-seen record that measures how long
+//! such a pane has sat unchanged. That clock is seeded only on an applying
+//! sweep pass (card `20261122-b-7378a4`); `--dry-run`, a halt, and
+//! `MULTIVERSE_READ_ONLY=1` read it and never write.
 //!
 //! One file per project under `.multiverse/`, mirroring Python's own
 //! `_finish_nudge_memory_path` & co (`tasks.py`) byte-for-byte: same
@@ -35,6 +42,10 @@ const FINISH_NUDGE_MEMORY_FILENAME: &str = "finish-nudge-memory.json";
 const RUNTIME_CAP_MEMORY_FILENAME: &str = "runtime-cap-memory.json";
 const STUCK_RESUME_MEMORY_FILENAME: &str = "stuck-resume-memory.json";
 const STUCK_SIGNAL_MEMORY_FILENAME: &str = "stuck-signal-memory.json";
+/// Rust-only (card `20261122-b-3acaeb`); Python has no stall wake.
+const STALL_WAKE_MEMORY_FILENAME: &str = "stall-wake-memory.json";
+/// Rust-only (card `20261122-b-3acaeb`): see [`idle_pane_since`].
+const IDLE_PANE_MEMORY_FILENAME: &str = "idle-pane-memory.json";
 /// Python `tasks._STRANDED_TRIP_MEMORY_FILENAME`.
 pub const STRANDED_TRIP_MEMORY_FILENAME: &str = "stranded-trip-memory.json";
 /// Same bound `mv_engine::breaker::ESCALATION_RESET_WINDOW` uses. Duplicated
@@ -232,6 +243,35 @@ pub fn release_runtime_cap_claim(project_root: &Path, task_id: &str, recorded: &
     let mut map = load_claim_map(&path, recorded, mv_core::time::now_utc());
     map.remove(task_id);
     let _ = save_claim_map(&path, &map);
+}
+
+/// Whether `task_id` has already had its one stall wake
+/// (`STALL_WAKE_MEMORY_FILENAME`), the same flat claim map, pruning and
+/// read-only contract as [`finish_nudge_already_sent`].
+pub fn stall_wake_already_sent(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+) -> bool {
+    already_claimed(project_root, STALL_WAKE_MEMORY_FILENAME, task_id, recorded)
+}
+
+/// Atomically reserve `task_id`'s one stall wake. Like
+/// [`claim_finish_nudge`], the claim is kept even when the send that
+/// follows fails: the one wake this task gets is spent either way.
+pub fn claim_stall_wake(
+    project_root: &Path,
+    task_id: &str,
+    recorded: &BTreeSet<&str>,
+    now: OffsetDateTime,
+) -> bool {
+    claim_once(
+        project_root,
+        STALL_WAKE_MEMORY_FILENAME,
+        task_id,
+        recorded,
+        now,
+    )
 }
 
 const RUNTIME_CAP_FAILURE_MEMORY_FILENAME: &str = "runtime-cap-send-failures.json";
@@ -569,6 +609,91 @@ pub fn stuck_signal_confirmed(
         return false;
     }
     confirmed
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdlePaneEntry {
+    fingerprint: String,
+    first_seen: String,
+    observed_at: String,
+}
+
+/// Same 24h-since-last-read and live-listing pruning
+/// [`load_stuck_signal_map`] applies: an entry is dropped once its pane is
+/// no longer live or nothing has read it for a day. `first_seen` itself is
+/// never a pruning input — a pane can legitimately sit unchanged for hours.
+fn load_idle_pane_map(
+    path: &Path,
+    live_panes: &[String],
+    now: OffsetDateTime,
+) -> BTreeMap<String, IdlePaneEntry> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(raw) = serde_json::from_str::<BTreeMap<String, IdlePaneEntry>>(&text) else {
+        return BTreeMap::new();
+    };
+    let cutoff = now - time::Duration::hours(24);
+    raw.into_iter()
+        .filter(|(pane, entry)| {
+            mv_core::time::parse_flexible(&entry.observed_at)
+                .is_ok_and(|observed| observed >= cutoff)
+                && mv_core::time::parse_flexible(&entry.first_seen).is_ok()
+                && live_panes.iter().any(|p| p == pane)
+        })
+        .collect()
+}
+
+/// Remember one read of `pane`'s text and return when this exact text
+/// (by [`fingerprint`]) was first seen on it: the stored `first_seen` when
+/// the fingerprint matches the previous read, or `now` when the pane is new
+/// to this memory or its text changed (which restarts the clock). `None`
+/// only on a lock or write failure — fail closed, so a storage error can
+/// never make a pane look idle for longer than it has been. Card
+/// `20261122-b-3acaeb`: `mv_engine::sweep_nudges`'s stall wake measures
+/// "unchanged for N minutes" from this; [`stuck_signal_confirmed`] records
+/// no first-seen time, so it cannot answer that question itself.
+///
+/// `apply` is the real-sweep gate (card `20261122-b-7378a4`). An applying
+/// pass persists the observation into `.multiverse/idle-pane-memory.json`.
+/// Under `apply=false` (`sweep --dry-run` or a halt) or
+/// `MULTIVERSE_READ_ONLY=1` the same first-seen is returned from the
+/// existing file, and the file is neither created nor rewritten.
+pub fn idle_pane_since(
+    project_root: &Path,
+    pane: &str,
+    text: &str,
+    live_panes: &[String],
+    now: OffsetDateTime,
+    apply: bool,
+) -> Option<OffsetDateTime> {
+    let path = memory_path(project_root, IDLE_PANE_MEMORY_FILENAME);
+    let persist = apply && std::env::var("MULTIVERSE_READ_ONLY").as_deref() != Ok("1");
+    let _guard = if persist {
+        Some(mv_core::lock::acquire_default(&lock_path(&path), IDLE_PANE_MEMORY_FILENAME).ok()?)
+    } else {
+        None
+    };
+    let mut memory = load_idle_pane_map(&path, live_panes, now);
+    let fp = fingerprint(text);
+    let observed_at = mv_core::time::format_seconds_utc(now);
+    let first_seen = match memory.get(pane) {
+        Some(previous) if previous.fingerprint == fp => previous.first_seen.clone(),
+        _ => observed_at.clone(),
+    };
+    if persist {
+        memory.insert(
+            pane.to_string(),
+            IdlePaneEntry {
+                fingerprint: fp,
+                first_seen: first_seen.clone(),
+                observed_at,
+            },
+        );
+        let bytes = serde_json::to_vec(&memory).ok()?;
+        mv_core::atomic::write_atomic(&path, &bytes).ok()?;
+    }
+    mv_core::time::parse_flexible(&first_seen).ok()
 }
 
 /// One pane's last-tripped banner, matching Python's
@@ -1042,6 +1167,117 @@ mod tests {
             &live,
             second
         ));
+    }
+
+    #[test]
+    fn a_stall_wake_claim_wins_exactly_once_and_is_independent_of_finish() {
+        let root = temp_project();
+        assert!(claim_finish_nudge(&root, "t1", &none(), now()));
+        assert!(!stall_wake_already_sent(&root, "t1", &none()));
+        assert!(claim_stall_wake(&root, "t1", &none(), now()));
+        assert!(stall_wake_already_sent(&root, "t1", &none()));
+        assert!(!claim_stall_wake(&root, "t1", &none(), now()));
+        // Pruned once the task is recorded, like every flat claim map.
+        assert!(!stall_wake_already_sent(
+            &root,
+            "t1",
+            &recorded_set(&["t1"])
+        ));
+    }
+
+    #[test]
+    fn idle_pane_since_keeps_first_seen_while_the_text_is_unchanged() {
+        let root = temp_project();
+        let first = mv_core::time::parse_flexible("2026-11-21T10:00:00Z").unwrap();
+        let later = first + time::Duration::minutes(16);
+        let live = vec!["w1:p1".to_string()];
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &live, first, true),
+            Some(first)
+        );
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &live, later, true),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn idle_pane_since_restarts_the_clock_when_the_text_changes() {
+        let root = temp_project();
+        let first = mv_core::time::parse_flexible("2026-11-21T10:00:00Z").unwrap();
+        let later = first + time::Duration::minutes(16);
+        let live = vec!["w1:p1".to_string()];
+        idle_pane_since(&root, "w1:p1", "idle", &live, first, true);
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "new output", &live, later, true),
+            Some(later)
+        );
+    }
+
+    #[test]
+    fn idle_pane_since_forgets_a_pane_that_left_the_live_listing() {
+        let root = temp_project();
+        let first = mv_core::time::parse_flexible("2026-11-21T10:00:00Z").unwrap();
+        let later = first + time::Duration::minutes(16);
+        idle_pane_since(&root, "w1:p1", "idle", &["w1:p1".to_string()], first, true);
+        // A pass where the pane was gone prunes it; its return restarts.
+        idle_pane_since(&root, "w2:p2", "other", &["w2:p2".to_string()], later, true);
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &["w1:p1".to_string()], later, true),
+            Some(later)
+        );
+    }
+
+    #[test]
+    fn idle_pane_since_without_apply_does_not_create_the_file() {
+        let root = temp_project();
+        let first = mv_core::time::parse_flexible("2026-11-21T10:00:00Z").unwrap();
+        let live = vec!["w1:p1".to_string()];
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &live, first, false),
+            Some(first)
+        );
+        assert!(!memory_path(&root, IDLE_PANE_MEMORY_FILENAME).exists());
+    }
+
+    #[test]
+    fn idle_pane_since_without_apply_leaves_existing_bytes_identical() {
+        let root = temp_project();
+        let first = mv_core::time::parse_flexible("2026-11-21T10:00:00Z").unwrap();
+        let later = first + time::Duration::minutes(16);
+        let live = vec!["w1:p1".to_string()];
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &live, first, true),
+            Some(first)
+        );
+        let path = memory_path(&root, IDLE_PANE_MEMORY_FILENAME);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &live, later, false),
+            Some(first)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn idle_pane_since_without_apply_does_not_persist_a_restarted_clock() {
+        let root = temp_project();
+        let first = mv_core::time::parse_flexible("2026-11-21T10:00:00Z").unwrap();
+        let later = first + time::Duration::minutes(16);
+        let live = vec!["w1:p1".to_string()];
+        idle_pane_since(&root, "w1:p1", "idle", &live, first, true);
+        let path = memory_path(&root, IDLE_PANE_MEMORY_FILENAME);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "new output", &live, later, false),
+            Some(later)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // A later applying pass still sees the original fingerprint.
+        assert_eq!(
+            idle_pane_since(&root, "w1:p1", "idle", &live, later, true),
+            Some(first)
+        );
     }
 
     #[test]

@@ -1108,10 +1108,18 @@ pub enum WaitError {
     /// `timeout` was `NaN`, infinite, or negative.
     #[error("timeout must be None or a finite, non-negative number of seconds, got {0:?}")]
     InvalidTimeout(f64),
-    /// Either the chain ran out for a reason waiting cannot fix, or the
-    /// timeout elapsed while every remaining skip was still at capacity.
+    /// The chain ran out for a reason waiting cannot fix.
     #[error(transparent)]
     ChainExhausted(#[from] ChainExhaustedError),
+    /// The timeout elapsed while every remaining skip was still at
+    /// capacity (card `20261123-b-853616`): the same exhaustion, plus how
+    /// long was waited for it to clear, so a refusal after a 30-minute
+    /// wait does not read like one raised at once.
+    #[error("{error}{}", crate::dispatch::waited_note(*.waited_secs))]
+    TimedOut {
+        error: ChainExhaustedError,
+        waited_secs: f64,
+    },
 }
 
 /// The entries [`select_or_wait`] is willing to keep waiting on: for
@@ -1207,7 +1215,10 @@ pub fn select_or_wait(
                 }
                 if let Some(timeout) = opts.timeout {
                     if waited >= timeout {
-                        return Err(WaitError::ChainExhausted(err));
+                        return Err(WaitError::TimedOut {
+                            error: err,
+                            waited_secs: waited,
+                        });
                     }
                 }
                 (opts.on_wait)(&wait_message(&err, opts.poll_interval, waited));
@@ -2092,7 +2103,10 @@ mod tests {
                 t
             },
         );
-        assert!(matches!(result, Err(WaitError::ChainExhausted(_))));
+        let Err(WaitError::TimedOut { waited_secs, .. }) = result else {
+            panic!("expected a timed-out wait, got {result:?}");
+        };
+        assert_eq!(waited_secs, 5.0);
         assert!(!sleeper.calls.is_empty());
     }
 

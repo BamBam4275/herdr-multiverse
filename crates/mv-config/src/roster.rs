@@ -2,7 +2,10 @@
 //! does not merge with them.
 //!
 //! `<project>/.multiverse/roster.toml` lives inside the project's own
-//! repository and may name exactly one table, `[chains]`. Loading it
+//! repository and may name two tables, `[chains]` and `[lane_setup]`
+//! (whose one key, `regenerable`, lists the gitignored paths the
+//! project's `lane_setup` regenerates — the `worktrees --merge` gate
+//! treats them like `target/`, never as unrescued work). Loading it
 //! is stricter than loading the global config in two ways that matter:
 //! an unknown top-level table is a **hard error**, not a warning
 //! (spec-config.md §B, "unlike the global config's warn-only policy"),
@@ -24,6 +27,13 @@ use crate::roles::Role;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RosterOverride {
     pub chains: std::collections::BTreeMap<Role, Vec<String>>,
+    /// `[lane_setup] regenerable`: gitignored paths this project's
+    /// `lane_setup` regenerates (e.g. `prisma/generated/`), in the order
+    /// written. Gitignore-shaped: a trailing `/` names a directory, a
+    /// pattern with an inner or leading `/` is anchored at the repository
+    /// root, one without matches at any depth, and `*`/`?` glob within a
+    /// single path component. Empty when the table or key is absent.
+    pub lane_setup_regenerable: Vec<String>,
 }
 
 /// Loads `<project>/.multiverse/roster.toml`, or `Ok(None)` if the
@@ -50,10 +60,12 @@ pub fn load_roster_str(content: &str, path: &Path) -> Result<RosterOverride, Con
         .map_err(|e| ConfigError::at(path, format!("malformed TOML: {e}")))?;
 
     for key in root.keys() {
-        if key != "chains" {
+        if key != "chains" && key != "lane_setup" {
             return Err(ConfigError::at(
                 path,
-                format!("{key:?} is not permitted in roster.toml — only [chains] is"),
+                format!(
+                    "{key:?} is not permitted in roster.toml — only [chains] and [lane_setup] are"
+                ),
             ));
         }
     }
@@ -114,7 +126,77 @@ pub fn load_roster_str(content: &str, path: &Path) -> Result<RosterOverride, Con
         }
     }
 
-    Ok(RosterOverride { chains })
+    let lane_setup_regenerable = match root.get("lane_setup") {
+        Some(value) => parse_lane_setup(value, path)?,
+        None => Vec::new(),
+    };
+
+    Ok(RosterOverride {
+        chains,
+        lane_setup_regenerable,
+    })
+}
+
+/// `[lane_setup]`'s one key, `regenerable` — a list of non-empty path
+/// patterns, none with a `..` component or a control character. Any other
+/// key in the table is a hard error, the same strictness as the file's
+/// own top level.
+fn parse_lane_setup(value: &Value, path: &Path) -> Result<Vec<String>, ConfigError> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| ConfigError::at(path, "lane_setup must be a table"))?;
+    for key in table.keys() {
+        if key != "regenerable" {
+            return Err(ConfigError::at(
+                path,
+                format!("lane_setup: {key:?} is not permitted — only regenerable is"),
+            ));
+        }
+    }
+    let Some(list) = table.get("regenerable") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = list else {
+        return Err(ConfigError::at(
+            path,
+            format!("lane_setup.regenerable: must be a list of strings, got {list:?}"),
+        ));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::String(pattern) = item else {
+            return Err(ConfigError::at(
+                path,
+                format!("lane_setup.regenerable: must be a list of strings, got {item:?} in it"),
+            ));
+        };
+        let bad = pattern.trim_matches('/').is_empty()
+            || pattern.chars().any(char::is_control)
+            || pattern.split('/').any(|component| component == "..");
+        if bad {
+            return Err(ConfigError::at(
+                path,
+                format!(
+                    "lane_setup.regenerable: {pattern:?} must be a non-empty path pattern with \
+                     no \"..\" component or control character"
+                ),
+            ));
+        }
+        out.push(pattern.clone());
+    }
+    Ok(out)
+}
+
+/// `<project_root>/.multiverse/roster.toml`'s `[lane_setup] regenerable`
+/// list, or empty when the project has no roster file or the file names
+/// no such list. A malformed roster is still an error: the merge gate
+/// must not silently fall back to the defaults when the operator's own
+/// declaration failed to load.
+pub fn lane_setup_regenerable(project_root: &Path) -> Result<Vec<String>, ConfigError> {
+    let path = project_root.join(".multiverse").join("roster.toml");
+    Ok(load_roster(&path)?
+        .map(|roster| roster.lane_setup_regenerable)
+        .unwrap_or_default())
 }
 
 /// Re-applies every chain rule that the global config enforces (known
@@ -244,6 +326,57 @@ critic = ["claude-work"]
         let chain = effective_chain(&config, "example", Role::Critic, Some(&roster)).unwrap();
         assert_eq!(chain, ["claude-work"]);
         assert!(!is_locally_overridden(Some(&roster), Role::Critic));
+    }
+
+    #[test]
+    fn roster_reads_lane_setup_regenerable_alongside_chains() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roster.toml");
+        let roster = load_roster_str(
+            "[chains]\n\n[lane_setup]\nregenerable = [\"prisma/generated/\", \"*.egg-info/\"]\n",
+            &path,
+        )
+        .unwrap();
+        assert!(roster.chains.is_empty());
+        assert_eq!(
+            roster.lane_setup_regenerable,
+            ["prisma/generated/", "*.egg-info/"]
+        );
+    }
+
+    #[test]
+    fn lane_setup_regenerable_reads_the_project_roster_and_defaults_empty() {
+        let dir = tempdir().unwrap();
+        assert!(lane_setup_regenerable(dir.path()).unwrap().is_empty());
+        fs::create_dir_all(dir.path().join(".multiverse")).unwrap();
+        fs::write(
+            dir.path().join(".multiverse/roster.toml"),
+            "[lane_setup]\nregenerable = [\"gen/\"]\n",
+        )
+        .unwrap();
+        assert_eq!(lane_setup_regenerable(dir.path()).unwrap(), ["gen/"]);
+    }
+
+    #[test]
+    fn roster_rejects_a_bad_lane_setup_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roster.toml");
+        for (content, needle) in [
+            ("[lane_setup]\ncommand = \"make\"\n", "command"),
+            ("[lane_setup]\nregenerable = \"gen/\"\n", "list of strings"),
+            ("[lane_setup]\nregenerable = [1]\n", "list of strings"),
+            ("[lane_setup]\nregenerable = [\"\"]\n", "non-empty"),
+            ("[lane_setup]\nregenerable = [\"/\"]\n", "non-empty"),
+            ("[lane_setup]\nregenerable = [\"../up/\"]\n", "\"..\""),
+            ("lane_setup = \"make\"\n", "must be a table"),
+        ] {
+            let err = load_roster_str(content, &path).unwrap_err();
+            assert!(
+                err.message().contains(needle),
+                "{content}: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]

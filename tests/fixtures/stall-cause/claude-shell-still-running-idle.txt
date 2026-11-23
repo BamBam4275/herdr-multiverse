@@ -1,0 +1,16 @@
+⏺ Bash(cargo build --workspace --locked)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(cargo test --workspace --all-features --locked --no-fail-fast)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Both are running in the background; I'll wait for their completion notifications.
+
+✻ Worked for 1m 12s · done 7:42 PM
+
+⏺ Background command "Build the workspace" completed (exit code 0)
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← 1 agent

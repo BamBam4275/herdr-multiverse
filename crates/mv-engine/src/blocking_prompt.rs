@@ -97,6 +97,115 @@ fn quote(text: &str, start: usize) -> String {
 /// Python's `_LIVE_BANNER_TAIL_LINES`.
 const LIVE_BANNER_TAIL_LINES: usize = 5;
 
+/// Cap on [`dialog_region`]: after cutting below the last turn-end or
+/// composer line, only this many trailing lines are scanned. Large enough
+/// for every captured dialog under `tests/fixtures/{sandbox-dialog,
+/// rate-limit,stall-cause}` (the longest sandbox frame is 16 lines).
+const DIALOG_REGION_TAIL_LINES: usize = 40;
+
+/// Claude's turn-end (`✻ Worked for 50s · done 7:42 PM`) and grok's
+/// equivalent from `tests/fixtures/rate-limit/grok-weekly-quota-remaining.txt`
+/// (`Worked for 19m24s`). Codex fixtures have no distinct turn-end line;
+/// the composer marker is that vendor's cut.
+fn is_turn_end_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('✻') && trimmed.contains("· done") {
+        return true;
+    }
+    let trimmed = trimmed.trim_end_matches('█').trim();
+    let Some(rest) = trimmed.strip_prefix("Worked for ") else {
+        return false;
+    };
+    rest.split_whitespace().next().is_some_and(|tok| {
+        tok.chars().any(|c| c.is_ascii_digit()) && tok.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+/// A numbered option (`1. Yes`, `› 2. No`, `1 (●) …`), not a composer.
+fn is_numbered_option_prefix(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let after = &rest[digits..];
+    after.starts_with('.') || after.starts_with(')') || after.starts_with(" (")
+}
+
+/// An idle/input composer line (`❯ …`, `› …`, including boxed `│ ❯`).
+/// Codex/grok option markers (`› 1. Trust and continue`) are not composers.
+fn is_composer_line(line: &str) -> bool {
+    let trimmed = line
+        .trim_start()
+        .trim_start_matches(['│', '┃'])
+        .trim_start();
+    let rest = if let Some(rest) = trimmed.strip_prefix('❯') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix('›') {
+        rest
+    } else {
+        return false;
+    };
+    !is_numbered_option_prefix(rest)
+}
+
+fn last_n_lines(text: &str, n: usize) -> &str {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= n {
+        return text;
+    }
+    let skip = lines.len() - n;
+    let mut offset = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if i == skip {
+            return text.get(offset..).unwrap_or("");
+        }
+        offset += line.len();
+        if offset < text.len() {
+            if text.as_bytes()[offset] == b'\r' {
+                offset += 1;
+            }
+            if offset < text.len() && text.as_bytes()[offset] == b'\n' {
+                offset += 1;
+            }
+        }
+    }
+    text
+}
+
+fn byte_after_line(text: &str, offset: usize, line: &str) -> usize {
+    let mut after = offset + line.len();
+    if after < text.len() && text.as_bytes()[after] == b'\r' {
+        after += 1;
+    }
+    if after < text.len() && text.as_bytes()[after] == b'\n' {
+        after += 1;
+    }
+    after
+}
+
+/// The candidate dialog region: text below the last turn-end line or the
+/// last composer marker, whichever is later, then bounded to the last 40
+/// lines. A pane with neither marker yields the last 40 lines of the
+/// whole pane. Shared by [`classify_prompt`] and
+/// `crate::runner::attention_reason` so nudge, board, and sweep never
+/// treat scrollback prose as a live dialog (card `20261122-b-8ad25a`).
+pub fn dialog_region(text: &str) -> &str {
+    if text.is_empty() {
+        return text;
+    }
+    let mut cut = 0;
+    let mut offset = 0;
+    for line in text.lines() {
+        let after = byte_after_line(text, offset, line);
+        if is_turn_end_line(line) || is_composer_line(line) {
+            cut = after;
+        }
+        offset = after;
+    }
+    last_n_lines(text.get(cut..).unwrap_or(""), DIALOG_REGION_TAIL_LINES)
+}
+
 /// Python's `_live_banner_region`: the trailing slice of `text` a live
 /// vendor dialog would actually be sitting in, with Herdr's own
 /// box-border-only lines and pane-footer row removed first so they cannot
@@ -346,22 +455,27 @@ fn detect_codex_prompt(text: &str) -> Option<BlockingPrompt> {
 ///
 /// Same fail-open contract as Python: empty/whitespace-only text, an
 /// unrecognised `kind`, and text with no known prompt shape all return
-/// `None`.
+/// `None`. Search is restricted to [`dialog_region`]: a vendor frame in
+/// scrollback above the last turn-end or composer is not a live prompt.
 pub fn classify_prompt(text: &str, kind: &str) -> Option<BlockingPrompt> {
     if text.trim().is_empty() {
         return None;
     }
+    let region = dialog_region(text);
+    if region.trim().is_empty() {
+        return None;
+    }
     let prompt = match kind {
-        "codex" => detect_codex_prompt(text),
-        "grok" => detect_grok_sandbox_permission(text),
+        "codex" => detect_codex_prompt(region),
+        "grok" => detect_grok_sandbox_permission(region),
         _ => None,
     };
     if prompt.is_some() {
         return prompt;
     }
     match kind {
-        "codex" => detect_codex_billing_prompt(text),
-        "grok" => detect_grok_billing_prompt(text),
+        "codex" => detect_codex_billing_prompt(region),
+        "grok" => detect_grok_billing_prompt(region),
         _ => None,
     }
 }
@@ -388,6 +502,8 @@ mod tests {
         include_str!("../../../tests/fixtures/sandbox-dialog/codex-reviewer-loopback-approval.txt");
     const CODEX_UPDATE_PROMPT: &str =
         include_str!("../../../tests/fixtures/stall-cause/codex-cli-update-prompt.txt");
+    const GROK_TRUST: &str =
+        include_str!("../../../tests/fixtures/sandbox-dialog/grok-trust-directory.txt");
 
     #[test]
     fn empty_or_whitespace_text_never_classifies() {
@@ -557,6 +673,19 @@ mod tests {
     }
 
     #[test]
+    fn the_grok_folder_trust_dialog_is_left_to_the_generic_trust_scan() {
+        // Card `20261122-b-1961a6`: grok's "Do you trust the contents of
+        // this directory? y/n" is a folder-trust dialog, which
+        // `runner::attention_reason` recognises for every vendor and the
+        // runner then waits out and never records failed. No vendor shape
+        // here may claim it first — a `ProjectOwner` sandbox or `Operator`
+        // billing reading would route it away from that handling.
+        for vendor in ["grok", "codex", "claude"] {
+            assert_eq!(classify_prompt(GROK_TRUST, vendor), None);
+        }
+    }
+
+    #[test]
     fn classify_prompt_is_a_pure_function_for_all_three_new_kinds() {
         assert_eq!(
             classify_prompt(GROK_SANDBOX, "grok"),
@@ -569,6 +698,84 @@ mod tests {
         assert_eq!(
             classify_prompt(CODEX_UPDATE_PROMPT, "codex"),
             classify_prompt(CODEX_UPDATE_PROMPT, "codex")
+        );
+    }
+
+    const CLAUDE_IDLE_TRUST_PROSE: &str = include_str!(
+        "../../../tests/fixtures/sandbox-dialog/claude-idle-with-trust-prose-in-scrollback.txt"
+    );
+    const CODEX_TRUST: &str =
+        include_str!("../../../tests/fixtures/sandbox-dialog/codex-directory-trust-prompt.txt");
+
+    #[test]
+    fn existing_dialog_fixtures_still_classify_inside_the_dialog_region() {
+        assert_eq!(
+            classify_prompt(GROK_SANDBOX, "grok")
+                .expect("grok sandbox")
+                .rule,
+            "grok_sandbox_permission_request"
+        );
+        assert_eq!(
+            classify_prompt(CODEX_SANDBOX, "codex")
+                .expect("codex sandbox")
+                .rule,
+            "codex_sandbox_permission_request"
+        );
+        assert_eq!(
+            classify_prompt(CODEX_UPDATE_PROMPT, "codex")
+                .expect("codex update")
+                .rule,
+            "codex_cli_update_prompt"
+        );
+        assert_eq!(
+            classify_prompt(CODEX_EXHAUSTED, "codex")
+                .expect("codex billing")
+                .rule,
+            "codex_usage_limit_reached"
+        );
+        assert_eq!(
+            classify_prompt(GROK_EXHAUSTED, "grok")
+                .expect("grok billing")
+                .rule,
+            "grok_weekly_limit_reached"
+        );
+        assert_eq!(
+            classify_prompt(CODEX_MODEL_SWITCH, "codex")
+                .expect("codex model switch")
+                .rule,
+            "codex_model_switch_offer"
+        );
+        assert_eq!(classify_prompt(GROK_TRUST, "grok"), None);
+        assert_eq!(classify_prompt(CODEX_TRUST, "codex"), None);
+        assert!(dialog_region(GROK_SANDBOX).contains("always-approve mode"));
+        assert!(dialog_region(CODEX_SANDBOX).contains("Yes, proceed"));
+        assert!(dialog_region(CODEX_UPDATE_PROMPT).contains("Update available!"));
+        assert!(dialog_region(CODEX_EXHAUSTED).contains("Usage limit reached"));
+        assert!(dialog_region(GROK_EXHAUSTED).contains("You hit your weekly limit."));
+        assert!(dialog_region(CODEX_MODEL_SWITCH).contains("Approaching rate limits"));
+        assert!(dialog_region(GROK_TRUST).contains("Do you trust the contents of this directory?"));
+        assert!(dialog_region(CODEX_TRUST).contains("Trust this folder?"));
+    }
+
+    #[test]
+    fn trust_prose_in_scrollback_is_not_a_blocking_prompt() {
+        for kind in ["claude", "codex", "grok"] {
+            assert_eq!(classify_prompt(CLAUDE_IDLE_TRUST_PROSE, kind), None);
+        }
+        let region = dialog_region(CLAUDE_IDLE_TRUST_PROSE);
+        assert!(
+            !region.to_lowercase().contains("do you trust"),
+            "dialog region must sit below the idle composer, got {region:?}"
+        );
+        assert!(!region.to_lowercase().contains("update available"));
+        // Revert check: the quoted vendor frames are in the pane, so a
+        // whole-pane classify_prompt("codex") would match the update frame.
+        assert!(CLAUDE_IDLE_TRUST_PROSE.contains("Update available!"));
+        assert!(CLAUDE_IDLE_TRUST_PROSE.contains("Do you trust the contents of this directory?"));
+        let whole_pane_update = detect_codex_update_prompt(CLAUDE_IDLE_TRUST_PROSE);
+        assert!(
+            whole_pane_update.is_some(),
+            "restoring whole-pane search must make this fixture classify"
         );
     }
 }

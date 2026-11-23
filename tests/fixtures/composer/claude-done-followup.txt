@@ -1,0 +1,8 @@
+⏺ The sample checks passed for the first component.
+
+✻ Worked for 50s · done 7:42 PM
+
+╭──────────────────────────────────────────────────────────────╮
+│ ❯ sample EndToEnd the same way too                            │
+╰──────────────────────────────────────────────────────────────╯
+  ? for shortcuts

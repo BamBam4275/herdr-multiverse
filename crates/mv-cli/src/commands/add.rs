@@ -160,7 +160,7 @@ fn format_chain(accounts: &[&Account]) -> String {
 /// seat per vendor, Nexus is the interactive seat only. `None` means no
 /// role can be served — the caller must refuse rather than append an
 /// empty table.
-fn chain_lines(config: &Config) -> Option<String> {
+pub(crate) fn chain_lines(config: &Config) -> Option<String> {
     let usable = usable_accounts(config);
     let mut ordered: BTreeMap<Role, Vec<&Account>> = BTreeMap::new();
     let mut local_tail: BTreeMap<Role, Vec<&Account>> = BTreeMap::new();
@@ -213,7 +213,7 @@ fn chain_lines(config: &Config) -> Option<String> {
                     "# critic: leads on a vendor other than builder's \
                      ({vendor}) on purpose — reviewing on the vendor \
                      that wrote the code is theatre; same family, same blind \
-                     spots (§12.1)."
+                     spots."
                 )
             } else {
                 format!(
@@ -221,7 +221,7 @@ fn chain_lines(config: &Config) -> Option<String> {
                      same as builder's lead. Cross-vendor review is not \
                      achievable with the accounts configured for this \
                      project — add a seat from another vendor to close this \
-                     gap (§12.1)."
+                     gap."
                 )
             });
         }
@@ -298,13 +298,13 @@ fn chain_lines(config: &Config) -> Option<String> {
                 "# council: one seat per vendor, never two of the same — a \
                  second account of a vendor already seated is silently \
                  skipped, so this writes only the one that would actually \
-                 run (§3.6)."
+                 run."
                     .into(),
             );
             lines.push(
                 "# council: no local — a candidate pool is not a fallback \
-                 chain, and adding it here would permanently seat a 20B \
-                 model beside Opus rather than give the council a floor."
+                 chain, and adding it here would seat a local model in the \
+                 council rather than give the council a floor."
                     .into(),
             );
             lines.push(format!("council = [{}]", format_chain(&council_seats)));
@@ -330,7 +330,7 @@ fn chain_lines(config: &Config) -> Option<String> {
             lines.push(
                 "# seer: no local — `on_exhausted = \"queue\"` means \
                  waiting beats a confident wrong answer from the smallest \
-                 model (§12.1)."
+                 model."
                     .into(),
             );
             if let Some(comment) = &seer_comment {
@@ -339,7 +339,7 @@ fn chain_lines(config: &Config) -> Option<String> {
         }
         if role == Role::Watcher {
             lines.push(
-                "# watcher: no local — a 20B model can't see the \
+                "# watcher: no local — a local model can't see the \
                  screenshot it was dispatched to look at."
                     .into(),
             );
@@ -418,6 +418,28 @@ pub(crate) fn register(
     name: &str,
     dry_run: bool,
 ) -> Result<String, Failure> {
+    register_with_chains(
+        config_path,
+        config,
+        canonical_path,
+        name,
+        chain_lines(config),
+        dry_run,
+    )
+}
+
+/// [`register`] with the chain table body supplied by the caller rather
+/// than derived by [`chain_lines`]: `onboard` writes the recommended set
+/// from `docs/ONBOARDING.md` instead. `None` is refused exactly as an
+/// empty [`chain_lines`] is.
+pub(crate) fn register_with_chains(
+    config_path: &Path,
+    config: &Config,
+    canonical_path: &Path,
+    name: &str,
+    chains: Option<String>,
+    dry_run: bool,
+) -> Result<String, Failure> {
     if config.projects.contains_key(name) {
         println!("config error: a project named {name:?} is already configured.");
         return Err(Failure::Reported(NEEDS_CONFIG));
@@ -434,7 +456,7 @@ pub(crate) fn register(
         return Err(Failure::Reported(NEEDS_CONFIG));
     }
 
-    let Some(chains) = chain_lines(config) else {
+    let Some(chains) = chains else {
         return Err(Failure::AccountSelection(
             "No role can be served by any available account, so a chain table \
              would be empty.\nCheck `multiverse accounts` and your roles' \
@@ -1012,6 +1034,10 @@ grok = "m"
             "{chains}"
         );
         assert!(chains.contains("moved off grok"), "{chains}");
+        assert!(!chains.contains("§12.1"), "{chains}");
+        assert!(!chains.contains("§3.6"), "{chains}");
+        assert!(!chains.contains("20B"), "{chains}");
+        assert!(!chains.contains("Opus"), "{chains}");
     }
 
     /// Row #26 rule 2 honesty clause: one vendor cannot satisfy

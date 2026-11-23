@@ -1,14 +1,21 @@
 //! Conservative redaction for credential-shaped text.
 //!
-//! Ports `multiverse/redact.py` verbatim at the regex level: the patterns
-//! lean on negative lookaround and a conditional backreference that the
-//! `regex` crate cannot express, so this module is the one place in
-//! `mv-core` that reaches for `fancy-regex` instead — a direct dependency
-//! of this crate, not a workspace one, since no other crate needs it.
+//! Ports `multiverse/redact.py` at the match level. The Python patterns
+//! use negative lookaround and a conditional backreference; those
+//! features force `fancy-regex`'s backtracking VM, whose `replace_all`
+//! unwraps on `RuntimeError::BacktrackLimitExceeded` (card
+//! `20261123-b-7f6462`). Every pattern here is rewritten without
+//! lookaround or backreferences so the `regex` crate's linear engine
+//! can run it. Boundary characters are never consumed: each pattern
+//! matches the bare token, and a char-aware check of the character
+//! before `m.start()` and after `m.end()` stands in for the lookbehind
+//! / lookahead. A failed check skips the match and the search resumes
+//! one character later, so an adjacent token still has its leading
+//! boundary.
 
 use std::sync::OnceLock;
 
-use fancy_regex::{Captures, Regex};
+use regex::{Captures, Regex};
 
 const REDACTED_MARKER: &str = "…[redacted]";
 
@@ -25,28 +32,22 @@ fn pem_re() -> &'static Regex {
 fn prefix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?<![A-Za-z0-9])(?P<prefix>sk-ant-|sk-|ghp_|gho_|github_pat_|glpat-|xox[bpas]-)(?P<value>[A-Za-z0-9._~+/=-]{4,})",
-        )
-        .expect("static regex compiles")
+        Regex::new(r"(sk-ant-|sk-|ghp_|gho_|github_pat_|glpat-|xox[bpas]-)([A-Za-z0-9._~+/=-]{4,})")
+            .expect("static regex compiles")
     })
 }
 
 fn aws_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?<![A-Za-z0-9])(?:AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{14,16})(?![A-Za-z0-9])")
-            .expect("static regex compiles")
+        Regex::new(r"AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{14,16}").expect("static regex compiles")
     })
 }
 
 fn bearer_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?<![A-Za-z0-9])Bearer[ \t]+(?P<value>[A-Za-z0-9._~+/=-]{4,})(?![A-Za-z0-9._~+/=-])",
-        )
-        .expect("static regex compiles")
+        Regex::new(r"(?i)Bearer[ \t]+([A-Za-z0-9._~+/=-]{4,})").expect("static regex compiles")
     })
 }
 
@@ -71,21 +72,6 @@ fn non_credential_key_re() -> &'static Regex {
     })
 }
 
-/// Matches the zero-width boundary inside a camelCase word — between a
-/// lowercase letter/digit and the following uppercase one (`apiKey` ->
-/// boundary before `K`), or between two consecutive uppercase letters
-/// where the second starts a new word (`myAPIKey` -> boundary before the
-/// final `K`). [`is_credential_key`] replaces every such boundary with
-/// `_` so the same delimited-stem regexes written for `snake_case` keys
-/// also catch camelCase ones like `apiKey` or `clientSecret`.
-fn camel_boundary_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
-            .expect("static regex compiles")
-    })
-}
-
 fn camel_credential_suffix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -96,23 +82,49 @@ fn camel_credential_suffix_re() -> &'static Regex {
     })
 }
 
-/// Mirrors `_ASSIGNMENT_RE`, but with every group numbered rather than named:
-/// `fancy-regex` 0.13 (and 0.20 — checked directly, not just changelog) mis-handles
-/// a *named* group used as a conditional's test, matching the condition but
-/// silently failing to consume the "then" branch; the identical pattern
-/// written with numbered groups and a numbered conditional (`(?(1)\1)`)
-/// behaves correctly, and `fancy-regex` forbids mixing named and numbered
-/// backreferences in one pattern, so every group here stays numbered.
-/// Group 1 is `keyquote`, 2 is `key`, 3 is `separator`, 4 is `quote`, 5 is
-/// `quoted`, 6 is `bare` — [`replace_assignment`] reads them positionally.
+/// Assignment of a credential-shaped key to a value.
+///
+/// Written without lookbehind or a matching-quote conditional so the
+/// `regex` crate's linear engine can run it. Groups 1/2/3 are the
+/// double-quoted, single-quoted, or bare key. Group 4 is the separator.
+/// Groups 5/6/7 are the double-quoted, single-quoted, or bare value.
+/// The leading `(?<![A-Za-z0-9_-])` boundary is checked in
+/// [`replace_bounded`], not consumed by the pattern.
 fn assignment_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?<![A-Za-z0-9_-])(["'])?([A-Za-z][A-Za-z0-9_-]{0,63})(?(1)\1)(\s*[:=]\s*)(?:(["'])([^"'\r\n]*)\4|([^\s,;]*))"#,
+            r#"(?i)(?:"([A-Za-z][A-Za-z0-9_-]{0,63})"|'([A-Za-z][A-Za-z0-9_-]{0,63})'|([A-Za-z][A-Za-z0-9_-]{0,63}))(\s*[:=]\s*)(?:"([^"'\r\n]*)"|'([^"'\r\n]*)'|([^\s,;]*))"#,
         )
         .expect("static regex compiles")
     })
+}
+
+/// Insert `_` at the camelCase word boundaries the previous
+/// lookaround regex `(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])`
+/// matched: between a lowercase letter/digit and the following
+/// uppercase one (`apiKey` -> `api_Key`), or between two consecutive
+/// uppercase letters where the second starts a new word (`myAPIKey` ->
+/// `my_API_Key`). [`is_credential_key`] then runs the snake_case stem
+/// regexes against the result.
+fn insert_camel_boundaries(key: &str) -> String {
+    let bytes = key.as_bytes();
+    let mut out = String::with_capacity(key.len() + 8);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 {
+            let prev = bytes[i - 1];
+            let lower_or_digit_then_upper =
+                (prev.is_ascii_lowercase() || prev.is_ascii_digit()) && b.is_ascii_uppercase();
+            let upper_run_then_word = prev.is_ascii_uppercase()
+                && b.is_ascii_uppercase()
+                && bytes.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+            if lower_or_digit_then_upper || upper_run_then_word {
+                out.push('_');
+            }
+        }
+        out.push(char::from(b));
+    }
+    out
 }
 
 /// Mirrors `_is_credential_key`: a delimited credential stem (`password`,
@@ -122,25 +134,139 @@ fn assignment_re() -> &'static Regex {
 /// happens to end or begin with `key` (`foreign_key`, `key_count`).
 fn is_credential_key(key: &str) -> bool {
     let delimited = key.replace('-', "_");
-    if non_credential_key_re()
-        .is_match(&delimited)
-        .unwrap_or(false)
-    {
+    if non_credential_key_re().is_match(&delimited) {
         return false;
     }
-    if credential_stem_re().is_match(&delimited).unwrap_or(false) {
+    if credential_stem_re().is_match(&delimited) {
         return true;
     }
-    let normalized = camel_boundary_re().replace_all(&delimited, "_");
-    if non_credential_key_re()
-        .is_match(normalized.as_ref())
-        .unwrap_or(false)
-    {
+    let normalized = insert_camel_boundaries(&delimited);
+    if non_credential_key_re().is_match(&normalized) {
         return false;
     }
-    camel_credential_suffix_re()
-        .is_match(normalized.as_ref())
-        .unwrap_or(false)
+    camel_credential_suffix_re().is_match(&normalized)
+}
+
+fn char_before(text: &str, index: usize) -> Option<char> {
+    text.get(..index)?.chars().next_back()
+}
+
+fn char_after(text: &str, index: usize) -> Option<char> {
+    text.get(index..)?.chars().next()
+}
+
+fn next_char_index(text: &str, index: usize) -> usize {
+    match text.get(index..).and_then(|rest| rest.chars().next()) {
+        Some(c) => index + c.len_utf8(),
+        None => index + 1,
+    }
+}
+
+fn is_ascii_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+fn is_bearer_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '+' | '/' | '=' | '-')
+}
+
+fn leading_ascii_alnum_ok(text: &str, start: usize, _end: usize) -> bool {
+    !char_before(text, start).is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+fn aws_boundary_ok(text: &str, start: usize, end: usize) -> bool {
+    leading_ascii_alnum_ok(text, start, end)
+        && !char_after(text, end).is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+fn bearer_boundary_ok(text: &str, start: usize, end: usize) -> bool {
+    leading_ascii_alnum_ok(text, start, end)
+        && !char_after(text, end).is_some_and(is_bearer_token_char)
+}
+
+fn leading_ident_ok(text: &str, start: usize, _end: usize) -> bool {
+    !char_before(text, start).is_some_and(is_ascii_ident)
+}
+
+/// Replace matches of `re` that pass `boundary_ok`. Matches that fail
+/// the check are left in place; the search resumes one character later
+/// so a later token can still see a leading boundary the previous
+/// candidate did not consume.
+fn replace_bounded(
+    text: &str,
+    re: &Regex,
+    boundary_ok: impl Fn(&str, usize, usize) -> bool,
+    replace: impl Fn(&Captures) -> String,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut search_at = 0;
+    while search_at < text.len() {
+        let Some(caps) = re.captures_at(text, search_at) else {
+            break;
+        };
+        let m = caps.get(0).expect("match always has group 0");
+        let start = m.start();
+        let end = m.end();
+        if start == end {
+            search_at = next_char_index(text, start);
+            continue;
+        }
+        if !boundary_ok(text, start, end) {
+            search_at = next_char_index(text, start);
+            continue;
+        }
+        out.push_str(&text[last..start]);
+        out.push_str(&replace(&caps));
+        last = end;
+        search_at = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn replace_prefix(caps: &Captures) -> String {
+    format!("{}{REDACTED_MARKER}", &caps[1])
+}
+
+fn replace_aws(caps: &Captures) -> String {
+    let id = caps.get(0).expect("match always has group 0").as_str();
+    format!("{}{REDACTED_MARKER}", &id[..4])
+}
+
+fn replace_bearer(_: &Captures) -> String {
+    format!("Bearer {REDACTED_MARKER}")
+}
+
+fn replace_assignment(caps: &Captures) -> String {
+    let (keyquote, key) = if let Some(key) = caps.get(1) {
+        ("\"", key.as_str())
+    } else if let Some(key) = caps.get(2) {
+        ("'", key.as_str())
+    } else {
+        (
+            "",
+            caps.get(3)
+                .expect("assignment regex always has a key group")
+                .as_str(),
+        )
+    };
+    if !is_credential_key(key) {
+        return caps
+            .get(0)
+            .expect("match always has group 0")
+            .as_str()
+            .to_string();
+    }
+    let separator = &caps[4];
+    let quote = if caps.get(5).is_some() {
+        "\""
+    } else if caps.get(6).is_some() {
+        "'"
+    } else {
+        ""
+    };
+    format!("{keyquote}{key}{keyquote}{separator}{quote}{REDACTED_MARKER}{quote}")
 }
 
 /// Mask common credentials while leaving identifiers and ordinary text intact.
@@ -157,42 +283,19 @@ pub fn redact_text(text: &str) -> String {
         return String::new();
     }
 
-    let text = pem_re().replace_all(text, |caps: &Captures<str>| {
+    let text = pem_re().replace_all(text, |caps: &Captures| {
         format!("{}\n{REDACTED_MARKER}\n{}", &caps["begin"], &caps["end"])
     });
 
-    let text = prefix_re().replace_all(&text, |caps: &Captures<str>| {
-        format!("{}{REDACTED_MARKER}", &caps["prefix"])
-    });
-
-    let text = aws_re().replace_all(&text, |caps: &Captures<str>| {
-        let whole = caps.get(0).expect("match always has group 0").as_str();
-        format!("{}{REDACTED_MARKER}", &whole[..4])
-    });
-
-    let text = bearer_re().replace_all(&text, |_: &Captures<str>| {
-        format!("Bearer {REDACTED_MARKER}")
-    });
-
-    let text = assignment_re().replace_all(&text, |caps: &Captures<str>| {
-        let whole = caps.get(0).expect("match always has group 0").as_str();
-        let key = caps
-            .get(2)
-            .expect("assignment regex always has group 2 (key)")
-            .as_str();
-        if !is_credential_key(key) {
-            return whole.to_string();
-        }
-        let keyquote = caps.get(1).map_or("", |m| m.as_str());
-        let separator = caps
-            .get(3)
-            .expect("assignment regex always has group 3 (separator)")
-            .as_str();
-        let quote = caps.get(4).map_or("", |m| m.as_str());
-        format!("{keyquote}{key}{keyquote}{separator}{quote}{REDACTED_MARKER}{quote}")
-    });
-
-    text.into_owned()
+    let text = replace_bounded(
+        text.as_ref(),
+        prefix_re(),
+        leading_ascii_alnum_ok,
+        replace_prefix,
+    );
+    let text = replace_bounded(&text, aws_re(), aws_boundary_ok, replace_aws);
+    let text = replace_bounded(&text, bearer_re(), bearer_boundary_ok, replace_bearer);
+    replace_bounded(&text, assignment_re(), leading_ident_ok, replace_assignment)
 }
 
 /// Alias matching the Python module's `redact = redact_text`.
@@ -431,5 +534,192 @@ mod tests {
             redact("token=supersecret"),
             redact_text("token=supersecret")
         );
+    }
+
+    #[test]
+    fn preserves_boundary_characters_around_masked_tokens() {
+        assert_eq!(
+            redact_text("(sk-fake-1234567890)"),
+            format!("(sk-{REDACTED_MARKER})")
+        );
+        assert_eq!(
+            redact_text("(AKIA1234567890ABCDEF)"),
+            format!("(AKIA{REDACTED_MARKER})")
+        );
+        assert_eq!(
+            redact_text("see Bearer fake-bearer-token!"),
+            format!("see Bearer {REDACTED_MARKER}!")
+        );
+    }
+
+    /// Card `20261123-b-7f6462` fix-round: a consuming trailing
+    /// `($|[^A-Za-z0-9])` stole the next token's leading boundary, so
+    /// `redact_text("AKIA… AKIA…")` leaked the second key. Separators
+    /// that main's fancy-regex version also treats as boundaries must
+    /// mask both sides; a secret glued inside a longer alnum word must
+    /// still not match.
+    #[test]
+    fn adjacent_secrets_mask_both_sides_of_a_shared_boundary() {
+        let akia_a = concat!("AKIA", "ABCDEFGHIJKLMNOP");
+        let akia_b = concat!("AKIA", "QRSTUVWXYZ234567");
+        let asia_a = concat!("ASIA", "1234567890ABCD");
+        let asia_b = concat!("ASIA", "1234567890ABCDEF");
+        let bearer_a = concat!("Bearer ", "tok-aaaa-1111");
+        let bearer_b = concat!("Bearer ", "tok-bbbb-2222");
+        let sk_a = concat!("sk-", "aaaa1111bbbb");
+        let sk_b = concat!("sk-", "cccc2222dddd");
+        let ghp_a = concat!("ghp_", "aaaa1111bbbb");
+        let ghp_b = concat!("ghp_", "cccc2222dddd");
+        let xoxb_a = concat!("xoxb-", "aaaa1111bbbb");
+        let xoxb_b = concat!("xoxb-", "cccc2222dddd");
+        let assign_a = "password=secret1";
+        let assign_b = "password=secret2";
+        let assign_dq_a = r#""password"="secret1""#;
+        let assign_dq_b = r#""password"="secret2""#;
+        let assign_sq_a = "'password'='secret1'";
+        let assign_sq_b = "'password'='secret2'";
+
+        let masked_akia = format!("AKIA{REDACTED_MARKER}");
+        let masked_asia = format!("ASIA{REDACTED_MARKER}");
+        let masked_bearer = format!("Bearer {REDACTED_MARKER}");
+        let masked_sk = format!("sk-{REDACTED_MARKER}");
+        let masked_ghp = format!("ghp_{REDACTED_MARKER}");
+        let masked_xoxb = format!("xoxb-{REDACTED_MARKER}");
+        let masked_assign = format!("password={REDACTED_MARKER}");
+        let masked_assign_dq = format!("\"password\"=\"{REDACTED_MARKER}\"");
+        let masked_assign_sq = format!("'password'='{REDACTED_MARKER}'");
+
+        for sep in [" ", ",", ";", "\n"] {
+            assert_eq!(
+                redact_text(&format!("{akia_a}{sep}{akia_b}")),
+                format!("{masked_akia}{sep}{masked_akia}"),
+                "AKIA sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{asia_a}{sep}{asia_b}")),
+                format!("{masked_asia}{sep}{masked_asia}"),
+                "ASIA sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{bearer_a}{sep}{bearer_b}")),
+                format!("{masked_bearer}{sep}{masked_bearer}"),
+                "Bearer sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{sk_a}{sep}{sk_b}")),
+                format!("{masked_sk}{sep}{masked_sk}"),
+                "sk- sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{ghp_a}{sep}{ghp_b}")),
+                format!("{masked_ghp}{sep}{masked_ghp}"),
+                "ghp_ sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{xoxb_a}{sep}{xoxb_b}")),
+                format!("{masked_xoxb}{sep}{masked_xoxb}"),
+                "xoxb- sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{assign_a}{sep}{assign_b}")),
+                format!("{masked_assign}{sep}{masked_assign}"),
+                "assignment unquoted sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{assign_dq_a}{sep}{assign_dq_b}")),
+                format!("{masked_assign_dq}{sep}{masked_assign_dq}"),
+                "assignment double-quoted sep={sep:?}"
+            );
+            assert_eq!(
+                redact_text(&format!("{assign_sq_a}{sep}{assign_sq_b}")),
+                format!("{masked_assign_sq}{sep}{masked_assign_sq}"),
+                "assignment single-quoted sep={sep:?}"
+            );
+        }
+
+        // No separator: AWS keys form one alnum word and must not match,
+        // matching fancy-regex lookaround. Prefix/Bearer/unquoted
+        // assignment greedily consume the second token as part of the
+        // first value. Quoted assignments have explicit delimiters, so
+        // both still mask.
+        assert_eq!(
+            redact_text(&format!("{akia_a}{akia_b}")),
+            format!("{akia_a}{akia_b}")
+        );
+        assert_eq!(
+            redact_text(&format!("{asia_a}{asia_b}")),
+            format!("{asia_a}{asia_b}")
+        );
+        assert_eq!(redact_text(&format!("{sk_a}{sk_b}")), masked_sk);
+        assert_eq!(redact_text(&format!("{ghp_a}{ghp_b}")), masked_ghp);
+        assert_eq!(redact_text(&format!("{xoxb_a}{xoxb_b}")), masked_xoxb);
+        assert_eq!(
+            redact_text(&format!("{bearer_a}{bearer_b}")),
+            format!("{masked_bearer} tok-bbbb-2222")
+        );
+        assert_eq!(
+            redact_text(&format!("{assign_a}{assign_b}")),
+            masked_assign.as_str()
+        );
+        assert_eq!(
+            redact_text(&format!("{assign_dq_a}{assign_dq_b}")),
+            format!("{masked_assign_dq}{masked_assign_dq}")
+        );
+        assert_eq!(
+            redact_text(&format!("{assign_sq_a}{assign_sq_b}")),
+            format!("{masked_assign_sq}{masked_assign_sq}")
+        );
+
+        // Embedded in a longer alnum/ident word: same negative as
+        // fancy-regex lookbehind / lookahead.
+        assert_eq!(redact_text(&format!("xx{akia_a}")), format!("xx{akia_a}"));
+        assert_eq!(redact_text(&format!("{akia_a}xx")), format!("{akia_a}xx"));
+        assert_eq!(redact_text(&format!("xx{asia_a}")), format!("xx{asia_a}"));
+        assert_eq!(redact_text(&format!("{asia_b}xx")), format!("{asia_b}xx"));
+        assert_eq!(redact_text(&format!("xx{sk_a}")), format!("xx{sk_a}"));
+        assert_eq!(redact_text(&format!("xx{ghp_a}")), format!("xx{ghp_a}"));
+        assert_eq!(redact_text(&format!("xx{xoxb_a}")), format!("xx{xoxb_a}"));
+        assert_eq!(
+            redact_text(&format!("xx{bearer_a}")),
+            format!("xx{bearer_a}")
+        );
+        assert_eq!(
+            redact_text(&format!("xx{assign_a}")),
+            format!("xx{assign_a}")
+        );
+    }
+
+    /// Card `20261123-b-7f6462`: `fancy-regex` `replace_all` panicked on
+    /// this corpus (prefix / aws / bearer lookbehinds exceeded the
+    /// 1_000_000 backtrack cap at ~832 KiB). After the linear rewrite
+    /// the same input returns, and neither planted secret leaks.
+    #[test]
+    fn large_adversarial_input_masks_planted_secrets_without_panicking() {
+        let block = concat!(
+            "Role:        Builder\n",
+            "Account:     grok\n",
+            "Repo:        /tmp/repo\n",
+            "let foo = bar;\n",
+            "fn render() { let x = 1; }\n",
+        );
+        let mut text = block.repeat(8_000);
+        text.push_str("password=planted-secret-value-abcdef\n");
+        text.push_str("sk-plantedtoken1234567890\n");
+        text.push_str("ordinary_field=keep-me\n");
+
+        let redacted = redact_text(&text);
+        assert!(
+            !redacted.contains("planted-secret-value-abcdef"),
+            "assignment secret leaked"
+        );
+        assert!(
+            !redacted.contains("plantedtoken1234567890"),
+            "prefix secret leaked"
+        );
+        assert!(redacted.contains("ordinary_field=keep-me"));
+        assert!(redacted.contains(&format!("password={REDACTED_MARKER}")));
+        assert!(redacted.contains(&format!("sk-{REDACTED_MARKER}")));
+        assert!(redacted.contains("let foo = bar;"));
+        assert_eq!(redact_text(&redacted), redacted);
     }
 }

@@ -43,6 +43,7 @@ max_concurrent = 3
 # [board]
 # refresh_seconds = 300
 # dashboard_tab = ["example"]
+# color = false   # true = --color always, including inside a Herdr pane
 
 # Project state is private: Multiverse-created private-state directories are
 # mode 0700, and sensitive state files (including routing.log/index) are mode

@@ -19,6 +19,21 @@
 //! gone unchanged for [`STALL_THRESHOLD`]. Seat and project occupancy
 //! still read Herdr's raw status exactly as before — only the printed
 //! STATUS cell changes.
+//!
+//! The same pane read also yields `waiting-on-shell` (card
+//! `20261122-b-e98304`): a Claude seat's pane Herdr reports idle/done whose
+//! footer below the prompt still shows `N shell(s)`/`N monitor` running
+//! ([`mv_engine::sweep_nudges::waiting_on_shell`]). The lane is waiting on
+//! its own background job, not finished; display only, like `stalled`, and
+//! shown in preference to it.
+//!
+//! Before printing, `workers` records settled-but-unrecorded outcomes
+//! through [`mv_state::tasks::reconcile_project`] (same pass `tasks` uses
+//! on a plain listing), so a first-run user does not see
+//! "needs --reconcile". `--read-only` skips that write. The live listing
+//! already fetched for the table is reused (`CachedAgents`); this command
+//! does not make a second `agent list` call. Panes are not closed and
+//! stale AWAITING tasks are not expired here.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -31,6 +46,7 @@ use sha2::{Digest, Sha256};
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
 use super::{herdr_command, run_herdr};
 use crate::exit::Failure;
+use mv_state::tasks::{AgentPanes, ReconcileRequest};
 
 // --- a minimal, read-only JSON reader (object/array/string/number/bool/null) ---
 // Just enough to walk `{"result": {"agents": [...]}}`; not a general-purpose
@@ -514,6 +530,40 @@ pub(super) fn is_dispatched_name(config: &Config, name: &str) -> bool {
     recognize(config, name).is_some_and(|(_, worker)| worker.role != Role::Nexus)
 }
 
+/// Whether `name` is a Nexus session — a project's own name, or the
+/// (current or legacy) Nexus agent name an interactive seat hosts for it.
+/// Such a pane is reported on the `nexus sessions` line and never holds a
+/// `max_concurrent` slot; `commands::dispatch::fleet_worker_count` uses
+/// this same test so the two exclude the same panes.
+pub(super) fn is_nexus_session_name(config: &Config, name: &str) -> bool {
+    if config.projects.contains_key(name) {
+        return true;
+    }
+    config.projects.values().any(|project| {
+        config
+            .accounts
+            .values()
+            .filter(|account| account.interactive)
+            .any(|account| {
+                [
+                    mv_engine::fleet_start::nexus_agent_name(
+                        &project.name,
+                        &account.short,
+                        project.short.as_deref().unwrap_or(""),
+                    ),
+                    mv_engine::fleet_start::nexus_legacy_agent_name(
+                        &project.name,
+                        &account.short,
+                        project.short.as_deref().unwrap_or(""),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(Result::ok)
+                .any(|nexus| nexus == name)
+            })
+    })
+}
+
 const DASH: &str = "\u{2014}";
 
 /// A pane whose own content has not moved in this long is shown `stalled`
@@ -525,19 +575,43 @@ const DASH: &str = "\u{2014}";
 /// signals the pane, it only changes what this table prints.
 const STALL_THRESHOLD: time::Duration = time::Duration::minutes(30);
 
-/// One `herdr pane read` per live agent with a pane id, hashed via
-/// [`content_hash`] — the per-pane signal [`stalled_panes`] persists.
+/// One `herdr pane read` per live agent with a pane id — the one read both
+/// [`pane_hashes`] (for [`stalled_panes`]) and [`shell_waiting_panes`]
+/// consume, so the waiting-on-shell check costs no second Herdr call.
 /// `None` (a failed read) is kept as `None` rather than dropped, so that
 /// pane still fails open to "just changed" instead of silently vanishing
 /// from this cycle's observation.
-fn fetch_pane_hashes(binary: &str, agents: &[LiveAgent]) -> HashMap<String, Option<String>> {
+fn fetch_pane_texts(binary: &str, agents: &[LiveAgent]) -> HashMap<String, Option<String>> {
     agents
         .iter()
         .filter(|agent| !agent.pane.is_empty())
-        .map(|agent| {
-            let hash = fetch_pane_content(binary, &agent.pane).map(|text| content_hash(&text));
-            (agent.pane.clone(), hash)
+        .map(|agent| (agent.pane.clone(), fetch_pane_content(binary, &agent.pane)))
+        .collect()
+}
+
+/// Each pane read hashed via [`content_hash`] — the per-pane signal
+/// [`stalled_panes`] persists; a failed read stays `None`.
+fn pane_hashes(pane_texts: &HashMap<String, Option<String>>) -> HashMap<String, Option<String>> {
+    pane_texts
+        .iter()
+        .map(|(pane, text)| (pane.clone(), text.as_deref().map(content_hash)))
+        .collect()
+}
+
+/// The `pane_id` of every pane whose read shows Claude's footer still
+/// running a background shell or monitor below its prompt
+/// ([`mv_engine::sweep_nudges::waiting_on_shell`], the same test the stall
+/// wake applies). [`build_report`] shows such a pane `waiting-on-shell`
+/// only when Herdr also reports it idle/done and its seat is a Claude one.
+/// A failed read is never waiting.
+fn shell_waiting_panes(pane_texts: &HashMap<String, Option<String>>) -> HashSet<String> {
+    pane_texts
+        .iter()
+        .filter(|(_, text)| {
+            text.as_deref()
+                .is_some_and(mv_engine::sweep_nudges::waiting_on_shell)
         })
+        .map(|(pane, _)| pane.clone())
         .collect()
 }
 
@@ -793,13 +867,32 @@ struct WorkersReport {
 /// STATUS column's displayed text — never seat/project occupancy, which
 /// still reads `agent.status` exactly as Herdr reported it, so a pane
 /// shown `stalled` here still occupies its seat precisely as before.
+///
+/// `shell_waiting_panes` (from [`shell_waiting_panes`]) does the same for
+/// `waiting-on-shell` (card `20261122-b-e98304`): a Claude seat's pane
+/// Herdr reports idle/done whose footer still shows a running background
+/// shell or monitor. It takes precedence over `stalled` — a long quiet
+/// suite is the lane legitimately waiting, not frozen. Display only, like
+/// `stalled`: the `workers N/CAP` count already holds every unrecorded
+/// row's slot whatever its STATUS reads.
 fn build_report(
     config: &Config,
     agents: Option<&[LiveAgent]>,
     stalled_panes: &HashSet<String>,
+    shell_waiting_panes: &HashSet<String>,
 ) -> WorkersReport {
-    let display_status = |agent: &LiveAgent| {
-        if !agent.pane.is_empty() && stalled_panes.contains(&agent.pane) {
+    let display_status = |agent: &LiveAgent, seat: &str| {
+        let claude_seat = config
+            .accounts
+            .get(seat)
+            .is_some_and(|account| account.kind == "claude");
+        if claude_seat
+            && matches!(agent.status.as_str(), "idle" | "done")
+            && !agent.pane.is_empty()
+            && shell_waiting_panes.contains(&agent.pane)
+        {
+            "waiting-on-shell".to_string()
+        } else if !agent.pane.is_empty() && stalled_panes.contains(&agent.pane) {
             "stalled".to_string()
         } else {
             agent.status.clone()
@@ -829,40 +922,13 @@ fn build_report(
             seat_counts = open_seat_counts(config, &history, agents);
             let mut rows = Vec::new();
             let mut orchestrators = 0u32;
-            // A recorded task's pane does not hold a fleet slot even while
-            // Herdr has not reaped it yet — `open_seat_counts` above
-            // already skips a `recorded` task for the same reason
-            // (line ~710), and `commands::dispatch::fleet_open_counts`
-            // skips it fleet-wide. The row still prints (still-open panes
-            // worth a human's look stay visible), but it must not inflate
-            // the `workers N/CAP` line past what dispatch actually
-            // enforces (card `20261116-b-ed6d3c`).
-            let mut cap_count = 0u32;
+            // A recorded task's row still prints (still-open panes worth a
+            // human's look stay visible), but the `workers N/CAP` count
+            // below never includes it — it is
+            // `commands::dispatch::fleet_worker_count`, the number dispatch
+            // enforces (cards `20261116-b-ed6d3c`, `20261123-b-a80bc1`).
             for agent in agents {
-                let nexus = config.projects.values().any(|project| {
-                    config
-                        .accounts
-                        .values()
-                        .filter(|account| account.interactive)
-                        .any(|account| {
-                            [
-                                mv_engine::fleet_start::nexus_agent_name(
-                                    &project.name,
-                                    &account.short,
-                                    project.short.as_deref().unwrap_or(""),
-                                ),
-                                mv_engine::fleet_start::nexus_legacy_agent_name(
-                                    &project.name,
-                                    &account.short,
-                                    project.short.as_deref().unwrap_or(""),
-                                ),
-                            ]
-                            .into_iter()
-                            .filter_map(Result::ok)
-                            .any(|name| name == agent.name)
-                        })
-                });
-                if nexus || config.projects.contains_key(&agent.name) {
+                if is_nexus_session_name(config, &agent.name) {
                     orchestrators += 1;
                     continue;
                 }
@@ -875,9 +941,6 @@ fn build_report(
                     .max_by_key(|(_, task)| task.dispatch_ordinal);
                 if let Some((project, task)) = joined {
                     let seat = task.account.as_deref().unwrap_or(DASH);
-                    if !task.recorded {
-                        cap_count += 1;
-                    }
                     *project_counts.entry(&project.name).or_default() += 1;
                     let age = task
                         .dispatched_at
@@ -892,7 +955,7 @@ fn build_report(
                         role: Role::from_any_config_key(&task.role)
                             .map_or_else(|_| task.role.clone(), |role| role.config_key().into()),
                         seat: seat.into(),
-                        status: display_status(agent),
+                        status: display_status(agent, seat),
                         outcome: task.status.map_or_else(
                             || {
                                 if task.file_status.is_some() {
@@ -906,11 +969,10 @@ fn build_report(
                         ),
                     });
                 } else if let Some((_project, recognized)) = recognize(config, &agent.name) {
-                    cap_count += 1;
                     rows.push(WorkerRow {
                         role: recognized.role.config_key().into(),
                         seat: recognized.seat.into(),
-                        status: display_status(agent),
+                        status: display_status(agent, recognized.seat),
                         ..Default::default()
                     });
                 } else if !agent.cwd.is_empty() {
@@ -937,6 +999,15 @@ fn build_report(
                 (&a.project, &a.task, &a.role, &a.seat)
                     .cmp(&(&b.project, &b.task, &b.role, &b.seat))
             });
+            // Card 20261123-b-a80bc1: the `workers N/CAP` count is the
+            // one dispatch enforces, computed by the same function from
+            // the same listing — never a second tally kept here.
+            let statuses: HashMap<String, String> = agents
+                .iter()
+                .filter(|agent| !agent.name.is_empty())
+                .map(|agent| (agent.name.clone(), agent.status.clone()))
+                .collect();
+            let cap_count = super::dispatch::fleet_worker_count(config, Some(&statuses));
             (Some(rows), Some(cap_count), Some(orchestrators))
         }
         None => (None, None, None),
@@ -1009,7 +1080,11 @@ fn render_text(report: &WorkersReport) -> String {
             .iter()
             .map(|(name, open, ceiling)| {
                 let open_text = open.map_or_else(|| "?".to_string(), |n| n.to_string());
-                format!("{name} {open_text} open, ceiling {ceiling}")
+                if name == mv_state::activity::HUB_PROJECT_NAME {
+                    format!("{name} {open_text} open, ceiling {ceiling} (home hub)")
+                } else {
+                    format!("{name} {open_text} open, ceiling {ceiling}")
+                }
             })
             .collect::<Vec<_>>()
             // Each project already contains a comma (`0 open, ceiling N`);
@@ -1039,7 +1114,12 @@ fn render_with_stalled(
     agents: Option<&[LiveAgent]>,
     stalled_panes: &HashSet<String>,
 ) -> String {
-    render_text(&build_report(config, agents, stalled_panes))
+    render_text(&build_report(
+        config,
+        agents,
+        stalled_panes,
+        &HashSet::new(),
+    ))
 }
 
 /// Minimal ASCII-only JSON string escaper (`ensure_ascii=True` style),
@@ -1175,13 +1255,116 @@ fn halt_banner(state: &mv_state::halt::HaltState) -> Option<String> {
     }
 }
 
+/// Reuses the live listing `run` already fetched so auto-reconcile does
+/// not make a second `agent list` call. `close` is a no-op: this command
+/// records outcomes, it does not tear panes down (`close_panes: false`).
+struct CachedAgents {
+    live: Option<Vec<mv_state::tasks::LiveAgentStatus>>,
+}
+
+impl CachedAgents {
+    fn from_listing(agents: &[LiveAgent]) -> Self {
+        Self {
+            live: Some(agents.iter().map(to_live_status).collect()),
+        }
+    }
+}
+
+fn to_live_status(agent: &LiveAgent) -> mv_state::tasks::LiveAgentStatus {
+    mv_state::tasks::LiveAgentStatus {
+        pane_id: agent.pane.clone(),
+        name: (!agent.name.is_empty()).then(|| agent.name.clone()),
+        status: agent.status.parse().ok(),
+    }
+}
+
+impl AgentPanes for CachedAgents {
+    fn list(&mut self) -> Vec<mv_state::tasks::LiveAgent> {
+        self.list_checked()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|agent| mv_state::tasks::LiveAgent {
+                pane_id: agent.pane_id,
+            })
+            .collect()
+    }
+
+    fn list_checked(&mut self) -> Option<Vec<mv_state::tasks::LiveAgentStatus>> {
+        self.live.clone()
+    }
+
+    fn close(&mut self, _pane_id: &str) -> bool {
+        false
+    }
+}
+
+fn read_only_mode(args: &ArgMatches) -> bool {
+    args.get_flag("read-only") || std::env::var("MULTIVERSE_READ_ONLY").as_deref() == Ok("1")
+}
+
+/// Records settled-but-unrecorded outcomes on every configured project,
+/// using the listing already in hand. Skipped when Herdr was unreachable
+/// (`require_live`): guessing without a live listing is `tasks --reconcile`'s
+/// job, not an automatic listing's.
+fn auto_reconcile_unrecorded(config: &Config, agents: Option<&[LiveAgent]>) {
+    let Some(agents) = agents else {
+        return;
+    };
+    let overrides: HashMap<String, u32> = config
+        .accounts
+        .iter()
+        .filter_map(|(name, account)| {
+            account
+                .awaiting_lease_minutes_override
+                .map(|minutes| (name.clone(), minutes))
+        })
+        .collect();
+    let mut cached = CachedAgents::from_listing(agents);
+    for project in config.projects.values() {
+        let Some(root) = project_path(project) else {
+            continue;
+        };
+        let _ = mv_state::tasks::reconcile_project(
+            root,
+            ReconcileRequest {
+                only_task: None,
+                close_panes: false,
+                expire_stale: false,
+                lease_minutes: config.awaiting_lease_minutes,
+                lease_overrides: &overrides,
+                now: mv_core::time::now_utc(),
+                require_live: true,
+            },
+            &mut cached,
+        );
+    }
+}
+
+fn remaining_unrecorded(config: &Config) -> usize {
+    config
+        .projects
+        .values()
+        .filter_map(project_path)
+        .map(|root| {
+            mv_state::tasks::sweep_tasks(root)
+                .into_iter()
+                .filter(|task| !task.recorded && task.file_status.is_some())
+                .count()
+        })
+        .sum()
+}
+
+fn unrecorded_note(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("{count} unrecorded outcome(s), needs --reconcile"))
+}
+
 /// `multiverse workers`'s entry point: loads config, fetches live agents
 /// from Herdr (best-effort — an unreachable fleet still renders, with `?`
-/// where live counts would go), and prints the report. Plain text prints
-/// the fleet-halt banner line first, then [`render_text`]'s report;
-/// `--json` folds the halt state into the single JSON line's `halted` key
-/// instead, so stdout stays one parseable value (card for this task,
-/// `20261117-builder-0cbb48`).
+/// where live counts would go), auto-reconciles unrecorded outcomes unless
+/// `--read-only`, and prints the report. Plain text prints the fleet-halt
+/// banner line first, then [`render_text`]'s report; `--json` folds the
+/// halt state into the single JSON line's `halted` key instead, so stdout
+/// stays one parseable value (card for this task, `20261117-builder-0cbb48`).
 pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
@@ -1199,21 +1382,40 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
 
     let binary = herdr_binary();
     let agents = fetch_live_agents(&binary);
-    let stalled = agents
+    let (stalled, shell_waiting) = agents
         .as_deref()
         .map(|agents| {
-            let pane_hashes = fetch_pane_hashes(&binary, agents);
-            stalled_panes(&state_dir, &pane_hashes, mv_core::time::now_utc())
+            let pane_texts = fetch_pane_texts(&binary, agents);
+            (
+                stalled_panes(
+                    &state_dir,
+                    &pane_hashes(&pane_texts),
+                    mv_core::time::now_utc(),
+                ),
+                shell_waiting_panes(&pane_texts),
+            )
         })
         .unwrap_or_default();
-    let report = build_report(&config, agents.as_deref(), &stalled);
+    if !read_only_mode(args) {
+        auto_reconcile_unrecorded(&config, agents.as_deref());
+    }
+    let report = build_report(&config, agents.as_deref(), &stalled, &shell_waiting);
     if args.get_flag("json") {
         println!("{}", render_json(&report, &halt_state));
     } else {
         if let Some(line) = halt_banner(&halt_state) {
             println!("{line}");
         }
-        println!("{}", render_text(&report));
+        let text = render_text(&report);
+        if mv_board::layout::ascii_requested() {
+            println!("{}", mv_board::layout::to_ascii_plain(&text));
+        } else {
+            println!("{text}");
+        }
+        if let Some(note) = unrecorded_note(remaining_unrecorded(&config)) {
+            println!();
+            println!("{note}");
+        }
     }
     Ok(())
 }
@@ -1803,6 +2005,244 @@ nexus sessions 0 (excluded from workers; they do not count against max_concurren
         );
     }
 
+    const SHELL_STILL_RUNNING_IDLE: &str =
+        include_str!("../../../../tests/fixtures/stall-cause/claude-shell-still-running-idle.txt");
+
+    /// Card `20261122-b-e98304`: three working lanes, two Claude lanes
+    /// parked at their prompt with a background shell still running (Herdr
+    /// says `done`), and one lane that wrote its status but is not yet
+    /// recorded, at `max_concurrent = 6`. The two parked lanes print
+    /// `waiting-on-shell`, not `done`, and every one of the six rows holds
+    /// a slot — `workers 6/6`, the count the dispatch gate enforces too.
+    /// Revert check: drop the `waiting-on-shell` arm of `build_report`'s
+    /// `display_status` and the two rows read `done` again.
+    #[test]
+    fn waiting_on_shell_lanes_print_as_such_and_every_unrecorded_row_counts_against_the_cap() {
+        let delta = tempfile::tempdir().unwrap();
+        std::fs::create_dir(delta.path().join(".multiverse")).unwrap();
+        let ids: Vec<String> = (1..=6)
+            .map(|n| format!("20261122-builder-d0000{n}"))
+            .collect();
+        let names: Vec<String> = (1..=6)
+            .map(|n| {
+                if n == 1 {
+                    "delta-buil-cl".to_string()
+                } else {
+                    format!("delta-buil-cl-{n}")
+                }
+            })
+            .collect();
+        let log: String = ids
+            .iter()
+            .zip(&names)
+            .enumerate()
+            .map(|(index, (id, name))| {
+                format!(
+                    "2020-01-01T00:00:00Z\tevent=dispatch\ttask={id}\tproject=delta\trole=builder\taccount=claude-a\tagent={name}\n\
+                     2020-01-01T00:00:00Z\tevent=started\ttask={id}\tpane=w1:p{}\n",
+                    index + 1
+                )
+            })
+            .collect();
+        std::fs::write(delta.path().join(".multiverse/routing.log"), log).unwrap();
+        // The sixth lane wrote `done` but nobody has recorded it yet.
+        let status_dir = delta.path().join(".multiverse/tasks").join(&ids[5]);
+        std::fs::create_dir_all(&status_dir).unwrap();
+        std::fs::write(status_dir.join("status"), "done\n").unwrap();
+
+        let toml = format!(
+            "max_concurrent = 6\n\n\
+             [accounts.claude-a]\nkind = \"claude\"\nshort = \"cl\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"/tmp\"\npool = \"claude:a\"\n\n\
+             [projects.delta]\npath = \"{delta}\"\n\n\
+             [projects.delta.chains]\nbuilder = [\"claude-a\"]\n\n\
+             [roles.builder]\nwrite_scope = \"declared\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n\
+             [roles.builder.models]\nclaude = \"claude-test\"\n",
+            delta = delta.path().display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+
+        let statuses = ["working", "working", "working", "done", "done", "done"];
+        let agents: Vec<LiveAgent> = names
+            .iter()
+            .zip(statuses)
+            .enumerate()
+            .map(|(index, (name, status))| LiveAgent {
+                name: name.clone(),
+                status: status.into(),
+                pane: format!("w1:p{}", index + 1),
+                ..Default::default()
+            })
+            .collect();
+        // Panes 4 and 5 show the running-shell footer; pane 6 (the
+        // done-unrecorded lane) and the working panes do not.
+        let finished = SHELL_STILL_RUNNING_IDLE.replace(" · 1 shell", "");
+        let pane_texts: HashMap<String, Option<String>> = (1..=6)
+            .map(|n| {
+                let text = if n == 4 || n == 5 {
+                    SHELL_STILL_RUNNING_IDLE.to_string()
+                } else {
+                    finished.clone()
+                };
+                (format!("w1:p{n}"), Some(text))
+            })
+            .collect();
+        let shell_waiting = shell_waiting_panes(&pane_texts);
+        assert_eq!(
+            shell_waiting,
+            HashSet::from(["w1:p4".to_string(), "w1:p5".to_string()])
+        );
+
+        let text = render_text(&build_report(
+            &config,
+            Some(&agents),
+            &HashSet::new(),
+            &shell_waiting,
+        ));
+        let status_of = |id: &str| {
+            text.lines()
+                .find(|line| line.contains(id))
+                .and_then(|line| line.split_whitespace().nth(4))
+                .unwrap_or_else(|| panic!("no row for {id} in:\n{text}"))
+                .to_string()
+        };
+        assert_eq!(status_of(&ids[0]), "working", "{text}");
+        assert_eq!(status_of(&ids[3]), "waiting-on-shell", "{text}");
+        assert_eq!(status_of(&ids[4]), "waiting-on-shell", "{text}");
+        assert_eq!(status_of(&ids[5]), "done", "{text}");
+        assert!(text.contains("done-unrecorded"), "{text}");
+        assert!(text.contains("workers 6/6"), "{text}");
+        // Card 20261122-b-4ad223: the dispatch gate enforces the same six.
+        assert_eq!(
+            crate::commands::dispatch::fleet_open_counts(
+                &config,
+                "",
+                Some(&live_statuses_from(&agents))
+            )
+            .0,
+            6
+        );
+
+        // A working pane is never relabelled, footer or not.
+        let mut working = agents.clone();
+        working[3].status = "working".into();
+        let text = render_text(&build_report(
+            &config,
+            Some(&working),
+            &HashSet::new(),
+            &shell_waiting,
+        ));
+        assert_eq!(
+            text.matches("waiting-on-shell").count(),
+            1,
+            "only the still-done pane: {text}"
+        );
+    }
+
+    /// Card `20261123-b-a80bc1`: `workers N/CAP` and the count dispatch
+    /// admits against are one number for one fleet, including the rows
+    /// the two separate joins used to disagree on — a live pane under a
+    /// dispatched worker name with no task history (`workers` counted it,
+    /// dispatch did not), a live lane dispatched on a since-renamed seat
+    /// (same), and a lane inside its startup grace Herdr does not list yet
+    /// (dispatch counted it, `workers` did not). A working lane and a
+    /// `done-unrecorded` lane count; a recorded lane and a Nexus pane do
+    /// not. At `max_concurrent = 5` the fleet is full and dispatch says so
+    /// with the count `workers` prints. Revert check: give `build_report`
+    /// back its own tally and the header reads 4/5 while dispatch counts 5
+    /// (or, with dispatch's old join, dispatch counts 3).
+    #[test]
+    fn workers_header_is_the_count_dispatch_admits_against() {
+        let echo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(echo.path().join(".multiverse")).unwrap();
+        let now = mv_core::time::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            echo.path().join(".multiverse/routing.log"),
+            format!(
+                "2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-e00001\tproject=echo\trole=builder\taccount=seat-b\tagent=echo-buil-sb\n\
+                 2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-e00001\tpane=w1:p1\n\
+                 2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-e00002\tproject=echo\trole=builder\taccount=seat-b\tagent=echo-buil-sb-2\n\
+                 2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-e00002\tpane=w1:p2\n\
+                 2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-e00003\tproject=echo\trole=builder\taccount=retired-seat\tagent=echo-buil-zz\n\
+                 2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-e00003\tpane=w1:p3\n\
+                 2020-01-01T00:00:00Z\tevent=dispatch\ttask=20250101-builder-e00004\tproject=echo\trole=builder\taccount=seat-b\tagent=echo-buil-sb-4\n\
+                 2020-01-01T00:00:00Z\tevent=started\ttask=20250101-builder-e00004\tpane=w1:p4\n\
+                 2020-01-01T00:00:00Z\tevent=result\ttask=20250101-builder-e00004\tstatus=done\tstate=done\n\
+                 {now}\tevent=dispatch\ttask=20250101-builder-e00005\tproject=echo\trole=builder\taccount=seat-b\tagent=echo-buil-sb-5\n",
+            ),
+        )
+        .unwrap();
+        let status_dir = echo
+            .path()
+            .join(".multiverse/tasks/20250101-builder-e00002");
+        std::fs::create_dir_all(&status_dir).unwrap();
+        std::fs::write(status_dir.join("status"), "done\n").unwrap();
+
+        let toml = format!(
+            "max_concurrent = 5\n\n\
+             [accounts.seat-b]\nkind = \"codex\"\nshort = \"sb\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:b\"\n\n\
+             [accounts.nex]\nkind = \"codex\"\nshort = \"nx\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:nex\"\ninteractive = true\n\n\
+             [projects.echo]\npath = \"{echo}\"\n\n\
+             [projects.echo.chains]\nbuilder = [\"seat-b\"]\n\n\
+             [roles.builder]\nwrite_scope = \"declared\"\neffort = \"low\"\non_exhausted = \"degrade\"\nskills = []\n\n\
+             [roles.builder.models]\ncodex = \"gpt-test\"\n",
+            echo = echo.path().display(),
+        );
+        let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
+
+        let live = |name: &str, status: &str, pane: &str| LiveAgent {
+            name: name.into(),
+            status: status.into(),
+            pane: pane.into(),
+            ..Default::default()
+        };
+        let agents = [
+            live("echo-buil-sb", "working", "w1:p1"),
+            live("echo-buil-sb-2", "done", "w1:p2"),
+            live("echo-buil-zz", "idle", "w1:p3"),
+            live("echo-buil-sb-4", "idle", "w1:p4"),
+            live("echo-buil-sb-3", "working", "w1:p6"),
+            live("echo-nexu-nx", "working", "w1:p7"),
+        ];
+
+        let text = render(&config, Some(&agents));
+        let workers_open: u32 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("workers "))
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no 'workers N/CAP' line in: {text}"));
+        let (dispatch_open, _) = crate::commands::dispatch::fleet_open_counts(
+            &config,
+            "",
+            Some(&live_statuses_from(&agents)),
+        );
+        assert_eq!(workers_open, dispatch_open, "{text}");
+        assert_eq!(workers_open, 5, "{text}");
+        assert!(text.contains("workers 5/5"), "{text}");
+        assert!(text.contains("done-unrecorded"), "{text}");
+        assert!(text.contains("nexus sessions 1"), "{text}");
+
+        let refusal =
+            mv_engine::dispatch::check_fleet_capacity(&mv_engine::dispatch::FleetCapacityInputs {
+                max_concurrent: config.max_concurrent,
+                fleet_open: dispatch_open,
+                project_open: 0,
+                project_min_slots: 0,
+                project_max_slots: None,
+                other_floor_gaps: Vec::new(),
+                batch_count: 1,
+            })
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("5 agent(s) already running and max_concurrent is 5"),
+            "{refusal}"
+        );
+    }
+
     /// `live_statuses_from`'s own helper: [`crate::commands::dispatch::
     /// fleet_open_counts`] joins a task to Herdr's listing by agent name
     /// to raw status, the same map [`status_by_name`] builds here — so
@@ -1941,6 +2381,35 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
     }
 
     #[test]
+    fn hub_project_is_labelled_home_hub_on_the_projects_line() {
+        let config = load_config_str(
+            "[accounts.seat-b]\n\
+             kind = \"codex\"\n\
+             short = \"sb\"\n\
+             config_dir_var = \"CODEX_HOME\"\n\
+             config_dir = \"/tmp\"\n\
+             pool = \"codex:b\"\n\n\
+             [projects.sandbox]\n\
+             path = \"/tmp/a\"\n\n\
+             [projects.multiverse]\n\
+             path = \"/tmp/hub\"\n\
+             short = \"mv\"\n",
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        let output = render(&config, Some(&[]));
+        assert!(
+            output.contains("multiverse 0 open, ceiling 3 (home hub)"),
+            "{output}"
+        );
+        assert!(output.contains("sandbox 0 open, ceiling 3"), "{output}");
+        assert!(
+            !output.contains("sandbox 0 open, ceiling 3 (home hub)"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn render_table_strips_osc_52_from_a_herdr_status_string() {
         let rows = [WorkerRow {
             role: "scout".into(),
@@ -1969,7 +2438,7 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
     /// that detector once those two counters stopped moving, which is
     /// exactly the false positive the card reports. This call site cannot
     /// reproduce that failure even by construction: `pane_hashes` is built
-    /// from pane content alone ([`fetch_pane_hashes`]), and [`LiveAgent`]
+    /// from pane content alone ([`pane_hashes`]), and [`LiveAgent`]
     /// no longer carries a `revision` or `state_change_seq` field for
     /// anything to key on — a changed hash is the only way the age here
     /// ever resets. The store-level half of the same proof is
@@ -2006,7 +2475,7 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
     }
 
     #[test]
-    fn fetch_pane_hashes_keeps_a_failed_read_as_a_missing_signal_not_a_dropped_pane() {
+    fn fetch_pane_texts_keeps_a_failed_read_as_a_missing_signal_not_a_dropped_pane() {
         // `herdr_binary()` never resolves to a real executable under
         // `cargo test`, so this exercises the same fail-open path a real
         // spawn failure would: the pane is still a key in the map, just
@@ -2016,8 +2485,12 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
             pane: "w1:p1".into(),
             ..Default::default()
         }];
-        let pane_hashes = fetch_pane_hashes(&herdr_binary(), &agents);
-        assert_eq!(pane_hashes, HashMap::from([("w1:p1".to_string(), None)]));
+        let pane_texts = fetch_pane_texts(&herdr_binary(), &agents);
+        assert_eq!(
+            pane_hashes(&pane_texts),
+            HashMap::from([("w1:p1".to_string(), None)])
+        );
+        assert!(shell_waiting_panes(&pane_texts).is_empty());
     }
 
     #[test]
@@ -2089,7 +2562,7 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
             status: "working".to_string(),
             ..Default::default()
         }];
-        let report = build_report(&config, Some(&agents), &HashSet::new());
+        let report = build_report(&config, Some(&agents), &HashSet::new(), &HashSet::new());
         let halt = mv_state::halt::HaltState {
             halted: false,
             reason: None,
@@ -2154,7 +2627,7 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
     #[test]
     fn render_json_fails_open_to_null_when_herdr_is_unreachable() {
         let config = config();
-        let report = build_report(&config, None, &HashSet::new());
+        let report = build_report(&config, None, &HashSet::new(), &HashSet::new());
         let halt = mv_state::halt::HaltState {
             halted: false,
             reason: None,
@@ -2175,7 +2648,7 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
     #[test]
     fn render_json_embeds_the_halt_state_instead_of_a_banner_line() {
         let config = config();
-        let report = build_report(&config, Some(&[]), &HashSet::new());
+        let report = build_report(&config, Some(&[]), &HashSet::new(), &HashSet::new());
         let halt = mv_state::halt::HaltState {
             halted: true,
             reason: Some("fuzz maintenance".into()),
@@ -2267,6 +2740,100 @@ nexus sessions ? (excluded from workers; they do not count against max_concurren
         assert_eq!(
             content.as_deref(),
             Some("argv:pane read w1:p1 --lines 200\n")
+        );
+    }
+
+    fn seed_unrecorded_done(root: &Path, task: &str) {
+        std::fs::create_dir_all(root.join(".multiverse/tasks").join(task)).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={task}\trole=builder\taccount=seat-b\tagent=sandbox-buil-sb\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".multiverse/tasks").join(task).join("status"),
+            "done",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".multiverse/tasks").join(task).join("result.md"),
+            "# Result\ndone.\n",
+        )
+        .unwrap();
+    }
+
+    fn project_config(root: &Path) -> Config {
+        let toml = format!(
+            "[accounts.seat-b]\n\
+             kind = \"codex\"\n\
+             short = \"sb\"\n\
+             config_dir_var = \"CODEX_HOME\"\n\
+             config_dir = \"/tmp\"\n\
+             pool = \"codex:b\"\n\n\
+             [projects.sandbox]\n\
+             path = \"{}\"\n\n\
+             [projects.sandbox.chains]\n\
+             builder = [\"seat-b\"]\n\n\
+             [roles.builder]\n\
+             write_scope = \"declared\"\n\
+             effort = \"high\"\n\
+             on_exhausted = \"degrade_once\"\n\
+             skills = []\n\n\
+             [roles.builder.models]\n\
+             codex = \"gpt-test\"\n",
+            root.display()
+        );
+        load_config_str(&toml, Path::new("config.toml")).unwrap()
+    }
+
+    fn render_with_auto_reconcile(
+        config: &Config,
+        agents: Option<&[LiveAgent]>,
+        read_only: bool,
+    ) -> String {
+        if !read_only {
+            auto_reconcile_unrecorded(config, agents);
+        }
+        let mut text = render(config, agents);
+        if let Some(note) = unrecorded_note(remaining_unrecorded(config)) {
+            text.push_str("\n\n");
+            text.push_str(&note);
+        }
+        text
+    }
+
+    #[test]
+    fn auto_reconcile_records_an_unrecorded_lane_without_the_reconcile_note() {
+        let root = tempfile::tempdir().unwrap();
+        seed_unrecorded_done(root.path(), "20261101-builder-aaaaaa");
+        let config = project_config(root.path());
+        let output = render_with_auto_reconcile(&config, Some(&[]), false);
+        let log = std::fs::read_to_string(root.path().join(".multiverse/routing.log")).unwrap();
+        assert!(
+            log.contains("event=result\ttask=20261101-builder-aaaaaa"),
+            "workers must auto-reconcile an unrecorded done lane: {log}"
+        );
+        assert!(
+            !output.contains("needs --reconcile"),
+            "auto-reconcile must clear the unrecorded note: {output}"
+        );
+        assert_eq!(remaining_unrecorded(&config), 0);
+    }
+
+    #[test]
+    fn read_only_leaves_an_unrecorded_lane_and_notes_it() {
+        let root = tempfile::tempdir().unwrap();
+        seed_unrecorded_done(root.path(), "20261101-builder-bbbbbb");
+        let config = project_config(root.path());
+        let before = std::fs::read(root.path().join(".multiverse/routing.log")).unwrap();
+        let output = render_with_auto_reconcile(&config, Some(&[]), true);
+        let after = std::fs::read(root.path().join(".multiverse/routing.log")).unwrap();
+        assert_eq!(before, after, "--read-only must not record an outcome");
+        assert!(
+            output.contains("1 unrecorded outcome(s), needs --reconcile"),
+            "read-only must still name the leftover unrecorded lane: {output}"
         );
     }
 }

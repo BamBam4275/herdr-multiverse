@@ -633,10 +633,14 @@ class ElapsedNormalizationTests(unittest.TestCase):
     def test_existing_clock_and_historical_card_ages_still_normalize(self):
         for clock in ("03:16 · 0m", "03:17 · 1m"):
             self.assertEqual(self.render(clock, "board"), "<TIME> · <ELAPSED>")
+        for clock in ("03:16 . 0m", "03:17 . 1m"):
+            self.assertEqual(self.render(clock, "board"), "<TIME> . <ELAPSED>")
         self.assertEqual(self.render("Dec 31 2019 · 6y", "board"),
                          "Dec 31 2019 · <ELAPSED>")
         self.assertEqual(self.render("┌" + "─" * 20 + " 03:16 · 9m ┐", "board"),
                          self.render("┌" + "─" * 19 + " 03:17 · 10m ┐", "board"))
+        self.assertEqual(self.render("+" + "-" * 20 + " 03:16 . 9m +", "board"),
+                         self.render("+" + "-" * 19 + " 03:17 . 10m +", "board"))
 
     def test_resets_normalizes_whole_duration_and_keeps_reason(self):
         for elapsed in ("3m", "2h10m", "6d23h", "3 hr", "2 min"):

@@ -1213,7 +1213,10 @@ pub(crate) fn reorder_chain_by_preference(
 /// has reconciled/recorded it yet, and must not go on holding a
 /// `max_concurrent` slot until a Nexus gets to it (card
 /// `20261110-b-fa4365`: a fleet sat at 15/15 while 7 finished lanes held
-/// slots for 25+ minutes).
+/// slots for 25+ minutes). This count now feeds only the project's own
+/// ceiling and floor gaps: the fleet-wide `max_concurrent` count in
+/// [`fleet_open_counts`] keeps a done-unrecorded lane until it is
+/// reconciled (card `20261122-b-4ad223`, Mike's ASK #1496).
 ///
 /// This reading stays here rather than moving into `mv_state::tasks`:
 /// "finished but unrecorded does not hold a capacity slot" is a
@@ -1257,71 +1260,167 @@ pub(super) fn is_nexus_role(role: &str) -> bool {
 /// `check_fleet_capacity`'s `max_concurrent` comparison is narrowed; a
 /// project's own floor gap is unchanged (not part of this card's decision).
 ///
-/// `pub(super)`, like [`is_nexus_role`]/[`open_task_count`] above, so
-/// `commands::workers` can check its own displayed `workers N/CAP` count
-/// against this one — the number dispatch actually enforces — without a
-/// second, drifting re-derivation (card `20261116-b-ed6d3c`).
+/// `pub(super)`, like [`is_nexus_role`]/[`open_task_count`] above. The
+/// `fleet_open` half is [`fleet_worker_count`] — the very number
+/// `commands::workers` prints as `workers N/CAP` (card
+/// `20261123-b-a80bc1`; it used to be a second join `workers` was only
+/// tested against, card `20261116-b-ed6d3c`). Every unrecorded worker
+/// task counts whatever its status file or Herdr status says (card
+/// `20261122-b-4ad223`), several tasks under one reissued agent name count
+/// once, and a live, dispatched-named pane no history accounts for counts
+/// too.
 ///
 /// `live_statuses` is this moment's [`live_agent_statuses`] reading (agent
-/// name to raw `agent_status`), or `None` to keep today's conservative
-/// count — every unrecorded, still-status-file-less worker task holds its
-/// slot, liveness unchecked, no Herdr call made. Callers pass `None` on
-/// their first (cheap, no-Herdr-call) attempt and only retry with a real
-/// [`live_agent_statuses`] reading when that conservative count would
-/// itself refuse the dispatch (card `20261116-b-8b5b22`): a stranded
-/// task — no recorded result, no status file, no live pane — used to cost
-/// a fleet slot forever that way, disagreeing with `workers` (which
-/// already excludes it, via [`is_task_pane_still_open`]'s own join), until
-/// a Nexus's reconcile finally closed it out. A failed listing (`None`
-/// returned from an actual attempt) keeps the same conservative count: an
-/// unknown never frees a slot. Only the `fleet_open` sum is narrowed this
-/// way — a project's own floor gap (`other_floor_gaps`) is unchanged, same
-/// as card `20261115-b-65fe80` left it.
+/// name to raw `agent_status`), or `None` for the conservative count —
+/// every unrecorded worker task holds its slot, liveness unchecked, no
+/// Herdr call made. A stranded task (no recorded result, no live pane, past
+/// grace) frees its slot only on a real listing (card
+/// `20261116-b-8b5b22`); an untracked live pane can only be seen on one.
+/// Dispatch's admission recheck, under the fleet lock, therefore always
+/// asks for a listing (card `20261123-b-a80bc1`: its cheap first pass,
+/// which skipped the listing whenever it did not already refuse, admitted
+/// past a fleet `workers` read as full); plan time keeps that cheap pass
+/// so a dry run stays Herdr-free, as Python's does. A failed listing (`None` from an actual
+/// attempt) keeps the conservative count: an unknown never frees a slot.
+/// A project's own floor gap (`other_floor_gaps`) is unchanged, same as
+/// card `20261115-b-65fe80` left it.
 pub(super) fn fleet_open_counts(
     config: &Config,
     current_project: &str,
     live_statuses: Option<&HashMap<String, String>>,
 ) -> (u32, Vec<(String, u32)>) {
-    let mut fleet_open = 0u32;
+    let histories = fleet_histories(config);
     let mut other_floor_gaps = Vec::new();
     for (name, project) in &config.projects {
-        let Some(raw) = project.path.value() else {
+        if name == current_project {
+            continue;
+        }
+        let Some((_, tasks)) = canonical_project_root(project)
+            .and_then(|root| histories.iter().find(|(seen, _)| *seen == root))
+        else {
             continue;
         };
-        let Ok(root) = std::fs::canonicalize(raw) else {
-            continue;
-        };
-        let tasks = mv_state::tasks::sweep_tasks(&root);
-        let open_tasks = tasks
+        let open = tasks
             .iter()
-            .filter(|task| !task.recorded && task.file_status.is_none());
-        let open = open_tasks.clone().count() as u32;
-        let worker_open = open_tasks
-            .filter(|task| !is_nexus_role(&task.role))
-            .filter(|task| is_task_pane_still_open(config, task, live_statuses))
+            .filter(|task| !task.recorded && task.file_status.is_none())
             .count() as u32;
-        fleet_open += worker_open;
-        if name != current_project {
-            let gap = project.min_slots.saturating_sub(open);
-            if gap > 0 {
-                other_floor_gaps.push((name.clone(), gap));
-            }
+        let gap = project.min_slots.saturating_sub(open);
+        if gap > 0 {
+            other_floor_gaps.push((name.clone(), gap));
         }
     }
-    (fleet_open, other_floor_gaps)
+    (
+        count_fleet_workers(config, &histories, live_statuses),
+        other_floor_gaps,
+    )
 }
 
-/// Whether an unrecorded, still-status-file-less task still holds a live
-/// pane or agent — [`fleet_open_counts`]'s own join, matched to the one
-/// `commands::workers::open_seat_counts` already does: live when Herdr's
-/// listing reports `working`/`blocked` for the task's dispatched agent
-/// name, or when the task is still within its account's post-dispatch
+/// The one fleet-wide worker count `max_concurrent` is enforced against,
+/// and the `N` `multiverse workers` prints as `workers N/CAP` (card
+/// `20261123-b-a80bc1`: dispatch was admitting while `workers` read
+/// 10/10, because the two were separate joins that disagreed on rows
+/// neither side's tests covered). `commands::workers` calls this with
+/// the same listing it renders its table from, rather than keeping its
+/// own tally, so the two cannot drift apart again.
+///
+/// A slot is held by:
+/// - every unrecorded, non-Nexus task (the newest dispatch under its
+///   agent name) whose agent Herdr still lists, whatever its status or
+///   status file says — working, `waiting-on-shell`, any other idle/done
+///   lane, and `done-unrecorded` — or which is still inside its account's
+///   startup grace;
+/// - every live pane Herdr lists under a dispatched worker name (the
+///   naming `workers` recognizes) that no task history accounts for.
+///
+/// Nexus sessions never hold one, by task role or by session name.
+/// `live_statuses` of `None` (Herdr could not be asked) keeps the
+/// conservative reading [`fleet_open_counts`] documents: every unrecorded
+/// worker task holds its slot, and no untracked pane can be seen.
+pub(super) fn fleet_worker_count(
+    config: &Config,
+    live_statuses: Option<&HashMap<String, String>>,
+) -> u32 {
+    count_fleet_workers(config, &fleet_histories(config), live_statuses)
+}
+
+/// A project's `path`, canonicalized; `None` for a placeholder or a path
+/// that no longer resolves.
+fn canonical_project_root(project: &mv_config::load::Project) -> Option<PathBuf> {
+    std::fs::canonicalize(project.path.value()?).ok()
+}
+
+/// Every resolvable project's task history, once per distinct root — two
+/// config entries naming the same checkout must not count its lanes twice.
+fn fleet_histories(config: &Config) -> Vec<(PathBuf, Vec<mv_state::tasks::SweepTask>)> {
+    let mut histories: Vec<(PathBuf, Vec<mv_state::tasks::SweepTask>)> = Vec::new();
+    for project in config.projects.values() {
+        let Some(root) = canonical_project_root(project) else {
+            continue;
+        };
+        if histories.iter().any(|(seen, _)| *seen == root) {
+            continue;
+        }
+        let tasks = mv_state::tasks::sweep_tasks(&root);
+        histories.push((root, tasks));
+    }
+    histories
+}
+
+/// [`fleet_worker_count`] over already-read histories.
+fn count_fleet_workers(
+    config: &Config,
+    histories: &[(PathBuf, Vec<mv_state::tasks::SweepTask>)],
+    live_statuses: Option<&HashMap<String, String>>,
+) -> u32 {
+    let tasks: Vec<&mv_state::tasks::SweepTask> =
+        histories.iter().flat_map(|(_, tasks)| tasks).collect();
+    // Only the newest dispatch under a reissued agent name answers for
+    // it, joined fleet-wide the way `workers` joins a live pane to history.
+    let mut latest_ordinal: HashMap<&str, u64> = HashMap::new();
+    for task in &tasks {
+        if let Some(agent) = task.agent.as_deref() {
+            let ordinal = latest_ordinal.entry(agent).or_default();
+            *ordinal = (*ordinal).max(task.dispatch_ordinal);
+        }
+    }
+    let task_rows = tasks
+        .iter()
+        .filter(|task| !task.recorded)
+        .filter(|task| !is_nexus_role(&task.role))
+        .filter(|task| {
+            task.agent.as_deref().is_none_or(|agent| {
+                latest_ordinal.get(agent).copied() == Some(task.dispatch_ordinal)
+                    && !super::workers::is_nexus_session_name(config, agent)
+            })
+        })
+        .filter(|task| is_task_pane_still_open(config, task, live_statuses))
+        .count();
+    let untracked_panes = live_statuses.map_or(0, |statuses| {
+        statuses
+            .keys()
+            .filter(|name| !latest_ordinal.contains_key(name.as_str()))
+            .filter(|name| !super::workers::is_nexus_session_name(config, name))
+            .filter(|name| super::workers::is_dispatched_name(config, name))
+            .count()
+    });
+    (task_rows + untracked_panes) as u32
+}
+
+/// Whether an unrecorded task still holds a live pane or agent —
+/// [`fleet_open_counts`]'s own join, matched to the `workers N/CAP` row
+/// count: live when Herdr's listing still lists the task's dispatched
+/// agent name at all, whatever its `agent_status` (card
+/// `20261122-b-4ad223`: an idle/done lane waiting on its own background
+/// shell, or one that wrote `done` nobody has recorded yet, still holds
+/// its pane), or when the task is still within its account's post-dispatch
 /// [`grace_open_counts`]-style startup grace (so a pane Herdr has not
 /// caught up on yet is never mistaken for stranded). `live_statuses` of
 /// `None` (the listing itself could not be asked) always reads as still
 /// open — the conservative, pre-card-`20261116-b-8b5b22` posture, so an
-/// unknown never frees a slot. An unresolvable account — the same gate
-/// `open_seat_counts` applies — reads as not open, same as that caller.
+/// unknown never frees a slot. An unresolvable account (a renamed or
+/// retired seat) only forfeits the grace: a pane Herdr still lists holds
+/// its slot whatever account it was dispatched on, as `workers` counts it
+/// (card `20261123-b-a80bc1`).
 fn is_task_pane_still_open(
     config: &Config,
     task: &mv_state::tasks::SweepTask,
@@ -1330,18 +1429,16 @@ fn is_task_pane_still_open(
     let Some(statuses) = live_statuses else {
         return true;
     };
+    if task
+        .agent
+        .as_deref()
+        .is_some_and(|agent| statuses.contains_key(agent))
+    {
+        return true;
+    }
     let Some(account) = resolve_task_account(task, config) else {
         return false;
     };
-    let status = task
-        .agent
-        .as_deref()
-        .and_then(|agent| statuses.get(agent))
-        .map(String::as_str)
-        .unwrap_or("");
-    if is_open_agent_status(status) {
-        return true;
-    }
     let grace = time::Duration::seconds(account.startup_grace_seconds.unwrap_or(600).into());
     let now = time::OffsetDateTime::now_utc();
     match task.started_at {
@@ -1366,14 +1463,20 @@ fn is_task_pane_still_open(
 /// `capacity_source` does, rather than keeping a second copy of this call
 /// (card `20261117-b-f2b742`).
 pub(super) fn live_agent_statuses() -> Option<HashMap<String, String>> {
+    checked_agent_statuses(&live_agent_listing()?)
+}
+
+/// One live `agent list` reply, or `None` when Herdr could not be asked
+/// (spawn failure or a non-`ok` reply) — the single round trip
+/// [`live_agent_statuses`] and [`live_open_counts`] each fold, and that
+/// `RealDispatchStore::recheck_admission` folds both ways from one call so
+/// its fleet count and its seat-cap probe read the same moment.
+fn live_agent_listing() -> Option<CommandResult> {
     let mut herdr = runner::ProcessHerdr;
     let result = herdr
         .call(&argv::agent_list(), Duration::from_secs(10))
         .ok()?;
-    if !result.ok() {
-        return None;
-    }
-    checked_agent_statuses(&result)
+    result.ok().then_some(result)
 }
 
 /// `result`'s agent-status map, or `None` when `result.agents` is missing
@@ -1628,14 +1731,12 @@ fn grace_open_counts(
 /// is folded in here so every caller sees the post-start grace window
 /// without having to ask for it separately.
 fn live_open_counts(config: &Config) -> Option<HashMap<String, u32>> {
-    let mut herdr = runner::ProcessHerdr;
-    let result = herdr
-        .call(&argv::agent_list(), Duration::from_secs(10))
-        .ok()?;
-    if !result.ok() {
-        return None;
-    }
-    let statuses = agent_status_by_name(&result);
+    Some(open_counts_from_listing(config, &live_agent_listing()?))
+}
+
+/// [`live_open_counts`]'s fold of an already-fetched `agent list` reply.
+fn open_counts_from_listing(config: &Config, result: &CommandResult) -> HashMap<String, u32> {
+    let statuses = agent_status_by_name(result);
     let latest = latest_tasks_by_agent(config);
     let mut counts = live_seat_counts(&statuses, &latest, config);
     for (short, grace_count) in
@@ -1643,7 +1744,7 @@ fn live_open_counts(config: &Config) -> Option<HashMap<String, u32>> {
     {
         *counts.entry(short).or_insert(0) += grace_count;
     }
-    Some(counts)
+    counts
 }
 
 /// One chain entry's config, joined with the live seatstate reads
@@ -1773,7 +1874,28 @@ fn to_engine_error(
         | engine_dispatch::DispatchError::FleetHaltUnreadable { .. }) => {
             EngineError::FleetHalted(halt.to_string())
         }
-        other => EngineError::NeedsConfig(other.to_string()),
+        other => EngineError::NeedsConfig(capacity_refusal_text(&other)),
+    }
+}
+
+/// `error`'s own `Display`, with a fleet-cap refusal led by the same
+/// `workers N/CAP` count `multiverse workers` prints (card
+/// `20261122-b-4ad223`), so an operator reading the refusal sees the
+/// number the panel shows rather than a second phrasing of it.
+fn capacity_refusal_text(error: &engine_dispatch::DispatchError) -> String {
+    match error {
+        engine_dispatch::DispatchError::FleetCapExceeded { running, cap } => {
+            format!("workers {running}/{cap}: {error}")
+        }
+        engine_dispatch::DispatchError::CapacityWaitTimedOut {
+            refusal,
+            waited_secs,
+        } => format!(
+            "{}{}",
+            capacity_refusal_text(refusal),
+            engine_dispatch::waited_note(*waited_secs)
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -2245,6 +2367,74 @@ struct Resolved {
     /// [`RealEngine::dispatch`] does not re-print it on its own, separate
     /// `resolve()` call for a real dispatch.
     scope_warning: Option<String>,
+    /// Seconds this dispatch has spent waiting under `--wait-for-seat` so
+    /// far — the `already_waited` it was resolved with plus whatever this
+    /// resolve's own plan-time waits slept (card `20261122-b-4c82c5`).
+    waited: f64,
+}
+
+/// [`selector::RealSleeper`], tallying how long it slept so
+/// [`RealEngine::resolve_with`] can report a plan-time wait's length to
+/// [`RealEngine::dispatch`]: `--wait-for-seat-seconds` bounds the time
+/// spent waiting, not the planning and admission work around it (card
+/// `20261122-b-4c82c5`).
+#[derive(Default)]
+struct TallyingSleeper {
+    slept: f64,
+}
+
+impl selector::Sleeper for TallyingSleeper {
+    fn sleep(&mut self, duration: Duration) {
+        self.slept += duration.as_secs_f64();
+        selector::RealSleeper.sleep(duration);
+    }
+}
+
+/// One seat [`RealDispatchStore::recheck_admission`] refused because it
+/// was already at its open-agent cap by the time the fleet lock was held
+/// — selection saw room, another dispatch took it in between (card
+/// `20261122-b-e78b3b`). [`RealEngine::dispatch`] re-runs selection with
+/// every such seat pinned at this count, so the chain falls through to the
+/// next entry the role's own fallback policy allows rather than refusing
+/// outright.
+#[derive(Debug, Clone)]
+struct FullAtAdmission {
+    seat: String,
+    open_now: u32,
+    cap: u32,
+}
+
+/// The refusal [`RealEngine::dispatch`] returns once a chain fallthrough
+/// (card `20261122-b-e78b3b`) has run out of seats: names every seat
+/// admission found full, then — when it was re-selection rather than the
+/// chain's length that stopped the walk — the selector's own refusal.
+/// Always [`EngineError::Refused`] (`EXIT_ERROR`), the same exit an
+/// admission-time seat-cap refusal had before any fallthrough existed.
+fn no_seat_admitted(
+    role_display: &str,
+    tried: &[FullAtAdmission],
+    reselection: Option<EngineError>,
+) -> EngineError {
+    let seats = tried
+        .iter()
+        .map(|f| format!("{} ({}/{} open)", f.seat, f.open_now, f.cap))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = format!(
+        "dispatch: {role_display}: no seat could be admitted; each seat tried was at its \
+         open-agent cap by admission: {seats}"
+    );
+    if let Some(error) = reselection {
+        let text = match error {
+            EngineError::FleetHalted(text)
+            | EngineError::ProjectResolution(text)
+            | EngineError::NeedsConfig(text)
+            | EngineError::Refused(text)
+            | EngineError::RoleNotImplemented(text) => text,
+        };
+        message.push_str(&format!("\nre-selection without them refused: {text}"));
+    }
+    EngineError::Refused(message)
 }
 
 /// The real [`Engine`]: reads `config.toml`, resolves the project and
@@ -2263,6 +2453,36 @@ impl RealEngine {
     /// module doc; previously the `--dry-run` card alone used the
     /// retired name, task `20261102-fixer-e1e2c3`).
     fn resolve(&self, request: &Request) -> Result<Resolved, EngineError> {
+        self.resolve_with(request, &[], 0.0)
+    }
+
+    /// [`RealEngine::resolve`], with every seat in `full_at_admission`
+    /// read as at its cap regardless of what the live count says now —
+    /// [`RealEngine::dispatch`]'s chain fallthrough (card
+    /// `20261122-b-e78b3b`). Pinned rather than dropped from the chain, so
+    /// the role's own `on_exhausted` policy still decides whether an
+    /// `AtCapacity` skip may fall through, exactly as it would have had
+    /// selection seen the fresh count in the first place; and pinned
+    /// rather than re-read, so a seat whose count flickers cannot be
+    /// picked, refused, and picked again.
+    ///
+    /// Under `--wait-for-seat` the pin holds for this re-selection's first
+    /// chain read only (card `20261123-b-03108f`): every later poll of the
+    /// wait re-reads each seat's live count, so a seat admission found
+    /// full is picked up again once it actually frees, rather than read as
+    /// full for the rest of the wait.
+    ///
+    /// `already_waited` is how long this dispatch has already spent
+    /// waiting under `--wait-for-seat` (card `20261122-b-4c82c5`): `0.0`
+    /// on a first resolve, the elapsed wait when [`RealEngine::dispatch`]
+    /// re-plans after admission found the fleet full, so the
+    /// `--wait-for-seat-seconds` budget bounds the whole dispatch.
+    fn resolve_with(
+        &self,
+        request: &Request,
+        full_at_admission: &[FullAtAdmission],
+        already_waited: f64,
+    ) -> Result<Resolved, EngineError> {
         // Resolved before `config.toml` is ever read: a path that does not
         // exist refuses on that fact alone, with no dependency on — or
         // need to load — whatever config happens to be on this machine.
@@ -2318,15 +2538,26 @@ impl RealEngine {
         // Card 20261102-b-15ee38: one live `agent list` call, made only
         // when at least one chain entry is actually capped — see
         // `live_open_counts`/`seat_from_account`'s own doc comments.
-        let live_counts = chain_names
-            .iter()
-            .any(|name| mv_engine::seatstate::get_cap(&config_dir, name).is_some())
-            .then(|| live_open_counts(&config))
-            .flatten();
-        let seats: Vec<Seat> = chain_names
-            .iter()
-            .map(|name| seat_from_account(&config.accounts[name], &config_dir, &live_counts))
-            .collect();
+        let read_chain = |pin: bool| -> Vec<Seat> {
+            let live_counts = chain_names
+                .iter()
+                .any(|name| mv_engine::seatstate::get_cap(&config_dir, name).is_some())
+                .then(|| live_open_counts(&config))
+                .flatten();
+            chain_names
+                .iter()
+                .map(|name| {
+                    let mut seat =
+                        seat_from_account(&config.accounts[name], &config_dir, &live_counts);
+                    if let Some(full) = full_at_admission.iter().find(|f| pin && &f.seat == name) {
+                        seat.cap = Some(full.cap);
+                        seat.open_count = Some(full.open_now.max(full.cap));
+                    }
+                    seat
+                })
+                .collect()
+        };
+        let seats: Vec<Seat> = read_chain(true);
 
         let role_settings = config.roles.get(&role);
         let on_exhausted = role_settings
@@ -2375,7 +2606,11 @@ impl RealEngine {
             // recorded result, no status file, no live pane) does not go
             // on costing a fleet slot once that refusal is the only thing
             // standing in the way. A fleet nowhere near its cap never
-            // makes this call at all.
+            // makes this call at all, so a dry run stays Herdr-free.
+            // Admission (`RealDispatchStore::recheck_admission`) is the
+            // authoritative check and always takes the live listing (card
+            // `20261123-b-a80bc1`): this plan-time pass cannot see a live
+            // worker pane no task history accounts for.
             if engine_dispatch::check_fleet_capacity(&inputs).is_err() {
                 let live_statuses = live_agent_statuses();
                 inputs.fleet_open =
@@ -2408,6 +2643,7 @@ impl RealEngine {
                     .wait_for_seat_seconds
                     .unwrap_or(selector::DEFAULT_SEAT_WAIT_TIMEOUT_SECS),
             ),
+            already_waited,
             force: request.force,
             dry_run: request.dry_run,
         };
@@ -2428,15 +2664,24 @@ impl RealEngine {
             &ConfigAccounts(&config),
         )
         .map_err(|e| to_engine_error(e, &role_display, &project_name))?;
+        // Card 20261123-b-31b32b: a `--wait-for-seat` poll re-reads every
+        // capped seat's live open count, so a seat that frees mid-wait is
+        // picked up; the first poll reuses the read just made above rather
+        // than paying for a second `agent list` straight away. Card
+        // 20261123-b-03108f: later polls drop the admission pins too.
+        let mut first_chain = Some(seats.clone());
+        let mut chain_source = || first_chain.take().unwrap_or_else(|| read_chain(false));
+        let mut sleeper = TallyingSleeper::default();
         let selection = engine_dispatch::plan_dispatch(
             &req,
             &routing,
             &ConfigAccounts(&config),
             &routing,
             &mut capacity_source,
+            &mut chain_source,
             &halt,
             &breaker,
-            &mut selector::RealSleeper,
+            &mut sleeper,
             Instant::now(),
         )
         .map_err(|e| to_engine_error(e, &role_display, &project_name))?;
@@ -2479,6 +2724,7 @@ impl RealEngine {
             model,
             exclusion_notes: exclusions.notes,
             scope_warning,
+            waited: already_waited + sleeper.slept,
         })
     }
 }
@@ -2534,10 +2780,21 @@ impl Engine for RealEngine {
             }
         }
 
+        // Card `20261122-b-4c82c5`: `--wait-for-seat`'s budget covers every
+        // wait this dispatch makes — plan-time waits (`Resolved::waited`)
+        // and any wait after admission finds the fleet full.
+        let waiting =
+            !request.dry_run && (request.wait_for_seat || request.wait_for_seat_seconds.is_some());
+        let wait_budget = request
+            .wait_for_seat_seconds
+            .unwrap_or(selector::DEFAULT_SEAT_WAIT_TIMEOUT_SECS);
+
         let resolved = self.resolve(request)?;
         let role_display = resolved.role_display.clone();
         let minted_role_key = resolved.minted_role_key;
-        let seat_name = resolved.selection.seat.name.clone();
+        let mut seat_name = resolved.selection.seat.name.clone();
+        let mut waited = resolved.waited;
+        let chain_len = resolved.chain_names.len();
 
         // Critic finding 1 / card 20261102-b-0a4062: Python refuses
         // `--into` outright for a non-writer (`LaneAdoptionNotWritingError`)
@@ -2569,7 +2826,139 @@ impl Engine for RealEngine {
             .then(|| tree_state(&store.project_root))
             .flatten();
 
-        match runner::dispatch(&mut store, &mut herdr, &current_pane, &timing) {
+        // Card `20261122-b-e78b3b`: a seat selection saw room on can be
+        // full by the time admission holds the fleet lock — another
+        // dispatch took its last slot in between. Rather than refusing,
+        // re-run selection with that seat pinned at its cap and try the
+        // seat the chain falls through to, at most once per chain entry.
+        // Only the selected seat's own open-agent cap falls through
+        // ([`RealDispatchStore::admission_seat_full`]); a fleet-wide
+        // `max_concurrent` or project-slot refusal applies to every seat
+        // alike, so it is still returned as-is. A refusal at admission
+        // happens before any routing-log line, pane, or lane exists, and
+        // `runner::dispatch` has already released this attempt's breaker
+        // trial, so the next attempt starts clean.
+        let mut full_at_admission: Vec<FullAtAdmission> = Vec::new();
+        let mut fallthrough_notes: Vec<String> = Vec::new();
+        let mut noted_fleet_wait = false;
+        let attempt = loop {
+            let attempt = runner::dispatch(&mut store, &mut herdr, &current_pane, &timing);
+            // Card `20261122-b-4c82c5`: selection saw a free fleet slot
+            // (or waited for one), but by the time admission held the fleet
+            // lock the fleet was full again — a sibling `--wait-for-seat`
+            // dispatch woke on the same freed slot, or the cap was lowered
+            // under live agents. Without `--wait-for-seat` that is still a
+            // refusal; with it, wait a poll interval and re-plan on fresh
+            // counts (plan-time waits again if still full) until the budget
+            // runs out, then refuse saying how long was waited.
+            if let Some(full) = attempt
+                .is_err()
+                .then(|| store.admission_fleet_full.take())
+                .flatten()
+            {
+                if !waiting {
+                    break attempt;
+                }
+                if waited >= wait_budget {
+                    return Err(EngineError::Refused(format!(
+                        "dispatch: {role_display} on {seat_name}: {full}{}",
+                        engine_dispatch::waited_note(waited)
+                    )));
+                }
+                fallthrough_notes.append(&mut store.reconcile_notes);
+                if !noted_fleet_wait {
+                    noted_fleet_wait = true;
+                    fallthrough_notes.push(format!(
+                        "  admission found the fleet full ({full}); waited for a free slot \
+                         (--wait-for-seat)"
+                    ));
+                }
+                let pause = selector::DEFAULT_POLL_INTERVAL_SECS.min(wait_budget - waited);
+                thread::sleep(Duration::from_secs_f64(pause));
+                let next = self.resolve_with(request, &full_at_admission, waited + pause)?;
+                waited = next.waited;
+                seat_name = next.selection.seat.name.clone();
+                store = RealDispatchStore::new(next, request);
+                continue;
+            }
+            let Some((open_now, cap)) = attempt
+                .is_err()
+                .then(|| store.admission_seat_full.take())
+                .flatten()
+            else {
+                break attempt;
+            };
+            fallthrough_notes.append(&mut store.reconcile_notes);
+            // Card `20261123-b-03108f`: under `--wait-for-seat`, a seat full
+            // at admission is waited on like a full fleet rather than
+            // refused once the chain runs out of seats. Re-planning pins it
+            // for the first read only (see [`RealEngine::resolve_with`]),
+            // so each round either falls through to a seat not yet pinned
+            // or waits at least one poll and re-reads live counts — the
+            // `--wait-for-seat-seconds` budget bounds the whole loop, and
+            // a timed-out wait refuses saying how long it waited.
+            if waiting {
+                match full_at_admission.iter_mut().find(|f| f.seat == seat_name) {
+                    Some(full) => {
+                        full.open_now = open_now;
+                        full.cap = cap;
+                    }
+                    None => full_at_admission.push(FullAtAdmission {
+                        seat: seat_name.clone(),
+                        open_now,
+                        cap,
+                    }),
+                }
+                let next = self.resolve_with(request, &full_at_admission, waited)?;
+                let action = if next.selection.seat.name == seat_name {
+                    "waited for it to free (--wait-for-seat)".to_string()
+                } else {
+                    format!("falling through to {:?}", next.selection.seat.name)
+                };
+                fallthrough_notes.push(format!(
+                    "  seat {seat_name:?} reached its open-agent cap before admission \
+                     ({open_now}/{cap} open); {action}"
+                ));
+                waited = next.waited;
+                seat_name = next.selection.seat.name.clone();
+                store = RealDispatchStore::new(next, request);
+                continue;
+            }
+            full_at_admission.push(FullAtAdmission {
+                seat: seat_name.clone(),
+                open_now,
+                cap,
+            });
+            if full_at_admission.len() >= chain_len {
+                // A one-seat chain had nowhere to fall through to: keep
+                // its refusal exactly as it always read.
+                if full_at_admission.len() == 1 {
+                    break attempt;
+                }
+                return Err(no_seat_admitted(&role_display, &full_at_admission, None));
+            }
+            let next = match self.resolve_with(request, &full_at_admission, waited) {
+                Ok(next) => next,
+                Err(halt @ EngineError::FleetHalted(_)) => return Err(halt),
+                Err(other) => {
+                    return Err(no_seat_admitted(
+                        &role_display,
+                        &full_at_admission,
+                        Some(other),
+                    ))
+                }
+            };
+            fallthrough_notes.push(format!(
+                "  seat {seat_name:?} reached its open-agent cap before admission \
+                 ({open_now}/{cap} open); falling through to {:?}",
+                next.selection.seat.name
+            ));
+            waited = next.waited;
+            seat_name = next.selection.seat.name.clone();
+            store = RealDispatchStore::new(next, request);
+        };
+
+        match attempt {
             Ok(dispatched) => {
                 let worktree = store
                     .isolated
@@ -2691,7 +3080,10 @@ impl Engine for RealEngine {
                     seat: dispatched.launch.seat.clone(),
                     task_id: dispatched.launch.task_id.clone(),
                     dry_run_report: String::new(),
-                    pre_dispatch_notes: std::mem::take(&mut store.reconcile_notes),
+                    pre_dispatch_notes: {
+                        fallthrough_notes.append(&mut store.reconcile_notes);
+                        fallthrough_notes
+                    },
                     worktree,
                     branch,
                     linked_backlog,
@@ -2871,6 +3263,19 @@ pub(super) struct RealDispatchStore {
     /// own `_run_dispatch` call. Always empty for a council seat, which
     /// skips the pass entirely (`FleetLock::AlreadyHeld`).
     reconcile_notes: Vec<String>,
+    /// `(open_now, cap)` when [`recheck_admission`](DispatchStore::recheck_admission)
+    /// refused because this store's own seat was at its open-agent cap —
+    /// the one admission refusal [`RealEngine::dispatch`] answers by
+    /// falling through to the next chain entry (card `20261122-b-e78b3b`)
+    /// rather than returning. `None` for every other refusal.
+    admission_seat_full: Option<(u32, u32)>,
+    /// The refusal text when [`recheck_admission`](DispatchStore::recheck_admission)
+    /// refused because the fleet (or this project's slots) was already
+    /// full under the fleet lock — the admission refusal a `--wait-for-seat`
+    /// dispatch answers by waiting and re-planning (card
+    /// `20261122-b-4c82c5`) rather than returning at once. `None` for
+    /// every other refusal.
+    admission_fleet_full: Option<String>,
 }
 
 impl RealDispatchStore {
@@ -2940,6 +3345,8 @@ impl RealDispatchStore {
                 .clone()
                 .map(|token| (resolved.selection.seat.pool.clone(), token)),
             reconcile_notes: Vec::new(),
+            admission_seat_full: None,
+            admission_fleet_full: None,
         }
     }
 
@@ -3025,6 +3432,8 @@ impl RealDispatchStore {
             trial: None,
             no_reconcile: false,
             reconcile_notes: Vec::new(),
+            admission_seat_full: None,
+            admission_fleet_full: None,
         }
     }
 
@@ -3369,19 +3778,30 @@ impl RealDispatchStore {
 /// (`commands::tasks::reclaimable_and_report`) records that bookkeeping —
 /// a `dispatch` call must never write it as a side effect, recorded or
 /// not, of trying to admit a different task.
-fn reclaim_stale_panes(root: &Path, agents: &mut impl mv_state::tasks::AgentPanes) -> usize {
+///
+/// Card `20261122-b-4ad223`: a Claude pane whose footer still shows a
+/// running background shell ([`reclaim_shell_check`]) is kept open, and
+/// so is one whose text could not be read to rule that out. The second
+/// count returned is the panes kept as `waiting-on-shell`.
+fn reclaim_stale_panes(
+    config: &Config,
+    root: &Path,
+    agents: &mut impl mv_state::tasks::AgentPanes,
+) -> (usize, usize) {
     let (candidates, _stale) = mv_state::tasks::reclaimable_panes(root, agents);
     if candidates.is_empty() {
-        return 0;
+        return (0, 0);
     }
     // A failed probe is "nothing known live", never "nothing is live" —
     // the same posture `AgentPanes::list_checked`'s own doc comment
     // requires, and the same read `supersede_collision_predecessor` and
     // `sweep_project` already give it.
     let Some(live_now) = agents.list_checked() else {
-        return 0;
+        return (0, 0);
     };
+    let tasks = mv_state::tasks::sweep_tasks(root);
     let mut reclaimed = 0;
+    let mut kept_waiting = 0;
     for candidate in &candidates {
         let Some(current) = live_now.iter().find(|a| a.pane_id == candidate.pane) else {
             continue;
@@ -3395,11 +3815,66 @@ fn reclaim_stale_panes(root: &Path, agents: &mut impl mv_state::tasks::AgentPane
         {
             continue;
         }
+        match reclaim_shell_check(config, &tasks, candidate, agents) {
+            ReclaimShellCheck::Clear => {}
+            ReclaimShellCheck::WaitingOnShell => {
+                kept_waiting += 1;
+                continue;
+            }
+            ReclaimShellCheck::Unreadable => continue,
+        }
         if agents.close(&candidate.pane) {
             reclaimed += 1;
         }
     }
-    reclaimed
+    (reclaimed, kept_waiting)
+}
+
+/// [`reclaim_shell_check`]'s verdict on one reclaim candidate's pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReclaimShellCheck {
+    /// Nothing in the pane says a background job is still running (or the
+    /// seat is not Claude, whose footer is the only one read).
+    Clear,
+    /// The pane's footer still shows a running shell or monitor
+    /// ([`mv_engine::sweep_nudges::waiting_on_shell`]): keep it open.
+    WaitingOnShell,
+    /// A Claude pane whose text could not be read, so a running shell
+    /// cannot be ruled out: keep it open too.
+    Unreadable,
+}
+
+/// Whether a recorded reclaim candidate's Claude pane is still waiting on
+/// a background shell it started (card `20261122-b-4ad223`). A recorded
+/// lane can have finished its result while a suite it launched is still
+/// running, and Herdr reports that pane idle/done like a finished one.
+/// Only a candidate whose task's own seat is a configured `claude`
+/// account is read, the same Claude-only scope `workers` and the stall
+/// wake give the footer; every other candidate is [`ReclaimShellCheck::
+/// Clear`] with no Herdr call made. Shared by [`reclaim_stale_panes`] and
+/// `commands::tasks`'s `--reclaimable`.
+pub(super) fn reclaim_shell_check(
+    config: &Config,
+    tasks: &[mv_state::tasks::SweepTask],
+    candidate: &mv_state::tasks::ReclaimCandidate,
+    agents: &mut impl mv_state::tasks::AgentPanes,
+) -> ReclaimShellCheck {
+    let claude_seat = tasks
+        .iter()
+        .find(|task| task.task_id == candidate.task_id)
+        .and_then(|task| task.account.as_deref())
+        .and_then(|account| config.accounts.get(account))
+        .is_some_and(|account| account.kind == "claude");
+    if !claude_seat {
+        return ReclaimShellCheck::Clear;
+    }
+    match agents.read_visible(&candidate.pane) {
+        Some(text) if mv_engine::sweep_nudges::waiting_on_shell(&text) => {
+            ReclaimShellCheck::WaitingOnShell
+        }
+        Some(_) => ReclaimShellCheck::Clear,
+        None => ReclaimShellCheck::Unreadable,
+    }
 }
 
 /// `{account name: minutes}` for every account with its own
@@ -3464,7 +3939,7 @@ fn reconcile_and_reclaim_fleet(
         },
         agents,
     );
-    let reclaimed = reclaim_stale_panes(dispatching_root, agents);
+    let (reclaimed, kept_waiting) = reclaim_stale_panes(config, dispatching_root, agents);
     // Python `cli.py:3669-3692`: reconciled, then reclaimed, then
     // superseded, then lease-expired — in that order, each only when its
     // own count is nonzero.
@@ -3479,6 +3954,9 @@ fn reconcile_and_reclaim_fleet(
         notes.push(format!(
             "  reclaimed {reclaimed} pane(s) in {dispatching_project} before dispatching"
         ));
+    }
+    if kept_waiting > 0 {
+        notes.push(waiting_on_shell_note(kept_waiting, dispatching_project));
     }
     if !outcome.superseded.is_empty() {
         notes.push(format!(
@@ -3502,14 +3980,26 @@ fn reconcile_and_reclaim_fleet(
         let Ok(root) = std::fs::canonicalize(raw) else {
             continue;
         };
-        let reclaimed = reclaim_stale_panes(&root, agents);
+        let (reclaimed, kept_waiting) = reclaim_stale_panes(config, &root, agents);
         if reclaimed > 0 {
             notes.push(format!(
                 "  reclaimed {reclaimed} pane(s) in {name} before dispatching"
             ));
         }
+        if kept_waiting > 0 {
+            notes.push(waiting_on_shell_note(kept_waiting, name));
+        }
     }
     notes
+}
+
+/// The pre-dispatch note for reclaimable panes [`reclaim_stale_panes`]
+/// kept open because a background shell is still running in them.
+fn waiting_on_shell_note(kept: usize, project: &str) -> String {
+    format!(
+        "  kept {kept} waiting-on-shell pane(s) in {project} open before dispatching \
+         (a background shell is still running)"
+    )
 }
 
 /// Port of Python's `dispatch.redispatch_predecessor_ids`
@@ -4003,10 +4493,17 @@ impl DispatchStore for RealDispatchStore {
                 &mut agents,
             );
         }
+        // Card 20261123-b-a80bc1: the same live count `plan_dispatch`'s
+        // `capacity_source` and `workers N/CAP` use, asked fresh under the
+        // fleet lock — never a conservative pass that skips the listing
+        // when it happens not to refuse. One `agent list` serves both this
+        // count and the seat-cap probe below.
+        let listing = live_agent_listing();
+        let live_statuses = listing.as_ref().and_then(checked_agent_statuses);
         let (fleet_open, other_floor_gaps) =
-            fleet_open_counts(&self.config, &self.project_name, None);
+            fleet_open_counts(&self.config, &self.project_name, live_statuses.as_ref());
         let project = &self.config.projects[&self.project_name];
-        let mut capacity = engine_dispatch::FleetCapacityInputs {
+        let capacity = engine_dispatch::FleetCapacityInputs {
             max_concurrent: self.config.max_concurrent,
             fleet_open,
             project_open: open_task_count(&self.project_root),
@@ -4015,27 +4512,24 @@ impl DispatchStore for RealDispatchStore {
             other_floor_gaps,
             batch_count: 1,
         };
-        // Card 20261116-b-8b5b22: same posture as `plan_dispatch`'s own
-        // `capacity_source` — a live `agent list` round trip is only worth
-        // its cost when the conservative count above would actually
-        // refuse this dispatch, so a stranded task does not go on costing
-        // a fleet slot once that refusal is the only thing in the way.
-        if engine_dispatch::check_fleet_capacity(&capacity).is_err() {
-            let live_statuses = live_agent_statuses();
-            capacity.fleet_open =
-                fleet_open_counts(&self.config, &self.project_name, live_statuses.as_ref()).0;
+        if let Err(e) = engine_dispatch::check_fleet_capacity(&capacity) {
+            let text = capacity_refusal_text(&e);
+            self.admission_fleet_full = Some(text.clone());
+            return Err(RunnerError::Refused(text));
         }
-        engine_dispatch::check_fleet_capacity(&capacity)
-            .map_err(|e| RunnerError::Refused(e.to_string()))?;
 
         if let Some(cap) = mv_engine::seatstate::get_cap(&self.config_dir, &self.account.name) {
-            let open_now = match live_open_counts(&self.config) {
+            let open_now = match listing
+                .as_ref()
+                .map(|result| open_counts_from_listing(&self.config, result))
+            {
                 Some(counts) => counts.get(&self.account.short).copied().unwrap_or(0),
                 // Herdr unreadable reads as at-cap, the same fail-closed
                 // posture `seat_from_account` already takes at plan time.
                 None => cap,
             };
             if open_now >= cap {
+                self.admission_seat_full = Some((open_now, cap));
                 return Err(RunnerError::Refused(format!(
                     "seat {:?} is now at its open-agent cap ({open_now}/{cap} open)",
                     self.account.name
@@ -5101,6 +5595,9 @@ mod tests {
         /// fake that was never told to answer this probe, same posture
         /// as the trait default: `pane_label` returns `None`.
         labels: HashMap<String, String>,
+        /// `agent read`'s visible text, by pane id; a pane with no entry
+        /// reads as "could not ask", same as the trait default.
+        visible: HashMap<String, String>,
     }
 
     impl FakeFleetAgents {
@@ -5144,6 +5641,10 @@ mod tests {
 
         fn pane_label(&mut self, pane_id: &str) -> Option<String> {
             self.labels.get(pane_id).cloned()
+        }
+
+        fn read_visible(&mut self, pane_id: &str) -> Option<String> {
+            self.visible.get(pane_id).cloned()
         }
     }
 
@@ -5203,6 +5704,7 @@ mod tests {
             live: vec![FakeFleetAgents::idle("w2:p1", "mv-fixer-b")],
             closed: Vec::new(),
             labels: HashMap::new(),
+            visible: HashMap::new(),
         }
         .with_label("w2:p1", "fixer · 20260101-fixer-bbbbbb");
         reconcile_and_reclaim_fleet(&config, "a", &root_a, &mut agents);
@@ -5248,8 +5750,10 @@ mod tests {
             live: vec![FakeFleetAgents::idle("w1:p1", "unrelated-agent")],
             closed: Vec::new(),
             labels: HashMap::new(),
+            visible: HashMap::new(),
         };
-        reclaim_stale_panes(&root, &mut agents);
+        let config = load::load_config_str("", &dir.path().join("config.toml")).unwrap();
+        reclaim_stale_panes(&config, &root, &mut agents);
         assert!(
             agents.closed.is_empty(),
             "a reused pane under an unrelated agent must never be closed: {:?}",
@@ -5275,9 +5779,77 @@ mod tests {
             live: vec![FakeFleetAgents::idle("w1:p1", "mv-fixer-a")],
             closed: Vec::new(),
             labels: HashMap::new(),
+            visible: HashMap::new(),
         }
         .with_label("w1:p1", "fixer · 20260101-fixer-aaaaaa");
-        reclaim_stale_panes(&root, &mut agents);
+        let config = load::load_config_str("", &dir.path().join("config.toml")).unwrap();
+        reclaim_stale_panes(&config, &root, &mut agents);
+        assert_eq!(agents.closed, vec!["w1:p1".to_string()]);
+    }
+
+    /// Card `20261122-b-4ad223`: a recorded, otherwise reclaimable Claude
+    /// lane whose pane footer still shows a running background shell is
+    /// kept open by the pre-dispatch reclaim and reported as kept
+    /// waiting-on-shell; the same pane with the footer gone is closed, and
+    /// a Claude pane whose text cannot be read is kept (fail closed).
+    /// Revert check: drop the [`reclaim_shell_check`] match in
+    /// [`reclaim_stale_panes`] and the first case closes `w1:p1`.
+    #[test]
+    fn reclaim_stale_panes_keeps_a_claude_pane_still_waiting_on_its_shell() {
+        let shell_footer = include_str!(
+            "../../../../tests/fixtures/stall-cause/claude-shell-still-running-idle.txt"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a");
+        std::fs::create_dir_all(root.join(".multiverse")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2026-01-01T00:00:00+00:00\tevent=dispatch\ttask=20260101-builder-aaaaaa\tagent=a-buil-cl\taccount=claude-a\tbranch=main\trole=builder\n\
+             2026-01-01T00:01:00+00:00\tevent=result\ttask=20260101-builder-aaaaaa\tstatus=done\tstate=done\trevisions=0\tpane=w1:p1\n",
+        )
+        .unwrap();
+        let toml = format!(
+            "[accounts.claude-a]\nkind = \"claude\"\nshort = \"cl\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"/tmp\"\npool = \"claude:a\"\n\
+             [projects.a]\npath = \"{}\"\n",
+            root.display()
+        );
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+        let agents_with = |text: Option<&str>| {
+            let mut agents = FakeFleetAgents {
+                live: vec![FakeFleetAgents::idle("w1:p1", "a-buil-cl")],
+                closed: Vec::new(),
+                labels: HashMap::new(),
+                visible: HashMap::new(),
+            }
+            .with_label("w1:p1", "builder · 20260101-builder-aaaaaa");
+            if let Some(text) = text {
+                agents.visible.insert("w1:p1".into(), text.into());
+            }
+            agents
+        };
+
+        let mut agents = agents_with(Some(shell_footer));
+        assert_eq!(reclaim_stale_panes(&config, &root, &mut agents), (0, 1));
+        assert!(agents.closed.is_empty(), "{:?}", agents.closed);
+        let notes = reconcile_and_reclaim_fleet(&config, "a", &root, &mut agents);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("kept 1 waiting-on-shell pane(s) in a")),
+            "{notes:?}"
+        );
+        assert!(agents.closed.is_empty(), "{:?}", agents.closed);
+
+        let mut agents = agents_with(None);
+        assert_eq!(reclaim_stale_panes(&config, &root, &mut agents), (0, 0));
+        assert!(
+            agents.closed.is_empty(),
+            "an unreadable Claude pane stays open"
+        );
+
+        let finished = shell_footer.replace(" · 1 shell", "");
+        let mut agents = agents_with(Some(&finished));
+        assert_eq!(reclaim_stale_panes(&config, &root, &mut agents), (1, 0));
         assert_eq!(agents.closed, vec!["w1:p1".to_string()]);
     }
 
@@ -5315,6 +5887,7 @@ mod tests {
             live: Vec::new(),
             closed: Vec::new(),
             labels: HashMap::new(),
+            visible: HashMap::new(),
         };
         reconcile_and_reclaim_fleet(&config, "a", &root_a, &mut agents);
 
@@ -6353,6 +6926,19 @@ review_scope = "repo"
         )
         .unwrap();
         assert_eq!(open_task_count(root), 0);
+
+        // Card 20261122-b-4ad223 (Mike's ASK #1496) reverses that card's
+        // rule for the fleet-wide `max_concurrent` count only: the same
+        // done-unrecorded lane holds its fleet slot until it is reconciled,
+        // as `workers N/CAP` counts it. `open_task_count` (project ceiling
+        // and floor gaps) keeps the exclusion above.
+        let toml = format!("[projects.sandbox]\npath = \"{}\"\n", root.display());
+        let config = load::load_config_str(&toml, &root.join("config.toml")).unwrap();
+        assert_eq!(
+            fleet_open_counts(&config, "", None).0,
+            1,
+            "a done-unrecorded lane must hold its fleet slot until reconciled"
+        );
     }
 
     #[test]
@@ -6467,6 +7053,124 @@ review_scope = "repo"
             fleet_open, 1,
             "a failed live listing must count an unrecorded task conservatively, not free its slot"
         );
+    }
+
+    /// The card `20261122-b-4ad223` fleet: three working Claude lanes, two
+    /// parked at their prompt on a background shell (Herdr says `done`),
+    /// and one that wrote `done` nobody has recorded yet — all dispatched
+    /// long past any startup grace, at `max_concurrent = 6`. Returns the
+    /// config and Herdr's listing (agent name to `agent_status`).
+    fn waiting_on_shell_fleet(dir: &Path) -> (Config, HashMap<String, String>) {
+        let root = dir.join("delta");
+        std::fs::create_dir_all(root.join(".multiverse")).unwrap();
+        let mut log = String::new();
+        let mut live = HashMap::new();
+        let statuses = ["working", "working", "working", "done", "done", "done"];
+        for (index, status) in statuses.into_iter().enumerate() {
+            let n = index + 1;
+            let id = format!("20261122-builder-d0000{n}");
+            let name = if n == 1 {
+                "delta-buil-cl".to_string()
+            } else {
+                format!("delta-buil-cl-{n}")
+            };
+            log.push_str(&format!(
+                "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask={id}\tproject=delta\trole=builder\taccount=claude-a\tagent={name}\tbranch=main\n\
+                 2020-01-01T00:00:00+00:00\tevent=started\ttask={id}\tpane=w1:p{n}\n"
+            ));
+            live.insert(name, status.to_string());
+        }
+        std::fs::write(root.join(".multiverse/routing.log"), log).unwrap();
+        let status_dir = root.join(".multiverse/tasks/20261122-builder-d00006");
+        std::fs::create_dir_all(&status_dir).unwrap();
+        std::fs::write(status_dir.join("status"), "done\n").unwrap();
+        let toml = format!(
+            "max_concurrent = 6\n\
+             [accounts.claude-a]\nkind = \"claude\"\nshort = \"cl\"\nconfig_dir_var = \"CLAUDE_CONFIG_DIR\"\nconfig_dir = \"/tmp\"\npool = \"claude:a\"\n\
+             [projects.delta]\npath = \"{}\"\n",
+            root.display()
+        );
+        let config = load::load_config_str(&toml, &dir.join("config.toml")).unwrap();
+        (config, live)
+    }
+
+    /// Card `20261122-b-4ad223` / `20261122-b-e98304` proof: 3 working + 2
+    /// waiting-on-shell + 1 done-unrecorded at `max_concurrent = 6` is a
+    /// full fleet. The live recount keeps all six (the old gate kept only
+    /// the three `working` panes, so a dispatch took a parked lane's
+    /// seat), the conservative count agrees, and the refusal names the
+    /// count the way `workers` prints it. Revert check: restore
+    /// `is_open_agent_status` in [`is_task_pane_still_open`] or the
+    /// `file_status` filter on `worker_open` and this reads 3 or 5.
+    #[test]
+    fn a_full_waiting_on_shell_fleet_refuses_and_names_the_workers_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, live) = waiting_on_shell_fleet(dir.path());
+
+        let (live_open, _) = fleet_open_counts(&config, "", Some(&live));
+        assert_eq!(
+            live_open, 6,
+            "every unrecorded lane Herdr still lists holds a slot"
+        );
+        let (conservative_open, _) = fleet_open_counts(&config, "", None);
+        assert_eq!(conservative_open, 6);
+
+        let inputs = engine_dispatch::FleetCapacityInputs {
+            max_concurrent: config.max_concurrent,
+            fleet_open: live_open,
+            project_open: 0,
+            project_min_slots: 0,
+            project_max_slots: None,
+            other_floor_gaps: Vec::new(),
+            batch_count: 1,
+        };
+        let refusal = engine_dispatch::check_fleet_capacity(&inputs).unwrap_err();
+        assert_eq!(
+            capacity_refusal_text(&refusal),
+            "workers 6/6: 6 agent(s) already running and max_concurrent is 6; nothing was started"
+        );
+        match to_engine_error(refusal, "Builder", "delta") {
+            EngineError::NeedsConfig(text) => assert!(text.starts_with("workers 6/6: "), "{text}"),
+            other => panic!("expected a NeedsConfig refusal, got {other:?}"),
+        }
+
+        // A lane whose agent Herdr no longer lists at all (past grace) is
+        // stranded, not parked, and still frees its slot.
+        let mut gone = live.clone();
+        gone.remove("delta-buil-cl-6");
+        assert_eq!(fleet_open_counts(&config, "", Some(&gone)).0, 5);
+    }
+
+    /// A reissued agent name: an older done-unrecorded dispatch and the
+    /// newer working one share `delta-buil-cl`. Herdr lists that name
+    /// once, so it holds one slot — the newest dispatch answers for it,
+    /// the same join `workers` makes — never two.
+    #[test]
+    fn fleet_open_counts_counts_a_reissued_agent_name_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("here");
+        std::fs::create_dir_all(root.join(".multiverse/tasks/20250101-builder-aaaaaa")).unwrap();
+        std::fs::write(
+            root.join(".multiverse/routing.log"),
+            "2020-01-01T00:00:00+00:00\tevent=dispatch\ttask=20250101-builder-aaaaaa\tproject=here\trole=builder\taccount=seat\tagent=here-buil-st\tbranch=main\n\
+             2020-01-01T01:00:00+00:00\tevent=dispatch\ttask=20250101-builder-bbbbbb\tproject=here\trole=builder\taccount=seat\tagent=here-buil-st\tbranch=main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".multiverse/tasks/20250101-builder-aaaaaa/status"),
+            "done",
+        )
+        .unwrap();
+        let toml = format!(
+            "[accounts.seat]\nkind = \"codex\"\nshort = \"st\"\nconfig_dir_var = \"CODEX_HOME\"\nconfig_dir = \"/tmp\"\npool = \"codex:test\"\n\
+             [projects.here]\npath = \"{}\"\n",
+            root.display()
+        );
+        let config = load::load_config_str(&toml, &dir.path().join("config.toml")).unwrap();
+        let live = HashMap::from([("here-buil-st".to_string(), "working".to_string())]);
+
+        assert_eq!(fleet_open_counts(&config, "", None).0, 1);
+        assert_eq!(fleet_open_counts(&config, "", Some(&live)).0, 1);
     }
 
     fn ok_result(payload: serde_json::Value) -> CommandResult {

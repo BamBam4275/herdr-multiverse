@@ -107,6 +107,7 @@ One JSON file per behavior under `scenarios/`. Shape:
         "exit": 1,
         "stdout": "...exact normalized text...",       // exact match, OR:
         "stdout_contains": ["substring one", "substring two"],  // substring checks (also normalized)
+        "stdout_not_contains": ["\\u001b"],            // forbidden substrings (also normalized)
         "stderr": "..."
       }
     }

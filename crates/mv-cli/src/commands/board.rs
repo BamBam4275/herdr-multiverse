@@ -16,9 +16,15 @@
 //! Terminal width comes from [`mv_board::layout::terminal_width`]
 //! (`COLUMNS`, then the tty ioctl), falling back to 80 off a tty — the
 //! same fallback `cmd_board`'s `shutil.get_terminal_size(fallback=(80, 24))`
-//! uses. Color follows `--no-color` and a non-empty `NO_COLOR`.
+//! uses. Color follows [`mv_board::layout::ColorRequest`]: `--no-color`
+//! and a non-empty `NO_COLOR` force it off; `--color always` and
+//! `[board].color = true` force it on; Auto emits SGR only when stdout
+//! is a tty, `TERM` is not `dumb`, the process is not inside a Herdr
+//! pane, and the terminal is confirmed (`COLORTERM` or `TERM` containing
+//! `color`/`256`/`xterm`).
 
 use clap::ArgMatches;
+use mv_board::layout::ColorRequest;
 use mv_board::render::{
     self, BoardColumn, BoardSnapshot as ProjectRenderSnapshot, CardsPerRow, FleetSnapshot,
     RenderOptions, StatusFilter,
@@ -80,6 +86,13 @@ pub trait BoardDataSource {
 
     fn fingerprint(&self, view: &BoardView) -> watch::Fingerprint {
         fingerprint_view(view)
+    }
+
+    /// `[board].color = true` forces SGR even inside a Herdr pane.
+    /// Default false; `LiveSource` reads the loaded config field.
+    /// `--no-color` still wins at the request layer.
+    fn force_color(&self) -> bool {
+        false
     }
 }
 
@@ -268,8 +281,35 @@ fn resolve_width() -> usize {
     mv_board::layout::terminal_width().unwrap_or(DEFAULT_WIDTH)
 }
 
-fn resolve_color(args: &ArgMatches, is_tty: bool) -> bool {
-    mv_board::layout::color_enabled(args.get_flag("no-color"), is_tty)
+/// `--no-color` wins over `--color`. `--color` defaults to `auto`.
+fn color_request_from_args(args: &ArgMatches) -> ColorRequest {
+    if args.get_flag("no-color") {
+        return ColorRequest::Never;
+    }
+    match args.get_one::<String>("color").map(String::as_str) {
+        Some("always") => ColorRequest::Always,
+        Some("never") => ColorRequest::Never,
+        _ => ColorRequest::Auto,
+    }
+}
+
+fn color_request(args: &ArgMatches, config_force: bool) -> ColorRequest {
+    let mut request = color_request_from_args(args);
+    if config_force && request != ColorRequest::Never {
+        request = ColorRequest::Always;
+    }
+    request
+}
+
+fn resolve_color(args: &ArgMatches, is_tty: bool, config_force: bool) -> bool {
+    mv_board::layout::color_enabled_with(color_request(args, config_force), is_tty)
+}
+
+/// Plain ASCII boxes and markers: `--no-color`, a non-empty `NO_COLOR`,
+/// or `TERM=dumb`. `--color never` still keeps Unicode; that flag only
+/// suppresses SGR.
+fn want_ascii(args: &ArgMatches) -> bool {
+    args.get_flag("no-color") || mv_board::layout::ascii_requested()
 }
 
 fn resolve_limit(args: &ArgMatches) -> usize {
@@ -352,7 +392,7 @@ fn run_with(
                 mv_board::layout::terminal_height().unwrap_or(24),
             ),
             limit: resolve_limit(args),
-            color: resolve_color(args, is_tty),
+            color: resolve_color(args, is_tty, source.force_color()),
             cards_per_row: resolve_cards_per_row(args),
             statuses: resolve_statuses(args),
         };
@@ -363,6 +403,11 @@ fn run_with(
             .map(|h| mv_board::layout::sanitize_multiline(&h))
             .collect();
         lines.extend(render_view(&view, &options, args.get_flag("by-project")));
+        if want_ascii(args) {
+            for line in &mut lines {
+                *line = mv_board::layout::to_ascii_plain(line);
+            }
+        }
         Ok(BoardFrame { lines, fingerprint })
     };
     if is_watch(args) {
@@ -672,13 +717,105 @@ mod tests {
 
     #[test]
     fn resolve_color_is_false_when_no_color_flag_is_set() {
-        assert!(!resolve_color(&matches(&["board", "--no-color"]), true));
+        assert_eq!(
+            color_request_from_args(&matches(&["board", "--no-color"])),
+            ColorRequest::Never
+        );
+        assert!(!resolve_color(
+            &matches(&["board", "--no-color"]),
+            true,
+            false
+        ));
+        assert!(!resolve_color(
+            &matches(&["board", "--no-color"]),
+            true,
+            true
+        ));
     }
 
     #[test]
-    fn resolve_color_is_false_off_a_tty_even_without_the_flag() {
-        assert!(resolve_color(&matches(&["board"]), true));
-        assert!(!resolve_color(&matches(&["board"]), false));
+    fn default_color_request_is_auto_and_stays_off_when_piped() {
+        assert_eq!(
+            color_request_from_args(&matches(&["board"])),
+            ColorRequest::Auto
+        );
+        // Piped / captured stdout is never colored under Auto, regardless
+        // of TERM/COLORTERM/HERDR_* on the test process.
+        assert!(!resolve_color(&matches(&["board"]), false, false));
+    }
+
+    #[test]
+    fn config_force_color_is_always_unless_no_color() {
+        // Request mapping only — `color_enabled_with(Always, …)` still
+        // reads process `NO_COLOR`, so the bool is not asserted here.
+        assert_eq!(
+            color_request(&matches(&["board"]), true),
+            ColorRequest::Always
+        );
+        assert_eq!(
+            color_request(&matches(&["board", "--no-color"]), true),
+            ColorRequest::Never
+        );
+        assert_eq!(
+            color_request(&matches(&["board"]), false),
+            ColorRequest::Auto
+        );
+        assert!(!resolve_color(
+            &matches(&["board", "--no-color"]),
+            true,
+            true
+        ));
+        assert_eq!(
+            color_request_from_args(&matches(&["board", "--color", "always", "--no-color"])),
+            ColorRequest::Never
+        );
+    }
+
+    #[test]
+    fn color_always_on_a_piped_board_emits_esc_and_never_does_not() {
+        let mut project = empty_project();
+        project.tasks.push(running_task("task"));
+        let view = BoardView::Project(ProjectRenderSnapshot {
+            project,
+            fleet_health: FleetHealth::default(),
+        });
+        let always = matches(&["board", "--color", "always"]);
+        let never = matches(&["board", "--color", "never"]);
+        assert_eq!(color_request_from_args(&always), ColorRequest::Always);
+        assert_eq!(color_request_from_args(&never), ColorRequest::Never);
+        // Piped Auto stays off. Always is on at the request layer;
+        // `color_enabled_with` still reads process `NO_COLOR`, so this
+        // drives `render_view` from the mapped request rather than the env.
+        let mut options = RenderOptions {
+            width: 80,
+            height: None,
+            limit: 10,
+            color: false,
+            cards_per_row: CardsPerRow::Auto,
+            statuses: StatusFilter::all(),
+        };
+        options.color = color_request(&always, false) == ColorRequest::Always;
+        let colored = render_view(&view, &options, false);
+        options.color = color_request(&never, false) == ColorRequest::Always;
+        let plain = render_view(&view, &options, false);
+        assert!(
+            colored.iter().any(|line| line.contains('\u{1b}')),
+            "piped --color always must emit ESC: {colored:?}"
+        );
+        assert!(
+            plain.iter().all(|line| !line.contains('\u{1b}')),
+            "piped --color never must be ESC-free: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn no_color_flag_requests_ascii_boxes() {
+        assert!(want_ascii(&matches(&["board", "--no-color"])));
+        // `--color never` is SGR-only; ASCII still follows TERM/NO_COLOR.
+        assert_eq!(
+            want_ascii(&matches(&["board", "--color", "never"])),
+            want_ascii(&matches(&["board"]))
+        );
     }
 
     #[test]

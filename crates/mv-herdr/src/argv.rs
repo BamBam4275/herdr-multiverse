@@ -232,6 +232,17 @@ fn effort_args(kind: &str, level: &str) -> Option<Vec<String>> {
 /// to upgrade itself.
 const CODEX_DISABLE_UPDATE_ON_STARTUP: [&str; 2] = ["-c", "check_for_update_on_startup=false"];
 
+/// Selects the `fleet` permission profile on every dispatched Codex seat
+/// (card `20261122-b-4971ad`). `mv-engine`'s `apply_codex_worktree_permissions`
+/// always defines that profile on the same launch (card `20261122-b-a8b112`):
+/// the filesystem table when the worktree exists, and a minimal
+/// `permissions.fleet.extends=":workspace"` when it does not, so this
+/// select can never name an undefined profile. A profile with a `deny`
+/// entry is the one Codex lever that restricts what it can *read*. Never
+/// pair it with `--sandbox`/`sandbox_mode` — Codex refuses both as
+/// overrides, and the legacy sandbox cannot deny a read.
+const CODEX_FLEET_PERMISSION_PROFILE: [&str; 2] = ["-c", "default_permissions=\"fleet\""];
+
 /// Native CLI arguments for `agent start ... -- <args>`.
 ///
 /// Native arguments go only after `--`; this is the one place that
@@ -242,10 +253,12 @@ const CODEX_DISABLE_UPDATE_ON_STARTUP: [&str; 2] = ["-c", "check_for_update_on_s
 ///
 /// `worktree` pins a Codex lane's working root with `-C`/`--cd` — the
 /// only documented lever Codex exposes for where it considers itself
-/// rooted. Codex has no flag that restricts what it can *read* (`-s`/
-/// `--sandbox` and `--add-dir` only govern writes/exec), so this stops
-/// deliberate re-rooting rather than enforcing a read boundary; every
-/// other `kind` ignores the argument.
+/// rooted; every other `kind` ignores the argument. The pin stops
+/// deliberate re-rooting; the read boundary is the `fleet` permission
+/// profile every Codex seat selects here with `-c default_permissions=
+/// "fleet"`, which `apply_codex_worktree_permissions` always defines on
+/// the same launch (`-s`/`--sandbox` and `--add-dir` only govern
+/// writes/exec, and are never passed alongside it).
 pub fn native_args(
     model: &str,
     kind: &str,
@@ -266,6 +279,7 @@ pub fn native_args(
         args.extend(
             CODEX_DISABLE_UPDATE_ON_STARTUP
                 .iter()
+                .chain(CODEX_FLEET_PERMISSION_PROFILE.iter())
                 .map(|s| s.to_string()),
         );
     }
@@ -992,9 +1006,37 @@ mod tests {
                 "-C",
                 "/lane/x",
                 "-c",
-                "check_for_update_on_startup=false"
+                "check_for_update_on_startup=false",
+                "-c",
+                "default_permissions=\"fleet\"",
             ]
         );
+    }
+
+    /// Card `20261122-b-4971ad`: every Codex seat selects the `fleet`
+    /// permission profile, and never through the legacy sandbox flag
+    /// Codex refuses to combine it with; no other kind gets either.
+    #[test]
+    fn codex_native_args_select_the_fleet_permission_profile_without_sandbox() {
+        for effort in [None, Some("high")] {
+            let args = native_args("gpt-5", "codex", effort, "/lane/x");
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "-c" && w[1] == "default_permissions=\"fleet\""),
+                "{args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "--sandbox" || a == "-s"),
+                "{args:?}"
+            );
+        }
+        for kind in ["claude", "grok", "mastracode"] {
+            let args = native_args("m", kind, Some("high"), "/lane/x");
+            assert!(
+                !args.iter().any(|a| a.starts_with("default_permissions")),
+                "{kind}: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -1018,6 +1060,8 @@ mod tests {
                 "model_reasoning_effort=high",
                 "-c",
                 "check_for_update_on_startup=false",
+                "-c",
+                "default_permissions=\"fleet\"",
             ]
         );
     }
@@ -1040,7 +1084,9 @@ mod tests {
                 "-C",
                 "/lane/one",
                 "-c",
-                "check_for_update_on_startup=false"
+                "check_for_update_on_startup=false",
+                "-c",
+                "default_permissions=\"fleet\"",
             ]
         );
         assert_eq!(
@@ -1051,7 +1097,9 @@ mod tests {
                 "-C",
                 "/lane/two",
                 "-c",
-                "check_for_update_on_startup=false"
+                "check_for_update_on_startup=false",
+                "-c",
+                "default_permissions=\"fleet\"",
             ]
         );
     }

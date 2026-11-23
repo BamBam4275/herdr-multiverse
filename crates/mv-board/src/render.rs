@@ -593,6 +593,18 @@ mod tests {
             "{colored:?}"
         );
         assert_ne!(colored, plain);
+        // The Linux board-tab screenshot showed `[92m` / `[0m` as literal
+        // text with no ESC glyph: this crate emits the ESC byte (0x1b)
+        // in front of every SGR. If a pane then drops C0, the viewer
+        // prints the rest as text and visible_width undercounts.
+        assert!(
+            colored.iter().any(|line| line.contains('\u{1b}')),
+            "colored render must include the ESC byte, not just [NNm: {colored:?}"
+        );
+        assert!(
+            plain.iter().all(|line| !line.contains('\u{1b}')),
+            "plain render must be ESC-free: {plain:?}"
+        );
     }
 
     #[test]

@@ -118,16 +118,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0700ddab506f33b20a03b13996eccd309a48e5ff77d0d95926aa0210fb4e95f1"
 dependencies = [
- "bit-vec 0.6.3",
-]
-
-[[package]]
-name = "bit-set"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
-dependencies = [
- "bit-vec 0.8.0",
+ "bit-vec",
 ]
 
 [[package]]
@@ -135,12 +126,6 @@ name = "bit-vec"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
-
-[[package]]
-name = "bit-vec"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
@@ -540,19 +525,8 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b95f7c0680e4142284cf8b22c14a476e87d61b004a3a0861872b32ef7ead40a2"
 dependencies = [
- "bit-set 0.5.3",
+ "bit-set",
  "regex",
-]
-
-[[package]]
-name = "fancy-regex"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b32c6266c2b14b0db7aa3409d3ee3f0ddda3b1d0279c4ba24fbec18af81d90e"
-dependencies = [
- "bit-set 0.8.0",
- "regex-automata",
- "regex-syntax",
 ]
 
 [[package]]
@@ -912,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "mv-board"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "crc32fast",
  "crossterm",
@@ -925,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "mv-cli"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -945,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "mv-config"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "dirs",
  "mv-core",
@@ -959,10 +933,9 @@ dependencies = [
 
 [[package]]
 name = "mv-core"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "crc32fast",
- "fancy-regex 0.20.1",
  "regex",
  "rustix",
  "tempfile",
@@ -973,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "mv-engine"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "mv-config",
  "mv-core",
@@ -990,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "mv-herdr"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "mv-core",
  "serde",
@@ -1000,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "mv-state"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "crc32fast",
  "mv-config",
@@ -1817,7 +1790,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bitflags 2.13.2",
- "fancy-regex 0.11.0",
+ "fancy-regex",
  "filedescriptor",
  "finl_unicode",
  "fixedbitset",

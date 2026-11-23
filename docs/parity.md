@@ -29,7 +29,7 @@ Role names on Rust **write** surfaces (config keys, `--role`, help text) use the
 
 ## Command inventory
 
-Python top-level subcommands: 27. Rust top-level subcommands: 31 (`config`, `down`, `import-python`, and `up` are Rust-only). Counts exclude clap's generated `help` command. Nested leaves match one-for-one except `config migrate`.
+Python top-level subcommands: 27. Rust top-level subcommands: 32 (`config`, `down`, `import-python`, `onboard`, and `up` are Rust-only). Counts exclude clap's generated `help` command. Nested leaves match one-for-one except `config migrate`.
 
 | Command | Python | Rust |
 |---|---|---|
@@ -78,6 +78,7 @@ Python top-level subcommands: 27. Rust top-level subcommands: 31 (`config`, `dow
 | `inspect` | yes | yes |
 | `new` | yes | yes |
 | `notify` | yes | yes |
+| `onboard` | — | yes (Rust-only) |
 | `presence` | yes | yes |
 | `projects` | yes | yes |
 | `result` | yes | yes |
@@ -497,7 +498,8 @@ Rust about: Show the task board
 | `--cards-per-row` | VAL {1, 2, auto} | {auto,1,2} | Same `{auto,1,2}` default auto. |
 | `--here` | flag | flag |  |
 | `--limit` | {auto,N} | {auto,N} | Same `{auto,N}` default auto. Off a tty, `auto` falls back to 10 cards. |
-| `--no-color` | flag | flag |  |
+| `--no-color` | flag | flag | Same as `--color never`. Wins if both `--color` and `--no-color` are passed. |
+| `--color` | — | {always,auto,never} | Rust-only (card `20261122-b-71379f`). Default `auto`: only a confirmed color terminal; inside a Herdr pane auto is off (`crates/mv-cli/src/args.rs`). |
 | `--no-reconcile` | flag | flag |  |
 | `--read-only` | flag | flag |  |
 | `--status` | repeat {blocked,in-progress,backlog} {backlog, blocked, in-progress} | repeat {blocked,in-progress,backlog} | Repeatable column filter; a single selected column uses the full width. |
@@ -687,6 +689,23 @@ Rust about: Queue or flush operator notifications
 | `--tag` | repeat TAG | repeat TAG | Repeatable; joined with commas on the ntfy `Tags` header. |
 | `--title` | TITLE | TITLE |  |
 
+### `onboard`
+
+Rust-only. Python has no matching subcommand.
+
+Rust about: Interactive first-run setup: write config, seats, chains, models, and the first project
+
+No positionals.
+
+| Flag | Shape | Help |
+|---|---|---|
+| `--non-interactive` | flag | Apply recommended defaults without prompting |
+| `--dry-run` | flag | Show the plan without performing the operation |
+| `--yes` | flag | Explicitly authorize overwriting a config that already has accounts |
+| `--project` | PATH | Register this existing git repository as the first project |
+| `--name` | NAME | Configured name for `--project` |
+| `--start` | flag | After adding the first project, run `multiverse start` |
+
 ### `presence`
 
 Rust about: Report operator presence (exit 2 if unknown)
@@ -823,9 +842,9 @@ Rust about: Inspect or update project tasks
 | `--close-stranded` | flag | flag |  |
 | `--no-reconcile` | flag | flag |  |
 | `--read-only` | flag | flag |  |
-| `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--reclaimable`, end a reclaimed lane's own lingering host process instead of only reporting it; without `--yes` previews "would reap" and signals nothing. |
+| `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--reclaimable`, after a successful close end that lane's own lingering process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; without `--yes` prints what would be reaped and kills nothing (`crates/mv-cli/src/args.rs`). `--reclaimable --yes` also reaps a just-closed lane without `--reap` (`commands::tasks`). |
 | `--reason` | TEXT | TEXT |  |
-| `--reclaimable` | flag | flag |  |
+| `--reclaimable` | flag | flag | Rust adds one skip (card `20261122-b-4ad223`): a recorded Claude lane whose pane footer still shows a running shell, or whose pane text cannot be read, prints `kept … waiting-on-shell` (or the unreadable reason) and is never closed. The pre-dispatch reclaim applies the same skip. |
 | `--reconcile` | flag | flag |  |
 | `--revisions` | VAL | N |  |
 | `--state` | STATE | STATE |  |
@@ -852,11 +871,12 @@ Rust about: Start project Nexus sessions and clear a halt `down` set
 
 ### `workers`
 
-Rust about: List worker sessions
+Rust about: List worker sessions; auto-reconciles unrecorded outcomes unless --read-only
 
 | Flag | Python | Rust | Notes |
 |---|---|---|---|
 | `--json` | — | flag | Rust-only (task `20261117-builder-0cbb48`, Scout finding `20261117-scout-c950ad`#4). Emits one line of JSON instead of the table and summary lines; never changes the plain-text output. |
+| `--read-only` | — | flag | Rust-only. Skip auto-reconcile of unrecorded outcomes; listing only. |
 
 **`--json` shape (stable script surface).** One JSON object, alphabetical
 keys:
@@ -869,6 +889,12 @@ keys:
   `seat`/`status`/`task`), or `null` when Herdr was unreachable (an empty,
   reachable fleet is `[]`). A field the text table shows as `\u{2014}`
   (no data joined) is JSON `null`, never `""`.
+- `status` — Herdr's own `agent_status`, except two display-only,
+  Rust-only overrides read from the pane's text: `waiting-on-shell` (a
+  Claude seat's idle/done pane whose footer still shows a running
+  background shell or monitor, card `20261122-b-e98304`), and otherwise
+  `stalled` (pane text unchanged for 30 minutes). Neither changes seat or
+  project occupancy.
 - `worker_count` / `max_concurrent` — the `workers N/CAP` line's own two
   numbers; `worker_count` is `null` exactly when `workers` is.
 - `seats` / `projects` — the `seats:`/`projects:` lines, one object per
@@ -895,8 +921,8 @@ Rust about: Inspect, prune, rescue, restore, or merge task worktrees
 | `--dry-run` | flag | flag |  |
 | `--force` | flag | flag |  |
 | `--merge` | — | TASK_ID | Rust-only (commit `6984508`). Scan the lane's commits for secrets (gitleaks, and trufflehog when configured and present), then merge it into this checkout with `git merge --no-ff --no-edit`; refuses on a finding or a missing required scanner. |
-| `--prune` | flag | flag | Rust-only shared-build reclaim, active only when `.cargo/config.toml` (or `CARGO_BUILD_BUILD_DIR`) sets a `build-dir` containing `{workspace-path-hash}` (see [configuration](configuration.md#shared-cargo-build-dir)). Per lane: once a lane has no live pane, every occupant has a terminal status and no process has its cwd there, its build-dir is the hash dir computed from the lane's own manifest path, freed only when that dir's dep-info names the lane; the full shared-root scan runs only when the computed dir does not exist, and the shared root itself and the main checkout's own build-dir are never freed. A lane listed in this project's routing log whose worktree path no longer exists has its computed hash dir freed when that dir's evidence names only paths under the vanished lane. Then a global orphan sweep over every hash dir under the shared root frees one only when its evidence names at least one workspace root, all of them gone; it keeps any dir naming a live workspace, any dir whose relative sources could still belong to an existing workspace root, any dir it could not read in full, and any dir a lane above already reported. Caches are freed only with `--yes` (or `--force`), as the `--yes` row says. Output: per lane `would free build-dir (N bytes)` / `freed build-dir (N bytes)`, or `kept build-dir — <reason>` when a hash dir was resolved but not freed, or `build-dir unresolved — <reason>` when none was found; the sweep prints `cargo shared-build <dir>` followed by `would free build-dir (N bytes)` or `freed build-dir (N bytes)`. |
-| `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--prune`, end a kept lane's own lingering host process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; never with `--force`, and `--dry-run` previews "would reap" and signals nothing. |
+| `--prune` | flag | flag | Rust-only shared-build reclaim, active only when `.cargo/config.toml` (or `CARGO_BUILD_BUILD_DIR`) sets a `build-dir` containing `{workspace-path-hash}` (see [configuration](configuration.md#shared-cargo-build-dir)). Per lane: once a lane has no live pane, every occupant has a terminal status and no process has its cwd there, its build-dir is the hash dir computed from the lane's own manifest path, freed only when that dir's dep-info names the lane; the full shared-root scan runs only when the computed dir does not exist, and the shared root itself and the main checkout's own build-dir are never freed. A lane listed in this project's routing log whose worktree path no longer exists has its computed hash dir freed when that dir's evidence names only paths under the vanished lane. Then a global orphan sweep over every hash dir under the shared root frees one only when its evidence names at least one workspace root, all of them gone; it keeps any dir naming a live workspace, any dir whose relative sources could still belong to an existing workspace root, any dir it could not read in full, and any dir a lane above already reported. Caches are freed only with `--yes` (or `--force`), as the `--yes` row says. Output: per lane `would free build-dir (N bytes)` / `freed build-dir (N bytes)`, or `kept build-dir — <reason>` when a hash dir was resolved but not freed, or `build-dir unresolved — <reason>` when none was found; the sweep prints `cargo shared-build <dir>` followed by `would free build-dir (N bytes)` or `freed build-dir (N bytes)`, or `kept build-dir — <reason>` when a delete failed (`crates/mv-cli/src/commands/worktrees.rs`). |
+| `--reap` | — | flag | Rust-only (card `20261115-b-9815fe`). With `--prune`, end a kept lane's own lingering process (SIGTERM, then SIGKILL on re-confirmed identity) instead of only reporting it; never with `--force` (`crates/mv-cli/src/args.rs`). `--dry-run` previews "would reap" and signals nothing (`commands::worktrees`). |
 | `--rescue` | flag | flag |  |
 | `--restore` | TASK_ID | TASK_ID |  |
 | `--yes` | flag | flag | With `--prune`, Rust also requires `--yes` (or `--force`) before deleting any Rust-only cache — a lane's `target/` and shared-cache build-dir, the orphaned shared-build sweep, and `--deep`'s `.multiverse/worktree-state/` quarantine removals (card `20261119-b-73759c`); without it each is reported exactly as `--dry-run` reports it ("would free ..."). Lane removal, archiving, branch reclaim and `--deep`'s task/scratch sweep keep Python's plain-`--prune` behavior. |
@@ -964,7 +990,7 @@ Handlers already reject several of these at runtime; clap is looser than argpars
 - `backlog mark-asked --recommend` is required `int` on Python; Rust parses a string as a 1-based index in `commands::backlog` and errors if it is missing or non-numeric.
 - Cwd-scoped `backlog` writes (`add` / `done` / `reopen` / `annotate` / `reprioritize` / `show` / `ask` / `mark-asked` / `answer`) take `nargs='+'` on Python so a mistaken project-name token is explained in-handler. Rust takes a single positional.
 - `dispatch --column` is a closed, case-sensitive `{Explore, Execute, Review}` choice on both sides (`crates/mv-cli/src/args.rs:116`) — not free text as this page previously said; the accepted value is only looked up case-insensitively further downstream, as `column-{name}.md` (`crates/mv-engine/src/prompts.rs`).
-- `worktrees --reap` / `tasks --reap` (card `20261115-b-9815fe`) are new Rust-only functionality, not a Python port: a leftover host process with its cwd still inside a finished lane is now only ever ended when an operator explicitly opts in on `--prune`/`--reclaimable`. `sweep` still only ever reports this class of leak (`crates/mv-cli/src/commands/sweep.rs`'s `lane_process_notes`), the same as Python; the shared process probe/signal primitives live in `mv_engine::dockerreport` (`process_cwds`, `processes_under`, `protected`, `reap`).
+- `worktrees --reap` / `tasks --reap` (card `20261115-b-9815fe`) are new Rust-only functionality, not a Python port: a leftover host process with its cwd still inside a finished lane is now only ever ended when an operator opts in on `--prune`/`--reclaimable`. `--reap --dry-run` (and `tasks --reap` without `--yes`) previews "would reap" and signals nothing; `--force` never reaps. `tasks --reclaimable --yes` also reaps a just-closed lane without `--reap`. `sweep` still only ever reports this class of leak (`crates/mv-cli/src/commands/sweep.rs`'s `lane_process_notes`), the same as Python; the shared process probe/signal primitives live in `mv_engine::dockerreport` (`process_cwds`, `processes_under`, `protected`, `reap`).
 - `dispatch --role` / `backlog add --role` / `backlog ask --role`: Python argparse still lists the retired keys (and treats `orchestrator`/`council` as undispatchable on `dispatch`). Rust write surfaces accept current worker names only; unknown and retired names exit 3.
 - `notify --priority` is a closed, case-sensitive `{low, default, high, urgent}` choice on both sides (`crates/mv-cli/src/args.rs:242`) — not free text as this page previously said; Rust treats `urgent` as the bypass and every other value as normal (`commands::notify`).
 - `config migrate` (`--dry-run`, `--backup`) is Rust-only. It rewrites retired role keys so an unmigrated Python `config.toml` can load.
@@ -992,6 +1018,9 @@ without waiting for a writer.
 `result` resolves a worktree or subdirectory cwd to the longest containing
 configured project. Task results are read from that project's history, so a
 lane can read a sibling result even if its checkout contains an older copy.
+A Codex writer lane's `fleet` profile denies other entries under
+`.multiverse/tasks`, so that sibling read is refused at the sandbox for
+those lanes (`crates/mv-engine/src/codex_worktree_permissions.rs`).
 
 Inspect emits selected file text as-is, including credentials and terminal
 control characters; only audit metadata is redacted. An audit append failure

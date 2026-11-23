@@ -161,7 +161,10 @@
 //! Python has no analogue for `submit_unsubmitted_composers` (card
 //! `20261114-b-4d8baf`, design `20261115-seer-c2c967`): a lane idle with
 //! its own reconstructed dispatch brief still sitting, unsubmitted, in its
-//! composer gets exactly one `send-keys … Enter`, run from [`run`] before
+//! composer gets exactly one `send-keys … Enter`. A Claude follow-up below
+//! a done banner also qualifies after two unchanged idle passes (card
+//! `20261122-b-c43f1f`), with its own pane/text claim so a spent dispatch
+//! claim cannot suppress it. Both run from [`run`] before
 //! the three senders above so none of them types a competing canned prompt
 //! over it. Its own one-shot claim lives in a dedicated
 //! `composer-enter-memory.json`, kept local to this module rather than
@@ -170,6 +173,28 @@
 //! `mv-engine/src/runner.rs`, not a new `mv-state` claim file or the
 //! `commands::sweep` print wiring a full board-facing rollout would also
 //! need; both are filed as follow-ups rather than attempted here.
+//!
+//! Python has no analogue for [`wake_stalled_lanes`] either (card
+//! `20261122-b-3acaeb`, Scout `20261122-scout-daeed4`): a Claude lane that
+//! ended its turn to wait on its own background shell reads idle to Herdr,
+//! exactly like a finished one, so its one finish nudge can be spent while
+//! the job is still running — and once the job's completion notification
+//! fails to wake it, nothing else ever addresses it. The stall wake is a
+//! separate one-shot prompt ([`STALL_WAKE_PROMPT`], claim in
+//! `stall-wake-memory.json`, kept on a failed send like the finish nudge's)
+//! for exactly that shape: idle, no result, finish nudge already spent, a
+//! `⏺ Background command "…" completed (exit code N)` line below the last
+//! turn-end line with nothing after it but an empty composer, no footer
+//! still showing a running shell or monitor ([`waiting_on_shell`], card
+//! `20261122-b-e98304` — that job has not finished), and that same
+//! pane text unchanged for `STALL_WAKE_AFTER_MINUTES` (15) (measured through
+//! [`mv_state::nudge_memory::idle_pane_since`], host sleep discounted).
+//! That clock is seeded only on an applying pass (card `20261122-b-7378a4`);
+//! `--dry-run`, a halt, and `MULTIVERSE_READ_ONLY=1` read an existing clock
+//! and never write `.multiverse/idle-pane-memory.json`.
+//! Claude only: no Codex background-terminal pane text has been captured
+//! to match against. [`run`] runs it last, skipping any task the finish,
+//! resume or cap senders already touched this pass.
 //!
 //! Hardened past Python, not narrowed from it: every `send()` below — the
 //! finish nudge, the stuck resume, and the runtime cap — is now gated on
@@ -205,9 +230,18 @@ pub const FINISH_NUDGE_PROMPT: &str = "finish: write result.md and status";
 pub const STUCK_RESUME_PROMPT: &str = "resume: the connection dropped mid-turn — continue";
 /// Python's `RUNTIME_CAP_PROMPT`, verbatim.
 pub const RUNTIME_CAP_PROMPT: &str = "wrap up now: write result.md with what you have and status";
+/// Rust-only (card `20261122-b-3acaeb`): the one canned text
+/// [`wake_stalled_lanes`] sends.
+pub const STALL_WAKE_PROMPT: &str =
+    "wake: your background job has finished — check its output, continue, then write result.md and status";
 
 /// Python's `STUCK_AFTER_MINUTES`.
 const STUCK_AFTER_MINUTES: i64 = 30;
+
+/// How long [`wake_stalled_lanes`] requires a lane's pane text to have sat
+/// unchanged (host sleep discounted) before it may wake it. Comfortably
+/// longer than a sweep interval, so one pass alone can never qualify.
+const STALL_WAKE_AFTER_MINUTES: i64 = 15;
 
 const SEND_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 
@@ -244,15 +278,111 @@ fn stuck_pane_re() -> &'static Regex {
 /// Python's `_CONNECTION_LOSS_RE`: the narrower vocabulary required while
 /// Herdr still reports the pane `Working` (a reconnect spinner can keep it
 /// there; only explicit connection loss is evidence against that state).
+/// Rust-only (card `20261122-b-1049ab`): also Claude's own API-retry park
+/// (`✻ Waiting for API response · will retry in 3m 50s · check your
+/// network`), whose footer still reads `esc to interrupt`, so Herdr can
+/// keep reporting the pane `Working` throughout — the
+/// `stall-cause/claude-waiting-for-api-response-retry.txt` fixture. Deliberately absent from [`stuck_pane_re`], so finish-nudge
+/// and stall-wake eligibility are unchanged.
 fn connection_loss_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
             r"(?i)reconnecting|idle timeout|connection lost|ENOTFOUND|stopped arriving\
-             |stream disconnected|network error|transport error",
+             |stream disconnected|network error|transport error\
+             |waiting for api response\W+will retry",
         )
         .expect("static pattern")
     })
+}
+
+/// Claude's own background-shell completion notification, the positive
+/// signal [`background_job_finished_unwoken`] requires. Only the
+/// `completed (exit code N)` form has been observed (Scout
+/// `20261122-scout-daeed4`), so no other verb is matched.
+fn background_completed_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^\s*⏺ Background command ".*" completed \(exit code \d+\)"#)
+            .expect("static pattern")
+    })
+}
+
+/// Claude's turn-end line (`✻ Worked for 50s · done 7:42 PM`).
+fn turn_done_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*✻ .*· done\b").expect("static pattern"))
+}
+
+/// Whether a Claude pane shows a background job that finished without
+/// waking its agent: the last completion notification comes after the last
+/// turn-end line, no assistant (`⏺`) or status (`✻`) line follows it, and
+/// an empty `❯` composer sits below it. Any later activity means the
+/// notification did wake the agent (the 7abd49 capture's own shape).
+fn background_job_finished_unwoken(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(completed) = lines
+        .iter()
+        .rposition(|line| background_completed_re().is_match(line))
+    else {
+        return false;
+    };
+    if lines
+        .iter()
+        .rposition(|line| turn_done_re().is_match(line))
+        .is_some_and(|done| done > completed)
+    {
+        return false;
+    }
+    let after = &lines[completed + 1..];
+    if after.iter().any(|line| {
+        let line = line.trim_start();
+        line.starts_with('⏺') || line.starts_with('✻')
+    }) {
+        return false;
+    }
+    let marker = composer_marker("claude");
+    after
+        .iter()
+        .any(|line| line.trim_start().starts_with(marker))
+        && composer_inner_text(text, "claude").is_some_and(|inner| inner.is_empty())
+}
+
+/// One footer segment Claude Code shows below its composer while a
+/// background shell or monitor it started is still running: `1 shell`,
+/// `2 shells`, `1 monitor`, optionally followed by `still running`, set off
+/// by the footer's own ` · ` separators (`⏵⏵ bypass permissions on · 1
+/// shell · ← 1 agent`).
+fn running_shell_footer_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?:^|·)\s*\d+ (?:shells?|monitors?)(?: still running)?\s*(?:·|$)")
+            .expect("static pattern")
+    })
+}
+
+/// Whether a Claude pane is parked at its prompt while a background shell
+/// or monitor it started is still running — `waiting-on-shell` (card
+/// `20261122-b-e98304`). Herdr reports such a pane idle/done exactly like
+/// a finished one, but the lane is legitimately waiting on its own job.
+/// Only the lines below the pane's last `❯` composer line are read, so the
+/// same words in the transcript above it never count; a pane with no
+/// composer at all is not at its prompt and never qualifies. The caller
+/// supplies the ready-for-input check (Herdr's own `agent_status`); this
+/// reads pane text only. Shared by the stall wake below and by
+/// `multiverse workers`/`board`'s display, which read the same pane text.
+pub fn waiting_on_shell(text: &str) -> bool {
+    let marker = composer_marker("claude");
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(composer) = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with(marker))
+    else {
+        return false;
+    };
+    lines[composer + 1..]
+        .iter()
+        .any(|line| running_shell_footer_re().is_match(line.trim()))
 }
 
 /// Python's `_DIALOG_MENU_MARKERS`, verbatim: the fixed vocabulary an open
@@ -274,11 +404,12 @@ const DIALOG_MENU_MARKERS: &[&str] = &[
 const DIALOG_MENU_TAIL_LINES: usize = 6;
 
 /// Whether `text`'s last few non-blank lines show an open question-menu
-/// footer — Python's `dialog_or_menu_reason`'s own menu-tail-line scan,
-/// ported standalone (its vendor-dialog half, `limits.classify_prompt`, has
-/// no `mv-engine` port to call here — see the module doc comment).
+/// footer — Python's `dialog_or_menu_reason`'s own menu-tail-line scan.
+/// Only [`crate::blocking_prompt::dialog_region`] is scanned, so a menu
+/// footer that has scrolled above the last turn-end or composer is idle.
 fn menu_reason(text: &str) -> bool {
-    let tail: Vec<&str> = text
+    let region = crate::blocking_prompt::dialog_region(text);
+    let tail: Vec<&str> = region
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
@@ -324,6 +455,15 @@ pub struct RuntimeCap {
     pub failed: bool,
 }
 
+/// One task's outcome from [`wake_stalled_lanes`]: `sent` is `true` only
+/// once the one stall wake has actually gone out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallWake {
+    pub task_id: String,
+    pub pane: String,
+    pub sent: bool,
+}
+
 /// One task's outcome from `submit_unsubmitted_composers`: `sent` is
 /// `true` only once the one Enter for a positively matched, reconstructed
 /// dispatch brief has actually gone out (card `20261114-b-4d8baf`).
@@ -351,6 +491,8 @@ pub struct NudgeOutcome {
     /// non-empty text that matched none of this task's own reconstructed
     /// dispatch prompts — reported, never acted on.
     pub unsubmitted_composer: Vec<String>,
+    /// [`wake_stalled_lanes`]'s own wake-or-would-wake outcomes.
+    pub stall_wake: Vec<StallWake>,
 }
 
 /// The "RUNNING or STALLED" proxy every function below starts from: not
@@ -468,14 +610,14 @@ fn account_for<'a>(task: &SweepTask, config: &'a Config) -> Option<&'a Account> 
 
 /// Read `pane`'s visible text and classify it the same way every send in
 /// this module does: `Some(text)` only when the pane is safe to act on
-/// (readable, non-empty, no trust/approval dialog per [`crate::runner::
-/// attention_reason`], no vendor dialog per [`crate::blocking_prompt::
-/// classify_prompt`], no open question-menu footer per [`menu_reason`]);
-/// `None` for a dialog, a parked menu, an unreadable pane, or any Herdr
-/// error — "not safe to act on" either way, the same fail-closed posture
-/// Python's own `fail_closed=True` reads use for this exact decision.
-/// `kind` is the account's vendor kind (`"codex"`, `"grok"`, ...), the same
-/// string Python's own `classify_prompt(text, kind)` callers pass.
+/// (readable, non-empty, no trust/approval/menu per [`crate::runner::
+/// dialog_or_menu_reason`], which already restricts itself to
+/// [`crate::blocking_prompt::dialog_region`]); `None` for a dialog, a
+/// parked menu, an unreadable pane, or any Herdr error — "not safe to act
+/// on" either way, the same fail-closed posture Python's own
+/// `fail_closed=True` reads use for this exact decision. `kind` is the
+/// account's vendor kind (`"codex"`, `"grok"`, ...), the same string
+/// Python's own `classify_prompt(text, kind)` callers pass.
 fn safe_pane_text(
     herdr: &mut impl Herdr,
     task: &SweepTask,
@@ -484,7 +626,7 @@ fn safe_pane_text(
 ) -> Option<String> {
     let name = task.agent.as_deref().unwrap_or(pane);
     let text = visible(herdr, name, pane).ok()?;
-    if crate::blocking_prompt::classify_prompt(&text, kind).is_some() {
+    if crate::runner::dialog_or_menu_reason(&text, kind).is_some() {
         return None;
     }
     if menu_reason(&text) {
@@ -1134,6 +1276,73 @@ fn claim_composer_enter(project_root: &Path, task_id: &str, now: OffsetDateTime)
     mv_core::atomic::write_atomic(&path, &bytes).is_ok()
 }
 
+/// Short follow-ups cannot use dispatch's distinctive-prompt match. Only
+/// consider Claude's own non-empty composer below its last done banner;
+/// observation across two idle passes supplies the additional evidence.
+fn followup_composer_key(task: &SweepTask, text: &str, kind: &str) -> Option<String> {
+    if kind != "claude" || composer_inner_text(text, kind)?.is_empty() {
+        return None;
+    }
+    let composer = text.rfind(composer_marker(kind))?;
+    if !text[..composer]
+        .lines()
+        .any(|line| turn_done_re().is_match(line))
+    {
+        return None;
+    }
+    Some(format!(
+        "followup:{}:{}:{}",
+        task.task_id,
+        task.pane.as_deref()?,
+        mv_state::nudge_memory::fingerprint(text),
+    ))
+}
+
+/// Keep the existing string-to-timestamp memory format. Pending keys are
+/// observations, not spent Enter claims. A changed pane, busy agent or
+/// failed/dialog read clears the observation; dry runs never seed it.
+fn observe_followup_composer(
+    project_root: &Path,
+    task_id: &str,
+    key: Option<&str>,
+    apply: bool,
+    now: OffsetDateTime,
+) -> bool {
+    let path = composer_enter_memory_path(project_root);
+    let prefix = format!("pending:{task_id}:");
+    let pending = key.map(|key| format!("{prefix}{key}"));
+    let previous = load_composer_enter_map(&path);
+    if !apply {
+        return pending
+            .as_ref()
+            .is_some_and(|key| previous.contains_key(key));
+    }
+    if pending.is_none() && !previous.keys().any(|key| key.starts_with(&prefix)) {
+        return false;
+    }
+    let Ok(_guard) = mv_core::lock::acquire_default(
+        &composer_enter_lock_path(&path),
+        COMPOSER_ENTER_MEMORY_FILENAME,
+    ) else {
+        return false;
+    };
+    let mut map = load_composer_enter_map(&path);
+    let seen = pending.as_ref().is_some_and(|key| map.contains_key(key));
+    let before = map.clone();
+    map.retain(|key, _| !key.starts_with(&prefix) || Some(key) == pending.as_ref());
+    if let Some(pending) = pending {
+        map.entry(pending)
+            .or_insert_with(|| mv_core::time::format_seconds_utc(now));
+    }
+    if map != before {
+        let bytes = serde_json::to_vec(&map).expect("claim map always serializes");
+        if mv_core::atomic::write_atomic(&path, &bytes).is_err() {
+            return false;
+        }
+    }
+    seen
+}
+
 fn send_enter(herdr: &mut impl Herdr, name: &str) -> bool {
     herdr
         .call(&argv::agent_send_keys(name, &["Enter"]), SEND_TIMEOUT)
@@ -1168,8 +1377,10 @@ struct ComposerCheck {
 ///   one `send-keys … Enter`, [`claim_composer_enter`] spent either way, no
 ///   second Enter once [`composer_enter_already_sent`] is already true.
 /// - the composer's own [`composer_inner_text`] is non-empty but matches
-///   neither reconstruction: no Enter, reported as `"unsubmitted composer:
-///   <id>"`, held out of the three senders below.
+///   neither reconstruction: a Claude follow-up below a done banner gets
+///   its own Enter after two unchanged idle passes. Other text gets no
+///   Enter. Until eligible, reported as `"unsubmitted composer: <id>"`;
+///   always held out of the three senders below.
 /// - the composer's own inner text is empty (today's shape): no hold at
 ///   all — the three senders below see this task exactly as before.
 #[allow(clippy::too_many_arguments)]
@@ -1187,29 +1398,40 @@ fn submit_unsubmitted_composers(
     let mut check = ComposerCheck::default();
     for task in tasks {
         if !finish_nudge_base_eligible(task, config, project_root, now, sleep_intervals) {
+            observe_followup_composer(project_root, &task.task_id, None, apply, now);
             continue;
         }
         let pane = task.pane.as_deref().expect("base_eligible checked pane");
         if !pane_status(live, pane).is_some_and(AgentState::is_ready_for_input) {
+            observe_followup_composer(project_root, &task.task_id, None, apply, now);
             continue;
         }
         let Some(account) = account_for(task, config) else {
             continue;
         };
         let Some(text) = safe_pane_text(herdr, task, pane, &account.kind) else {
+            observe_followup_composer(project_root, &task.task_id, None, apply, now);
             continue;
         };
+        let followup = followup_composer_key(task, &text, &account.kind);
+        let followup_ready =
+            observe_followup_composer(project_root, &task.task_id, followup.as_deref(), apply, now);
         let matched = reconstructed_dispatch_prompts(project_root, &task.task_id)
             .iter()
             .any(|prompt| prompt_still_in_composer(&text, prompt, &account.kind));
-        if matched {
+        if matched || followup_ready {
             // Held out of the three senders below regardless of claim
             // state: a brief still positively matched in the composer
             // must never receive a competing canned prompt on top of it,
             // whether this is the first pass to see it or a later one
             // whose own Enter already claimed this task's one-time slot.
             check.held.insert(task.task_id.clone());
-            if composer_enter_already_sent(project_root, &task.task_id) {
+            let claim_key = if matched {
+                task.task_id.as_str()
+            } else {
+                followup.as_deref().expect("ready follow-up has a key")
+            };
+            if composer_enter_already_sent(project_root, claim_key) {
                 continue;
             }
             if !apply {
@@ -1220,11 +1442,22 @@ fn submit_unsubmitted_composers(
                 });
                 continue;
             }
-            if !claim_composer_enter(project_root, &task.task_id, now) {
+            if !claim_composer_enter(project_root, claim_key, now) {
                 continue;
             }
             let name = task.agent.as_deref().expect("base_eligible checked agent");
-            let sent = pane_still_hosts_task_agent(agents, task, pane) && send_enter(herdr, name);
+            let safe = if matched {
+                pane_still_hosts_task_agent(agents, task, pane)
+            } else {
+                agents.list_checked().is_some_and(|fresh| {
+                    fresh.iter().any(|agent| {
+                        agent.pane_id == pane
+                            && agent.name.as_deref() == Some(name)
+                            && agent.status.is_some_and(AgentState::is_ready_for_input)
+                    })
+                }) && safe_pane_text(herdr, task, pane, &account.kind).as_deref() == Some(&text)
+            };
+            let sent = safe && send_enter(herdr, name);
             check.holds.push(ComposerHold {
                 task_id: task.task_id.clone(),
                 pane: pane.to_string(),
@@ -1242,6 +1475,118 @@ fn submit_unsubmitted_composers(
         }
     }
     check
+}
+
+/// Unchanged-pane time since `first_seen`, discounting the slice of
+/// `sleep_intervals` that overlaps it — the same floor-at-zero arithmetic
+/// [`elapsed_since`] applies to a task's own window.
+fn idle_elapsed(
+    first_seen: OffsetDateTime,
+    now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
+) -> time::Duration {
+    let sleep_minutes =
+        crate::hostsleep::sleep_minutes_overlapping(sleep_intervals, first_seen, now);
+    ((now - first_seen) - time::Duration::minutes(sleep_minutes)).max(time::Duration::ZERO)
+}
+
+/// Send [`STALL_WAKE_PROMPT`] to every Claude lane whose background job
+/// finished without waking it (card `20261122-b-3acaeb`; see the module
+/// doc comment). Every check that needs no pane read runs first, so a lane
+/// whose finish nudge is still unspent, or whose wake is already spent,
+/// costs no Herdr call here. A pane read that passes every text check is
+/// recorded in idle-pane memory only on an applying pass. Under
+/// `apply=false` (`sweep --dry-run` or a halt) or `MULTIVERSE_READ_ONLY=1`
+/// [`mv_state::nudge_memory::idle_pane_since`] still returns the stored
+/// first-seen so a preview can fire, but never creates or rewrites
+/// `.multiverse/idle-pane-memory.json` (card `20261122-b-7378a4`).
+#[allow(clippy::too_many_arguments)]
+pub fn wake_stalled_lanes(
+    project_root: &Path,
+    tasks: &[SweepTask],
+    live: &[LiveAgentStatus],
+    config: &Config,
+    apply: bool,
+    now: OffsetDateTime,
+    sleep_intervals: &[crate::hostsleep::SleepInterval],
+    agents: &mut impl AgentPanes,
+    herdr: &mut impl Herdr,
+) -> Vec<StallWake> {
+    let recorded = recorded_task_ids(tasks);
+    let live_panes: Vec<String> = live.iter().map(|agent| agent.pane_id.clone()).collect();
+    let mut results = Vec::new();
+    for task in tasks {
+        if !finish_nudge_base_eligible(task, config, project_root, now, sleep_intervals) {
+            continue;
+        }
+        let Some(account) = account_for(task, config) else {
+            continue;
+        };
+        if account.kind != "claude" {
+            continue;
+        }
+        let pane = task.pane.as_deref().expect("base_eligible checked pane");
+        if !pane_status(live, pane).is_some_and(AgentState::is_ready_for_input) {
+            continue;
+        }
+        if !mv_state::nudge_memory::finish_nudge_already_sent(
+            project_root,
+            &task.task_id,
+            &recorded,
+        ) {
+            continue;
+        }
+        if mv_state::nudge_memory::stall_wake_already_sent(project_root, &task.task_id, &recorded) {
+            continue;
+        }
+        let Some(text) = safe_pane_text(herdr, task, pane, &account.kind) else {
+            continue;
+        };
+        // A footer still showing a running shell or monitor means the job
+        // the lane is waiting on has not finished (card
+        // `20261122-b-e98304`): never wake it, even when an earlier
+        // background command's completion line reads as unwoken.
+        if stuck_pane_re().is_match(&text)
+            || waiting_on_shell(&text)
+            || !background_job_finished_unwoken(&text)
+        {
+            continue;
+        }
+        let Some(first_seen) = mv_state::nudge_memory::idle_pane_since(
+            project_root,
+            pane,
+            &text,
+            &live_panes,
+            now,
+            apply,
+        ) else {
+            continue;
+        };
+        if idle_elapsed(first_seen, now, sleep_intervals)
+            < time::Duration::minutes(STALL_WAKE_AFTER_MINUTES)
+        {
+            continue;
+        }
+        if !apply {
+            results.push(StallWake {
+                task_id: task.task_id.clone(),
+                pane: pane.to_string(),
+                sent: false,
+            });
+            continue;
+        }
+        if !mv_state::nudge_memory::claim_stall_wake(project_root, &task.task_id, &recorded, now) {
+            continue;
+        }
+        let sent =
+            pane_still_hosts_task_agent(agents, task, pane) && send(herdr, pane, STALL_WAKE_PROMPT);
+        results.push(StallWake {
+            task_id: task.task_id.clone(),
+            pane: pane.to_string(),
+            sent,
+        });
+    }
+    results
 }
 
 /// Run all three nudges for one project's already-fetched `tasks`. Calls
@@ -1342,6 +1687,34 @@ pub fn run(
         agents,
         herdr,
     );
+    // Card `20261122-b-3acaeb`: the stall wake runs last and, keeping
+    // finding 2's one-canned-prompt-per-lane-per-pass rule, never sees a
+    // task finish, resume or cap touched this pass. Finish matters most:
+    // a finish nudge claimed moments ago already reads as spent, so
+    // without this filter the same pass could wake the lane it just
+    // nudged.
+    let touched: HashSet<&str> = finish
+        .iter()
+        .map(|n| n.task_id.as_str())
+        .chain(resume.iter().map(|r| r.task_id.as_str()))
+        .chain(cap.iter().map(|c| c.task_id.as_str()))
+        .collect();
+    let wake_candidates: Vec<SweepTask> = remaining
+        .iter()
+        .filter(|task| !touched.contains(task.task_id.as_str()))
+        .cloned()
+        .collect();
+    let stall_wake = wake_stalled_lanes(
+        project_root,
+        &wake_candidates,
+        &live,
+        config,
+        apply,
+        now,
+        sleep_intervals,
+        agents,
+        herdr,
+    );
     NudgeOutcome {
         stuck,
         finish,
@@ -1349,6 +1722,7 @@ pub fn run(
         composer: composer_check.holds,
         unsubmitted_composer: composer_check.unsubmitted,
         cap,
+        stall_wake,
     }
 }
 
@@ -1754,6 +2128,38 @@ mod tests {
             "t1",
             &BTreeSet::new()
         ));
+    }
+
+    #[test]
+    fn trust_prose_in_scrollback_does_not_block_the_finish_nudge() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let t = task("t1", "claude-main", "w1:p1", 1);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        let mut herdr = FakeHerdr {
+            pane_text: include_str!(
+                "../../../tests/fixtures/sandbox-dialog/claude-idle-with-trust-prose-in-scrollback.txt"
+            ),
+            prompts: Vec::new(),
+        };
+        let results = nudge_idle_lanes_to_finish(
+            &root,
+            std::slice::from_ref(&t),
+            &live,
+            &config,
+            true,
+            mv_core::time::now_utc(),
+            &[],
+            &mut FakeAgents { live: live.clone() },
+            &mut herdr,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].sent);
+        assert_eq!(herdr.prompts, vec![FINISH_NUDGE_PROMPT.to_string()]);
     }
 
     #[test]
@@ -3460,6 +3866,244 @@ mod tests {
     // --- `submit_unsubmitted_composers` (card `20261114-b-4d8baf`, design
     // `20261115-seer-c2c967`). ---
 
+    const DONE_FOLLOWUP: &str =
+        include_str!("../../../tests/fixtures/composer/claude-done-followup.txt");
+
+    #[test]
+    fn a_short_done_followup_gets_one_enter_after_two_idle_passes_even_after_dispatch_enter() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let now = mv_core::time::now_utc();
+        assert!(claim_composer_enter(&root, "t1", now));
+        let mut agents = FakeAgents {
+            live: vec![LiveAgentStatus {
+                pane_id: "w1:p1".into(),
+                name: Some("t1-agent".into()),
+                status: Some(AgentState::Done),
+            }],
+        };
+        let mut herdr = FakeHerdr {
+            pane_text: DONE_FOLLOWUP,
+            prompts: Vec::new(),
+        };
+        for pass in 0..3 {
+            let outcome = run(
+                &root,
+                std::slice::from_ref(&t),
+                &config,
+                true,
+                now + time::Duration::minutes(pass),
+                &[],
+                &mut agents,
+                &mut herdr,
+            );
+            assert_eq!(outcome.composer.len(), usize::from(pass == 1));
+            assert!(outcome.composer.iter().all(|hold| hold.sent));
+            assert!(outcome.finish.is_empty());
+            assert!(outcome.resume.is_empty());
+            assert!(outcome.cap.is_empty());
+            assert_eq!(herdr.prompts.len(), usize::from(pass >= 1));
+        }
+        assert_eq!(herdr.prompts, ["Enter:t1-agent"]);
+        let memory = load_composer_enter_map(&composer_enter_memory_path(&root));
+        assert_eq!(
+            memory
+                .keys()
+                .filter(|key| !key.starts_with("pending:"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_done_followup_dialog_never_gets_enter_even_on_repeated_passes() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let mut agents = FakeAgents {
+            live: vec![LiveAgentStatus {
+                pane_id: "w1:p1".into(),
+                name: Some("t1-agent".into()),
+                status: Some(AgentState::Idle),
+            }],
+        };
+        let mut herdr = FakeHerdr {
+            pane_text: Box::leak(
+                format!("{DONE_FOLLOWUP}\nDo you trust this folder?\n").into_boxed_str(),
+            ),
+            prompts: Vec::new(),
+        };
+        for _ in 0..3 {
+            let outcome = run(
+                &root,
+                std::slice::from_ref(&t),
+                &config,
+                true,
+                mv_core::time::now_utc(),
+                &[],
+                &mut agents,
+                &mut herdr,
+            );
+            assert!(outcome.composer.is_empty());
+        }
+        assert!(herdr.prompts.is_empty());
+        assert!(!composer_enter_memory_path(&root).exists());
+    }
+
+    #[test]
+    fn a_followup_needs_two_new_idle_passes_after_busy_dialog_or_text_change() {
+        for interruption in ["busy", "dialog", "text"] {
+            let root = temp_project();
+            let config = config_with_claude_account("startup_grace_seconds = 30");
+            let t = task("t1", "claude-main", "w1:p1", 5);
+            let live = vec![LiveAgentStatus {
+                pane_id: "w1:p1".into(),
+                name: Some("t1-agent".into()),
+                status: Some(AgentState::Idle),
+            }];
+            let mut agents = FakeAgents { live: live.clone() };
+            let mut herdr = FakeHerdr {
+                pane_text: DONE_FOLLOWUP,
+                prompts: Vec::new(),
+            };
+            for pass in 0..4 {
+                agents.live = live.clone();
+                herdr.pane_text = DONE_FOLLOWUP;
+                if pass == 1 {
+                    match interruption {
+                        "busy" => agents.live[0].status = Some(AgentState::Working),
+                        "dialog" => herdr.pane_text = "Do you trust this folder?",
+                        "text" => {
+                            herdr.pane_text = Box::leak(
+                                DONE_FOLLOWUP
+                                    .replace("sample EndToEnd", "sample NextComponent")
+                                    .into_boxed_str(),
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                run(
+                    &root,
+                    std::slice::from_ref(&t),
+                    &config,
+                    true,
+                    mv_core::time::now_utc(),
+                    &[],
+                    &mut agents,
+                    &mut herdr,
+                );
+                assert_eq!(
+                    herdr.prompts.len(),
+                    usize::from(pass == 3),
+                    "{interruption}, pass {pass}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_followup_dry_run_never_seeds_an_idle_observation_or_claim() {
+        let root = temp_project();
+        let config = config_with_claude_account("startup_grace_seconds = 30");
+        let t = task("t1", "claude-main", "w1:p1", 5);
+        let mut agents = FakeAgents {
+            live: vec![LiveAgentStatus {
+                pane_id: "w1:p1".into(),
+                name: Some("t1-agent".into()),
+                status: Some(AgentState::Idle),
+            }],
+        };
+        let mut herdr = FakeHerdr {
+            pane_text: DONE_FOLLOWUP,
+            prompts: Vec::new(),
+        };
+        for apply in [false, false, true] {
+            run(
+                &root,
+                std::slice::from_ref(&t),
+                &config,
+                apply,
+                mv_core::time::now_utc(),
+                &[],
+                &mut agents,
+                &mut herdr,
+            );
+            assert!(herdr.prompts.is_empty());
+            if !apply {
+                assert!(!composer_enter_memory_path(&root).exists());
+                assert!(!composer_enter_lock_path(&composer_enter_memory_path(&root)).exists());
+            }
+        }
+        let before = std::fs::read(composer_enter_memory_path(&root)).unwrap();
+        let preview = run(
+            &root,
+            std::slice::from_ref(&t),
+            &config,
+            false,
+            mv_core::time::now_utc(),
+            &[],
+            &mut agents,
+            &mut herdr,
+        );
+        assert_eq!(preview.composer.len(), 1);
+        assert!(!preview.composer[0].sent);
+        assert!(herdr.prompts.is_empty());
+        assert_eq!(
+            std::fs::read(composer_enter_memory_path(&root)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_followup_enter_rechecks_agent_identity_and_idle_state() {
+        for recycled in [false, true] {
+            let root = temp_project();
+            let config = config_with_claude_account("startup_grace_seconds = 30");
+            let t = task("t1", "claude-main", "w1:p1", 5);
+            let live = vec![LiveAgentStatus {
+                pane_id: "w1:p1".into(),
+                name: Some("t1-agent".into()),
+                status: Some(AgentState::Idle),
+            }];
+            let mut agents = FakeAgents { live: live.clone() };
+            let mut herdr = FakeHerdr {
+                pane_text: DONE_FOLLOWUP,
+                prompts: Vec::new(),
+            };
+            run(
+                &root,
+                std::slice::from_ref(&t),
+                &config,
+                true,
+                mv_core::time::now_utc(),
+                &[],
+                &mut agents,
+                &mut herdr,
+            );
+            if recycled {
+                agents.live[0].name = Some("other-agent".into());
+            } else {
+                agents.live[0].status = Some(AgentState::Working);
+            }
+            let checked = submit_unsubmitted_composers(
+                &root,
+                &[t],
+                &live,
+                &config,
+                true,
+                mv_core::time::now_utc(),
+                &[],
+                &mut agents,
+                &mut herdr,
+            );
+            assert_eq!(checked.holds.len(), 1);
+            assert!(!checked.holds[0].sent);
+            assert!(herdr.prompts.is_empty());
+        }
+    }
+
     /// Fixed-width character wrap, oblivious to word boundaries — the same
     /// bordered-composer shape `runner.rs`'s own `boxed_composer` test
     /// helper builds (card `20261109-b-620eeb`), duplicated here rather
@@ -3732,5 +4376,492 @@ mod tests {
             herdr.prompts.is_empty(),
             "the composer Enter must never reach other-agent's pane"
         );
+    }
+
+    // --- stall wake (card 20261122-b-3acaeb) -------------------------------
+
+    const BACKGROUND_COMPLETED_IDLE: &str = include_str!(
+        "../../../tests/fixtures/stall-cause/claude-background-command-completed-idle.txt"
+    );
+
+    fn idle_claude_lane() -> (SweepTask, Vec<LiveAgentStatus>) {
+        let t = task("t1", "claude-main", "w1:p1", 1);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        (t, live)
+    }
+
+    fn stall_pass(
+        root: &Path,
+        t: &SweepTask,
+        live: &[LiveAgentStatus],
+        config: &Config,
+        apply: bool,
+        at: OffsetDateTime,
+        herdr: &mut FakeHerdr,
+    ) -> NudgeOutcome {
+        run(
+            root,
+            std::slice::from_ref(t),
+            config,
+            apply,
+            at,
+            &[],
+            &mut FakeAgents {
+                live: live.to_vec(),
+            },
+            herdr,
+        )
+    }
+
+    #[test]
+    fn the_fixture_reads_as_a_background_job_that_finished_unwoken() {
+        assert!(background_job_finished_unwoken(BACKGROUND_COMPLETED_IDLE));
+        // The 7abd49 capture's own shape: the notification did wake the
+        // agent, which went straight on to new tool activity.
+        let woken = BACKGROUND_COMPLETED_IDLE
+            .replace("(exit code 0)\n", "(exit code 0)\n\n⏺ Bash(cargo test)\n");
+        assert!(!background_job_finished_unwoken(&woken));
+        // A turn that ended after the notification was handled.
+        let handled = BACKGROUND_COMPLETED_IDLE.replace(
+            "(exit code 0)\n",
+            "(exit code 0)\n\n✻ Worked for 3s · done 7:45 PM\n",
+        );
+        assert!(!background_job_finished_unwoken(&handled));
+        // Typed text left in the composer is not an idle composer.
+        let typed = BACKGROUND_COMPLETED_IDLE.replace("❯ \n", "❯ half a thought\n");
+        assert!(!background_job_finished_unwoken(&typed));
+    }
+
+    #[test]
+    fn a_claude_lane_whose_background_job_finished_is_woken_once_after_15_unchanged_minutes() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+
+        // Pass 1 seeds idle-pane memory and sends nothing.
+        let first = stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        assert!(first.stall_wake.is_empty());
+        assert!(herdr.prompts.is_empty());
+
+        // Pass 2, the same text 16 minutes later: exactly one wake.
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert_eq!(herdr.prompts, vec![STALL_WAKE_PROMPT.to_string()]);
+        assert_eq!(
+            second.stall_wake,
+            vec![StallWake {
+                task_id: "t1".to_string(),
+                pane: "w1:p1".to_string(),
+                sent: true,
+            }]
+        );
+        assert!(second.finish.is_empty());
+        assert!(mv_state::nudge_memory::stall_wake_already_sent(
+            &root,
+            "t1",
+            &BTreeSet::new()
+        ));
+
+        // Pass 3: the one-shot claim is spent.
+        let latest = later + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let third = stall_pass(&root, &t, &live, &config, true, latest, &mut herdr);
+        assert!(third.stall_wake.is_empty());
+        assert_eq!(herdr.prompts.len(), 1, "no second wake");
+    }
+
+    #[test]
+    fn a_lane_still_waiting_with_no_completion_line_is_never_woken() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let waiting: String = BACKGROUND_COMPLETED_IDLE
+            .lines()
+            .filter(|line| !line.contains("Background command"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let mut herdr = FakeHerdr {
+            pane_text: Box::leak(waiting.into_boxed_str()),
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert!(second.stall_wake.is_empty());
+        assert!(herdr.prompts.is_empty());
+    }
+
+    #[test]
+    fn a_pane_whose_text_changed_between_passes_restarts_the_stall_clock() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        herdr.pane_text = Box::leak(
+            BACKGROUND_COMPLETED_IDLE
+                .replace("exit code 0", "exit code 1")
+                .into_boxed_str(),
+        );
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert!(
+            second.stall_wake.is_empty(),
+            "the clock restarted at pass 2"
+        );
+        assert!(herdr.prompts.is_empty());
+    }
+
+    #[test]
+    fn a_working_claude_lane_is_never_stall_woken() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, mut live) = idle_claude_lane();
+        live[0].status = Some(AgentState::Working);
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert!(second.stall_wake.is_empty());
+        assert!(herdr.prompts.is_empty());
+    }
+
+    #[test]
+    fn a_lane_with_result_md_on_disk_is_never_stall_woken() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        let task_dir = root.join(".multiverse/tasks/t1");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(task_dir.join("result.md"), "some findings\n").unwrap();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert!(second.stall_wake.is_empty());
+        assert!(herdr.prompts.is_empty());
+    }
+
+    /// The finish nudge keeps precedence: an unspent finish claim means the
+    /// lane gets [`FINISH_NUDGE_PROMPT`] and nothing else, even once its
+    /// pane has sat unchanged long enough — and the finish claim that pass
+    /// just made must not let the same pass wake it too.
+    #[test]
+    fn an_unspent_finish_claim_gets_the_finish_nudge_only_never_a_wake() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        let now = mv_core::time::now_utc();
+        let live_panes = vec!["w1:p1".to_string()];
+        assert_eq!(
+            mv_state::nudge_memory::idle_pane_since(
+                &root,
+                "w1:p1",
+                BACKGROUND_COMPLETED_IDLE,
+                &live_panes,
+                now,
+                true
+            ),
+            Some(now.replace_nanosecond(0).unwrap())
+        );
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let outcome = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert_eq!(herdr.prompts, vec![FINISH_NUDGE_PROMPT.to_string()]);
+        assert_eq!(outcome.finish.len(), 1);
+        assert!(outcome.stall_wake.is_empty());
+        assert!(!mv_state::nudge_memory::stall_wake_already_sent(
+            &root,
+            "t1",
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
+    fn a_dry_run_previews_the_stall_wake_without_claiming_or_sending() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        // A real pass seeds the pane-unchanged clock without sending (not
+        // yet 15 minutes). `commands::sweep` maps both `--dry-run` and a
+        // halt onto `apply=false`; that path must read the clock and leave
+        // the file byte-identical.
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        let memory = root.join(".multiverse/idle-pane-memory.json");
+        let before = std::fs::read(&memory).expect("applying pass seeds idle-pane memory");
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let preview = stall_pass(&root, &t, &live, &config, false, later, &mut herdr);
+        assert_eq!(
+            preview.stall_wake,
+            vec![StallWake {
+                task_id: "t1".to_string(),
+                pane: "w1:p1".to_string(),
+                sent: false,
+            }]
+        );
+        assert!(herdr.prompts.is_empty());
+        assert!(!mv_state::nudge_memory::stall_wake_already_sent(
+            &root,
+            "t1",
+            &BTreeSet::new()
+        ));
+        assert_eq!(
+            std::fs::read(&memory).unwrap(),
+            before,
+            "dry-run/halt must not rewrite idle-pane-memory.json"
+        );
+    }
+
+    /// `commands::sweep` sets `nudges_apply = !dry_run && !halted`, so a
+    /// dry-run and a halted sweep share this `apply=false` path. Revert
+    /// the persist gate on [`idle_pane_since`] and this creates the file
+    /// and previews a wake after the second pass.
+    #[test]
+    fn a_dry_run_or_halted_sweep_does_not_create_idle_pane_memory() {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, false, now, &mut herdr);
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let preview = stall_pass(&root, &t, &live, &config, false, later, &mut herdr);
+        assert!(
+            preview.stall_wake.is_empty(),
+            "apply=false must not seed the clock, so two dry-run/halt passes cannot qualify"
+        );
+        assert!(herdr.prompts.is_empty());
+        assert!(!root.join(".multiverse/idle-pane-memory.json").exists());
+    }
+
+    #[test]
+    fn a_codex_lane_is_never_stall_woken() {
+        let root = temp_project();
+        let config = config_with_codex_account("");
+        let t = task("t1", "codex-main", "w1:p1", 1);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Idle),
+        }];
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: BACKGROUND_COMPLETED_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert!(second.stall_wake.is_empty());
+        assert!(herdr.prompts.is_empty());
+    }
+
+    // --- Claude API-retry park (card 20261122-b-1049ab) ---------------------
+
+    const WAITING_FOR_API_RESPONSE_RETRY: &str = include_str!(
+        "../../../tests/fixtures/stall-cause/claude-waiting-for-api-response-retry.txt"
+    );
+
+    /// Two `resume_stuck_lanes` passes five minutes apart over a still-
+    /// `Working` Claude lane 45 minutes in, showing `pane_text` both times;
+    /// returns the prompts sent.
+    fn resume_two_passes_over_working_claude_lane(pane_text: &'static str) -> Vec<String> {
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let t = task("t1", "claude-main", "w1:p1", 45);
+        let live = vec![LiveAgentStatus {
+            pane_id: "w1:p1".to_string(),
+            name: Some("t1-agent".to_string()),
+            status: Some(AgentState::Working),
+        }];
+        let now = mv_core::time::now_utc();
+        let mut herdr = FakeHerdr {
+            pane_text,
+            prompts: Vec::new(),
+        };
+        for at in [now, now + time::Duration::minutes(5)] {
+            resume_stuck_lanes(
+                &root,
+                std::slice::from_ref(&t),
+                &live,
+                &config,
+                true,
+                at,
+                &[],
+                &mut FakeAgents { live: live.clone() },
+                &mut herdr,
+            );
+        }
+        herdr.prompts
+    }
+
+    /// A Claude lane parked on `✻ Waiting for API response · will retry in
+    /// … · check your network` (the 7abd49 capture) gets the resume prompt.
+    /// Revert check: drop the `waiting for api response` alternative from
+    /// `connection_loss_re` and the first assertion fails — the control
+    /// below shows nothing else in the capture matches, so the lane would
+    /// again get no prompt at all.
+    #[test]
+    fn a_claude_lane_parked_waiting_for_an_api_response_retry_is_resumed() {
+        assert_eq!(
+            resume_two_passes_over_working_claude_lane(WAITING_FOR_API_RESPONSE_RETRY),
+            vec![STUCK_RESUME_PROMPT.to_string()]
+        );
+
+        let without_park: &'static str = Box::leak(
+            WAITING_FOR_API_RESPONSE_RETRY
+                .replace(
+                    "✻ Waiting for API response · will retry in 3m 50s · check your network\n",
+                    "",
+                )
+                .into_boxed_str(),
+        );
+        assert_ne!(without_park, WAITING_FOR_API_RESPONSE_RETRY);
+        assert!(resume_two_passes_over_working_claude_lane(without_park).is_empty());
+
+        // Finish-nudge and stall-wake read `stuck_pane_re`, which stays
+        // unchanged: this park is not in its vocabulary.
+        assert!(!stuck_pane_re().is_match(WAITING_FOR_API_RESPONSE_RETRY));
+    }
+
+    // --- waiting-on-shell (card 20261122-b-e98304) --------------------------
+
+    const SHELL_STILL_RUNNING_IDLE: &str =
+        include_str!("../../../tests/fixtures/stall-cause/claude-shell-still-running-idle.txt");
+
+    #[test]
+    fn the_shell_footer_fixture_reads_as_waiting_on_shell() {
+        assert!(waiting_on_shell(SHELL_STILL_RUNNING_IDLE));
+        // The `N shell(s) still running` and monitor forms.
+        for footer in [
+            "  ⏵⏵ bypass permissions on · 2 shells still running",
+            "  1 monitor still running · ← 1 agent",
+        ] {
+            let text = SHELL_STILL_RUNNING_IDLE
+                .replace("  ⏵⏵ bypass permissions on · 1 shell · ← 1 agent", footer);
+            assert!(waiting_on_shell(&text), "{footer}");
+        }
+        // No running-shell segment in the footer: not waiting.
+        let finished = SHELL_STILL_RUNNING_IDLE.replace(" · 1 shell", "");
+        assert!(!waiting_on_shell(&finished));
+        assert!(!waiting_on_shell(BACKGROUND_COMPLETED_IDLE));
+        // The same words in the transcript above the composer never count.
+        let quoted = format!("⏺ The footer said · 1 shell still running ·\n{finished}");
+        assert!(!waiting_on_shell(&quoted));
+        // No composer at all: not at its prompt.
+        assert!(!waiting_on_shell("  ⏵⏵ bypass permissions on · 1 shell"));
+    }
+
+    /// Revert check: drop `waiting_on_shell` from `wake_stalled_lanes`'s
+    /// skip condition and this lane is woken on the second pass — the
+    /// fixture's earlier `Background command … completed` line alone reads
+    /// as a finished-but-unwoken job (asserted below).
+    #[test]
+    fn a_claude_lane_whose_footer_still_shows_a_running_shell_is_never_stall_woken() {
+        assert!(background_job_finished_unwoken(SHELL_STILL_RUNNING_IDLE));
+        let root = temp_project();
+        let config = config_with_claude_account("");
+        let (t, live) = idle_claude_lane();
+        assert!(mv_state::nudge_memory::claim_finish_nudge(
+            &root,
+            "t1",
+            &BTreeSet::new(),
+            mv_core::time::now_utc()
+        ));
+        let mut herdr = FakeHerdr {
+            pane_text: SHELL_STILL_RUNNING_IDLE,
+            prompts: Vec::new(),
+        };
+        let now = mv_core::time::now_utc();
+        stall_pass(&root, &t, &live, &config, true, now, &mut herdr);
+        let later = now + time::Duration::minutes(STALL_WAKE_AFTER_MINUTES + 1);
+        let second = stall_pass(&root, &t, &live, &config, true, later, &mut herdr);
+        assert!(second.stall_wake.is_empty());
+        assert!(herdr.prompts.is_empty());
+        assert!(!mv_state::nudge_memory::stall_wake_already_sent(
+            &root,
+            "t1",
+            &BTreeSet::new()
+        ));
     }
 }

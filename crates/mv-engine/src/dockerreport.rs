@@ -1165,6 +1165,37 @@ pub fn own_ancestor_pids_with(
     ancestors
 }
 
+/// Card `20261123-b-ccc2cc`: one process's parent pid and full argument
+/// list (`ps -o ppid=,command=`), which a [`process_cwds`] snapshot does
+/// not carry — its `comm=` column names only the executable, so neither an
+/// orphaned leftover (parent pid 1) nor an ssh ControlMaster's own `[mux]`
+/// title is visible there. `None` when the pid is gone or `ps` fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessParent {
+    pub ppid: u32,
+    pub args: String,
+}
+
+/// [`ProcessParent`] for `pid` via the real `ps`.
+pub fn process_parent(pid: u32) -> Option<ProcessParent> {
+    process_parent_with(pid, &mut host_probe)
+}
+
+/// Same as [`process_parent`], with the same injectable `ps` probe
+/// [`own_ancestor_pids_with`] takes.
+pub fn process_parent_with(
+    pid: u32,
+    probe: &mut impl FnMut(&str, &[&str]) -> Option<String>,
+) -> Option<ProcessParent> {
+    let out = probe("ps", &["-o", "ppid=,command=", "-p", &pid.to_string()])?;
+    let line = out.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let (ppid, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    Some(ProcessParent {
+        ppid: ppid.parse().ok()?,
+        args: args.trim().to_string(),
+    })
+}
+
 /// Whether `process` must never be signaled — checked by every call site
 /// before it invokes [`reap`], not by `reap` itself: `own_ancestor_pids` is
 /// one `ps` walk a caller makes once per pass, not once per candidate.
@@ -1449,6 +1480,29 @@ mod reap_tests {
             _ => panic!("must stop walking past pid 1: {args:?}"),
         });
         assert_eq!(ancestors, vec![200, 1]);
+    }
+
+    #[test]
+    fn process_parent_with_reads_the_parent_pid_and_full_argument_list() {
+        let parent = process_parent_with(77, &mut |program, args| match (program, args) {
+            ("ps", ["-o", "ppid=,command=", "-p", "77"]) => {
+                Some("    1 ssh: /tmp/cm.sock [mux]\n".into())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            parent,
+            Some(ProcessParent {
+                ppid: 1,
+                args: "ssh: /tmp/cm.sock [mux]".into(),
+            })
+        );
+        assert_eq!(process_parent_with(77, &mut |_, _| None), None);
+        assert_eq!(
+            process_parent_with(77, &mut |_, _| Some("\n".into())),
+            None,
+            "a gone pid prints nothing"
+        );
     }
 
     #[test]

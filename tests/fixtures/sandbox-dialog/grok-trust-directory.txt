@@ -1,0 +1,11 @@
+  Grok Build 1.0.92
+
+  /home/agent/project/worktree
+
+  This folder has project files Grok can load: instructions (AGENTS.md),
+  hooks, MCP servers, and skills. Only trust folders whose contents you
+  have reviewed.
+
+  Do you trust the contents of this directory? y/n
+
+  y:trust  │  n:don't trust  │  Ctrl+c:quit

@@ -126,6 +126,12 @@ fn with_extra_lines(mut message: String, lines: Vec<String>) -> String {
 /// Extracted so tests can drive it with a literal invocation directly,
 /// instead of mutating `MULTIVERSE_INVOCATION` — a process-global — to
 /// steer production code through it.
+///
+/// Does not pass `--color` / `--no-color`. The board process decides:
+/// a Herdr pane (`HERDR_ENV=1` / `HERDR_PANE_ID`) is unconfirmed, so
+/// Auto colour stays off unless the operator later passes `--color always`
+/// or sets `[board].color = true`. Baking `--no-color` into this script
+/// would make that opt-in unreachable.
 fn dashboard_tab_script(invocation: &str, config_path: &Path, target: &str) -> String {
     format!(
         "{invocation} --config {} board {target} --watch",
@@ -1478,21 +1484,21 @@ fn batch_summary(
     if project_seeded > 0 {
         parts.push(format!(
             "{project_seeded} of {project_opened} pane(s) were handed each project's own \
-             **{orch}**: its repository, the roles it may dispatch, and the rule that no \
-             other repository exists. Each project's **{orch}** is the one you talk to for \
+             {orch}: its repository, the roles it may dispatch, and the rule that no \
+             other repository exists. Each project's {orch} is the one you talk to for \
              it; it dispatches its own specialists, and nothing else was started or spent."
         ));
     }
     if hub_seeded > 0 {
         parts.push(format!(
-            "The home **{orch}** was handed its own seed: it has no repository of its own, \
+            "The home {orch} was handed its own seed: it has no repository of its own, \
              checks on every configured project, and routes work to each project's own \
-             **{orch}**. Nothing else was started and nothing was spent."
+             {orch}. Nothing else was started and nothing was spent."
         ));
     }
     if seeded < opened {
         parts.push(format!(
-            "{} pane(s) were opened but never told they are the\n**{orch}** — the reason is \
+            "{} pane(s) were opened but never told they are the\n{orch} — the reason is \
              printed under each one above. Until a session reads its seed\nit does not know \
              this project, and it will not dispatch anything.",
             opened - seeded
@@ -2124,12 +2130,10 @@ mod tests {
     #[test]
     fn batch_summary_project_only_run_names_the_repository_isolation_rule() {
         let summary = batch_summary(true, 2, 2, 2, 0).unwrap();
-        assert!(
-            summary.contains("each project's own **Nexus**"),
-            "{summary}"
-        );
+        assert!(summary.contains("each project's own Nexus"), "{summary}");
+        assert!(!summary.contains("**Nexus**"), "{summary}");
         assert!(summary.contains("no other repository exists"), "{summary}");
-        assert!(!summary.contains("home **Nexus**"), "{summary}");
+        assert!(!summary.contains("home Nexus"), "{summary}");
         assert!(
             !summary.to_lowercase().contains("orchestrator"),
             "{summary}"
@@ -2139,7 +2143,8 @@ mod tests {
     #[test]
     fn batch_summary_hub_only_run_uses_home_wording_and_claims_no_repository() {
         let summary = batch_summary(true, 1, 0, 0, 1).unwrap();
-        assert!(summary.contains("home **Nexus**"), "{summary}");
+        assert!(summary.contains("home Nexus"), "{summary}");
+        assert!(!summary.contains("**Nexus**"), "{summary}");
         assert!(summary.contains("no repository of its own"), "{summary}");
         assert!(!summary.contains("no other repository exists"), "{summary}");
         assert!(
@@ -2151,12 +2156,10 @@ mod tests {
     #[test]
     fn batch_summary_mixed_hub_and_project_batch_prints_both_paragraphs() {
         let summary = batch_summary(true, 3, 2, 2, 1).unwrap();
-        assert!(
-            summary.contains("each project's own **Nexus**"),
-            "{summary}"
-        );
+        assert!(summary.contains("each project's own Nexus"), "{summary}");
+        assert!(!summary.contains("**Nexus**"), "{summary}");
         assert!(summary.contains("no other repository exists"), "{summary}");
-        assert!(summary.contains("home **Nexus**"), "{summary}");
+        assert!(summary.contains("home Nexus"), "{summary}");
         assert!(summary.contains("no repository of its own"), "{summary}");
         assert!(
             !summary.to_lowercase().contains("orchestrator"),
@@ -2171,6 +2174,7 @@ mod tests {
             summary.contains("1 pane(s) were opened but never told"),
             "{summary}"
         );
+        assert!(!summary.contains("**Nexus**"), "{summary}");
     }
 
     #[test]
@@ -2464,6 +2468,21 @@ mod tests {
         let script = home_board_script("multiverse", config_path);
         assert!(script.contains("board --all --read-only"), "{script}");
         assert!(!script.contains("--watch"), "{script}");
+    }
+
+    #[test]
+    fn board_tab_scripts_do_not_force_color_on_or_off() {
+        // The Linux first-install screenshot printed `[92m` as text after
+        // Herdr dropped the ESC byte. Colour is decided inside `board`
+        // (Herdr pane → Auto off), not by the pane-run argv, so an
+        // operator can still opt in without this script fighting them.
+        let config_path = Path::new("/sandbox/config.toml");
+        let dashboard = dashboard_tab_script("multiverse", config_path, "--all");
+        let home = home_board_script("multiverse", config_path);
+        for script in [&dashboard, &home] {
+            assert!(!script.contains("--color"), "{script}");
+            assert!(!script.contains("--no-color"), "{script}");
+        }
     }
 
     #[test]

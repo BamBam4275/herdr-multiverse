@@ -278,6 +278,15 @@ def _run_step(
                         f"step {step_index}: {stream_name} missing expected "
                         f"substring: {wanted_needle!r}\n  --- actual ---\n{actual}"
                     )
+        not_contains_key = f"{stream_name}_not_contains"
+        if not_contains_key in expect:
+            for needle in expect[not_contains_key]:
+                wanted_needle = translate_expect_text(needle) if impl == "rust" else needle
+                if wanted_needle in actual:
+                    failures.append(
+                        f"step {step_index}: {stream_name} unexpectedly "
+                        f"contains {wanted_needle!r}\n  --- actual ---\n{actual}"
+                    )
 
     if stateful_herdr_state is None:
         state = json.loads(state_path.read_text()) if state_path.exists() else {"index": 0}

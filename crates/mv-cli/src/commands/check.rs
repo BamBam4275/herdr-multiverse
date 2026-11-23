@@ -20,10 +20,12 @@ use mv_config::roles::Role;
 use mv_engine::breaker;
 use mv_engine::mv_herdr::argv;
 use mv_engine::mv_herdr::error::HerdrError;
-use mv_engine::nexus_seed::{self, DispatchableRole, SeedContext, SeedRole};
+use mv_engine::nexus_seed::{
+    self, DispatchableRole, SeedContext, SeedPart, SeedRole, SeedStaleness,
+};
 use mv_engine::runner::{Herdr, ProcessHerdr};
 use mv_engine::selector;
-use mv_state::tasks::sweep_tasks;
+use mv_state::tasks::{sweep_tasks, SweepTask};
 
 use super::doctor::{project_path, resolve_config_path, state_dir_from_config};
 use super::{is_retired_role_key_error, MIGRATE_FIX_LINE};
@@ -175,13 +177,84 @@ fn fetch_live_open_counts(config: &Config) -> Result<OpenSnapshot, String> {
     })
 }
 
+/// Suffix on the hub project's `check` line so a first-run user can tell
+/// `[projects.multiverse]` is the built-in home workspace, not a project
+/// they added.
+fn hub_project_note(name: &str) -> &'static str {
+    if name == mv_state::activity::HUB_PROJECT_NAME {
+        "  (built-in home hub: cross-project chat; not a project you added)"
+    } else {
+        ""
+    }
+}
+
+/// Every kind of `note:`/`warning:` line `check` prints, for the
+/// trailing `see docs/ONBOARDING.md#<anchor>` that [`NoteKind::anchor`]
+/// maps it to (card `20261122-b-41530f`). A test reads the real
+/// `docs/ONBOARDING.md` and fails if any anchor here is not one of its
+/// headings.
+///
+/// Two lines are deliberately not linked yet: the missing-gitleaks note
+/// (`#gitleaks`) and the not-inside-a-Herdr-pane warning
+/// (`#outside-a-herdr-pane`). `conformance/scenarios/
+/// check-missing-accounts.json` pins both byte-for-byte, so linking them
+/// lands together with that scenario's update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteKind {
+    ClaudeCommand,
+    DockerContext,
+    RoutingLogSize,
+    IdleSleep,
+    TmpScratch,
+    Unrecorded,
+    Awaiting,
+    Prunable,
+    StaleSeed,
+}
+
+impl NoteKind {
+    #[cfg(test)]
+    const ALL: [NoteKind; 9] = [
+        NoteKind::ClaudeCommand,
+        NoteKind::DockerContext,
+        NoteKind::RoutingLogSize,
+        NoteKind::IdleSleep,
+        NoteKind::TmpScratch,
+        NoteKind::Unrecorded,
+        NoteKind::Awaiting,
+        NoteKind::Prunable,
+        NoteKind::StaleSeed,
+    ];
+
+    /// The `docs/ONBOARDING.md` heading anchor that explains this note.
+    fn anchor(self) -> &'static str {
+        match self {
+            NoteKind::ClaudeCommand => "claude-seats",
+            NoteKind::DockerContext => "docker-build-context",
+            NoteKind::RoutingLogSize => "routing-log-size",
+            NoteKind::IdleSleep => "idle-sleep",
+            NoteKind::TmpScratch => "scratch-copies-in-tmp",
+            NoteKind::Unrecorded | NoteKind::Awaiting => "unrecorded-and-stranded-lanes",
+            NoteKind::Prunable => "prunable-lanes",
+            NoteKind::StaleSeed => "stale-nexus-seed",
+        }
+    }
+}
+
+/// `line` with its onboarding link appended on the same line — the
+/// conformance normalizer drops the host-dependent idle-sleep warning one
+/// whole line at a time, so a link on a line of its own would survive it.
+fn with_onboarding_link(line: String, kind: NoteKind) -> String {
+    format!("{line} \u{2014} see docs/ONBOARDING.md#{}", kind.anchor())
+}
+
 /// Cheap, read-only filesystem advisories (`cli.py:10689-10695,10766-10772`).
 fn project_advisories(name: &str, root: &Path) -> Vec<String> {
     let mut notes = Vec::new();
     if let Ok(log) = std::fs::read(root.join(".multiverse/routing.log")) {
         let lines = log.split(|byte| *byte == b'\n').count() - usize::from(log.ends_with(b"\n"));
         if lines > 10_000 || log.len() > 2 * 1024 * 1024 {
-            notes.push(format!("note: {name}'s routing log is {} lines ({:.1} MB). Nothing is wrong and nothing trims it automatically — there is no compaction command, deliberately. Archive or truncate it by hand when you want it smaller; anything already recorded stays true.", super::accounts::with_commas(lines as u64), log.len() as f64 / 1024.0 / 1024.0));
+            notes.push(with_onboarding_link(format!("note: {name}'s routing log is {} lines ({:.1} MB). Nothing is wrong and nothing trims it automatically — there is no compaction command, deliberately. Archive or truncate it by hand when you want it smaller; anything already recorded stays true.", super::accounts::with_commas(lines as u64), log.len() as f64 / 1024.0 / 1024.0), NoteKind::RoutingLogSize));
         }
     }
     if root.join("Dockerfile").is_file() {
@@ -208,7 +281,7 @@ fn project_advisories(name: &str, root: &Path) -> Vec<String> {
             }
         }
         if !excluded {
-            notes.push(format!("warning: {name} builds a docker image from its root without excluding .multiverse in .dockerignore — every lane's worktree (each with its own node_modules) ships as build context. add .multiverse to {}/.dockerignore.", root.display()));
+            notes.push(with_onboarding_link(format!("warning: {name} builds a docker image from its root without excluding .multiverse in .dockerignore — every lane's worktree (each with its own node_modules) ships as build context. add .multiverse to {}/.dockerignore.", root.display()), NoteKind::DockerContext));
         }
     }
     notes
@@ -714,10 +787,28 @@ fn stale_seed_note(
     project: &Project,
     root: &Path,
 ) -> Option<String> {
-    let seed_path =
-        nexus_seed::existing_seed_path(root).unwrap_or_else(|| nexus_seed::seed_path(root));
     let state_dir = state_dir_from_config(config_path);
     let directives_root = mv_engine::directives::directives_root(&state_dir);
+    with_seed_context(
+        config,
+        project,
+        root,
+        &directives_root,
+        |seed_path, context| seed_note(&project.name, seed_path, context),
+    )
+}
+
+/// Build the same [`SeedContext`] `start` writes a project seed from, and
+/// hand it to `action` with the seed's on-disk path.
+fn with_seed_context<T>(
+    config: &Config,
+    project: &Project,
+    root: &Path,
+    directives_root: &Path,
+    action: impl FnOnce(&Path, &SeedContext<'_>) -> T,
+) -> T {
+    let seed_path =
+        nexus_seed::existing_seed_path(root).unwrap_or_else(|| nexus_seed::seed_path(root));
     let handoff = nexus_seed::resolve_handoff(root);
     let role_prompt = mv_engine::prompts::role_prompt("Nexus")
         .ok()
@@ -728,7 +819,7 @@ fn stale_seed_note(
         project: &project.name,
         repository: root,
         handoff,
-        directives_root: &directives_root,
+        directives_root,
         roles: &roles,
         review_policy: &review_policy,
         max_concurrent: config.max_concurrent as usize,
@@ -736,23 +827,46 @@ fn stale_seed_note(
         lend_interactive_to_workers: config.lend_interactive_to_workers,
         role_prompt: role_prompt.as_deref(),
     };
-    match nexus_seed::seed_is_stale(&seed_path, &context) {
-        Ok(Some(true)) => Some(format!(
-            "note: {}'s Nexus seed is stale — its dispatch \
-             table or role prompt has changed since it was written. \
-             `multiverse stop {}` then `multiverse start {}` \
-             regenerates it; `start` alone will not, because it is \
-             idempotent by label and skips a workspace already open. \
-             Nothing does this automatically.",
-            project.name, project.name, project.name
-        )),
-        Ok(_) => None,
-        Err(error) => Some(format!(
-            "warning: {}: cannot read Nexus seed {}: {error}",
-            project.name,
-            seed_path.display()
-        )),
+    action(&seed_path, &context)
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_parts(parts: &[SeedPart]) -> String {
+    let names: Vec<&str> = parts.iter().map(|part| part.display()).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => (*last).to_string(),
+        None => String::new(),
     }
+}
+
+/// Judged on the parts a `stop` + `start` would rewrite, never on per-run
+/// state such as a PASSDOWN sidecar flipping from `pending` to `up`.
+fn seed_note(name: &str, seed_path: &Path, context: &SeedContext<'_>) -> Option<String> {
+    let why = match nexus_seed::seed_staleness(seed_path, context) {
+        Ok(Some(SeedStaleness::Changed(parts))) => {
+            format!("its {} changed since it was written", join_parts(&parts))
+        }
+        Ok(Some(SeedStaleness::Unrecorded)) => format!(
+            "it predates per-part seed digests, so which part changed ({}) \
+             cannot be named",
+            join_parts(&SeedPart::ALL)
+        ),
+        Ok(_) => return None,
+        Err(error) => {
+            return Some(format!(
+                "warning: {name}: cannot read Nexus seed {}: {error}",
+                seed_path.display()
+            ))
+        }
+    };
+    Some(format!(
+        "note: {name}'s Nexus seed is stale — {why}. \
+         `multiverse stop {name}` then `multiverse start {name}` \
+         regenerates it; `start` alone will not, because it is \
+         idempotent by label and skips a workspace already open. \
+         Nothing does this automatically."
+    ))
 }
 
 fn tmp_top_level_names(path: &Path) -> BTreeSet<String> {
@@ -1029,6 +1143,21 @@ fn scanner_available(command: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
 }
 
+/// The unrecorded-outcomes note for one project: tasks whose status file
+/// is written but whose result was never recorded.
+fn unrecorded_note(project: &str, tasks: &[SweepTask]) -> Option<String> {
+    let unrecorded = tasks
+        .iter()
+        .filter(|task| !task.recorded && task.file_status.is_some())
+        .count();
+    (unrecorded > 0).then(|| {
+        with_onboarding_link(
+            format!("note: {project} has {unrecorded} unrecorded outcome(s) — task(s) that finished after their dispatch gave up. `multiverse tasks {project} --reconcile` records them, or run `multiverse sweep` to reconcile it."),
+            NoteKind::Unrecorded,
+        )
+    })
+}
+
 /// Same fix as `start.rs`'s `print_config_load_error` (card
 /// `20261102-b-5c41bb`): this file owns only this call site, so it keeps
 /// its own copy rather than a cross-file shared helper.
@@ -1168,7 +1297,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
             placeholders.push(format!("accounts.{}.model = {model}", account.name));
         }
         if account.kind == "claude" && account.command.trim().is_empty() {
-            blocks.push(format!("note: account {} is a Claude seat without the required command wrapper. Set accounts.{}.command to the wrapper from docs/install.md before dispatching.", account.name, account.name));
+            blocks.push(with_onboarding_link(format!("note: account {} is a Claude seat without the required command wrapper. Set accounts.{}.command to the wrapper from docs/install.md before dispatching.", account.name, account.name), NoteKind::ClaudeCommand));
         }
     }
     for (role, settings) in &config.roles {
@@ -1199,7 +1328,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     }
     if !placeholders.is_empty() {
         unresolved = true;
-        blocks.push(format!("unfilled placeholders ({}):\n  {}\n\nMultiverse will not guess these (spec §0). Dry-runs work; real dispatch is blocked until they are set.", placeholders.len(), placeholders.join("\n  ")));
+        blocks.push(format!("unfilled placeholders ({}):\n  {}\n\nMultiverse will not guess these. Dry-runs work; real dispatch is blocked until they are set.", placeholders.len(), placeholders.join("\n  ")));
     }
 
     if config.secrets_scan.required && !scanner_available(&config.secrets_scan.gitleaks) {
@@ -1230,8 +1359,10 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
             Some(counts) => counts.get(&project.name).copied().unwrap_or(0).to_string(),
         };
         project_lines.push(format!(
-            "  {}: {short}  slots: {open_display} open, floor {}, ceiling {ceiling}",
-            project.name, project.min_slots
+            "  {}: {short}  slots: {open_display} open, floor {}, ceiling {ceiling}{}",
+            project.name,
+            project.min_slots,
+            hub_project_note(&project.name)
         ));
         if project_path(project).is_none() {
             unresolved = true;
@@ -1244,13 +1375,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
         };
         blocks.extend(project_advisories(&project.name, root));
         let tasks = sweep_tasks(root);
-        let unrecorded = tasks
-            .iter()
-            .filter(|task| !task.recorded && task.file_status.is_some())
-            .count();
-        if unrecorded > 0 {
-            blocks.push(format!("note: {} has {unrecorded} unrecorded outcome(s) — task(s) that finished after their dispatch gave up. `multiverse tasks {} --reconcile` records them, or run `multiverse sweep` to reconcile it.", project.name, project.name));
-        }
+        blocks.extend(unrecorded_note(&project.name, &tasks));
         if let Some(panes) = &live_panes {
             let awaiting = tasks
                 .iter()
@@ -1261,7 +1386,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
                 })
                 .count();
             if awaiting > 0 {
-                blocks.push(format!("note: {} has {awaiting} task(s) awaiting with no live agent, still inside their {}m lease. `multiverse tasks {} --close-stranded` classifies one right now; left alone, `sweep` records it `failed` once the lease expires.", project.name, config.awaiting_lease_minutes, project.name));
+                blocks.push(with_onboarding_link(format!("note: {} has {awaiting} task(s) awaiting with no live agent, still inside their {}m lease. `multiverse tasks {} --close-stranded` classifies one right now; left alone, `sweep` records it `failed` once the lease expires.", project.name, config.awaiting_lease_minutes, project.name), NoteKind::Awaiting));
             }
         }
     }
@@ -1272,7 +1397,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
                 continue;
             };
             match prunable_count(root) {
-                Ok(count) if count > 0 => blocks.push(format!("note: {} has {count} prunable lane(s)/branch(es). Preview with `multiverse worktrees {} --prune --dry-run`; `multiverse worktrees {} --prune` would reclaim, archive, or remove them — nothing does this automatically.", project.name, root.display(), root.display())),
+                Ok(count) if count > 0 => blocks.push(with_onboarding_link(format!("note: {} has {count} prunable lane(s)/branch(es). Preview with `multiverse worktrees {} --prune --dry-run`; `multiverse worktrees {} --prune` would reclaim, archive, or remove them — nothing does this automatically.", project.name, root.display(), root.display()), NoteKind::Prunable)),
                 Err(error) => blocks.push(format!("advisory scan: {} worktree pile check unavailable: {error}", project.name)),
                 _ => {},
             }
@@ -1282,11 +1407,14 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
                 continue;
             };
             if let Some(note) = stale_seed_note(&config, &config_path, project, root) {
-                blocks.push(note);
+                blocks.push(with_onboarding_link(note, NoteKind::StaleSeed));
             }
         }
         if let Some(warning) = tmp_scratch_warning(&config) {
-            blocks.push(format!("warning: {warning}"));
+            blocks.push(with_onboarding_link(
+                format!("warning: {warning}"),
+                NoteKind::TmpScratch,
+            ));
         }
         blocks.push(format!(
             "review policy:\n  {}",
@@ -1318,7 +1446,7 @@ pub(crate) fn run(args: &ArgMatches) -> Result<(), Failure> {
     }
 
     if let Some(warning) = idle_sleep_warning() {
-        blocks.push(warning);
+        blocks.push(with_onboarding_link(warning, NoteKind::IdleSleep));
     }
 
     println!("{}", blocks.join("\n\n"));
@@ -1366,6 +1494,191 @@ mod tests {
             other.display(),
         );
         load_config_str(&toml, Path::new("config.toml")).unwrap()
+    }
+
+    fn chained_config(sandbox: &Path, chains: &str) -> Config {
+        let toml = format!(
+            "[accounts.seat]\n\
+             kind = \"codex\"\n\
+             short = \"st\"\n\
+             config_dir_var = \"CODEX_HOME\"\n\
+             config_dir = \"/tmp\"\n\
+             pool = \"codex:t\"\n\n\
+             [projects.sandbox]\npath = \"{}\"\n\n\
+             [projects.sandbox.chains]\n{chains}\n",
+            sandbox.display(),
+        );
+        load_config_str(&toml, Path::new("config.toml")).unwrap()
+    }
+
+    fn sandbox_seed_note(config: &Config, sandbox: &Path, directives: &Path) -> Option<String> {
+        let project = &config.projects["sandbox"];
+        with_seed_context(config, project, sandbox, directives, |path, context| {
+            seed_note("sandbox", path, context)
+        })
+    }
+
+    /// Card `20261122-b-be706e`: a seed written while `passdown.state`
+    /// read `pending` is not stale once the Nexus flips it to `up`; a
+    /// changed dispatch table still is, and the note says so by name.
+    #[test]
+    fn seed_note_ignores_a_passdown_flip_but_names_a_changed_dispatch_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        let directives = dir.path().join("directives");
+        let state = sandbox.join(".multiverse");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&directives).unwrap();
+        fs::write(
+            state.join("PASSDOWN.md"),
+            "## BRING-UP\nnothing to restart\n",
+        )
+        .unwrap();
+        fs::write(state.join("passdown.state"), "pending\n").unwrap();
+
+        let config = chained_config(&sandbox, "builder = [\"seat\"]");
+        let project = &config.projects["sandbox"];
+        with_seed_context(&config, project, &sandbox, &directives, |path, context| {
+            nexus_seed::write_seed(path, context)
+        })
+        .unwrap();
+        let seed = fs::read_to_string(nexus_seed::seed_path(&sandbox)).unwrap();
+        assert!(seed.contains("A pending PASSDOWN is at"), "{seed}");
+        assert_eq!(sandbox_seed_note(&config, &sandbox, &directives), None);
+
+        fs::write(state.join("passdown.state"), "up\n").unwrap();
+        assert_eq!(sandbox_seed_note(&config, &sandbox, &directives), None);
+
+        let changed = chained_config(&sandbox, "builder = [\"seat\"]\nscout = [\"seat\"]");
+        let note = sandbox_seed_note(&changed, &sandbox, &directives).unwrap();
+        assert!(
+            note.contains("Nexus seed is stale — its dispatch table changed"),
+            "{note}"
+        );
+        assert!(!note.contains("role prompt"), "{note}");
+    }
+
+    #[test]
+    fn seed_note_names_an_unrecorded_seed_without_guessing_a_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        fs::create_dir_all(sandbox.join(".multiverse")).unwrap();
+        fs::write(
+            nexus_seed::seed_path(&sandbox),
+            "# Nexus — sandbox\n<!-- multiverse:seed-digest 0123456789abcdef -->\nold\n",
+        )
+        .unwrap();
+        let config = chained_config(&sandbox, "builder = [\"seat\"]");
+        let note = sandbox_seed_note(&config, &sandbox, dir.path()).unwrap();
+        assert!(note.contains("Nexus seed is stale — it predates"), "{note}");
+        assert!(
+            note.contains("(dispatch table, role prompt, review policy and fleet rules)"),
+            "{note}"
+        );
+    }
+
+    /// GitHub's heading anchors for `markdown`: lowercase, drop every
+    /// character but letters, digits, `-`, `_` and spaces, turn spaces
+    /// into `-`, and suffix repeats `-1`, `-2`, ... Lines inside fenced
+    /// code blocks are skipped (a TOML `# comment` is not a heading).
+    fn heading_anchors(markdown: &str) -> BTreeSet<String> {
+        let mut anchors = BTreeSet::new();
+        let mut seen = BTreeMap::<String, usize>::new();
+        let mut fenced = false;
+        for line in markdown.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                continue;
+            }
+            let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+            if !(1..=6).contains(&hashes) || !trimmed[hashes..].starts_with(' ') {
+                continue;
+            }
+            let slug: String = trimmed[hashes..]
+                .trim()
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' '))
+                .map(|c| if c == ' ' { '-' } else { c })
+                .collect();
+            let count = seen.entry(slug.clone()).or_insert(0);
+            anchors.insert(if *count == 0 {
+                slug.clone()
+            } else {
+                format!("{slug}-{count}")
+            });
+            *count += 1;
+        }
+        anchors
+    }
+
+    fn onboarding_anchors() -> BTreeSet<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/ONBOARDING.md");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        heading_anchors(&text)
+    }
+
+    /// Card `20261122-b-41530f`: every link `check` prints must land on a
+    /// real heading. Revert check: misspell any arm of `NoteKind::anchor`
+    /// (e.g. `"claude-seat"`) and this fails naming it.
+    #[test]
+    fn every_note_kind_links_to_a_real_onboarding_heading() {
+        let anchors = onboarding_anchors();
+        let missing: Vec<_> = NoteKind::ALL
+            .iter()
+            .filter(|kind| !anchors.contains(kind.anchor()))
+            .map(|kind| format!("{kind:?} -> #{}", kind.anchor()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "anchors missing from docs/ONBOARDING.md: {missing:?}\nheadings: {anchors:?}"
+        );
+    }
+
+    /// The two pinned lines `NoteKind`'s own doc names still need real
+    /// headings for their follow-up, and the slugger must reject a
+    /// misspelling rather than accept anything.
+    #[test]
+    fn onboarding_anchor_check_rejects_a_misspelt_anchor() {
+        let anchors = onboarding_anchors();
+        assert!(anchors.contains("gitleaks"), "{anchors:?}");
+        assert!(anchors.contains("outside-a-herdr-pane"), "{anchors:?}");
+        assert!(!anchors.contains("unrecorded-and-stranded-lane"));
+        assert!(!anchors.contains("Stale-Nexus-Seed"));
+        let sample = heading_anchors(
+            "## Day-one cheat sheet\n```toml\n# not a heading\n```\n### A, b\n### A, b\n",
+        );
+        let expected: BTreeSet<String> = ["day-one-cheat-sheet", "a-b", "a-b-1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(sample, expected);
+    }
+
+    #[test]
+    fn unrecorded_note_on_an_unrecorded_lane_links_to_onboarding() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = dir.path().join("sandbox");
+        write_unrecorded(&sandbox, "sandbox-buil-st");
+        let task_dir = sandbox.join(".multiverse/tasks/20250101-builder-aaaaaa");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("status"), "done\n").unwrap();
+        let note = unrecorded_note("sandbox", &sweep_tasks(&sandbox)).expect("one unrecorded lane");
+        assert!(
+            note.starts_with("note: sandbox has 1 unrecorded outcome(s)"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with(" \u{2014} see docs/ONBOARDING.md#unrecorded-and-stranded-lanes"),
+            "{note}"
+        );
+        fs::remove_file(task_dir.join("status")).unwrap();
+        assert_eq!(unrecorded_note("sandbox", &sweep_tasks(&sandbox)), None);
     }
 
     #[test]
@@ -2000,5 +2313,13 @@ mod tests {
         let config = load_config_str(&toml, Path::new("config.toml")).unwrap();
         assert!(config.secrets_scan.required);
         assert!(!scanner_available(&config.secrets_scan.gitleaks));
+    }
+
+    #[test]
+    fn hub_project_note_names_the_built_in_home_hub_only() {
+        assert!(hub_project_note("multiverse").contains("built-in home hub"));
+        assert!(hub_project_note("multiverse").contains("not a project you added"));
+        assert_eq!(hub_project_note("sandbox"), "");
+        assert_eq!(hub_project_note("webapp"), "");
     }
 }

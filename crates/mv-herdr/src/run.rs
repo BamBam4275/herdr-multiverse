@@ -921,90 +921,74 @@ mod tests {
         }
     }
 
-    /// Spawns a throwaway `sleep 60 &`-then-`wait` script exactly like the
-    /// one under test, group-leadered the same way `run` spawns its own
-    /// child, and polls (bounded to 10s, no other deadline) for it to
-    /// fork `sleep` and record both pids to `pidfile`. Returns how long
-    /// that took, or `None` if it never happened at all. Always kills and
-    /// reaps the probe and deletes its files before returning, so a
-    /// never-ready probe leaves nothing behind either.
-    fn probe_fork_and_write_latency() -> Option<Duration> {
-        let suffix = unique_suffix();
-        let mut probe_pidfile = std::env::temp_dir();
-        probe_pidfile.push(format!(
-            "mv-herdr-pgid-probe-{}-{suffix}",
-            std::process::id()
-        ));
-        let probe_script = fake_herdr_script(&format!(
-            "sleep 60 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > '{}'\nwait\n",
-            probe_pidfile.display()
-        ));
-        let mut probe = Command::new(&probe_script)
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let start = Instant::now();
-        let mut latency = None;
-        for _ in 0..400 {
-            if std::fs::read_to_string(&probe_pidfile).is_ok_and(|s| s.lines().count() >= 2) {
-                latency = Some(start.elapsed());
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
+    /// Timed attempts `a_timeout_kills_grandchild_processes_and_leaves_no_zombie`
+    /// makes before concluding the host is too loaded to schedule its
+    /// script at all. The budget doubles each time from 2s, so the last
+    /// attempt allows 32s and the whole test is bounded at about a minute.
+    const TIMEOUT_KILL_ATTEMPTS: u32 = 5;
+
+    /// Both pids the script recorded, or `None` if it was killed before
+    /// completing the write. Only a fully written file (two lines, each
+    /// newline-terminated) counts: a pid cut short mid-write would parse
+    /// as some unrelated, much smaller pid.
+    fn recorded_pids(pidfile: &std::path::Path) -> Option<(u32, u32)> {
+        let recorded = std::fs::read_to_string(pidfile).ok()?;
+        if !recorded.ends_with('\n') {
+            return None;
         }
-        kill_and_reap(&mut probe);
-        std::fs::remove_file(&probe_script).ok();
-        std::fs::remove_file(&probe_pidfile).ok();
-        latency
+        let mut pids = recorded.lines().map(|line| line.parse::<u32>().ok());
+        match (pids.next(), pids.next(), pids.next()) {
+            (Some(Some(parent)), Some(Some(grandchild)), None) => Some((parent, grandchild)),
+            _ => None,
+        }
     }
 
     #[test]
     fn a_timeout_kills_grandchild_processes_and_leaves_no_zombie() {
-        let suffix = unique_suffix();
-        let mut pidfile = std::env::temp_dir();
-        pidfile.push(format!("mv-herdr-pgid-{}-{suffix}", std::process::id()));
-        let script = fake_herdr_script(&format!(
-            "sleep 60 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > '{}'\nwait\n",
-            pidfile.display()
-        ));
-        let command = HerdrCommand::new(vec![script.to_string_lossy().into_owned()]);
-        // Card `20261116-b-20fd84`: `run` starts its timeout clock the
-        // instant `spawn()` returns, before the OS has necessarily given
-        // the new process a single timeslice — so under enough host load,
-        // scheduling it far enough to fork `sleep` and write the pidfile
-        // can itself lose the race against a *fixed* budget, failing this
-        // test on scheduling noise rather than the kill logic under test
-        // (this is what the 500ms-to-2s bump in an earlier version of
-        // this test was already reaching for, and it still wasn't enough
-        // at load 30+). Rather than guessing at a bigger constant again,
-        // measure — outside this call, with its own 10s bound so a truly
-        // wedged host still fails loudly and distinctly — how long an
-        // identical throwaway script actually takes to reach the same
-        // "forked, pidfile written" point right now, and give `run`'s
-        // own budget enough headroom over that measurement for the fixed
-        // 60s sleep, not scheduling noise, to be what it waits out. Never
-        // less than the 2s this test used before measuring.
-        let probe_latency = probe_fork_and_write_latency().expect(
-            "host could not schedule a throwaway fork-and-write within 10s, outside any timed \
-             call — too loaded to exercise the timeout-kill path at all right now",
-        );
-        let budget = Duration::from_secs(2).max(probe_latency * 4);
-        let error = run(&command, Some(budget)).unwrap_err();
-        assert!(matches!(error, HerdrError::Timeout { .. }));
-
-        let recorded = std::fs::read_to_string(&pidfile).unwrap_or_default();
-        std::fs::remove_file(&script).ok();
-        std::fs::remove_file(&pidfile).ok();
-        let mut pids = recorded.lines().filter_map(|line| line.parse::<u32>().ok());
-        let parent = pids
-            .next()
-            .expect("script should have recorded its pid before the timeout");
-        let grandchild = pids
-            .next()
-            .expect("script should have recorded the sleep pid");
+        // Cards `20261116-b-20fd84` and `20261119-b-c51fd8`: `run` starts
+        // its timeout clock the instant `spawn()` returns, before the OS
+        // has necessarily given the new process a single timeslice, so no
+        // fixed or measured budget can guarantee the script forks `sleep`
+        // and writes the pidfile before the timeout fires — a fixed 2s and
+        // then 4x a measured fork-and-write latency both still lost that
+        // race at load 25+. An attempt where the pidfile is incomplete is
+        // therefore not a failure of the kill path (it still ran; there
+        // was just no grandchild yet to prove anything about), only an
+        // unmet precondition: discard it and retry with double the budget.
+        // The kill/no-zombie assertions below only ever run on an attempt
+        // whose grandchild provably existed before the timeout, so load
+        // can cost this test retries but can never make it assert on a
+        // run that didn't exercise the grandchild kill.
+        let mut budget = Duration::from_secs(2);
+        let mut pids = None;
+        for _ in 0..TIMEOUT_KILL_ATTEMPTS {
+            let suffix = unique_suffix();
+            let mut pidfile = std::env::temp_dir();
+            pidfile.push(format!("mv-herdr-pgid-{}-{suffix}", std::process::id()));
+            let script = fake_herdr_script(&format!(
+                "sleep 60 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > '{}'\nwait\n",
+                pidfile.display()
+            ));
+            let command = HerdrCommand::new(vec![script.to_string_lossy().into_owned()]);
+            let error = run(&command, Some(budget)).unwrap_err();
+            let recorded = recorded_pids(&pidfile);
+            std::fs::remove_file(&script).ok();
+            std::fs::remove_file(&pidfile).ok();
+            assert!(matches!(error, HerdrError::Timeout { .. }));
+            if recorded.is_some() {
+                pids = recorded;
+                break;
+            }
+            budget *= 2;
+        }
+        let (parent, grandchild) = pids.unwrap_or_else(|| {
+            panic!(
+                "host never scheduled the script far enough to fork `sleep` and record its \
+                 pids in {TIMEOUT_KILL_ATTEMPTS} attempts (last budget {:?}) — too loaded to \
+                 exercise the timeout-kill path at all right now",
+                budget / 2
+            )
+        });
 
         for _ in 0..40 {
             thread::sleep(Duration::from_millis(25));

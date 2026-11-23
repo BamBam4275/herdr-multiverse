@@ -1,0 +1,71 @@
+{
+  "id": "board-term-xterm-256color-no-colorterm",
+  "description": "TERM=xterm-256color with COLORTERM unset: piped board stdout still has zero ESC bytes. Auto colour requires a tty (and, inside a Herdr pane, an explicit --color always / [board].color). The dump is byte-stable against the TERM=dumb golden: same cards, same width, no SGR.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "fix the thing",
+        "--why",
+        "it breaks"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "board",
+        "--no-reconcile"
+      ],
+      "env": {
+        "TERM": "xterm-256color"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox",
+          "┌─ BACKLOG",
+          "fix the thing"
+        ],
+        "stdout_not_contains": [
+          "\u001b",
+          "[92m",
+          "[93m",
+          "[95m",
+          "[96m",
+          "[0m",
+          "[1;31m"
+        ],
+        "stdout": "project: sandbox only (one-project view; --all for the fleet)\n\nsandbox\n┌─ BLOCKED ────────────────────────────────────────────────────────────────────┐\n│ (none)                                                                       │\n└──────────────────────────────────────────────────────────────────────────────┘\n┌─ IN PROGRESS ────────────────────────────────────────────────────────────────┐\n│ (none)                                                                       │\n└──────────────────────────────────────────────────────────────────────────────┘\n┌─ BACKLOG ────────────────────────────────────────────────────────────────────┐\n│ ┌─────────────── <TIME> · <ELAPSED> ┐                                        │\n│ │ <ID>                 │                                        │\n│ │ fix the thing                     │                                        │\n│ │ P2                                │                                        │\n│ └───────────────────────────────────┘                                        │\n└──────────────────────────────────────────────────────────────────────────────┘\n┌─ SEATS ────────────────┐ ┌─ OWED REPLIES (0) ─────┐ ┌─ MAIL (0) ─────────────┐\n│ 0 working              │ │ (none)                 │ │ sandbox  0 · offline … │\n│ 0 held / 3 cap         │ │                        │ │                        │\n└────────────────────────┘ └────────────────────────┘ └────────────────────────┘\n┌─ NEXUS LAST PASS ──────┐                                                      \n│ (none)                 │                                                      \n└────────────────────────┘"
+      }
+    }
+  ]
+}

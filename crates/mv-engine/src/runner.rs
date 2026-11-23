@@ -22,6 +22,7 @@ use time::OffsetDateTime;
 use crate::blocking_prompt;
 use crate::codex_trust;
 use crate::codex_worktree_permissions;
+use crate::grok_trust;
 use crate::limits;
 
 /// Errors produced while preparing, starting, or driving a dispatch.
@@ -50,9 +51,9 @@ pub enum RunnerError {
 /// Fully bound launch, returned by `DispatchStore::prepare` while both locks
 /// are held. `native_args` starts with native model/effort arguments from
 /// `mv-herdr` and provider permission/deny rules `prepare` already applied;
-/// [`dispatch`] appends the Codex worktree permissions override to it once
-/// `prepare`'s own worktree creation means there is a lane to describe (see
-/// `apply_codex_worktree_permissions`).
+/// [`dispatch`] appends the Codex `fleet` profile definition to it (see
+/// `apply_codex_worktree_permissions`) so the `default_permissions="fleet"`
+/// select `native_args` already carried is never an undefined profile.
 #[derive(Debug, Clone)]
 pub struct PreparedLaunch {
     pub project_root: PathBuf,
@@ -559,22 +560,69 @@ fn ensure_codex_trust(launch: &PreparedLaunch) -> Result<(), RunnerError> {
     })
 }
 
+/// The Grok counterpart of [`ensure_codex_trust`] (card
+/// `20261122-b-1961a6`): pre-writes Grok's folder-trust decision for this
+/// launch's worktree and project root into the seat's own
+/// `GROK_HOME/trusted_folders.toml` ([`grok_trust::ensure_grok_trusted`]),
+/// so a first dispatch into a repo never parks on Grok's "Do you trust the
+/// contents of this directory?" dialog. A no-op for any other `kind`, and
+/// for a grok launch with no `GROK_HOME` in its environment —
+/// `RealDispatchStore::prepare` always puts it there, and falling back to
+/// Grok's own default home would mean writing a real `~/.grok` nobody
+/// named; the dialog itself is still caught as needs-attention
+/// ([`is_trust_dialog`]) if it ever appears.
+fn ensure_grok_trust(launch: &PreparedLaunch) -> Result<(), RunnerError> {
+    if launch.kind != "grok" {
+        return Ok(());
+    }
+    let Some(grok_home) = launch
+        .environment
+        .iter()
+        .find(|(key, _)| key == "GROK_HOME")
+        .map(|(_, value)| PathBuf::from(value))
+    else {
+        return Ok(());
+    };
+    grok_trust::ensure_grok_trusted(&grok_home, &launch.cwd, &launch.project_root).map_err(|e| {
+        RunnerError::Refused(format!(
+            "could not ensure Grok folder trust for {}: {e}",
+            launch.cwd.display()
+        ))
+    })
+}
+
 /// Port of Python's `_launch_commands` applying `herdr.
 /// codex_worktree_permissions` to `agent_args` (`runner.py:3474-3478`): a
-/// no-op for any other `kind`, and `None` for a reader dispatch or a
-/// plan-time call (`codex_worktree_permissions`'s own doc comment) — by
-/// this point in [`dispatch`], `launch.cwd` is the lane `store.prepare()`
-/// already created, so the override is computed here rather than at
-/// `prepare` time, when the worktree the override describes may not exist
-/// yet. Appended after whatever `prepare` already put in `native_args`,
-/// the same order Python's `[*agent_args, "-c", permissions]` uses.
+/// no-op for any other `kind`. The filesystem table is `None` only for a
+/// plan-time call (`codex_worktree_permissions`'s own doc comment) or when
+/// canonicalize fails — by this point in [`dispatch`], `launch.cwd` is the
+/// lane (or, for a reader, the project root) `store.prepare()` already
+/// resolved, so the override is computed here rather than at `prepare`
+/// time, when the worktree the override describes may not exist yet.
+/// `launch.task_id` is passed so a reader dispatch can write
+/// `.multiverse/tasks/<task-id>` without a whole-root `write`. Appended
+/// after whatever `prepare` already put in `native_args`, the same order
+/// Python's `[*agent_args, "-c", permissions]` uses.
+///
+/// Card `20261122-b-4971ad` plus card `20261122-b-a8b112`: `native_args`
+/// always selects `-c default_permissions="fleet"`. Codex refuses an
+/// undefined profile, so this function always defines `fleet` via
+/// [`codex_worktree_permissions::CODEX_FLEET_PROFILE_EXTENDS`] even when
+/// the filesystem table cannot be built. The select and the profile
+/// therefore cannot diverge.
 fn apply_codex_worktree_permissions(launch: &mut PreparedLaunch) {
     if launch.kind != "codex" {
         return;
     }
-    if let Some(permissions) =
-        codex_worktree_permissions::codex_worktree_permissions(&launch.cwd, &launch.project_root)
-    {
+    launch.native_args.push("-c".to_string());
+    launch
+        .native_args
+        .push(codex_worktree_permissions::CODEX_FLEET_PROFILE_EXTENDS.to_string());
+    if let Some(permissions) = codex_worktree_permissions::codex_worktree_permissions(
+        &launch.cwd,
+        &launch.project_root,
+        &launch.task_id,
+    ) {
         launch.native_args.push("-c".to_string());
         launch.native_args.push(permissions);
     }
@@ -929,7 +977,8 @@ const DIALOG_MENU_TAIL_LINES: usize = 6;
 
 /// Whether `text`'s last few non-blank lines show an open question-menu
 /// footer — Python's `dialog_or_menu_reason` menu-tail scan
-/// (`tasks.py:1884-1893`).
+/// (`tasks.py:1884-1893`). `text` is already the candidate dialog region
+/// (or a short stub with no turn-end/composer).
 fn menu_reason(text: &str) -> bool {
     let tail: Vec<&str> = text
         .lines()
@@ -942,43 +991,100 @@ fn menu_reason(text: &str) -> bool {
         .any(|marker| joined.contains(marker))
 }
 
-/// Return a reason to leave the pane open for a human. Never send keystrokes
-/// to trust/approval dialogs or an interactive menu.
-pub fn attention_reason(text: &str) -> Option<&'static str> {
-    let lower = text.to_lowercase();
-    if [
-        "do you trust",
-        "trust this folder",
-        "trust this workspace",
-        "trust the files",
-        "trust this directory",
-        "trust project",
-        "workspace trust",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
-        Some("trust dialog")
-    } else if [
-        "permission required",
-        "approve this",
-        "allow this",
-        "requires approval",
-        "select an option",
-        "choose an option",
-        "would you like to proceed",
-        "would you like to allow",
-        "press enter to continue",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
+/// [`attention_reason`]'s reason for a folder/workspace trust dialog —
+/// Claude's "Do you trust the files in this folder?", codex's "Trust this
+/// folder?", grok's "Do you trust the contents of this directory? y/n".
+/// [`is_trust_dialog`] keys off it.
+const TRUST_DIALOG: &str = "trust dialog";
+
+const TRUST_NEEDLES: &[&str] = &[
+    "do you trust",
+    // Grok Build 1.0.92's first-run dialog (card `20261122-b-1961a6`,
+    // `tests/fixtures/sandbox-dialog/grok-trust-directory.txt`).
+    // "do you trust" above already matches it; named on its own so a
+    // rewording of that lead-in still lands here.
+    "trust the contents of this directory",
+    "trust this folder",
+    "trust this workspace",
+    "trust the files",
+    "trust this directory",
+    "trust project",
+    "workspace trust",
+];
+
+const APPROVAL_NEEDLES: &[&str] = &[
+    "permission required",
+    "approve this",
+    "allow this",
+    "requires approval",
+    "select an option",
+    "choose an option",
+    "would you like to proceed",
+    "would you like to allow",
+    "press enter to continue",
+];
+
+fn line_has_yn(lower: &str) -> bool {
+    lower.contains("y/n") || lower.contains("yes/no")
+}
+
+fn line_is_numbered_option(line: &str) -> bool {
+    let trimmed = line
+        .trim_start()
+        .trim_start_matches(['│', '┃', '›', '>', ' ']);
+    let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let after = &trimmed[digits..];
+    after.starts_with('.') || after.starts_with(')') || after.starts_with(" (")
+}
+
+/// A dialog shape in `region`: a question line matching `needles` (the
+/// stub captures used across this crate are the question line alone), or
+/// a needle line plus a y/n / numbered-option line, never a bare
+/// substring of prose. Grok's `… directory? y/n` is both on one line.
+fn region_has_shaped_dialog(region: &str, needles: &[&str]) -> bool {
+    let mut saw_question = false;
+    let mut saw_needle = false;
+    let mut saw_options = false;
+    for line in region.lines() {
+        let lower = line.to_lowercase();
+        let has_needle = needles.iter().any(|needle| lower.contains(needle));
+        if has_needle {
+            saw_needle = true;
+            if lower.contains('?') || line_has_yn(&lower) {
+                saw_question = true;
+            }
+        }
+        if line_has_yn(&lower) || line_is_numbered_option(line) {
+            saw_options = true;
+        }
+    }
+    saw_question || (saw_needle && saw_options)
+}
+
+/// Scan already-cut dialog-region text. Tests use this on the whole pane
+/// as the revert check for card `20261122-b-8ad25a`.
+fn attention_reason_in(region: &str) -> Option<&'static str> {
+    if region_has_shaped_dialog(region, TRUST_NEEDLES) {
+        Some(TRUST_DIALOG)
+    } else if region_has_shaped_dialog(region, APPROVAL_NEEDLES) {
         Some("approval dialog or menu")
-    } else if menu_reason(text) {
+    } else if menu_reason(region) {
         Some("menu")
     } else {
         None
     }
+}
+
+/// Return a reason to leave the pane open for a human. Never send keystrokes
+/// to trust/approval dialogs or an interactive menu. Only the
+/// [`blocking_prompt::dialog_region`] is read, and only a dialog shape
+/// matches — a report that merely mentions "Do you trust" above an idle
+/// composer is not a live dialog (card `20261122-b-8ad25a`).
+pub fn attention_reason(text: &str) -> Option<&'static str> {
+    attention_reason_in(blocking_prompt::dialog_region(text))
 }
 
 /// The vendor-specific half of Python's `tasks.dialog_or_menu_reason`
@@ -1011,6 +1117,22 @@ pub fn dialog_or_menu_reason(text: &str, kind: &str) -> Option<String> {
         Some(other) => Some(format!("dialog ({other})")),
         None => None,
     }
+}
+
+/// Whether `error` is a pane parked on a folder/workspace trust dialog,
+/// whichever read caught it: [`visible`]'s bare [`TRUST_DIALOG`] or
+/// [`dialog_or_menu_reason`]'s `dialog (trust dialog)`. Card
+/// `20261122-b-1961a6`: such a pane is waiting on one human keypress, not
+/// failed — the agent is alive behind it — so a dispatch waits for it to
+/// clear ([`wait_for_trust_dialog_to_clear`]) and re-delivers its brief,
+/// and [`finalize_dispatch_attempt`] never records it `failed-to-start`
+/// while the dialog is still up.
+fn is_trust_dialog(error: &RunnerError) -> bool {
+    matches!(
+        error,
+        RunnerError::NeedsAttention { reason, .. }
+            if reason == TRUST_DIALOG || reason == &format!("dialog ({TRUST_DIALOG})")
+    )
 }
 
 fn update_screen(text: &str) -> bool {
@@ -1152,6 +1274,54 @@ pub fn wait_ready(
             return Err(RunnerError::Refused(format!(
                 "agent {agent} in pane {pane} did not become readable and ready"
             )));
+        }
+    }
+}
+
+/// Poll `pane` after a trust dialog was seen until a later read shows the
+/// dialog gone and `name` idle at its own composer again, bounded by
+/// `timing.readiness` (card `20261122-b-1961a6`). Returns the fresh
+/// `state_change_seq` from that read — the dialog's own keypress moved it,
+/// so it, not the pre-dialog sequence, is the baseline a following
+/// [`deliver_prompt_to`] must compare against. Never sends a key: the
+/// dialog is a human's to answer. A blank, unreadable, or failed read
+/// keeps polling (a TUI redraw between the dialog and its composer can
+/// read blank); a *different* dialog or menu is returned as its own
+/// [`RunnerError::NeedsAttention`] at once; a budget that ends with the
+/// dialog still up (or the pane never readable) returns `dialog`, the
+/// error that started the wait, unchanged.
+fn wait_for_trust_dialog_to_clear(
+    herdr: &mut impl Herdr,
+    name: &str,
+    pane: &str,
+    timing: &Timing,
+    dialog: RunnerError,
+) -> Result<u64, RunnerError> {
+    let start = Instant::now();
+    loop {
+        if !pause(start, timing.readiness, timing.poll) {
+            return Err(dialog);
+        }
+        match visible(herdr, name, pane) {
+            Err(error @ RunnerError::NeedsAttention { .. }) if !is_trust_dialog(&error) => {
+                return Err(error);
+            }
+            Err(_) => continue,
+            Ok(text) if update_screen(&text) => continue,
+            Ok(_) => {}
+        }
+        let fresh = checked(herdr, argv::agent_get(name), COMMAND_TIMEOUT)
+            .ok()
+            .and_then(|result| {
+                result
+                    .payload
+                    .as_ref()
+                    .and_then(|p| snapshot(&p["result"]["agent"], name, pane))
+            });
+        if let Some((state, seq)) = fresh {
+            if state.is_ready_for_input() {
+                return Ok(seq);
+            }
         }
     }
 }
@@ -1423,7 +1593,7 @@ fn deliver_prompt(
 }
 
 /// Whether `prompt` has actually landed with `name`/`pane`: the agent is
-/// `Working`, or `state_change_seq` has moved past `baseline_seq` *and*
+/// `Working` or `state_change_seq` has moved past `baseline_seq`, *and*
 /// `prompt` is no longer [`prompt_still_in_composer`] — not merely absent
 /// from the whole pane, which scrollback can satisfy long after a real
 /// submission (reviewer HOLD `20261106-reviewer-731eab`). A moved sequence
@@ -1459,10 +1629,19 @@ fn confirm_submitted(
                 .and_then(|p| snapshot(&p["result"]["agent"], name, pane))
             {
                 read_ever_succeeded = true;
-                // A working agent is enough even when Codex freezes seq.
+                // A working agent whose composer no longer holds `prompt` is
+                // enough even when Codex freezes seq. Working alone is not
+                // (card `20261122-b-3acaeb`): under load a claude or grok
+                // agent can report Working (startup, hooks, a settle) with
+                // the brief still sitting, unsubmitted, in its own boxed
+                // composer. Keep polling instead; if it never clears,
+                // `nudge_stuck_composer` decides on Enter from its own fresh
+                // read once the budget runs out.
                 if state == AgentState::Working {
-                    visible(herdr, name, pane)?;
-                    return Ok(true);
+                    let text = visible(herdr, name, pane)?;
+                    if !prompt_still_in_composer(&text, prompt, kind) {
+                        return Ok(true);
+                    }
                 }
                 if seq > baseline_seq && state.is_terminal_for_turn() {
                     // A failed read is not evidence of landing either way
@@ -1517,6 +1696,21 @@ fn confirm_submitted(
 /// is what makes that verification possible for a shared primitive: it lets
 /// a vendor-specific (billing/model-switch) dialog be refused before ever
 /// pressing Enter, the same way a first dispatch already could.
+///
+/// A trust dialog that opens *after* a send (card `20261122-b-1961a6`: a
+/// grok pane's first-run "Do you trust the contents of this directory?
+/// y/n" swallowed the brief, and once a human pressed `y` the pane came up
+/// at a bare prompt with nothing in it) is never answered either. Instead
+/// this waits for a later read to show it gone and the agent idle
+/// (`wait_for_trust_dialog_to_clear`), re-sends `prompt` against the
+/// fresh sequence that read returned, and continues the normal
+/// `confirm_submitted`/`nudge_stuck_composer` path. Bounded: one such
+/// re-send per call, which does not use up one of the two ordinary
+/// attempts; a dialog that reappears, or never clears within
+/// `timing.readiness`, is returned as needs-attention. A trust dialog
+/// already up *before* anything was sent is refused at once, unchanged, so
+/// a nudge/reseed caller skips a parked pane instead of blocking on it —
+/// [`prompt_dispatch`] does its own wait for that case.
 pub fn deliver_prompt_to(
     herdr: &mut impl Herdr,
     name: &str,
@@ -1527,7 +1721,11 @@ pub fn deliver_prompt_to(
     timing: &Timing,
 ) -> Result<(), RunnerError> {
     let mut last_error = "prompt did not land".to_string();
-    for _ in 0..2 {
+    let mut baseline_seq = baseline_seq;
+    let mut trust_resend_left = true;
+    let mut attempts = 0;
+    while attempts < 2 {
+        attempts += 1;
         visible(herdr, name, pane)?;
         let accepted = match herdr.call(
             &argv::agent_prompt(name, prompt, false, None),
@@ -1556,22 +1754,33 @@ pub fn deliver_prompt_to(
             }
         };
 
-        if confirm_submitted(herdr, name, pane, prompt, kind, baseline_seq, timing)? {
-            return Ok(());
-        }
-
-        if !accepted {
+        let outcome = match confirm_submitted(herdr, name, pane, prompt, kind, baseline_seq, timing)
+        {
+            Ok(true) => Ok(()),
             // Herdr never even accepted this send: nothing was typed, so a
             // second full attempt (if one remains) is the right mitigation.
-            continue;
+            Ok(false) if !accepted => continue,
+            // Herdr accepted the send, yet the agent never left idle and the
+            // composer never emptied within the landing window. Give it one
+            // chance to submit with a bare Enter — never a second full
+            // retype — and return whatever that decides; there is no further
+            // outer retry once a send has actually been accepted.
+            Ok(false) => {
+                nudge_stuck_composer(herdr, name, pane, prompt, kind, baseline_seq, timing)
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Err(dialog) if trust_resend_left && is_trust_dialog(&dialog) => {
+                // The send landed in a trust dialog, not the composer. Wait
+                // for a human to clear it, then re-send once from the top of
+                // this loop against the post-dialog sequence.
+                trust_resend_left = false;
+                baseline_seq = wait_for_trust_dialog_to_clear(herdr, name, pane, timing, dialog)?;
+                attempts -= 1;
+            }
+            other => return other,
         }
-
-        // Herdr accepted the send, yet the agent never left idle and the
-        // composer never emptied within the landing window. Give it one
-        // chance to submit with a bare Enter — never a second full retype —
-        // and return whatever that decides; there is no further outer retry
-        // once a send has actually been accepted.
-        return nudge_stuck_composer(herdr, name, pane, prompt, kind, baseline_seq, timing);
     }
     Err(RunnerError::Refused(last_error))
 }
@@ -1593,12 +1802,19 @@ pub fn deliver_prompt_to(
 /// A composer still showing `prompt` is not, on its own, licence to press
 /// Enter (Second Critic HOLD `20261106-reviewer-f7aaf4`): a *fresh*
 /// `agent get`, taken right here, must show the agent genuinely idle/done
-/// first. `Working` on that fresh read is the same "already landed" signal
-/// [`confirm_submitted`] itself treats as success — the prompt reached the
-/// agent's own turn late — so it returns `Ok(())` without ever touching the
-/// key. Any other state, or a read that fails outright, refuses the Enter
-/// and fails loudly instead of gambling a keystroke into whatever the agent
-/// is actually doing.
+/// first. `Working` on that fresh read is *not* landed (card
+/// `20261122-b-4530a3`): this point is only reached once the composer has
+/// been seen still holding `prompt`, and [`confirm_submitted`] no longer
+/// trusts Working while it does (card `20261122-b-3acaeb`) — under load a
+/// claude or grok agent can report Working (startup, hooks, a settle) with
+/// the brief still unsubmitted. So a Working read re-polls, within
+/// `timing.prompt / 2`, re-reading the pane each time: a composer that has
+/// moved on needs nothing further, and an idle read with `prompt` still
+/// there earns the one guarded Enter. A budget that ends still Working with
+/// `prompt` in the composer fails plainly — never `Ok(())`. Any other
+/// state, or a read that fails outright, refuses the Enter and fails loudly
+/// instead of gambling a keystroke into whatever the agent is actually
+/// doing.
 ///
 /// Nor is a composer match licence to press Enter when `prompt` is short
 /// (card `20261106-b-e08cef`, [`GHOST_ECHO_RISK_CHARS`]): a Claude Code
@@ -1616,67 +1832,80 @@ fn nudge_stuck_composer(
     baseline_seq: u64,
     timing: &Timing,
 ) -> Result<(), RunnerError> {
-    let text = match read_for_classification(herdr, pane) {
-        Some(text) => text,
-        None => {
-            return Err(RunnerError::Refused(format!(
-                "prompt not submitted — could not read agent {name:?} in pane {pane:?} \
-                 to confirm whether the prompt ever reached its own turn; nothing \
-                 further was sent.\n\
-                 The pane is still open; read it to see what the agent is showing."
-            )));
+    let start = Instant::now();
+    loop {
+        let text = match read_for_classification(herdr, pane) {
+            Some(text) => text,
+            None => {
+                return Err(RunnerError::Refused(format!(
+                    "prompt not submitted — could not read agent {name:?} in pane {pane:?} \
+                     to confirm whether the prompt ever reached its own turn; nothing \
+                     further was sent.\n\
+                     The pane is still open; read it to see what the agent is showing."
+                )));
+            }
+        };
+        if let Some(reason) = dialog_or_menu_reason(&text, kind) {
+            // Never press Enter into a trust/billing/model-switch dialog or an
+            // open menu — only the agent's own unanswered composer, still
+            // showing exactly the prompt it was handed, earns a nudge.
+            return Err(attention(name, pane, reason));
         }
-    };
-    if let Some(reason) = dialog_or_menu_reason(&text, kind) {
-        // Never press Enter into a trust/billing/model-switch dialog or an
-        // open menu — only the agent's own unanswered composer, still
-        // showing exactly the prompt it was handed, earns a nudge.
-        return Err(attention(name, pane, reason));
-    }
-    if prompt.chars().count() < GHOST_ECHO_RISK_CHARS {
-        // Too short to trust a composer-text match at all (see
-        // `GHOST_ECHO_RISK_CHARS`): a ghost suggestion echoing a just-run
-        // nudge this size is plausible, and nothing else here can tell
-        // that apart from a genuine stuck paste. Never gamble the
-        // keystroke — nothing further is sent, same as a composer that has
-        // already moved on.
-        return Ok(());
-    }
-    if !prompt_still_in_composer(&text, prompt, kind) {
-        // The composer moved on between the poll above and this read — a
-        // slow settle, not a stuck paste — or the pane is not recognisable
-        // as a composer at all. Either way, never a bare Enter: nothing
-        // further to send.
-        return Ok(());
-    }
+        if prompt.chars().count() < GHOST_ECHO_RISK_CHARS {
+            // Too short to trust a composer-text match at all (see
+            // `GHOST_ECHO_RISK_CHARS`): a ghost suggestion echoing a just-run
+            // nudge this size is plausible, and nothing else here can tell
+            // that apart from a genuine stuck paste. Never gamble the
+            // keystroke — nothing further is sent, same as a composer that has
+            // already moved on.
+            return Ok(());
+        }
+        if !prompt_still_in_composer(&text, prompt, kind) {
+            // The composer moved on between the poll above and this read — a
+            // slow settle, or a Working agent that submitted it while this
+            // re-polled, not a stuck paste — or the pane is not recognisable
+            // as a composer at all. Either way, never a bare Enter: nothing
+            // further to send.
+            return Ok(());
+        }
 
-    let fresh_state = checked(herdr, argv::agent_get(name), COMMAND_TIMEOUT)
-        .ok()
-        .and_then(|result| {
-            result
-                .payload
-                .as_ref()
-                .and_then(|p| snapshot(&p["result"]["agent"], name, pane))
-        })
-        .map(|(state, _)| state);
-    match fresh_state {
-        Some(state) if state.is_ready_for_input() => {}
-        Some(AgentState::Working) => return Ok(()),
-        Some(state) => {
-            return Err(attention(
-                name,
-                pane,
-                format!(
-                    "agent state is {state}, not idle; refusing to press Enter into its own composer"
-                ),
-            ));
-        }
-        None => {
-            return Err(RunnerError::Refused(format!(
-                "prompt not submitted — could not confirm agent {name:?} in pane {pane:?} is \
-                 idle before pressing Enter; nothing further was sent.\n\
-                 The pane is still open; read it to see what the agent is showing."
-            )));
+        let fresh_state = checked(herdr, argv::agent_get(name), COMMAND_TIMEOUT)
+            .ok()
+            .and_then(|result| {
+                result
+                    .payload
+                    .as_ref()
+                    .and_then(|p| snapshot(&p["result"]["agent"], name, pane))
+            })
+            .map(|(state, _)| state);
+        match fresh_state {
+            Some(state) if state.is_ready_for_input() => break,
+            Some(AgentState::Working) => {
+                if !pause(start, timing.prompt / 2, timing.poll) {
+                    return Err(RunnerError::Refused(format!(
+                        "prompt not submitted — agent {name:?} in pane {pane:?} stayed Working \
+                         with the prompt still sitting in its own input box and never turned \
+                         idle, so Enter was not pressed; nothing further was sent.\n\
+                         The pane is still open; read it to see what the agent is showing."
+                    )));
+                }
+            }
+            Some(state) => {
+                return Err(attention(
+                    name,
+                    pane,
+                    format!(
+                        "agent state is {state}, not idle; refusing to press Enter into its own composer"
+                    ),
+                ));
+            }
+            None => {
+                return Err(RunnerError::Refused(format!(
+                    "prompt not submitted — could not confirm agent {name:?} in pane {pane:?} is \
+                     idle before pressing Enter; nothing further was sent.\n\
+                     The pane is still open; read it to see what the agent is showing."
+                )));
+            }
         }
     }
 
@@ -1980,6 +2209,7 @@ pub fn start_dispatch(
             COMMAND_TIMEOUT,
         )?;
         ensure_codex_trust(&launch)?;
+        ensure_grok_trust(&launch)?;
         apply_codex_worktree_permissions(&mut launch);
         let cd = format!("cd {}", quote(&launch.cwd.to_string_lossy()));
         if let Some(command) = &launch.command {
@@ -2079,7 +2309,23 @@ pub fn prompt_dispatch(
     let dispatched = Some(started.launch.clone());
     let attempt = (|| {
         store.setup_lane(&started.launch)?;
-        let baseline_seq = wait_ready(herdr, &started.launch.agent_name, &started.pane, timing)?;
+        // A trust dialog at startup (grok's first run in a repo, card
+        // `20261122-b-1961a6`) is one human keypress away from a usable
+        // agent: wait for a later read to show it cleared, then deliver the
+        // brief as normal. Never answered here; if it does not clear in
+        // time, `finalize_dispatch_attempt` keeps the pane and does not
+        // record it failed.
+        let baseline_seq =
+            match wait_ready(herdr, &started.launch.agent_name, &started.pane, timing) {
+                Err(dialog) if is_trust_dialog(&dialog) => wait_for_trust_dialog_to_clear(
+                    herdr,
+                    &started.launch.agent_name,
+                    &started.pane,
+                    timing,
+                    dialog,
+                )?,
+                other => other?,
+            };
         refuse_if_parked_on_dialog(
             herdr,
             &started.launch.agent_name,
@@ -2112,6 +2358,10 @@ pub fn prompt_dispatch(
 /// grep routing.log for, not a copy of the free-text CLI message.
 fn failed_to_start_reason(error: &RunnerError) -> &'static str {
     match error {
+        // Card `20261122-b-1961a6`: a trust dialog is told apart from every
+        // other needs-attention pane — it is the one shape that is not
+        // recorded `failed-to-start` while it is still up.
+        error if is_trust_dialog(error) => "needs-attention:trust-dialog",
         RunnerError::NeedsAttention { .. } => "needs-attention",
         RunnerError::Refused(message) if message.contains("did not become readable and ready") => {
             "not-ready-timeout"
@@ -2119,24 +2369,38 @@ fn failed_to_start_reason(error: &RunnerError) -> &'static str {
         RunnerError::Refused(message) if message.contains("pane is unreadable") => {
             "unreadable-pane"
         }
+        // `nudge_stuck_composer`'s own blank post-prompt read (card
+        // `20261122-b-3acaeb`): the pane `wait_ready` accepted went blank
+        // after the brief was typed — the closest match to the field
+        // "could not confirm the prompt reached" report, tagged apart from
+        // a generic start error so the next occurrence can be found.
+        RunnerError::Refused(message)
+            if message.contains("to confirm whether the prompt ever reached its own turn") =>
+        {
+            "blank-after-prompt"
+        }
         _ => "start-error",
     }
 }
 
-/// Save what Herdr can still say about a pane that never became ready, so
-/// the next occurrence of the same timeout is diagnosable without having
-/// caught it live: the last `agent list` entry naming this agent/pane, and
-/// a visible plus a recent-scrollback pane read. Best effort, like the
+/// Save what Herdr can still say about a pane whose dispatch failed to
+/// start — whatever the reason (card `20261122-b-3acaeb`: a field
+/// `reason=start-error` left nothing behind) — so the next occurrence is
+/// diagnosable without having caught it live: the last `agent list` entry
+/// naming this agent/pane, and a visible plus a recent-scrollback pane
+/// read. Best effort, like the
 /// other cleanup in [`finalize_dispatch_attempt`] — a failed capture must
 /// not replace the dispatch error that triggered it, so failures only ever
-/// reach `store.warn`.
-fn capture_not_ready_evidence(
+/// reach `store.warn`. Named for every failed-to-start reason, not only a
+/// not-ready timeout (Scout finding 8 on card `20261122-b-a8b112`).
+fn capture_failed_to_start_evidence(
     store: &mut impl DispatchStore,
     herdr: &mut impl Herdr,
     launch: &PreparedLaunch,
     pane: &str,
+    reason: &str,
 ) {
-    let mut report = String::new();
+    let mut report = format!("reason: {reason}\n");
     match checked(herdr, argv::agent_list(), COMMAND_TIMEOUT) {
         Ok(result) => {
             let entry = result
@@ -2241,15 +2505,23 @@ fn finalize_dispatch_attempt<T>(
         // unconditionally here is harmless for every other failure (a trust
         // dialog, a halt, a lock timeout): no verdict, no trip.
         let mut pane_closed_by_trip = false;
+        let mut breaker_tripped = false;
+        // Card `20261122-b-1961a6`: a pane a fresh read still shows parked
+        // on a trust dialog is alive and one keypress from usable, not
+        // failed — see the `record_failed_to_start_reason` call below.
+        let mut parked_on_trust_dialog = false;
         if let (Some(launch), Some(pane)) = (&dispatched, &owned_pane) {
             if let Some(text) = read_for_classification(herdr, pane) {
+                parked_on_trust_dialog =
+                    is_trust_dialog(error) && attention_reason(&text) == Some(TRUST_DIALOG);
                 let now = OffsetDateTime::now_utc();
                 if let Some(verdict) = limits::classify(&text, &launch.kind, Some(now)) {
-                    if let Err(cleanup) = store.trip_breaker(launch, &verdict, &text, now) {
-                        store.warn(&format!(
+                    match store.trip_breaker(launch, &verdict, &text, now) {
+                        Ok(tripped) => breaker_tripped = tripped,
+                        Err(cleanup) => store.warn(&format!(
                             "could not trip breaker for task {:?}: {cleanup}",
                             launch.task_id
-                        ));
+                        )),
                     }
                     // Card `20260911-fixer-d23119`'s dead-seat half
                     // (`runner.py:3166-3175`): a plain exhaustion banner
@@ -2273,22 +2545,43 @@ fn finalize_dispatch_attempt<T>(
                 }
             }
         }
-        // A not-ready timeout is the one failure shape with nothing else
-        // left behind to diagnose it: the pane is about to be torn down
-        // (or kept, but the CLI invocation that will next read it may be
-        // long gone), and `wait_ready`'s own diagnostic text is only ever
-        // printed to that CLI's stdout, never logged. Capture what Herdr
-        // can still say about it now, before that's lost too.
-        if reason == "not-ready-timeout" {
+        // No failed-to-start leaves anything else behind to diagnose it:
+        // the pane is about to be torn down (or kept, but the CLI
+        // invocation that will next read it may be long gone), and the
+        // diagnostic text is only ever printed to that CLI's stdout, never
+        // logged. Capture what Herdr can still say about it now, before
+        // that's lost too — for every reason, not only a not-ready timeout
+        // (card `20261122-b-3acaeb`: field `reason=start-error` bc945d left
+        // no evidence file). A tripped breaker has already written its own
+        // redacted pane evidence under the same directory, so it is not
+        // captured twice.
+        if !breaker_tripped {
             if let (Some(launch), Some(pane)) = (&dispatched, &owned_pane) {
-                capture_not_ready_evidence(store, herdr, launch, pane);
+                capture_failed_to_start_evidence(store, herdr, launch, pane, reason);
             }
         }
         // A start or prompt that never lands must not leave the task
         // AWAITING forever against `tasks.resolve`, nor hold its fleet-cap
         // slot open — recorded even for a needs-attention pane, since
         // Python records `failed-to-start` the same way for one (finding 4).
-        if let Some(launch) = &dispatched {
+        // The one exception is a pane still parked on a trust dialog (card
+        // `20261122-b-1961a6`): the agent is alive behind it and nothing has
+        // failed, so the task stays AWAITING on that live pane — recording
+        // it failed is what let a human clear the dialog onto a lane the
+        // fleet had already written off. The evidence file above still
+        // carries `reason: needs-attention:trust-dialog`.
+        if parked_on_trust_dialog {
+            if let Some(launch) = &dispatched {
+                let pane = owned_pane.as_deref().unwrap_or("");
+                store.warn(&format!(
+                    "task {:?}: pane {pane} is waiting on a trust dialog \
+                     (reason={reason}); not recorded failed-to-start and the brief \
+                     was not delivered — answer the dialog in that pane, then \
+                     re-deliver the brief",
+                    launch.task_id
+                ));
+            }
+        } else if let Some(launch) = &dispatched {
             let pane = owned_pane.as_deref().unwrap_or("");
             if let Err(cleanup) = store.record_failed_to_start_reason(launch, pane, reason) {
                 store.warn(&format!(
@@ -2729,6 +3022,20 @@ mod tests {
         /// reviewer HOLD `20261106-reviewer-731eab` regression (b). Holds
         /// the dialog's own pane text.
         dialog_after_paste: Option<&'static str>,
+        /// How many more times `dialog_after_paste` re-arms after firing —
+        /// card `20261122-b-1961a6`'s "the trust dialog came back after
+        /// the one re-send" bound.
+        dialog_after_paste_repeats: usize,
+        /// Card `20261122-b-1961a6`: once a pane shows a trust dialog, how
+        /// many `pane read`s still see it before the next one finds it
+        /// cleared — a human pressed `y` — with the agent back at an idle
+        /// composer (`Ready >`, `agent_status: "idle"`, sequence advanced).
+        /// One-shot; `None` leaves the dialog up for good.
+        trust_clears_after_reads: Option<usize>,
+        /// How many more times `trust_clears_after_reads` re-arms (at
+        /// `Some(1)`) after a clear, so a dialog that comes back can be
+        /// cleared again.
+        trust_clear_repeats: usize,
         /// Second Critic HOLD `20261106-reviewer-f7aaf4` regressions: applied
         /// to the second `agent get` read after the next non-empty `agent
         /// prompt` send — the fresh idle check immediately before
@@ -3023,6 +3330,10 @@ mod tests {
                     });
                 }
                 if let Some(dialog) = self.dialog_after_paste.take() {
+                    if self.dialog_after_paste_repeats > 0 {
+                        self.dialog_after_paste_repeats -= 1;
+                        self.dialog_after_paste = Some(dialog);
+                    }
                     self.leave_dialog_after_paste(name, dialog);
                     return Ok(CommandResult {
                         argv: command.argv.clone(),
@@ -3032,6 +3343,38 @@ mod tests {
                         payload: None,
                         protocol_error: None,
                     });
+                }
+            }
+            if command.argv[1] == "pane" && action == "read" {
+                if let Some(left) = self.trust_clears_after_reads {
+                    let pane = command.argv[3].clone();
+                    let state: Value =
+                        serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap();
+                    let showing = state["text"][&pane]
+                        .as_str()
+                        .is_some_and(|text| attention_reason(text) == Some(TRUST_DIALOG));
+                    if showing && left > 0 {
+                        self.trust_clears_after_reads = Some(left - 1);
+                    } else if showing {
+                        self.trust_clears_after_reads = None;
+                        if self.trust_clear_repeats > 0 {
+                            self.trust_clear_repeats -= 1;
+                            self.trust_clears_after_reads = Some(1);
+                        }
+                        self.edit(|state| {
+                            if let Some(agent) = state["agents"]
+                                .as_array_mut()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|a| a["pane_id"] == pane)
+                            {
+                                let seq = agent["state_change_seq"].as_u64().unwrap_or(0) + 1;
+                                agent["state_change_seq"] = json!(seq);
+                                agent["agent_status"] = json!("idle");
+                            }
+                            state["text"][&pane] = json!("Ready >");
+                        });
+                    }
                 }
             }
             if action == "start" && self.start_failures > 0 {
@@ -3657,6 +4000,9 @@ mod tests {
             leave_scrollback_ghost: false,
             leave_scrollback_ghost_echo: false,
             dialog_after_paste: None,
+            dialog_after_paste_repeats: 0,
+            trust_clears_after_reads: None,
+            trust_clear_repeats: 0,
             second_get_override: None,
             gets_since_prompt: 0,
         };
@@ -3840,11 +4186,86 @@ mod tests {
                 .any(|w| w[0] == "-c" && w[1].starts_with("permissions.fleet.filesystem=")),
             "{tail:?}"
         );
+        // Card `20261122-b-4971ad`: the profile `default_permissions`
+        // selects must be defined on the same launch, with its read
+        // boundary — `native_args` names it, this override defines it.
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "default_permissions=\"fleet\""),
+            "{tail:?}"
+        );
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "permissions.fleet.extends=\":workspace\""),
+            "{tail:?}"
+        );
+        assert!(
+            !tail.iter().any(|arg| arg == "--sandbox" || arg == "-s"),
+            "{tail:?}"
+        );
         // The returned `Dispatched::launch` is the same mutated `launch`
         // `agent start` was actually called with, so it carries the
         // override too — unlike the earlier `record_dispatch` snapshot,
         // taken before this override is computed and so never sees it.
         assert_eq!(tail, task.launch.native_args.as_slice());
+    }
+
+    /// Card `20261122-b-a8b112`: `native_args` always selects
+    /// `default_permissions="fleet"`, but the filesystem table is `None`
+    /// when `cwd` does not exist. Codex refuses an undefined profile, so
+    /// apply must still define `fleet` via the extends override. Restoring
+    /// the None branch to a no-op fails this test.
+    #[test]
+    fn a_missing_codex_cwd_still_defines_the_fleet_profile_native_args_selects() {
+        let sandbox = Sandbox::new();
+        let missing = sandbox.0.join("not-created-yet");
+        let mut launch = PreparedLaunch {
+            project_root: sandbox.0.clone(),
+            cwd: missing.clone(),
+            task_id: "20261122-builder-a8b112".into(),
+            agent_name: "example-builder".into(),
+            role: "builder".into(),
+            kind: "codex".into(),
+            model: "test-model".into(),
+            seat: "test-seat".into(),
+            brief: String::new(),
+            native_args: argv::native_args("test-model", "codex", None, &missing),
+            environment: Vec::new(),
+            clear_auth: Vec::new(),
+            command: None,
+        };
+        assert!(
+            !missing.exists(),
+            "this test is the None path: cwd must not exist"
+        );
+        apply_codex_worktree_permissions(&mut launch);
+
+        let selected = launch
+            .native_args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "default_permissions=\"fleet\"");
+        let defined = launch
+            .native_args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "permissions.fleet.extends=\":workspace\"");
+        assert!(selected, "{:?}", launch.native_args);
+        assert!(defined, "{:?}", launch.native_args);
+        assert!(
+            !launch
+                .native_args
+                .iter()
+                .any(|a| a.starts_with("permissions.fleet.filesystem=")),
+            "a missing cwd cannot describe a filesystem table: {:?}",
+            launch.native_args
+        );
+        assert!(
+            !launch
+                .native_args
+                .iter()
+                .any(|a| a == "--sandbox" || a == "-s"),
+            "{:?}",
+            launch.native_args
+        );
     }
 
     /// Card `20261117-b-249af1`: Codex has no flag that restricts what it
@@ -4410,21 +4831,31 @@ mod tests {
 
     #[test]
     fn needs_attention_and_start_error_get_their_own_reason_tags() {
+        // A non-trust needs-attention pane (an approval prompt) is still
+        // recorded `failed-to-start`; a trust dialog no longer is while it
+        // is up (card `20261122-b-1961a6`, pinned by its own tests below).
         let (_sandbox, mut store, mut fake) = fixture();
-        fake.trust = true;
+        fake.banner = Some("Permission required: allow this tool call?");
         assert!(matches!(
             dispatch(&mut store, &mut fake, "w52:p1", &timing()),
             Err(RunnerError::NeedsAttention { .. })
         ));
         assert_eq!(store.failed_to_start.len(), 1);
         assert_eq!(store.failed_to_start[0].2, "needs-attention");
-        assert!(
-            !store
+        // Card `20261122-b-3acaeb`: every failed-to-start reason leaves its
+        // evidence file behind, not only a not-ready timeout.
+        let evidence = fs::read_to_string(
+            store
                 .launch
                 .project_root
                 .join(".multiverse/evidence")
-                .exists(),
-            "evidence capture is specific to a not-ready timeout"
+                .join(format!("{}-failed-to-start.txt", store.launch.task_id)),
+        )
+        .expect("a needs-attention failed-to-start must leave an evidence file behind");
+        assert!(evidence.contains("pane read (visible):"), "{evidence}");
+        assert!(
+            evidence.starts_with("reason: needs-attention\n"),
+            "{evidence}"
         );
 
         let (_sandbox, mut store, mut fake) = fixture();
@@ -4434,6 +4865,31 @@ mod tests {
         assert!(error.to_string().contains("not an available shell"));
         assert_eq!(store.failed_to_start.len(), 1);
         assert_eq!(store.failed_to_start[0].2, "start-error");
+    }
+
+    #[test]
+    fn a_start_error_failed_to_start_captures_evidence() {
+        // Card `20261122-b-3acaeb`: field bc945d recorded
+        // `reason=start-error` ~65 s after its pane opened and left no
+        // `<task>-failed-to-start.txt`, because capture ran only for a
+        // not-ready timeout.
+        let (_sandbox, mut store, mut fake) = fixture();
+        fake.start_failures = usize::MAX;
+        store.shell_retry = Duration::from_millis(5);
+        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert_eq!(store.failed_to_start.len(), 1);
+        assert_eq!(store.failed_to_start[0].2, "start-error");
+        let evidence = fs::read_to_string(
+            store
+                .launch
+                .project_root
+                .join(".multiverse/evidence")
+                .join(format!("{}-failed-to-start.txt", store.launch.task_id)),
+        )
+        .expect("a start-error failed-to-start must leave an evidence file behind");
+        assert!(evidence.contains("agent list entry:"), "{evidence}");
+        assert!(evidence.contains("pane read (visible):"), "{evidence}");
+        assert!(evidence.contains("pane read (recent):"), "{evidence}");
     }
 
     #[test]
@@ -4639,7 +5095,9 @@ mod tests {
              confirmation must never be answered with a bare Enter"
         );
         assert!(store.started.is_empty());
-        assert_eq!(store.failed_to_start.len(), 1);
+        // Card `20261122-b-1961a6`: still parked on that trust dialog, so
+        // not recorded `failed-to-start`.
+        assert!(store.failed_to_start.is_empty());
         assert!(fake.called("agent", "send-keys").is_empty());
     }
 
@@ -4671,20 +5129,23 @@ mod tests {
     }
 
     #[test]
-    fn a_working_agent_on_the_fresh_read_before_the_key_lands_without_the_enter() {
+    fn a_working_agent_still_holding_the_brief_on_the_fresh_read_refuses_the_enter() {
+        // Card `20261122-b-4530a3`: the fresh read is taken only after the
+        // composer was seen still holding the brief, so Working there is
+        // not "landed late". With no budget left to wait for idle, the
+        // dispatch fails plainly instead of recording `started`.
         let (_sandbox, mut store, mut fake) = fixture();
         fake.stuck_pastes = 1;
         fake.second_get_override = Some(GetOverride::Working);
-        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(error.to_string().contains("stayed Working"), "{error}");
         assert_eq!(
             fake.called("agent", "prompt").len(),
             1,
-            "the composer still shows the brief, but the fresh read says the \
-             agent is already Working — the brief landed late, same as \
-             confirm_submitted's own Working check, so no Enter is sent"
+            "the original paste only — never a retype"
         );
-        assert_eq!(store.started, ["example-builder"]);
-        assert!(store.failed_to_start.is_empty());
+        assert!(store.started.is_empty());
+        assert_eq!(store.failed_to_start.len(), 1);
         assert!(fake.called("agent", "send-keys").is_empty());
     }
 
@@ -4876,6 +5337,219 @@ mod tests {
         assert!(fake.called("agent", "send-keys").is_empty());
     }
 
+    // --- Card `20261122-b-1961a6`: grok's first-run folder-trust dialog
+    // ("Do you trust the contents of this directory? y/n") is
+    // needs-attention, never failed while it is up, and the brief is
+    // (re-)delivered once a later read shows it cleared. ---
+
+    const GROK_TRUST: &str =
+        include_str!("../../../tests/fixtures/sandbox-dialog/grok-trust-directory.txt");
+
+    /// A readiness budget long enough for the trust-clear wait to take its
+    /// second read; every other budget stays zero, as in [`timing`].
+    fn trust_clear_timing() -> Timing {
+        Timing {
+            readiness: Duration::from_secs(5),
+            prompt: Duration::ZERO,
+            poll: Duration::ZERO,
+        }
+    }
+
+    /// Whether an `agent get` (a [`confirm_submitted`] poll) was issued
+    /// after the last `agent prompt` this fake saw.
+    fn confirmed_after_last_prompt(fake: &Fake) -> bool {
+        let last_prompt = fake
+            .calls
+            .iter()
+            .rposition(|c| c.argv[1] == "agent" && c.argv[2] == "prompt")
+            .expect("a prompt was sent");
+        fake.calls[last_prompt..]
+            .iter()
+            .any(|c| c.argv[1] == "agent" && c.argv[2] == "get")
+    }
+
+    fn grok_fixture() -> (Sandbox, Store, Fake) {
+        let (sandbox, mut store, fake) = fixture();
+        store.launch.kind = "grok".into();
+        (sandbox, store, fake)
+    }
+
+    #[test]
+    fn the_grok_trust_dialog_is_classified_as_a_trust_dialog() {
+        assert_eq!(attention_reason(GROK_TRUST), Some(TRUST_DIALOG));
+        assert_eq!(
+            dialog_or_menu_reason(GROK_TRUST, "grok").as_deref(),
+            Some("dialog (trust dialog)")
+        );
+        // The question line alone, without the reconstructed frame.
+        assert_eq!(
+            attention_reason("Do you trust the contents of this directory? y/n"),
+            Some(TRUST_DIALOG)
+        );
+    }
+
+    #[test]
+    fn a_grok_trust_dialog_at_startup_is_needs_attention_and_never_recorded_failed() {
+        let (_sandbox, mut store, mut fake) = grok_fixture();
+        fake.banner = Some(GROK_TRUST);
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(is_trust_dialog(&error), "{error}");
+        assert_eq!(
+            failed_to_start_reason(&error),
+            "needs-attention:trust-dialog"
+        );
+        assert!(
+            store.failed_to_start.is_empty(),
+            "a pane alive at a trust dialog must never be recorded failed-to-start: {:?}",
+            store.failed_to_start
+        );
+        assert!(fake.called("agent", "prompt").is_empty());
+        assert!(fake.called("pane", "close").is_empty());
+        assert_eq!(store.released, 1);
+        let evidence = fs::read_to_string(
+            store
+                .launch
+                .project_root
+                .join(".multiverse/evidence")
+                .join(format!("{}-failed-to-start.txt", store.launch.task_id)),
+        )
+        .expect("a trust-dialog pane must still leave its evidence file behind");
+        assert!(
+            evidence.starts_with("reason: needs-attention:trust-dialog\n"),
+            "{evidence}"
+        );
+        assert!(evidence.contains("Do you trust the contents of this directory?"));
+        assert!(store
+            .warnings
+            .iter()
+            .any(|w| w.contains("trust dialog") && w.contains("not recorded failed-to-start")));
+    }
+
+    #[test]
+    fn a_trust_dialog_gone_by_finalize_is_recorded_failed_as_before() {
+        // "While the pane is alive at that dialog": the dialog swallowed the
+        // brief and the (zero) wait budget ran out, but by the time
+        // `finalize_dispatch_attempt` reads the pane it has cleared — the
+        // brief was never delivered there, so the ordinary record applies.
+        let (_sandbox, mut store, mut fake) = grok_fixture();
+        fake.dialog_after_paste = Some(GROK_TRUST);
+        fake.trust_clears_after_reads = Some(1);
+        let error = dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap_err();
+        assert!(is_trust_dialog(&error), "{error}");
+        assert_eq!(store.failed_to_start.len(), 1);
+        assert_eq!(store.failed_to_start[0].2, "needs-attention:trust-dialog");
+    }
+
+    #[test]
+    fn a_grok_trust_dialog_at_startup_delivers_the_brief_once_it_clears() {
+        let (_sandbox, mut store, mut fake) = grok_fixture();
+        fake.banner = Some(GROK_TRUST);
+        fake.trust_clears_after_reads = Some(1);
+        let task = dispatch(&mut store, &mut fake, "w52:p1", &trust_clear_timing()).unwrap();
+        assert_eq!(
+            fake.called("agent", "prompt").len(),
+            1,
+            "the brief is delivered exactly once, after the dialog clears"
+        );
+        assert!(confirmed_after_last_prompt(&fake));
+        assert!(fake.called("agent", "send-keys").is_empty());
+        assert_eq!(store.started, [task.launch.agent_name]);
+        assert!(store.failed_to_start.is_empty());
+    }
+
+    #[test]
+    fn a_trust_dialog_that_swallows_the_brief_re_sends_it_once_after_it_clears() {
+        let (_sandbox, mut store, mut fake) = grok_fixture();
+        fake.dialog_after_paste = Some(GROK_TRUST);
+        fake.trust_clears_after_reads = Some(1);
+        let task = dispatch(&mut store, &mut fake, "w52:p1", &trust_clear_timing()).unwrap();
+        let prompts = fake.called("agent", "prompt");
+        assert_eq!(
+            prompts.len(),
+            2,
+            "the swallowed send plus exactly one re-send of the same brief"
+        );
+        assert_eq!(prompts[0].argv[4], prompts[1].argv[4]);
+        assert!(confirmed_after_last_prompt(&fake));
+        assert!(fake.called("agent", "send-keys").is_empty());
+        assert_eq!(store.started, [task.launch.agent_name]);
+        assert!(store.failed_to_start.is_empty());
+    }
+
+    #[test]
+    fn deliver_prompt_to_re_sends_at_most_once_when_the_trust_dialog_returns() {
+        let (_sandbox, _store, mut fake, task, baseline) = nudge_fixture();
+        fake.dialog_after_paste = Some(GROK_TRUST);
+        fake.dialog_after_paste_repeats = 1;
+        // The second dialog would clear too: an unbounded re-send would
+        // then send a third time and land.
+        fake.trust_clears_after_reads = Some(1);
+        fake.trust_clear_repeats = 1;
+        let error = deliver_prompt_to(
+            &mut fake,
+            &task.launch.agent_name,
+            &task.pane,
+            LONG_NUDGE,
+            "grok",
+            baseline,
+            &trust_clear_timing(),
+        )
+        .unwrap_err();
+        assert!(is_trust_dialog(&error), "{error}");
+        assert_eq!(fake.called("agent", "prompt").len(), 2);
+        assert!(fake.called("agent", "send-keys").is_empty());
+    }
+
+    #[test]
+    fn deliver_prompt_to_still_refuses_a_trust_dialog_already_up_before_sending() {
+        // A nudge/reseed caller skips a parked pane at once; only a send
+        // the dialog swallowed earns the wait-and-re-send.
+        let (_sandbox, _store, mut fake, task, baseline) = nudge_fixture();
+        fake.edit(|state| state["text"][&task.pane] = json!(GROK_TRUST));
+        // Would clear on the second read — a waiting caller would then send.
+        fake.trust_clears_after_reads = Some(1);
+        let error = deliver_prompt_to(
+            &mut fake,
+            &task.launch.agent_name,
+            &task.pane,
+            LONG_NUDGE,
+            "grok",
+            baseline,
+            &trust_clear_timing(),
+        )
+        .unwrap_err();
+        assert!(is_trust_dialog(&error), "{error}");
+        assert!(fake.called("agent", "prompt").is_empty());
+    }
+
+    #[test]
+    fn a_grok_dispatch_pre_trusts_the_project_root_and_lane_in_its_own_grok_home() {
+        let (sandbox, mut store, mut fake) = grok_fixture();
+        let grok_home = sandbox.0.join("grok-home");
+        store.launch.environment = vec![("GROK_HOME".into(), grok_home.to_string_lossy().into())];
+        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+        let rendered = fs::read_to_string(grok_home.join("trusted_folders.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = rendered.parse().unwrap();
+        for path in [&store.launch.project_root, &store.launch.cwd] {
+            let key = fs::canonicalize(path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                doc["folders"][key.as_str()]["trusted"].as_bool(),
+                Some(true),
+                "{key} not pre-trusted in {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_dispatch_writes_no_grok_trust_store() {
+        let (sandbox, mut store, mut fake) = fixture();
+        dispatch(&mut store, &mut fake, "w52:p1", &timing()).unwrap();
+        assert!(!sandbox.0.join("config/trusted_folders.toml").exists());
+    }
+
     #[test]
     fn deliver_prompt_to_never_draws_a_phantom_enter_into_scrollback_ghost_text() {
         let (_sandbox, _store, mut fake, task, baseline) = nudge_fixture();
@@ -4955,11 +5629,13 @@ mod tests {
     }
 
     #[test]
-    fn deliver_prompt_to_treats_a_working_fresh_read_as_already_landed() {
+    fn deliver_prompt_to_does_not_treat_a_working_fresh_read_as_landed() {
+        // Card `20261122-b-4530a3`: the composer still shows the nudge, so a
+        // Working fresh read is not proof it reached the agent's own turn.
         let (_sandbox, _store, mut fake, task, baseline) = nudge_fixture();
         fake.stuck_pastes = 1;
         fake.second_get_override = Some(GetOverride::Working);
-        deliver_prompt_to(
+        let error = deliver_prompt_to(
             &mut fake,
             &task.launch.agent_name,
             &task.pane,
@@ -4968,14 +5644,9 @@ mod tests {
             baseline,
             &timing(),
         )
-        .unwrap();
-        assert_eq!(
-            fake.called("agent", "prompt").len(),
-            1,
-            "the composer still shows the nudge, but the fresh read says the \
-             agent is already Working — it reached its own turn late, so no \
-             Enter is sent"
-        );
+        .unwrap_err();
+        assert!(error.to_string().contains("stayed Working"), "{error}");
+        assert_eq!(fake.called("agent", "prompt").len(), 1);
         assert!(fake.called("agent", "send-keys").is_empty());
     }
 
@@ -5767,12 +6438,14 @@ mod tests {
     // pane's own bordered composer. ---
 
     /// A minimal in-process [`Herdr`] for [`confirm_submitted`] alone: one
-    /// `agent get` (idle, sequence already past baseline — the keystrokes
-    /// alone moved it, card `20261106-b-19efc6`) and one `pane read`,
-    /// returning `composer_text` verbatim, the same shape `HeartbeatFake`
-    /// uses for [`deliver_heartbeat`].
+    /// `agent get` (`status`/`seq`; idle with the sequence already past
+    /// baseline is the keystrokes-alone shape of card `20261106-b-19efc6`)
+    /// and one `pane read`, returning `composer_text` verbatim, the same
+    /// shape `HeartbeatFake` uses for [`deliver_heartbeat`].
     struct ConfirmFake {
         composer_text: String,
+        status: &'static str,
+        seq: u64,
     }
     impl Herdr for ConfirmFake {
         fn call(
@@ -5789,8 +6462,8 @@ mod tests {
                     payload: Some(json!({"result": {"agent": {
                         "name": "demo-builder",
                         "pane_id": "w1:p1",
-                        "agent_status": "idle",
-                        "state_change_seq": 1,
+                        "agent_status": self.status,
+                        "state_change_seq": self.seq,
                     }}})),
                     protocol_error: None,
                 }),
@@ -5816,6 +6489,8 @@ mod tests {
                        `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/status`.";
         let mut fake = ConfirmFake {
             composer_text: boxed_composer(prompt, "claude", 60),
+            status: "idle",
+            seq: 1,
         };
         let landed = confirm_submitted(
             &mut fake,
@@ -5833,6 +6508,209 @@ mod tests {
              composer rows; confirm_submitted must not report it submitted \
              just because the keystrokes alone moved state_change_seq"
         );
+    }
+
+    /// The wrapped claude dispatch brief card `20261109-b-620eeb`'s own
+    /// fixture uses, shared by the card `20261122-b-3acaeb` tests below.
+    const CLAUDE_BRIEF_PROMPT: &str =
+        "Read `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/\
+         brief.md` and execute it. Follow its write scope exactly. Write your \
+         findings to `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-\
+         000000/result.md` and then write `done`, `blocked`, or `failed` to \
+         `/worktrees/demo-builder-000000/.multiverse/tasks/demo-builder-000000/status`.";
+
+    #[test]
+    fn confirm_submitted_refuses_a_working_claude_whose_composer_still_holds_the_brief() {
+        // Card `20261122-b-3acaeb`: under load a claude agent reported
+        // Working while the brief still sat, unsubmitted, in its own boxed
+        // composer; the Working fast-path declared it landed and Enter was
+        // never retried. Seq is frozen at baseline, so only the composer
+        // check can tell this apart from a real turn.
+        let mut fake = ConfirmFake {
+            composer_text: boxed_composer(CLAUDE_BRIEF_PROMPT, "claude", 60),
+            status: "working",
+            seq: 0,
+        };
+        let landed = confirm_submitted(
+            &mut fake,
+            "demo-builder",
+            "w1:p1",
+            CLAUDE_BRIEF_PROMPT,
+            "claude",
+            0,
+            &timing(),
+        )
+        .expect("a readable working agent must never error here");
+        assert!(
+            !landed,
+            "Working alone is not landed while claude's own composer still \
+             shows the brief; the stuck-composer path must get its chance"
+        );
+    }
+
+    #[test]
+    fn confirm_submitted_still_lands_a_working_agent_with_a_frozen_seq_and_a_cleared_composer() {
+        // The Codex accommodation the Working fast-path exists for: seq never
+        // moves past baseline, but the agent is Working and its composer has
+        // moved on — the brief survives only in scrollback above it.
+        let mut fake = ConfirmFake {
+            composer_text: format!(
+                "{}\n\nWorking...\n\n{}",
+                boxed_composer(CLAUDE_BRIEF_PROMPT, "claude", 60),
+                boxed_composer("", "claude", 60),
+            ),
+            status: "working",
+            seq: 0,
+        };
+        let landed = confirm_submitted(
+            &mut fake,
+            "demo-builder",
+            "w1:p1",
+            CLAUDE_BRIEF_PROMPT,
+            "claude",
+            0,
+            &timing(),
+        )
+        .expect("a readable working agent must never error here");
+        assert!(
+            landed,
+            "a Working agent whose own composer no longer holds the brief has \
+             landed it, even with state_change_seq frozen at baseline"
+        );
+    }
+
+    // --- `nudge_stuck_composer` (card `20261122-b-4530a3`): a Working
+    // fresh read while the composer still holds the prompt is not landed. ---
+
+    /// A scripted [`Herdr`] for [`nudge_stuck_composer`] alone: each `agent
+    /// get` pops the next of `statuses` (the last one repeats), every `pane
+    /// read` returns `composer_text`, and a bare Enter submits — the
+    /// composer clears and the agent reports Working from then on.
+    struct ScriptedComposerFake {
+        composer_text: String,
+        statuses: Vec<&'static str>,
+        gets: usize,
+        enters: usize,
+    }
+    impl Herdr for ScriptedComposerFake {
+        fn call(
+            &mut self,
+            command: &HerdrCommand,
+            _timeout: Duration,
+        ) -> Result<CommandResult, RunnerError> {
+            let reply = |stdout: String, payload: Option<Value>| CommandResult {
+                argv: command.argv.clone(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+                payload,
+                protocol_error: None,
+            };
+            match (command.argv[1].as_str(), command.argv[2].as_str()) {
+                ("agent", "get") => {
+                    let status = if self.enters > 0 {
+                        "working"
+                    } else {
+                        let index = self.gets.min(self.statuses.len() - 1);
+                        self.statuses[index]
+                    };
+                    self.gets += 1;
+                    Ok(reply(
+                        String::new(),
+                        Some(json!({"result": {"agent": {
+                            "name": "demo-builder",
+                            "pane_id": "w1:p1",
+                            "agent_status": status,
+                            "state_change_seq": 1,
+                        }}})),
+                    ))
+                }
+                ("pane", "read") => Ok(reply(self.composer_text.clone(), None)),
+                ("agent", "send-keys") => {
+                    self.enters += 1;
+                    self.composer_text = boxed_composer("", "claude", 60);
+                    Ok(reply(String::new(), None))
+                }
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    }
+
+    fn short_wait() -> Timing {
+        Timing {
+            readiness: Duration::ZERO,
+            prompt: Duration::from_millis(60),
+            poll: Duration::from_millis(5),
+        }
+    }
+
+    #[test]
+    fn nudge_stuck_composer_fails_when_a_working_agent_never_clears_its_composer() {
+        let mut fake = ScriptedComposerFake {
+            composer_text: boxed_composer(CLAUDE_BRIEF_PROMPT, "claude", 60),
+            statuses: vec!["working"],
+            gets: 0,
+            enters: 0,
+        };
+        let error = nudge_stuck_composer(
+            &mut fake,
+            "demo-builder",
+            "w1:p1",
+            CLAUDE_BRIEF_PROMPT,
+            "claude",
+            0,
+            &short_wait(),
+        )
+        .expect_err("Working with the brief still in the composer is not landed");
+        assert!(matches!(error, RunnerError::Refused(_)), "{error}");
+        assert!(error.to_string().contains("stayed Working"), "{error}");
+        assert_eq!(fake.enters, 0, "never Enter into a Working agent");
+        assert!(fake.gets > 1, "the budget must re-poll, got {}", fake.gets);
+    }
+
+    #[test]
+    fn nudge_stuck_composer_presses_one_enter_once_a_working_agent_turns_idle() {
+        let mut fake = ScriptedComposerFake {
+            composer_text: boxed_composer(CLAUDE_BRIEF_PROMPT, "claude", 60),
+            statuses: vec!["working", "idle"],
+            gets: 0,
+            enters: 0,
+        };
+        nudge_stuck_composer(
+            &mut fake,
+            "demo-builder",
+            "w1:p1",
+            CLAUDE_BRIEF_PROMPT,
+            "claude",
+            0,
+            &short_wait(),
+        )
+        .expect("an idle read with the brief still there earns the Enter, which lands it");
+        assert_eq!(fake.enters, 1, "exactly one guarded Enter");
+    }
+
+    #[test]
+    fn a_blank_pane_after_the_prompt_gets_its_own_reason_tag() {
+        // Card `20261122-b-3acaeb`: the post-prompt blank read used to fall
+        // through to the generic `start-error` tag.
+        let mut fake = ScriptedComposerFake {
+            composer_text: String::new(),
+            statuses: vec!["idle"],
+            gets: 0,
+            enters: 0,
+        };
+        let error = nudge_stuck_composer(
+            &mut fake,
+            "demo-builder",
+            "w1:p1",
+            CLAUDE_BRIEF_PROMPT,
+            "claude",
+            0,
+            &short_wait(),
+        )
+        .unwrap_err();
+        assert_eq!(failed_to_start_reason(&error), "blank-after-prompt");
+        assert_eq!(fake.enters, 0);
     }
 
     #[test]
@@ -5862,6 +6740,40 @@ mod tests {
                         line 1\nline 2\nline 3\nline 4\nline 5\nline 6";
         assert!(!menu_reason(scrolled));
         assert_eq!(attention_reason(scrolled), None);
+    }
+
+    const CLAUDE_IDLE_TRUST_PROSE: &str = include_str!(
+        "../../../tests/fixtures/sandbox-dialog/claude-idle-with-trust-prose-in-scrollback.txt"
+    );
+
+    #[test]
+    fn trust_prose_in_scrollback_classifies_idle_for_nudge() {
+        assert_eq!(attention_reason(CLAUDE_IDLE_TRUST_PROSE), None);
+        assert!(dialog_or_menu_reason(CLAUDE_IDLE_TRUST_PROSE, "claude").is_none());
+        assert!(dialog_or_menu_reason(CLAUDE_IDLE_TRUST_PROSE, "grok").is_none());
+        assert!(dialog_or_menu_reason(CLAUDE_IDLE_TRUST_PROSE, "codex").is_none());
+        // Revert check: whole-pane shape scan still fires, so restoring
+        // whole-pane search in attention_reason fails the None asserts.
+        assert_eq!(
+            attention_reason_in(CLAUDE_IDLE_TRUST_PROSE),
+            Some(TRUST_DIALOG)
+        );
+        let lower = CLAUDE_IDLE_TRUST_PROSE.to_lowercase();
+        assert!(lower.contains("do you trust"));
+        assert!(lower.contains("trust dialog"));
+        assert!(lower.contains("update available"));
+    }
+
+    #[test]
+    fn a_bare_trust_substring_without_dialog_shape_is_not_attention() {
+        assert_eq!(
+            attention_reason("Grok trust-dialog card CLOSED after the report"),
+            None
+        );
+        assert_eq!(
+            attention_reason("the report mentioned Do you trust prompts in passing"),
+            None
+        );
     }
 
     // --- `prompt_still_in_composer` (reviewer HOLD `20261106-reviewer-

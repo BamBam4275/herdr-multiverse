@@ -221,9 +221,12 @@ enum NudgePlan {
     Deliver,
 }
 
-fn plan_nudge(working: bool, pane_text: Option<&str>, kind: &str) -> NudgePlan {
+fn plan_nudge(working: bool, blocked: bool, pane_text: Option<&str>, kind: &str) -> NudgePlan {
     if working {
         return NudgePlan::UnverifiableWorking;
+    }
+    if blocked {
+        return NudgePlan::UnreachedParked("dialog".into());
     }
     match pane_text {
         None => NudgePlan::UnreachedReadFailed,
@@ -432,7 +435,7 @@ fn nudge(args: &ArgMatches) -> Result<(), Failure> {
 /// dialog is never typed into (`cli.py:13754-13818`).
 #[allow(clippy::too_many_arguments)]
 fn nudge_one(
-    herdr: &mut ProcessHerdr,
+    herdr: &mut impl Herdr,
     name: &str,
     agent_name: &str,
     live: &mv_engine::fleet_start::LiveAgent,
@@ -464,7 +467,7 @@ fn nudge_one(
         Ok(result) if result.ok() => Some(result.stdout),
         _ => None,
     };
-    match plan_nudge(false, pane_text.as_deref(), kind) {
+    match plan_nudge(false, live.is_blocked(), pane_text.as_deref(), kind) {
         NudgePlan::UnreachedReadFailed => unreached.push((
             name.to_string(),
             "its pane could not be read; nothing was sent".into(),
@@ -1908,9 +1911,197 @@ mod tests {
     }
 
     #[test]
+    fn nudge_one_submits_a_stuck_claude_composer_with_exactly_one_enter() {
+        use mv_herdr::argv::HerdrCommand;
+        use mv_herdr::envelope::{AgentState, CommandResult};
+
+        struct StuckComposer {
+            prompted: bool,
+            enters: usize,
+        }
+        impl Herdr for StuckComposer {
+            fn call(
+                &mut self,
+                command: &HerdrCommand,
+                _timeout: Duration,
+            ) -> Result<CommandResult, RunnerError> {
+                let mut result = CommandResult {
+                    argv: command.argv.clone(),
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    payload: None,
+                    protocol_error: None,
+                };
+                match (command.argv[1].as_str(), command.argv[2].as_str()) {
+                    ("agent", "read") | ("pane", "read") => {
+                        result.stdout = if self.prompted && self.enters == 0 {
+                            include_str!(
+                                "../../../../tests/fixtures/composer/claude-done-followup.txt"
+                            )
+                            .replace("sample EndToEnd the same way too", NUDGE_PROMPT)
+                        } else {
+                            "❯ ".into()
+                        };
+                    }
+                    ("agent", "prompt") => {
+                        assert!(!self.prompted, "the nudge must never be retyped");
+                        assert_eq!(command.argv[3], "demo-nexu-cl");
+                        assert_eq!(command.argv[4], NUDGE_PROMPT);
+                        self.prompted = true;
+                    }
+                    ("agent", "send-keys") => {
+                        assert_eq!(&command.argv[3..], ["demo-nexu-cl", "Enter"]);
+                        self.enters += 1;
+                    }
+                    ("agent", "get") => {
+                        result.payload = Some(serde_json::json!({"result": {"agent": {
+                            "name": "demo-nexu-cl", "pane_id": "w1:p1",
+                            "agent_status": "idle", "state_change_seq": 2,
+                        }}}));
+                    }
+                    other => panic!("unexpected call {other:?}"),
+                }
+                Ok(result)
+            }
+        }
+        let mut herdr = StuckComposer {
+            prompted: false,
+            enters: 0,
+        };
+        let live = mv_engine::fleet_start::LiveAgent {
+            pane_id: "w1:p1".into(),
+            state: AgentState::Idle,
+            state_change_seq: 1,
+        };
+        let timing = Timing {
+            readiness: Duration::ZERO,
+            prompt: Duration::ZERO,
+            poll: Duration::ZERO,
+        };
+        let (mut reached, mut unconfirmed, mut unverifiable, mut unreached) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        nudge_one(
+            &mut herdr,
+            "demo",
+            "demo-nexu-cl",
+            &live,
+            "claude",
+            &timing,
+            &mut reached,
+            &mut unconfirmed,
+            &mut unverifiable,
+            &mut unreached,
+        );
+        assert_eq!(reached, ["demo"]);
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        assert!(unverifiable.is_empty());
+        assert!(unreached.is_empty(), "{unreached:?}");
+        assert!(herdr.prompted);
+        assert_eq!(herdr.enters, 1);
+    }
+
+    #[test]
+    fn nudge_one_sends_when_trust_prose_is_only_in_scrollback() {
+        use mv_herdr::argv::HerdrCommand;
+        use mv_herdr::envelope::{AgentState, CommandResult};
+
+        struct IdleProse {
+            prompted: bool,
+            enters: usize,
+        }
+        impl Herdr for IdleProse {
+            fn call(
+                &mut self,
+                command: &HerdrCommand,
+                _timeout: Duration,
+            ) -> Result<CommandResult, RunnerError> {
+                let mut result = CommandResult {
+                    argv: command.argv.clone(),
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    payload: None,
+                    protocol_error: None,
+                };
+                match (command.argv[1].as_str(), command.argv[2].as_str()) {
+                    ("agent", "read") | ("pane", "read") => {
+                        result.stdout = if self.prompted && self.enters == 0 {
+                            include_str!(
+                                "../../../../tests/fixtures/sandbox-dialog/claude-idle-with-trust-prose-in-scrollback.txt"
+                            )
+                            .replace("❯", &format!("❯ {NUDGE_PROMPT}"))
+                        } else if self.prompted {
+                            "❯ ".into()
+                        } else {
+                            include_str!(
+                                "../../../../tests/fixtures/sandbox-dialog/claude-idle-with-trust-prose-in-scrollback.txt"
+                            )
+                            .into()
+                        };
+                    }
+                    ("agent", "prompt") => {
+                        assert!(!self.prompted, "the nudge must never be retyped");
+                        self.prompted = true;
+                    }
+                    ("agent", "send-keys") => {
+                        assert_eq!(&command.argv[3..], ["demo-nexu-cl", "Enter"]);
+                        self.enters += 1;
+                    }
+                    ("agent", "get") => {
+                        result.payload = Some(serde_json::json!({"result": {"agent": {
+                            "name": "demo-nexu-cl", "pane_id": "w1:p1",
+                            "agent_status": "idle", "state_change_seq": 2,
+                        }}}));
+                    }
+                    other => panic!("unexpected call {other:?}"),
+                }
+                Ok(result)
+            }
+        }
+        let mut herdr = IdleProse {
+            prompted: false,
+            enters: 0,
+        };
+        let live = mv_engine::fleet_start::LiveAgent {
+            pane_id: "w1:p1".into(),
+            state: AgentState::Idle,
+            state_change_seq: 1,
+        };
+        let timing = Timing {
+            readiness: Duration::ZERO,
+            prompt: Duration::ZERO,
+            poll: Duration::ZERO,
+        };
+        let (mut reached, mut unconfirmed, mut unverifiable, mut unreached) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        nudge_one(
+            &mut herdr,
+            "demo",
+            "demo-nexu-cl",
+            &live,
+            "claude",
+            &timing,
+            &mut reached,
+            &mut unconfirmed,
+            &mut unverifiable,
+            &mut unreached,
+        );
+        assert_eq!(
+            reached,
+            ["demo"],
+            "unreached={unreached:?} unconfirmed={unconfirmed:?}"
+        );
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        assert!(unverifiable.is_empty());
+        assert!(unreached.is_empty(), "{unreached:?}");
+        assert!(herdr.prompted);
+    }
+
+    #[test]
     fn plan_nudge_refuses_a_parked_trust_dialog_without_typing() {
         let text = "Trust this folder?\n› 1. Trust and continue\n2. Cancel\n";
-        match plan_nudge(false, Some(text), "codex") {
+        match plan_nudge(false, false, Some(text), "codex") {
             NudgePlan::UnreachedParked(reason) => {
                 assert!(
                     reason.contains("dialog"),
@@ -1920,11 +2111,11 @@ mod tests {
             other => panic!("parked dialog must be UnreachedParked, got {other:?}"),
         }
         assert_eq!(
-            plan_nudge(false, None, "codex"),
+            plan_nudge(false, false, None, "codex"),
             NudgePlan::UnreachedReadFailed
         );
         assert_eq!(
-            plan_nudge(false, Some("Ready >"), "codex"),
+            plan_nudge(false, false, Some("Ready >"), "codex"),
             NudgePlan::Deliver
         );
     }
@@ -1932,12 +2123,35 @@ mod tests {
     #[test]
     fn plan_nudge_reports_already_working_as_unverifiable_before_any_pane_read() {
         assert_eq!(
-            plan_nudge(true, Some("Trust this folder?"), "codex"),
+            plan_nudge(true, false, Some("Trust this folder?"), "codex"),
             NudgePlan::UnverifiableWorking
         );
         assert_eq!(
-            plan_nudge(true, None, "codex"),
+            plan_nudge(true, false, None, "codex"),
             NudgePlan::UnverifiableWorking
+        );
+    }
+
+    #[test]
+    fn plan_nudge_short_circuits_herdr_blocked_to_dialog() {
+        assert!(matches!(
+            plan_nudge(false, true, Some("Ready >"), "claude"),
+            NudgePlan::UnreachedParked(reason) if reason == "dialog"
+        ));
+        assert!(matches!(
+            plan_nudge(false, true, None, "claude"),
+            NudgePlan::UnreachedParked(_)
+        ));
+    }
+
+    #[test]
+    fn plan_nudge_delivers_when_trust_prose_is_only_in_scrollback() {
+        let text = include_str!(
+            "../../../../tests/fixtures/sandbox-dialog/claude-idle-with-trust-prose-in-scrollback.txt"
+        );
+        assert_eq!(
+            plan_nudge(false, false, Some(text), "claude"),
+            NudgePlan::Deliver
         );
     }
 

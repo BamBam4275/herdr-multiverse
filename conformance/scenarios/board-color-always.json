@@ -1,0 +1,136 @@
+{
+  "id": "board-color-always",
+  "description": "Piped `board --color always` emits ESC+SGR (the Auto default stays off on a pipe). `--color never` stays Unicode and ESC-free (SGR only). `--color always` under a non-empty NO_COLOR stays ESC-free and draws ASCII boxes. The always dump is a byte-stable golden that must contain the ESC byte, not leftover [NNm fragments without it.",
+  "projects": {
+    "sandbox": {
+      "git": true,
+      "files": {
+        "README.md": "hi\n"
+      }
+    }
+  },
+  "home": {
+    "config_toml": "[projects.sandbox]\npath = \"{{PROJECT:sandbox}}\"\n"
+  },
+  "steps": [
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "backlog",
+        "add",
+        "fix the thing",
+        "--why",
+        "it breaks"
+      ],
+      "transcript": [],
+      "expect": {
+        "exit": 0
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "board",
+        "--no-reconcile",
+        "--color",
+        "always"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout": "project: sandbox only (one-project view; --all for the fleet)\n\nsandbox\n\u001b[1;31m┌─ BLOCKED ────────────────────────────────────────────────────────────────────┐\u001b[0m\n│ (none)                                                                       │\n\u001b[1;31m└──────────────────────────────────────────────────────────────────────────────┘\u001b[0m\n┌─ IN PROGRESS ────────────────────────────────────────────────────────────────┐\n│ (none)                                                                       │\n└──────────────────────────────────────────────────────────────────────────────┘\n┌─ BACKLOG ────────────────────────────────────────────────────────────────────┐\n│ \u001b[93m┌─────────────── <TIME> · <ELAPSED> ┐\u001b[0m                                        │\n│ \u001b[93m│ <ID>                 │\u001b[0m                                        │\n│ \u001b[93m│ fix the thing                     │\u001b[0m                                        │\n│ \u001b[93m│ P2                                │\u001b[0m                                        │\n│ \u001b[93m└───────────────────────────────────┘\u001b[0m                                        │\n└──────────────────────────────────────────────────────────────────────────────┘\n┌─ SEATS ────────────────┐ ┌─ OWED REPLIES (0) ─────┐ ┌─ MAIL (0) ─────────────┐\n│ 0 working              │ │ (none)                 │ │ sandbox  0 · offline … │\n│ 0 held / 3 cap         │ │                        │ │                        │\n└────────────────────────┘ └────────────────────────┘ └────────────────────────┘\n┌─ NEXUS LAST PASS ──────┐                                                      \n│ (none)                 │                                                      \n└────────────────────────┘",
+        "stdout_contains": [
+          "sandbox",
+          "┌─ BACKLOG",
+          "fix the thing",
+          "\u001b"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "board",
+        "--no-reconcile",
+        "--color",
+        "never"
+      ],
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox",
+          "┌─ BACKLOG",
+          "fix the thing"
+        ],
+        "stdout_not_contains": [
+          "\u001b",
+          "[92m",
+          "[93m",
+          "[95m",
+          "[96m",
+          "[0m",
+          "[1;31m"
+        ]
+      }
+    },
+    {
+      "cwd": "sandbox",
+      "argv": [
+        "board",
+        "--no-reconcile",
+        "--color",
+        "always"
+      ],
+      "env": {
+        "NO_COLOR": "1"
+      },
+      "transcript": [
+        {
+          "match_argv": [
+            "agent",
+            "list"
+          ],
+          "reply": {
+            "exit": 0,
+            "stdout": "{\"result\": {\"agents\": []}}\n"
+          }
+        }
+      ],
+      "expect": {
+        "exit": 0,
+        "stdout_contains": [
+          "sandbox",
+          "+- BACKLOG",
+          "fix the thing"
+        ],
+        "stdout_not_contains": [
+          "\u001b",
+          "┌─ BACKLOG"
+        ]
+      }
+    }
+  ]
+}

@@ -30,7 +30,7 @@ Rendered by `scripts/docs/render-demo.sh` from a real `multiverse board`,
 
 ## Status
 
-Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.16`.
+Herdr Multiverse is a **pre-1.0 rewrite**, currently released as `v0.1.17`.
 It is a from-scratch Rust port of a Python reference implementation, built
 so the two can be checked against each other for
 behavioral parity before the Rust binary becomes the only implementation.
@@ -40,7 +40,7 @@ What is on this tree today:
 - Seven crates (`mv-core`, `mv-config`, `mv-herdr`, `mv-state`,
   `mv-engine`, `mv-board`, `mv-cli`) and a `multiverse` binary, all with
   real implementations — none of the seven is a module-list stub.
-- Clap parsing for 31 top-level subcommands, exit codes 0/1/2/3, and `--yes`
+- Clap parsing for 32 top-level subcommands, exit codes 0/1/2/3, and `--yes`
   authorization on `dispatch` / `council`.
 - Crate unit/integration tests and verification commands, with current
   passing counts recorded in [`docs/install.md`](docs/install.md#verification-and-troubleshooting).
@@ -125,13 +125,16 @@ What is real but short of full Python parity, specifically:
   budget (not ported byte-for-byte) and a partial task-id collision
   rebind (`crates/mv-cli/src/commands/dispatch.rs`). Landing a dispatch's
   first prompt now confirms the brief was actually submitted, not just
-  pasted: `deliver_prompt` requires either a `Working` agent or the brief
-  no longer sitting in the pane's own composer region before declaring it
-  landed, sends at most one bare Enter (never the brief again) if the
-  window closes with it still unsubmitted and the agent reads idle, and
-  fails the dispatch loudly rather than leaving a silent idle lane
-  (`deliver_prompt` / `confirm_submitted` / `prompt_still_in_composer` in
-  `crates/mv-engine/src/runner.rs`).
+  pasted: `confirm_submitted` treats a `Working` agent as landed only
+  when the brief is no longer in the pane's own composer region
+  (`prompt_still_in_composer`); `Working` alone keeps polling. If the
+  window closes with the brief still unsubmitted, `nudge_stuck_composer`
+  sends at most one bare Enter (never the brief again) only when a fresh
+  `agent get` shows idle/done; a `Working` read is re-polled and then
+  refused rather than Entered into. A budget that ends still `Working`
+  with the brief in the composer fails the dispatch loudly
+  (`deliver_prompt` / `confirm_submitted` / `nudge_stuck_composer` /
+  `prompt_still_in_composer` in `crates/mv-engine/src/runner.rs`).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for what has shipped release by
 release, and [`docs/architecture.md`](docs/architecture.md) for crate
@@ -191,14 +194,32 @@ commands are ready for production.
    multiverse --version
    ```
 
-3. Try a read-only command against your own `config.toml`, such as
-   `multiverse doctor`, `multiverse check`, or `multiverse board`.
-   `dispatch` and `council` without `--yes` or `--dry-run` exit 1 naming
-   the flag; `dispatch --dry-run` plans a real dispatch (seat selection,
-   breaker/degrade policy) without spending quota. Retired `--role`
-   names such as `fixer` exit 3.
+3. First-run setup writes a config from `config.example.toml`, walks
+   vendor seats, offers recommended chains and model tiers, and can
+   register the first project:
 
-4. Plugin actions (`multiverse-doctor`, `multiverse-board`,
+   ```sh
+   multiverse onboard
+   ```
+
+   `--non-interactive --config <path>` applies those defaults for scripts
+   and tests; `--dry-run` prints the plan without writing (`Would write`
+   only on a dry-run or a `[Y/n]` preview; live runs say `Writing` /
+   `Wrote`). A config that already has accounts is merged into unless you
+   decline (or, non-interactively, unless you pass `--yes`). The day-one
+   commands and the words `board` / `workers` / `check` print are in
+   [`docs/cheat-sheet.md`](docs/cheat-sheet.md).
+
+4. Try a read-only command against your own `config.toml`, such as
+   `multiverse doctor`, `multiverse check`, or `multiverse board`.
+   `check` and `workers` list a built-in `multiverse` hub project — the
+   home workspace from `[projects.multiverse]` in the example config, not
+   a repository you added. `dispatch` and `council` without `--yes` or
+   `--dry-run` exit 1 naming the flag; `dispatch --dry-run` plans a real
+   dispatch (seat selection, breaker/degrade policy) without spending
+   quota. Retired `--role` names such as `fixer` exit 3.
+
+5. Plugin actions (`multiverse-doctor`, `multiverse-board`,
    `multiverse-start`, and the rest listed in
    [`docs/install.md`](docs/install.md)) invoke the same binary.
    `multiverse-start` opens a live Nexus pane (see [Status](#status)
@@ -208,12 +229,37 @@ commands are ready for production.
    [Status](#status) above for the exact gaps before treating a plugin
    install as a complete port of the Python fleet.
 
+## Documentation
+
+- [`docs/ONBOARDING.md`](docs/ONBOARDING.md): start here. Setup per
+  vendor, the nine roles, chains, model choice, a day-one cheat sheet,
+  and a legend for every word the board prints. `multiverse check` links
+  its notes to it.
+- [`docs/install.md`](docs/install.md): installing, plugin actions, and
+  troubleshooting.
+- [`docs/configuration.md`](docs/configuration.md): file locations,
+  environment variables, roster overrides, and migrations.
+- [`docs/roles.md`](docs/roles.md): the full contract for each role.
+- [`docs/architecture.md`](docs/architecture.md): the crates and how they
+  depend on each other.
+- [`docs/migrating-from-python.md`](docs/migrating-from-python.md):
+  upgrading from the Python reference.
+- [`docs/parity.md`](docs/parity.md): Python/Rust parity status.
+
 ## Configuration
 
 Configuration lives under Herdr's own plugin config directory
 (`HERDR_PLUGIN_CONFIG_DIR`), never inside the managed plugin checkout.
 The plugin wrapper requires a readable `config.toml` there before it will
-exec the binary. The minimum intended shape, matching
+exec the binary, and it ignores `~/.config/multiverse/config.toml` and
+`$XDG_CONFIG_HOME`. A standalone `multiverse onboard` with no
+`--config` writes that default `~/.config/multiverse/config.toml` path
+(`Config location (default location)`); copy it into the plugin config
+dir, or pass `--config` / `MULTIVERSE_CONFIG`, if you also run through
+Herdr. Why those paths, and what `check` / `board` / `workers` then
+print: [`docs/cheat-sheet.md`](docs/cheat-sheet.md).
+
+The minimum intended shape, matching
 [`config.example.toml`](config.example.toml), is one account, one role,
 and one project chain:
 

@@ -194,6 +194,26 @@ pub fn command() -> Command {
                 .arg(positional("name", true, "New project name"))
                 .arg(value("path", "PATH", "New project directory")).arg(yes()).arg(dry_run()),
         )
+        .subcommand(
+            Command::new("onboard")
+                .about("Interactive first-run setup: write config, seats, chains, models, and the first project")
+                .arg(flag(
+                    "non-interactive",
+                    "Apply recommended defaults without prompting",
+                ))
+                .arg(dry_run())
+                .arg(yes())
+                .arg(value(
+                    "project",
+                    "PATH",
+                    "Register this existing git repository as the first project",
+                ))
+                .arg(value("name", "NAME", "Configured name for --project"))
+                .arg(flag(
+                    "start",
+                    "After adding the first project, run multiverse start",
+                )),
+        )
         .subcommand(tasks())
         .subcommand(board())
         .subcommand(
@@ -282,7 +302,7 @@ pub fn command() -> Command {
                     .arg(value("until", "TIMESTAMP", "Directive expiration time")))
                 .subcommand(Command::new("show").about("Show project directives").arg(projects())),
         )
-        .subcommand(Command::new("workers").about("List worker sessions").arg(json()))
+        .subcommand(Command::new("workers").about("List worker sessions; auto-reconciles unrecorded outcomes unless --read-only").arg(json()).arg(read_only()))
         .subcommand(
             group("config", "Manage the configuration file")
                 .subcommand(
@@ -409,7 +429,16 @@ fn board() -> Command {
                 .value_parser(parse_board_limit)
                 .default_value("auto"),
         )
-        .arg(flag("no-color", "Disable ANSI color"))
+        .arg(
+            value(
+                "color",
+                "{always,auto,never}",
+                "When to emit ANSI color (default auto: only a confirmed color terminal; inside a Herdr pane auto is off)",
+            )
+            .value_parser(["always", "auto", "never"])
+            .default_value("auto"),
+        )
+        .arg(flag("no-color", "Disable ANSI color (same as --color never)"))
         .arg(
             value(
                 "cards-per-row",
@@ -823,6 +852,17 @@ mod tests {
         &["add", "project", "--name", "name", "--dry-run"],
         &["new", "name", "--path", "project", "--yes", "--dry-run"],
         &[
+            "onboard",
+            "--non-interactive",
+            "--dry-run",
+            "--yes",
+            "--project",
+            "project",
+            "--name",
+            "name",
+            "--start",
+        ],
+        &[
             "tasks",
             "one",
             "two",
@@ -865,6 +905,8 @@ mod tests {
             "backlog",
             "--limit",
             "10",
+            "--color",
+            "always",
             "--no-color",
             "--cards-per-row",
             "2",
@@ -1042,7 +1084,7 @@ mod tests {
             "2030-01-01T00:00:00Z",
         ],
         &["directives", "show", "one", "two"],
-        &["workers"],
+        &["workers", "--json", "--read-only"],
     ];
 
     // Commands wired to a real handler no longer return the generic "not
@@ -1105,6 +1147,7 @@ mod tests {
         "stop",
         "add",
         "new",
+        "onboard",
         "check",
         "doctor",
         "tasks",
@@ -1259,7 +1302,7 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             expected
         );
-        assert_eq!(expected.len(), 31);
+        assert_eq!(expected.len(), 32);
     }
 
     /// Card `20261110-b-d73da7`: council takes the same global `--config
@@ -1801,6 +1844,61 @@ mod tests {
         assert!(parse_err(&["board", "--status", "done"])
             .to_string()
             .contains("status"));
+    }
+
+    #[test]
+    fn board_color_flag_accepts_always_auto_never_and_keeps_no_color() {
+        let board = parse(&["board"])
+            .subcommand_matches("board")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            board.get_one::<String>("color").map(String::as_str),
+            Some("auto")
+        );
+        assert!(!board.get_flag("no-color"));
+
+        let board = parse(&["board", "--color", "always"])
+            .subcommand_matches("board")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            board.get_one::<String>("color").map(String::as_str),
+            Some("always")
+        );
+
+        let board = parse(&["board", "--color", "never", "--watch"])
+            .subcommand_matches("board")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            board.get_one::<String>("color").map(String::as_str),
+            Some("never")
+        );
+        assert_eq!(
+            board.get_one::<WatchArg>("watch"),
+            Some(&WatchArg::FromConfig)
+        );
+
+        // Both flags parse together; `--no-color` still wins in board.rs.
+        let board = parse(&["board", "--color", "always", "--no-color"])
+            .subcommand_matches("board")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            board.get_one::<String>("color").map(String::as_str),
+            Some("always")
+        );
+        assert!(board.get_flag("no-color"));
+
+        assert!(parse_err(&["board", "--color", "yes"])
+            .to_string()
+            .contains("color"));
+
+        let help = parse_err(&["board", "--help"]).to_string();
+        assert!(help.contains("--color"), "{help}");
+        assert!(help.contains("always"), "{help}");
+        assert!(help.contains("same as --color never"), "{help}");
     }
 
     #[test]

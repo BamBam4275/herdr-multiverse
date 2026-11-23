@@ -21,6 +21,7 @@ pub mod dispatch;
 pub mod dockerreport;
 pub mod fleet_start;
 pub mod gateway;
+pub mod grok_trust;
 pub mod grok_usage;
 pub mod health;
 pub mod hostdisk;

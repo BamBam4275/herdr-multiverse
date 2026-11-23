@@ -61,6 +61,19 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(result.steps[0].status, "FAIL")
         self.assertIn("stdout mismatch", "\n".join(result.failures))
 
+    def test_stdout_not_contains_rejects_a_forbidden_substring(self):
+        self.cli("print('recorded\\x1b[92m')\n")
+        self.scenario['steps'][0]['expect'] = {
+            "exit": 0,
+            "stdout_contains": ["recorded"],
+            "stdout_not_contains": ["\u001b"],
+        }
+        result = self.replay()
+        self.assertFalse(result.ok)
+        self.assertIn("unexpectedly contains", "\n".join(result.failures))
+        self.cli("print('recorded')\n")
+        self.assertTrue(self.replay().ok)
+
     def test_file_mutation_fails_even_when_command_passes(self):
         self.cli("from pathlib import Path\nPath('input').write_text('changed')\nprint('recorded')\n")
         result = self.replay()

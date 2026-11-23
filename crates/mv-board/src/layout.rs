@@ -79,35 +79,147 @@ pub fn terminal_height() -> Option<usize> {
         })
 }
 
+/// How the operator asked the board to treat SGR color.
+///
+/// `--no-color` and a non-empty `NO_COLOR` map to [`ColorRequest::Never`].
+/// `--color always` and `[board].color = true` map to
+/// [`ColorRequest::Always`]. Everything else is [`ColorRequest::Auto`]:
+/// emit color only when the terminal is confirmed, and never by default
+/// inside a Herdr pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorRequest {
+    /// Default: emit SGR only when stdout is a tty, `TERM` is not `dumb`,
+    /// the process is not inside a Herdr pane, and the terminal looks like
+    /// it actually understands color (`COLORTERM` set, or `TERM` contains
+    /// `color`, `256`, or `xterm`).
+    Auto,
+    /// Force SGR on. Still loses to [`ColorRequest::Never`] / `NO_COLOR`.
+    Always,
+    /// Force SGR off.
+    Never,
+}
+
+/// True when this process is running inside a Herdr pane.
+///
+/// `HERDR_ENV=1` is the pane guardrail Herdr itself exports;
+/// `HERDR_PANE_ID` is the pane identity. Plugin-directory variables
+/// (`HERDR_PLUGIN_*`) and `HERDR_BIN_PATH` do not count: those are set
+/// for any plugin action, including a CLI run that is not in a pane.
+pub fn in_herdr_pane() -> bool {
+    in_herdr_pane_from(
+        std::env::var("HERDR_ENV").ok().as_deref(),
+        std::env::var("HERDR_PANE_ID").ok().as_deref(),
+    )
+}
+
+fn in_herdr_pane_from(herdr_env: Option<&str>, herdr_pane_id: Option<&str>) -> bool {
+    herdr_env == Some("1") || matches!(herdr_pane_id, Some(value) if !value.is_empty())
+}
+
+/// True when `TERM`/`COLORTERM` say this is a color terminal.
+///
+/// `TERM=dumb` is never confirmed, even if `COLORTERM` is set. An unset
+/// `TERM` with no `COLORTERM` is unconfirmed — colour stays off until
+/// something positive names a color-capable terminal.
+fn terminal_confirms_color(term: Option<&str>, colorterm: Option<&str>) -> bool {
+    if matches!(term, Some("dumb")) {
+        return false;
+    }
+    if matches!(colorterm, Some(value) if !value.is_empty()) {
+        return true;
+    }
+    let Some(term) = term else {
+        return false;
+    };
+    let lower = term.to_ascii_lowercase();
+    lower.contains("color") || lower.contains("256") || lower.contains("xterm")
+}
+
 /// True when the board should emit SGR color. `--no-color` wins; so does
 /// a non-empty `NO_COLOR` env var (<https://no-color.org/>), regardless
-/// of its value; so does `TERM=dumb`; and so does stdout not being a real
-/// terminal (a pipe, a redirect, a log capture) — the caller passes that
-/// last check in as `is_tty` since only it can ask the question of its
-/// own stdout. Any one of these keeps the board at its plain, uncolored
-/// rendering, byte for byte.
+/// of its value. Otherwise this is [`ColorRequest::Auto`] against the
+/// process environment. Prefer [`color_enabled_with`] when the caller
+/// already resolved `--color always` / `--color never`.
 pub fn color_enabled(cli_no_color: bool, is_tty: bool) -> bool {
-    color_enabled_from(
-        cli_no_color,
+    color_enabled_with(
+        if cli_no_color {
+            ColorRequest::Never
+        } else {
+            ColorRequest::Auto
+        },
         is_tty,
+    )
+}
+
+/// [`color_enabled`] with an explicit [`ColorRequest`].
+pub fn color_enabled_with(request: ColorRequest, is_tty: bool) -> bool {
+    color_enabled_from(
+        request,
+        is_tty,
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("COLORTERM").ok().as_deref(),
+        in_herdr_pane(),
+    )
+}
+
+/// True when board/workers should draw boxes and markers in plain ASCII.
+///
+/// A non-empty `NO_COLOR` or `TERM=dumb` opts in. Each replacement is one
+/// cell wide so a converted line keeps the same visible width as the
+/// Unicode original.
+pub fn ascii_requested() -> bool {
+    ascii_requested_from(
         std::env::var("NO_COLOR").ok().as_deref(),
         std::env::var("TERM").ok().as_deref(),
     )
 }
 
+/// [`ascii_requested`] with explicit env values, so tests do not mutate
+/// process environment.
+pub fn ascii_requested_from(no_color: Option<&str>, term: Option<&str>) -> bool {
+    matches!(no_color, Some(value) if !value.is_empty()) || matches!(term, Some("dumb"))
+}
+
+/// Map box-drawing and status glyphs to one-cell ASCII. Other characters
+/// are left unchanged, including SGR/escape sequences.
+pub fn to_ascii_plain(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '┌' | '┐' | '└' | '┘' => '+',
+            '─' => '-',
+            '│' => '|',
+            '✓' => '*',
+            '✗' => 'x',
+            '⚠' => '!',
+            '◐' | '◔' => 'o',
+            '·' => '.',
+            '—' | '–' => '-',
+            '…' => '.',
+            '→' => '>',
+            other => other,
+        })
+        .collect()
+}
+
 fn color_enabled_from(
-    cli_no_color: bool,
+    request: ColorRequest,
     is_tty: bool,
     no_color: Option<&str>,
     term: Option<&str>,
+    colorterm: Option<&str>,
+    herdr_pane: bool,
 ) -> bool {
-    if cli_no_color || !is_tty {
+    if request == ColorRequest::Never {
         return false;
     }
     if matches!(no_color, Some(value) if !value.is_empty()) {
         return false;
     }
-    !matches!(term, Some("dumb"))
+    if request == ColorRequest::Always {
+        return true;
+    }
+    is_tty && !herdr_pane && terminal_confirms_color(term, colorterm)
 }
 
 /// How many of `n` equal-width cards fit on one row of `width` cells, and
@@ -914,23 +1026,142 @@ mod tests {
         assert_eq!(visible_width(osc), cell_width("abcd"));
     }
 
+    fn auto(
+        is_tty: bool,
+        no_color: Option<&str>,
+        term: Option<&str>,
+        colorterm: Option<&str>,
+        herdr_pane: bool,
+    ) -> bool {
+        color_enabled_from(
+            ColorRequest::Auto,
+            is_tty,
+            no_color,
+            term,
+            colorterm,
+            herdr_pane,
+        )
+    }
+
     #[test]
     fn color_enabled_honors_no_color_flag_and_env() {
-        assert!(color_enabled_from(false, true, None, None));
-        assert!(!color_enabled_from(true, true, None, None));
-        assert!(!color_enabled_from(false, true, Some("1"), None));
-        assert!(color_enabled_from(false, true, Some(""), None));
+        assert!(!color_enabled_from(
+            ColorRequest::Never,
+            true,
+            None,
+            Some("xterm-256color"),
+            Some("truecolor"),
+            false,
+        ));
+        assert!(!auto(true, Some("1"), Some("xterm-256color"), None, false));
+        // Empty NO_COLOR is unset per no-color.org; confirmation still
+        // has to come from TERM/COLORTERM.
+        assert!(!auto(true, Some(""), None, None, false));
+        assert!(auto(true, Some(""), Some("xterm-256color"), None, false));
     }
 
     #[test]
     fn color_enabled_is_off_for_term_dumb_or_a_non_tty() {
-        assert!(!color_enabled_from(false, true, None, Some("dumb")));
-        assert!(color_enabled_from(
-            false,
+        assert!(!auto(true, None, Some("dumb"), None, false));
+        assert!(!auto(true, None, Some("dumb"), Some("truecolor"), false));
+        assert!(!auto(false, None, Some("xterm-256color"), None, false));
+        assert!(!auto(false, None, None, None, false));
+    }
+
+    #[test]
+    fn auto_color_stays_off_until_the_terminal_is_confirmed() {
+        // Unset TERM, no COLORTERM: not confirmed.
+        assert!(!auto(true, None, None, None, false));
+        // Common Linux/vt/screen values look like terminals but do not
+        // name color support.
+        assert!(!auto(true, None, Some("linux"), None, false));
+        assert!(!auto(true, None, Some("vt100"), None, false));
+        assert!(!auto(true, None, Some("screen"), None, false));
+        // COLORTERM is enough even when TERM is generic.
+        assert!(auto(true, None, Some("linux"), Some("truecolor"), false));
+        assert!(auto(true, None, Some("linux"), Some("24bit"), false));
+        // TERM containing color / 256 / xterm is enough without COLORTERM.
+        assert!(auto(true, None, Some("xterm-256color"), None, false));
+        assert!(auto(true, None, Some("xterm"), None, false));
+        assert!(auto(true, None, Some("rxvt-unicode-256color"), None, false));
+        assert!(auto(true, None, Some("tmux-256color"), None, false));
+        assert!(auto(true, None, Some("ansi-color"), None, false));
+    }
+
+    #[test]
+    fn herdr_pane_keeps_auto_color_off_even_on_a_confirmed_terminal() {
+        assert!(!auto(
             true,
             None,
-            Some("xterm-256color")
+            Some("xterm-256color"),
+            Some("truecolor"),
+            true,
         ));
-        assert!(!color_enabled_from(false, false, None, None));
+        assert!(color_enabled_from(
+            ColorRequest::Always,
+            true,
+            None,
+            Some("xterm-256color"),
+            None,
+            true,
+        ));
+        // --color always still loses to NO_COLOR.
+        assert!(!color_enabled_from(
+            ColorRequest::Always,
+            true,
+            Some("1"),
+            Some("xterm-256color"),
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn color_always_emits_even_when_piped() {
+        assert!(color_enabled_from(
+            ColorRequest::Always,
+            false,
+            None,
+            Some("dumb"),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn in_herdr_pane_is_the_pane_identity_not_plugin_paths() {
+        assert!(!in_herdr_pane_from(None, None));
+        assert!(!in_herdr_pane_from(Some("0"), None));
+        assert!(!in_herdr_pane_from(Some(""), None));
+        assert!(in_herdr_pane_from(Some("1"), None));
+        assert!(in_herdr_pane_from(None, Some("w1:p2")));
+        assert!(!in_herdr_pane_from(None, Some("")));
+    }
+
+    #[test]
+    fn ascii_requested_for_no_color_or_term_dumb_only() {
+        assert!(ascii_requested_from(Some("1"), Some("xterm-256color")));
+        assert!(ascii_requested_from(None, Some("dumb")));
+        assert!(!ascii_requested_from(Some(""), Some("xterm-256color")));
+        assert!(!ascii_requested_from(None, Some("xterm-256color")));
+        assert!(!ascii_requested_from(None, None));
+    }
+
+    #[test]
+    fn to_ascii_plain_maps_box_drawing_and_markers_one_cell_each() {
+        let unicode = "┌─ BLOCKED ─┐│ ✓ AVAILABLE · window: n/a … ⚠ overdue → │└────────────┘";
+        let ascii = to_ascii_plain(unicode);
+        assert_eq!(
+            ascii,
+            "+- BLOCKED -+| * AVAILABLE . window: n/a . ! overdue > |+------------+"
+        );
+        assert_eq!(cell_width(unicode), cell_width(&ascii));
+        assert!(!ascii.contains('┌'));
+        assert!(!ascii.contains('│'));
+        assert!(!ascii.contains('─'));
+        assert!(!ascii.contains('✓'));
+        assert!(!ascii.contains('⚠'));
+        let already = "+- BLOCKED -+| * AVAILABLE |";
+        assert_eq!(to_ascii_plain(already), already);
     }
 }

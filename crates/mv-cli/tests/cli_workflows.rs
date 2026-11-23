@@ -579,6 +579,703 @@ fn enable_fallback_chain(sandbox: &Sandbox) {
         .expect("fallback-chain fixture must be valid under the real config schema");
 }
 
+/// A `HERDR_BIN_PATH` wrapper around the sandbox's own fake-herdr that
+/// stands in for a rival dispatch from another project landing between
+/// this dispatch's seat selection and its admission recheck (card
+/// `20261122-b-e78b3b`). Selection reads `agent list` without the fleet
+/// lock; admission reads it again while holding `dispatch.lock`. On each
+/// `agent list` made while that lock is held, the wrapper takes the next
+/// seat from `seats` (one per locked call, until the list runs out) and
+/// appends a just-dispatched, unrecorded task on it to the `recipient`
+/// project's routing log — which the post-start grace window counts as one
+/// open agent on that seat. Every call, that one included, then runs the
+/// real fake-herdr unchanged.
+fn rival_takes_seat_at_admission(sandbox: &Sandbox, seats: &[&str]) -> PathBuf {
+    let real = sandbox
+        .command("true")
+        .get_envs()
+        .find(|(key, _)| *key == "HERDR_BIN_PATH")
+        .and_then(|(_, value)| value.map(PathBuf::from))
+        .expect("sandbox pins HERDR_BIN_PATH to fake-herdr");
+    let fleet_lock = sandbox.root.join("runtime/dispatch.lock");
+    let queue = sandbox.root.join("rival-seats");
+    fs::write(
+        &queue,
+        seats.iter().map(|s| format!("{s}\n")).collect::<String>(),
+    )
+    .unwrap();
+    fs::create_dir_all(sandbox.recipient.join(".multiverse")).unwrap();
+    let rival_log = sandbox.recipient.join(".multiverse/routing.log");
+    let script = sandbox.root.join("rival-herdr.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = agent ] && [ \"$2\" = list ] && [ -f '{lock}' ] \\\n\
+                && ! python3 -c 'import fcntl, sys; fcntl.flock(open(sys.argv[1], \"a\"), fcntl.LOCK_EX | fcntl.LOCK_NB)' '{lock}' 2>/dev/null; then\n\
+               seat=$(head -n 1 '{queue}')\n\
+               if [ -n \"$seat\" ]; then\n\
+                 tail -n +2 '{queue}' > '{queue}.next' && mv '{queue}.next' '{queue}'\n\
+                 n=$(printf '%s' \"$seat\" | cksum | cut -c1-6)\n\
+                 printf '%s\\tevent=dispatch\\ttask=20261122-scout-%s\\tproject=recipient\\trole=scout\\taccount=%s\\tpool=rival\\toutcome=chain-primary\\treason=\\tagent=recipient-scou-%s\\tbranch=main\\n' \\\n\
+                   \"$(date -u +%Y-%m-%dT%H:%M:%S+00:00)\" \"$n\" \"$seat\" \"$n\" >> '{rival_log}'\n\
+               fi\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            lock = fleet_lock.display(),
+            queue = queue.display(),
+            rival_log = rival_log.display(),
+            real = real.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    script
+}
+
+/// Card `20261122-b-e78b3b`: selection picks the first seat while it still
+/// has room, a rival takes that seat's last slot before admission, and the
+/// dispatch falls through the chain to the next seat instead of refusing.
+#[test]
+fn a_seat_filled_between_selection_and_admission_falls_through_the_chain() {
+    let sandbox = Sandbox::new();
+    enable_fallback_chain(&sandbox);
+    assert_code(&sandbox.cli(&["accounts", "limit", "test-seat", "1"]), 0);
+    let herdr = rival_takes_seat_at_admission(&sandbox, &["test-seat"]);
+
+    let output = sandbox
+        .command(env!("CARGO_BIN_EXE_multiverse"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .args([
+            "dispatch",
+            sandbox.project.to_str().unwrap(),
+            "Map the repository",
+            "--role",
+            "scout",
+            "--timeout",
+            "5",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_code(&output, 0);
+    let text = stdout(&output);
+    assert!(
+        text.contains("reached its open-agent cap before admission (1/1 open)"),
+        "{text}"
+    );
+    assert!(text.contains("Dispatched scout on fallback-seat"), "{text}");
+    assert!(
+        fs::read_to_string(sandbox.recipient.join(".multiverse/routing.log"))
+            .unwrap()
+            .contains("account=test-seat"),
+        "the rival must have landed under the fleet lock, or this proves nothing"
+    );
+
+    let log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(!log.contains("account=test-seat"), "{log}");
+    assert!(log.contains("account=fallback-seat"), "{log}");
+    assert!(log.contains("outcome=chain-fallback"), "{log}");
+    assert!(
+        log.contains("skipped test-seat (at cap: 1/1 open agents"),
+        "{log}"
+    );
+}
+
+/// Card `20261122-b-e78b3b`: when every seat the chain falls through to is
+/// also full by admission, dispatch still refuses with the same exit code
+/// an admission-time seat-cap refusal always had, starts nothing, and
+/// names every seat it tried.
+#[test]
+fn every_seat_filled_before_admission_still_refuses_and_names_each_seat_tried() {
+    let sandbox = Sandbox::new();
+    enable_fallback_chain(&sandbox);
+    assert_code(&sandbox.cli(&["accounts", "limit", "test-seat", "1"]), 0);
+    assert_code(
+        &sandbox.cli(&["accounts", "limit", "fallback-seat", "1"]),
+        0,
+    );
+    let herdr = rival_takes_seat_at_admission(&sandbox, &["test-seat", "fallback-seat"]);
+    let panes = stdout(&sandbox.herdr(&["pane", "list"]));
+
+    // `--no-reconcile`: exactly one locked `agent list` per admission
+    // attempt, so each attempt's rival lands on the seat that attempt chose.
+    let output = sandbox
+        .command(env!("CARGO_BIN_EXE_multiverse"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .args([
+            "dispatch",
+            sandbox.project.to_str().unwrap(),
+            "Map the repository",
+            "--role",
+            "scout",
+            "--timeout",
+            "5",
+            "--no-reconcile",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_code(&output, 1);
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("no seat could be admitted"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("test-seat (1/1 open), fallback-seat (1/1 open)"),
+        "{diagnostic}"
+    );
+    assert_eq!(stdout(&sandbox.herdr(&["pane", "list"])), panes);
+    assert!(!sandbox.project.join(".multiverse/tasks").exists());
+    let log =
+        fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap_or_default();
+    assert!(!log.contains("event=dispatch"), "{log}");
+}
+
+/// Sets the sandbox's top-level `max_concurrent`, in both config copies.
+fn set_max_concurrent(sandbox: &Sandbox, cap: u32) {
+    let config_path = sandbox.root.join("config/config.toml");
+    let config = format!(
+        "max_concurrent = {cap}\n\n{}",
+        fs::read_to_string(&config_path).unwrap()
+    );
+    fs::write(&config_path, &config).unwrap();
+    fs::copy(
+        &config_path,
+        sandbox.root.join("home/.config/multiverse/config.toml"),
+    )
+    .unwrap();
+    mv_config::load::load_config(&config_path).expect("max_concurrent fixture must be valid");
+}
+
+/// One just-dispatched, unrecorded worker task in the `recipient`
+/// project's routing log — inside the post-start grace window, so it
+/// holds a fleet slot on both the conservative and the live count.
+fn rival_dispatch_line(id: &str) -> String {
+    format!(
+        "{}\tevent=dispatch\ttask=20261122-scout-{id}\tproject=recipient\trole=scout\t\
+         account=test-seat\tpool=rival\toutcome=chain-primary\treason=\t\
+         agent=recipient-scou-{id}\tbranch=main\n",
+        time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    )
+}
+
+/// A `HERDR_BIN_PATH` wrapper around the sandbox's fake-herdr that moves
+/// the fleet's open count for card `20261122-b-4c82c5`. `seeded` rival
+/// tasks are written up front. With `land_at_admission`, the first
+/// `agent list` made while `dispatch.lock` is held (admission's own
+/// recheck) adds one more rival, filling the fleet after selection saw
+/// room. Every `drop` id (a seeded or landed rival) is recorded finished
+/// on the `drop_on`-th `agent list` made *without* the fleet lock, counted
+/// from after the landing (or from the start, without one) — the live
+/// re-count a `--wait-for-seat` poll makes — so the fleet frees only once
+/// dispatch has gone back to waiting. Every call then runs the real
+/// fake-herdr unchanged.
+fn fleet_shifting_herdr(
+    sandbox: &Sandbox,
+    seeded: &[&str],
+    land_at_admission: Option<&str>,
+    drop: &[&str],
+    drop_on: u32,
+) -> PathBuf {
+    let real = sandbox
+        .command("true")
+        .get_envs()
+        .find(|(key, _)| *key == "HERDR_BIN_PATH")
+        .and_then(|(_, value)| value.map(PathBuf::from))
+        .expect("sandbox pins HERDR_BIN_PATH to fake-herdr");
+    fs::create_dir_all(sandbox.recipient.join(".multiverse")).unwrap();
+    let rival_log = sandbox.recipient.join(".multiverse/routing.log");
+    fs::write(
+        &rival_log,
+        seeded
+            .iter()
+            .map(|id| rival_dispatch_line(id))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let landing = sandbox.root.join("rival-landing");
+    let landed = sandbox.root.join("rival-landed");
+    match land_at_admission {
+        Some(id) => fs::write(&landing, rival_dispatch_line(id)).unwrap(),
+        None => fs::write(&landed, "").unwrap(),
+    }
+    let drops = sandbox.root.join("rival-drops");
+    fs::write(
+        &drops,
+        drop.iter()
+            .map(|id| format!("20261122-scout-{id}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let script = sandbox.root.join("fleet-herdr.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = agent ] && [ \"$2\" = list ]; then\n\
+               if [ -f '{lock}' ] \\\n\
+                  && ! python3 -c 'import fcntl, sys; fcntl.flock(open(sys.argv[1], \"a\"), fcntl.LOCK_EX | fcntl.LOCK_NB)' '{lock}' 2>/dev/null; then\n\
+                 if [ ! -f '{landed}' ]; then\n\
+                   cat '{landing}' >> '{rival_log}'\n\
+                   : > '{landed}'\n\
+                 fi\n\
+               elif [ -f '{landed}' ] && [ ! -f '{dropped}' ]; then\n\
+                 n=$(( $(cat '{count}' 2>/dev/null || echo 0) + 1 ))\n\
+                 echo \"$n\" > '{count}'\n\
+                 if [ \"$n\" -ge {drop_on} ]; then\n\
+                   while read -r task; do\n\
+                     printf '%s\\tevent=result\\ttask=%s\\tstatus=done\\tstate=done\\trevisions=0\\n' \\\n\
+                       \"$(date -u +%Y-%m-%dT%H:%M:%S+00:00)\" \"$task\" >> '{rival_log}'\n\
+                   done < '{drops}'\n\
+                   : > '{dropped}'\n\
+                 fi\n\
+               fi\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            lock = sandbox.root.join("runtime/dispatch.lock").display(),
+            landing = landing.display(),
+            landed = landed.display(),
+            rival_log = rival_log.display(),
+            count = sandbox.root.join("unlocked-lists").display(),
+            dropped = sandbox.root.join("rival-dropped").display(),
+            drops = drops.display(),
+            drop_on = drop_on,
+            real = real.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    script
+}
+
+fn dispatch_waiting_for_seat(
+    sandbox: &Sandbox,
+    herdr: &Path,
+    seconds: &str,
+) -> std::process::Output {
+    sandbox
+        .command(env!("CARGO_BIN_EXE_multiverse"))
+        .env("HERDR_BIN_PATH", herdr)
+        .args([
+            "dispatch",
+            sandbox.project.to_str().unwrap(),
+            "Map the repository",
+            "--role",
+            "scout",
+            "--timeout",
+            "5",
+            "--wait-for-seat",
+            "--wait-for-seat-seconds",
+            seconds,
+            "--yes",
+        ])
+        .output()
+        .unwrap()
+}
+
+/// Card `20261122-b-4c82c5`: selection sees a free fleet slot, but by
+/// admission (under the fleet lock) a rival has taken it. A
+/// `--wait-for-seat` dispatch used to exit 1 at once with "max_concurrent
+/// … nothing was started"; it now waits, re-plans on fresh counts once the
+/// rival finishes, and starts.
+#[test]
+fn wait_for_seat_waits_when_admission_finds_the_fleet_full_then_starts() {
+    let sandbox = Sandbox::new();
+    set_max_concurrent(&sandbox, 1);
+    let herdr = fleet_shifting_herdr(&sandbox, &[], Some("aaaaaa"), &["aaaaaa"], 1);
+
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert_code(&output, 0);
+    let text = stdout(&output);
+    assert!(
+        text.contains("admission found the fleet full (workers 1/1:"),
+        "{text}"
+    );
+    assert!(text.contains("Dispatched scout on test-seat"), "{text}");
+    assert!(
+        sandbox.root.join("rival-dropped").exists(),
+        "the rival must have finished during the wait, or this proves nothing"
+    );
+    let log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(log.contains("event=started"), "{log}");
+}
+
+/// Card `20261122-b-4c82c5`: the same admission-time full fleet that never
+/// frees refuses once `--wait-for-seat-seconds` runs out — after waiting,
+/// not at once — and says how long it waited; nothing is started.
+#[test]
+fn wait_for_seat_on_a_fleet_that_stays_full_refuses_saying_how_long_it_waited() {
+    let sandbox = Sandbox::new();
+    set_max_concurrent(&sandbox, 1);
+    let herdr = fleet_shifting_herdr(&sandbox, &[], Some("aaaaaa"), &[], 1);
+    let panes = stdout(&sandbox.herdr(&["pane", "list"]));
+
+    let started = std::time::Instant::now();
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "refused after {:?}, without waiting",
+        started.elapsed()
+    );
+    assert_code(&output, 3);
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains(
+            "1 agent(s) already running and max_concurrent is 1; nothing was started \
+             (gave up after waiting 1s with --wait-for-seat)"
+        ),
+        "{diagnostic}"
+    );
+    assert_eq!(stdout(&sandbox.herdr(&["pane", "list"])), panes);
+    assert!(!sandbox.project.join(".multiverse/tasks").exists());
+}
+
+/// Card `20261122-b-4c82c5`: a fleet already over its cap (3 open, cap 2
+/// — the cap lowered under live agents) waits at plan time just as a fleet
+/// at its cap does, re-counting each poll, and starts once the count
+/// drops to cap - 1.
+#[test]
+fn wait_for_seat_on_a_fleet_over_its_cap_waits_for_the_count_to_drop() {
+    let sandbox = Sandbox::new();
+    set_max_concurrent(&sandbox, 2);
+    let herdr = fleet_shifting_herdr(
+        &sandbox,
+        &["aaaaaa", "bbbbbb", "cccccc"],
+        None,
+        &["aaaaaa", "bbbbbb"],
+        2,
+    );
+
+    let started = std::time::Instant::now();
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "started after {:?}, without a poll in between",
+        started.elapsed()
+    );
+    assert_code(&output, 0);
+    let text = stdout(&output);
+    assert!(text.contains("Dispatched scout on test-seat"), "{text}");
+    assert!(
+        sandbox.root.join("rival-dropped").exists(),
+        "the fleet must have dropped during the wait, or this proves nothing"
+    );
+}
+
+/// Card `20261122-b-4c82c5`: over its cap and never dropping, a short
+/// limit refuses after polling, saying how long it waited.
+#[test]
+fn wait_for_seat_on_a_fleet_over_its_cap_with_a_short_limit_reports_the_wait() {
+    let sandbox = Sandbox::new();
+    set_max_concurrent(&sandbox, 2);
+    let herdr = fleet_shifting_herdr(&sandbox, &["aaaaaa", "bbbbbb", "cccccc"], None, &[], 1);
+
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert_code(&output, 3);
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains(
+            "workers 3/2: 3 agent(s) already running and max_concurrent is 2; nothing was \
+             started (gave up after waiting 1s with --wait-for-seat)"
+        ),
+        "{diagnostic}"
+    );
+    assert!(!sandbox.project.join(".multiverse/tasks").exists());
+}
+
+/// Card `20261123-b-31b32b`: a `--wait-for-seat` dispatch whose only seat
+/// is at its open-agent cap re-reads that seat's live count each poll, so
+/// the seat is picked up once its rival finishes. With the chain handed to
+/// the wait as a static snapshot, it stayed at cap until the limit ran out.
+#[test]
+fn wait_for_seat_picks_up_a_capped_seat_that_frees_mid_wait() {
+    let sandbox = Sandbox::new();
+    assert_code(&sandbox.cli(&["accounts", "limit", "test-seat", "1"]), 0);
+    let herdr = fleet_shifting_herdr(&sandbox, &["aaaaaa"], None, &["aaaaaa"], 2);
+
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert_code(&output, 0);
+    let text = stdout(&output);
+    assert!(text.contains("Dispatched scout on test-seat"), "{text}");
+    assert!(
+        sandbox.root.join("rival-dropped").exists(),
+        "the seat must have freed during the wait, or this proves nothing"
+    );
+}
+
+/// Card `20261123-b-a80bc1`: a fleet `workers` reads as full — one working
+/// lane, one `done-unrecorded` lane, and one live worker pane no task
+/// history accounts for, at `max_concurrent = 3` — must refuse a dispatch,
+/// and a `--wait-for-seat` dispatch must wait on it rather than start.
+/// Planning's Herdr-free count sees only 2/3 (the untracked pane has no
+/// history), so it is admission, under the fleet lock, that refuses —
+/// exit 1, the code an admission refusal has always had. Revert check:
+/// restore the conservative first pass (no `agent list` unless it already
+/// refuses) in `recheck_admission`, and dispatch counts 2/3 and starts a
+/// fourth lane.
+fn full_fleet_with_done_unrecorded_and_untracked_rows(sandbox: &Sandbox) {
+    set_max_concurrent(sandbox, 3);
+    let working = lane_name("sandbox", "scou");
+    let finished = format!("{working}-2");
+    let untracked = lane_name("sandbox", "buil");
+    let mut log = String::new();
+    for (index, (task_id, name)) in [
+        ("20261123-scout-aaaaaa", &working),
+        ("20261123-scout-bbbbbb", &finished),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pane_id = split_pane(sandbox);
+        sandbox.herdr(&["agent", "rename", &pane_id, name]);
+        log.push_str(&format!(
+            "2026-11-23T00:00:0{index}+00:00\tevent=dispatch\ttask={task_id}\t\
+             branch=\trole=scout\taccount=test-seat\tagent={name}\n\
+             2026-11-23T00:00:0{index}+00:00\tevent=started\ttask={task_id}\tpane={pane_id}\n"
+        ));
+    }
+    let pane_id = split_pane(sandbox);
+    sandbox.herdr(&["agent", "rename", &pane_id, &untracked]);
+    fs::create_dir_all(
+        sandbox
+            .project
+            .join(".multiverse/tasks/20261123-scout-bbbbbb"),
+    )
+    .unwrap();
+    fs::write(
+        sandbox
+            .project
+            .join(".multiverse/tasks/20261123-scout-bbbbbb/status"),
+        "done\n",
+    )
+    .unwrap();
+    fs::write(sandbox.project.join(".multiverse/routing.log"), log).unwrap();
+
+    let workers = sandbox.cli(&["workers", "--read-only"]);
+    assert_code(&workers, 0);
+    let table = stdout(&workers);
+    assert!(table.contains("done-unrecorded"), "{table}");
+    assert!(table.contains("workers 3/3"), "{table}");
+}
+
+#[test]
+fn dispatch_refuses_a_fleet_workers_reads_as_full() {
+    let sandbox = Sandbox::new();
+    full_fleet_with_done_unrecorded_and_untracked_rows(&sandbox);
+    let routing_log = sandbox.project.join(".multiverse/routing.log");
+    let before = fs::read_to_string(&routing_log).unwrap();
+
+    let output = sandbox.dispatch("Map the repository", &["--no-reconcile", "--yes"]);
+    assert_code(&output, 1);
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains(
+            "workers 3/3: 3 agent(s) already running and max_concurrent is 3; nothing was started"
+        ),
+        "{diagnostic}"
+    );
+    assert_eq!(fs::read_to_string(&routing_log).unwrap(), before);
+}
+
+#[test]
+fn wait_for_seat_waits_on_a_fleet_workers_reads_as_full() {
+    let sandbox = Sandbox::new();
+    full_fleet_with_done_unrecorded_and_untracked_rows(&sandbox);
+    let routing_log = sandbox.project.join(".multiverse/routing.log");
+    let before = fs::read_to_string(&routing_log).unwrap();
+
+    let started = std::time::Instant::now();
+    let output = sandbox.dispatch(
+        "Map the repository",
+        &[
+            "--no-reconcile",
+            "--wait-for-seat",
+            "--wait-for-seat-seconds",
+            "1",
+            "--yes",
+        ],
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "refused after {:?}, without waiting",
+        started.elapsed()
+    );
+    assert_code(&output, 1);
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains(
+            "workers 3/3: 3 agent(s) already running and max_concurrent is 3; nothing was \
+             started (gave up after waiting 1s with --wait-for-seat)"
+        ),
+        "{diagnostic}"
+    );
+    assert_eq!(fs::read_to_string(&routing_log).unwrap(), before);
+}
+
+/// Card `20261123-b-03108f`: a single-seat (`queue`) chain whose seat
+/// has room at selection but is full by admission — a rival took its last
+/// slot under the fleet lock. A `--wait-for-seat` dispatch used to refuse
+/// at once (the one-seat chain had nowhere to fall through to), and even
+/// a re-plan read the seat pinned at its cap for the rest of the wait. It
+/// now waits, re-reads the seat's live count on the next poll, and starts
+/// once the rival finishes.
+#[test]
+fn wait_for_seat_waits_when_admission_finds_its_only_seat_full_then_starts() {
+    let sandbox = Sandbox::new();
+    assert_code(&sandbox.cli(&["accounts", "limit", "test-seat", "1"]), 0);
+    let herdr = fleet_shifting_herdr(&sandbox, &[], Some("aaaaaa"), &["aaaaaa"], 1);
+
+    let started = std::time::Instant::now();
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "started after {:?}, without a poll in between",
+        started.elapsed()
+    );
+    assert_code(&output, 0);
+    let text = stdout(&output);
+    assert!(
+        text.contains(
+            "seat \"test-seat\" reached its open-agent cap before admission (1/1 open); \
+             waited for it to free (--wait-for-seat)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("Dispatched scout on test-seat"), "{text}");
+    assert!(
+        sandbox.root.join("rival-dropped").exists(),
+        "the rival must have finished during the wait, or this proves nothing"
+    );
+    let log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(log.contains("event=started"), "{log}");
+}
+
+/// Cards `20261123-b-03108f` + `20261123-b-853616`: the same seat, full at
+/// admission and never freeing, refuses once `--wait-for-seat-seconds`
+/// runs out — after waiting, not at once — and says how long it waited,
+/// the way a timed-out fleet-capacity wait already does. Nothing starts.
+#[test]
+fn wait_for_seat_on_a_seat_that_stays_full_refuses_saying_how_long_it_waited() {
+    let sandbox = Sandbox::new();
+    assert_code(&sandbox.cli(&["accounts", "limit", "test-seat", "1"]), 0);
+    let herdr = fleet_shifting_herdr(&sandbox, &[], Some("aaaaaa"), &[], 1);
+    let panes = stdout(&sandbox.herdr(&["pane", "list"]));
+
+    let started = std::time::Instant::now();
+    let output = dispatch_waiting_for_seat(&sandbox, &herdr, "1");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "refused after {:?}, without waiting",
+        started.elapsed()
+    );
+    assert_code(&output, 3);
+    let diagnostic = stderr(&output);
+    assert!(diagnostic.contains("test-seat: at cap"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("(gave up after waiting 1s with --wait-for-seat)"),
+        "{diagnostic}"
+    );
+    assert_eq!(stdout(&sandbox.herdr(&["pane", "list"])), panes);
+    assert!(!sandbox.project.join(".multiverse/tasks").exists());
+}
+
+/// A `HERDR_BIN_PATH` wrapper around the sandbox's fake-herdr whose first
+/// `agent list` made while `dispatch.lock` is held — admission's own
+/// seat-cap recheck, under `--no-reconcile` — fails, so admission reads
+/// the selected capped seat as full (fail-closed) while every unlocked
+/// read, selection's included, still sees it free. Every other call runs
+/// the real fake-herdr unchanged.
+fn herdr_unreadable_at_first_admission(sandbox: &Sandbox) -> PathBuf {
+    let real = sandbox
+        .command("true")
+        .get_envs()
+        .find(|(key, _)| *key == "HERDR_BIN_PATH")
+        .and_then(|(_, value)| value.map(PathBuf::from))
+        .expect("sandbox pins HERDR_BIN_PATH to fake-herdr");
+    let failed = sandbox.root.join("admission-list-failed");
+    let script = sandbox.root.join("stale-herdr.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = agent ] && [ \"$2\" = list ] && [ ! -f '{failed}' ] && [ -f '{lock}' ] \\\n\
+                && ! python3 -c 'import fcntl, sys; fcntl.flock(open(sys.argv[1], \"a\"), fcntl.LOCK_EX | fcntl.LOCK_NB)' '{lock}' 2>/dev/null; then\n\
+               : > '{failed}'\n\
+               echo 'herdr: socket unavailable' >&2\n\
+               exit 1\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            lock = sandbox.root.join("runtime/dispatch.lock").display(),
+            failed = failed.display(),
+            real = real.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    script
+}
+
+/// Card `20261123-b-2aea97`: the admission pin is load-bearing when the
+/// live count re-selection reads lags what admission saw. Here admission
+/// could not read Herdr and so treated the capped seat as full, while the
+/// unlocked re-read still shows it free: pinned, re-selection falls
+/// through to the next seat; unpinned, it would pick the same seat again
+/// and admit it on the second (readable) recheck.
+#[test]
+fn a_seat_admission_found_full_stays_pinned_when_the_live_count_lags() {
+    let sandbox = Sandbox::new();
+    enable_fallback_chain(&sandbox);
+    assert_code(&sandbox.cli(&["accounts", "limit", "test-seat", "1"]), 0);
+    let herdr = herdr_unreadable_at_first_admission(&sandbox);
+
+    let output = sandbox
+        .command(env!("CARGO_BIN_EXE_multiverse"))
+        .env("HERDR_BIN_PATH", &herdr)
+        .args([
+            "dispatch",
+            sandbox.project.to_str().unwrap(),
+            "Map the repository",
+            "--role",
+            "scout",
+            "--timeout",
+            "5",
+            "--no-reconcile",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_code(&output, 0);
+    assert!(
+        sandbox.root.join("admission-list-failed").exists(),
+        "admission's recheck must have hit the failing list, or this proves nothing"
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("reached its open-agent cap before admission (1/1 open)"),
+        "{text}"
+    );
+    assert!(text.contains("Dispatched scout on fallback-seat"), "{text}");
+    let log = fs::read_to_string(sandbox.project.join(".multiverse/routing.log")).unwrap();
+    assert!(!log.contains("account=test-seat"), "{log}");
+    assert!(log.contains("account=fallback-seat"), "{log}");
+}
+
 #[test]
 fn halt_refuses_dispatch_and_force_overrides_without_clearing_halt() {
     let sandbox = Sandbox::new();

@@ -108,6 +108,7 @@ binding — see each one's own module doc for the complete list.
 | `stop` | Stop project sessions | Real |
 | `add` | Register an existing project | Real (plain-text append, not yet through `mv-config::edit`) |
 | `new` | Create, register, and start a project | Real for create/register; its final `start` step shares `start`'s scope cuts above |
+| `onboard` | Interactive first-run setup | Real, Rust-only: writes `config.toml` from `config.example.toml`, walks vendor seats, offers recommended chains and model tiers, and can register the first project (`commands::onboard`'s own module doc). `--non-interactive` applies those defaults; `--dry-run` prints the plan without writing; a config that already has accounts is left untouched unless `--yes` (or interactive confirmation) |
 | `tasks` | Inspect or update project tasks | Real for listing/reconcile/`--close-stranded`/`--reclaimable`/`--supersede`/`--acknowledge` (each a dry run by default, `--yes` to write); Python's unattended, lease-expiry-gated auto-supersede pass (`converge_stale`) is not ported anywhere in this workspace (`commands::tasks`'s own module doc) |
 | `board` | One-shot text board; `--watch` is reserved for the interactive view | Real |
 | `council` | Ask Council; execution requires `--yes` | Real: a missing `--yes` seats the roster and prints it before refusing; `--yes` convenes every seated seat through `mv-engine::council::convene` against `ProcessHerdr` (see `commands::council`'s own module doc for scope cuts: no live `agent list` probe while seating, `accounts prefer` reordering not applied, per-seat result lines not rendered) |
@@ -124,10 +125,10 @@ binding — see each one's own module doc for the complete list.
 | `notify` | Queue or flush operator notifications | Real |
 | `inspect` | Inspect project context | Real |
 | `result` | Read a task result | Real |
-| `activity` | `send` / `reply` / `close` / `show` / `broadcast` / `nudge` / `inbox` / `update` | Real for all eight: `nudge` types Python's exact `NUDGE_PROMPT` into each permitted recipient's live Nexus pane and confirms it landed, through the same `FleetState::orchestrator_agent` / `deliver_prompt_to` pair `start --reseed` uses, but does not reproduce Python's fine-grained reached/unconfirmed/unverifiable/unreached split or its composer-text/dialog-menu pane-read checks (`commands::activity`'s own module doc) |
+| `activity` | `send` / `reply` / `close` / `show` / `broadcast` / `nudge` / `inbox` / `update` | Real for all eight: `nudge` types Python's exact `NUDGE_PROMPT` into each permitted recipient's live Nexus pane and confirms it landed through the same `FleetState::orchestrator_agent` / `deliver_prompt_to` pair `start --reseed` uses. Before typing, `nudge_one` `agent read`s and runs `dialog_or_menu_reason`; a parked dialog is never sent keystrokes, an already-working agent is prompted once and reported unverifiable, and the summary is the reached/unconfirmed/unverifiable/unreached/skipped split (`commands::activity`'s own module doc) |
 | `backlog` | `add` / `list` / `done` / `reopen` / `annotate` / `reprioritize` / `show` / `ask` / `mark-asked` / `answer` | Real |
 | `directives set\|show` | Standing project directives | Real |
-| `workers` | List worker sessions | Real |
+| `workers` | List worker sessions | Real: auto-reconciles unrecorded outcomes through `mv_state::tasks::reconcile_project` unless `--read-only` (`commands::workers`'s own module doc) |
 | `config migrate` | One-shot role-key rewrite, dry-run or in place with backup | Real |
 
 `activity inbox` takes `--as-nexus` (help text: authorize acknowledging as

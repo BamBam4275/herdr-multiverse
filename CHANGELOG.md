@@ -9,6 +9,255 @@ changes.
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-11-23
+
+### Added
+
+- Sweep: a Claude lane whose own background job finished without waking it
+  now gets one stall wake ("wake: your background job has finished — check
+  its output, continue, then write result.md and status"). It fires only
+  for an idle lane with no result whose finish nudge is already spent,
+  whose pane shows `⏺ Background command "…" completed (exit code N)` after
+  its last turn-end line with only an empty composer below, and whose pane
+  text has not changed for 15 minutes (host sleep discounted). Each lane is
+  woken at most once (`.multiverse/stall-wake-memory.json`; unchanged-pane
+  timing in `.multiverse/idle-pane-memory.json`). Sweep prints
+  `woke stalled: <ids>`. Under `--dry-run`, a halt, or
+  `MULTIVERSE_READ_ONLY=1` it prints `would wake stalled: <ids>` and writes
+  neither file, so the preview only appears once a real sweep has already
+  started the 15-minute clock. Codex lanes are not woken yet.
+- Docs: `docs/ONBOARDING.md` covers setup for each vendor (Claude, Codex,
+  Grok, local), the nine roles, chains and a recommended default set, model
+  tier choice, a day-one command cheat sheet, and a legend for every status
+  word the board and `workers` print. Setup starts from
+  `multiverse onboard` and explains the built-in `multiverse` home hub.
+  The README links it from a new Documentation section.
+- CLI: most `check` notes and warnings now end with
+  `see docs/ONBOARDING.md#<section>`, pointing to the section that explains
+  them.
+- CLI: `multiverse onboard` walks first-run setup. It asks for your first
+  project, which vendor seats to include, which of them is your
+  interactive Nexus seat, and exact model ids (or leaves a tier
+  placeholder that `check` lists), then writes the recommended chain set
+  from `docs/ONBOARDING.md` for the seats you chose. A seat whose config
+  directory shows no login is listed as `not logged in` or
+  `login unknown`, with its sign-in command. Every answer is checked
+  before anything is written: a project path that is not a git repository
+  or an answer that is not y/yes/n/no is asked again (up to three tries),
+  and declining model tiers so that no role can run is refused (exit 3).
+  On an existing config, onboard never replaces the file. It first copies
+  it to `config.toml.bak-<UTC stamp>`, then merges the new seats in with
+  targeted edits, keeping projects, accounts, comments and hand-set
+  models. A file that is not valid TOML is refused. `--non-interactive`
+  applies the defaults, `--yes` skips the confirmations, and `--dry-run`
+  prints the plan without writing. With `--start`, a failed start exits
+  with `start`'s own code.
+- CLI: `multiverse workers` now records any finished outcomes that have
+  not been recorded yet before it prints, unless `--read-only`.
+- Dispatch: Codex lanes now have a real read boundary. Every dispatched
+  and council Codex seat starts with a `fleet` permission profile
+  (`-c default_permissions="fleet"`, always defined on the same command
+  line) that extends `:workspace` and denies everything beside the path
+  from the project's parent down to the worktree: sibling projects, the
+  main checkout and other lanes, including other lanes' git directories
+  under `.git/worktrees/` and `.git/hooks`. The lane's worktree and gitdir
+  stay writable. A lane can still use `multiverse activity update`,
+  `activity inbox --peek` and `scratch`, and write its own `result.md` and
+  `status`; other tasks, briefs, inputs, evidence and `PASSDOWN.md` stay
+  denied. A project that sits directly in your home directory also denies
+  its home-level siblings, except the toolchain directories builds need.
+  See "Codex lane isolation" in `docs/configuration.md`.
+- Board: colour is now off unless the terminal confirms it supports it:
+  stdout is a terminal, `TERM` is not `dumb`, and `COLORTERM` is set or
+  `TERM` contains `color`, `256` or `xterm`. Inside a Herdr pane
+  (`HERDR_ENV=1` or `HERDR_PANE_ID` set) colour stays off, so a board tab
+  no longer shows stray `[92m` text. `board --color {always,auto,never}`
+  (default `auto`) and `[board].color = true` turn colour on anyway,
+  including inside a Herdr pane or when piped. `--no-color` and a
+  non-empty `NO_COLOR` always win.
+
+### Changed
+
+- Docs: the README, `docs/architecture.md`, `docs/configuration.md` and
+  `docs/parity.md` now match current behaviour, covering prompt delivery,
+  the `activity`, `onboard` and `workers` commands, the idle-pane and
+  stall-wake memory files, failed-to-start evidence and `reason=` tags,
+  Go cache paths, orphan-prune `kept build-dir` lines, `board --color`,
+  and `--reap` / `--prune` output.
+- Docs: the Chains section of `docs/ONBOARDING.md` no longer claims the
+  recommended chain set keeps Seer and Critic on different vendors. In
+  the set `multiverse onboard` writes, both start on the Codex (ChatGPT)
+  seat. The section now says so, and notes that `multiverse add` and
+  `multiverse new` do move Seer's first seat off Critic's vendor.
+
+### Fixed
+
+- Sweep: a Claude lane parked on `Waiting for API response · will retry in
+  … · check your network` now gets the stuck-lane resume prompt. The resume
+  sweep's connection-loss vocabulary did not include this line, so such a
+  lane never received a resume prompt.
+- Dispatch: Grok's first-run "Do you trust the contents of this
+  directory? y/n" dialog no longer loses the lane. A dispatch now writes
+  Grok's folder trust (`$GROK_HOME/trusted_folders.toml`) for the project
+  root and lane worktree before the seat starts, as it already did for
+  Codex. Any trust dialog that still appears is never answered: the
+  dispatch waits for it to clear, then delivers the brief, sending it
+  again once if the dialog swallowed it. A pane still at the dialog is
+  kept, gets an evidence file tagged `needs-attention:trust-dialog`, and
+  is not recorded `failed-to-start`.
+- Dispatch: every failed-to-start that got as far as opening a pane now
+  writes `.multiverse/evidence/<task>-failed-to-start.txt`, not only a
+  not-ready timeout. That covers `start-error`, `needs-attention` and
+  `unreadable-pane`. The exception is a tripped circuit breaker, which
+  already saves its own pane capture. A pane that goes blank after the
+  brief was typed is now logged as `reason=blank-after-prompt` instead of
+  the generic `start-error`.
+- `worktrees --merge` now judges a lane by its newest recorded outcome in
+  the routing log, not by the original task's status file: a lane redone
+  with `dispatch --into` merges once the newest round is `done`, and a
+  blocked record corrected with `tasks --supersede --status done` merges
+  too. The status file is only consulted while the newest round has no
+  recorded outcome yet.
+- `worktrees --merge <task>` accepts an adopted (`dispatch --into`) task id
+  and lands the branch of the lane it adopted, instead of failing with
+  "No such file or directory". It prints the branch that actually landed.
+- `tasks --supersede --status done --yes` also rewrites the task's status
+  file inside the worktree it ran in, when that worktree still exists.
+- `worktrees --merge` no longer refuses regenerable gitignored files. The
+  built-in list now also covers `prisma/generated/` and `*.egg-info/`
+  directories, and a project can declare its own `lane_setup` outputs with
+  `[lane_setup] regenerable = [...]` in `.multiverse/roster.toml`. The
+  refusal for any other ignored file names the path and says how to
+  declare it.
+- Dispatch and nudges: a prompt is no longer treated as delivered just
+  because the agent reports `Working` while the prompt still sits in its
+  composer. That happened under load with Claude and Grok, and the lane
+  then sat idle with an unsent brief recorded as `started`. Dispatch now
+  keeps re-reading the pane for up to half the prompt time budget. If the
+  agent goes idle with the prompt still in its composer, it presses Enter
+  once. If the budget runs out with the prompt still unsent, the dispatch
+  fails with a clear error.
+- `worktrees --rescue` skips regenerable caches (`venv`, `.venv`,
+  `__pycache__`, `node_modules`, `*.egg-info`, `.pytest_cache`, `target`)
+  inside a lane's `.multiverse/tasks/<task>/` instead of refusing the
+  whole lane as "unsafe state artifact" on the symlinks they contain, and
+  prints `skipped (regenerable)` for each. Remaining symlink refusals
+  name the path and the rule (`symlink at <path>; refuses to follow
+  symlinks out of the lane`). After that skip, `--prune` can remove the
+  lane. `--merge` already treats a gitignored `*.egg-info/` directory as
+  regenerable.
+- Dispatch: the `max_concurrent` limit now counts exactly what
+  `multiverse workers` shows as `workers N/CAP`. Both use one count, and
+  dispatch re-reads Herdr's live listing under the fleet lock before
+  admitting a lane. Every worker task without a recorded outcome whose
+  agent is still running holds a fleet slot: working, `waiting-on-shell`,
+  `outcome=running`, and a finished lane until its outcome is recorded.
+  Before, a finished but unrecorded lane freed its slot early, and a live
+  worker pane with no task history, or one on a since-renamed seat, held a
+  `workers` slot but not a dispatch slot. Per-project limits are
+  unchanged. Several tasks under one reused agent name count once. A
+  refusal now leads with the same count, for example `workers 6/6: 6
+  agent(s) already running and max_concurrent is 6; nothing was started`.
+- `tasks --reclaimable` and the cleanup before every dispatch no longer
+  close a Claude lane's pane while its footer still shows a running
+  background shell (`kept … waiting-on-shell`), or while its text cannot
+  be read.
+- CLI: `dispatch --wait-for-seat` now keeps waiting when the final
+  admission check finds the fleet full or the chosen seat at its
+  open-agent cap, including a fleet already over a lowered
+  `max_concurrent` and a single-seat chain. Before, if another dispatch
+  took the freed slot first, it exited 1 at once. Each poll re-reads live
+  counts, so a seat that frees during the wait is picked up. One
+  `--wait-for-seat-seconds` budget covers the whole wait. A wait that
+  times out ends with `(gave up after waiting Ns with --wait-for-seat)`.
+- CLI/docs: clearer first-run output. `onboard` says `Would write` only
+  before asking for confirmation or under `--dry-run`, and `Writing` /
+  `Wrote` when it actually writes. Leftover references to spec section
+  numbers are gone from `onboard`, `check` and the generated chain
+  comments. `check` and `workers` label the built-in `multiverse` hub.
+  The board legend now explains every marker it prints, and a Claude
+  seat with no usage data reads `no usage gauge`. `TERM=dumb`,
+  `NO_COLOR` and `board --no-color` draw plain ASCII boxes. `start` no
+  longer prints literal `**Nexus**` markdown. Day-one commands and the
+  board markers are listed in `docs/cheat-sheet.md`.
+- CLI: `worktrees --prune --reap` now ends processes left behind in a dead
+  lane, whatever the lane's keep-reason. A dead lane is one whose pane is
+  gone and that has a recorded pane or outcome. Leftovers include
+  `tail -f`, a `zsh -c`, `ugrep` and ssh ControlMaster processes reparented
+  to pid 1. Before, only the lane's own non-shell process was considered,
+  so a done, unmerged lane listed nothing. An ssh master gets
+  `ssh -O exit` before SIGTERM. `worktrees --merge`'s "live process cwd"
+  refusal now names each holder's pid, command and cwd, and the reap
+  command. `tasks --reclaimable --yes` reaps a lane's leftovers after
+  closing its pane, and `--reclaimable --reap` covers stale entries whose
+  pane was already gone.
+- Redaction no longer panics on large text, such as the brief from a
+  multi-lane `dispatch --dry-run --reviewing`. The credential patterns
+  now run on a linear-time regex engine instead of a backtracking one
+  that gave up past a million backtracks. Secrets are still masked,
+  including two AWS keys or Bearer tokens separated by a single
+  character.
+- Dialog detection for nudge, board, and sweep now reads only the pane
+  region below the last turn-end line or composer marker, and only a
+  dialog shape (question plus y/n or numbered options, or a known vendor
+  frame), never a substring of scrollback. A report that mentions a trust
+  dialog or "Update available" above an idle composer classifies idle.
+- Board: a Codex lane whose report quotes the folder-trust dialog's
+  "Trust and continue" above its idle composer no longer shows as blocked
+  on a prompt. The board's Codex trust check now reads only the pane's
+  dialog region, as the nudge and sweep classifiers already do; a live
+  trust dialog is still reported as `codex_directory_trust_prompt`.
+- `worktrees --prune --yes` now frees every orphaned cargo shared-build
+  directory that its `--dry-run` lists, in a single run. Deleting a large
+  directory no longer uses up the scan's time limit, and each directory
+  gets its own time allowance, so a slow scan of one live directory can
+  no longer cause later ones to be skipped silently. A directory still
+  cut off by the time limit is printed as `kept build-dir` with the
+  reason, in both the dry run and the real run.
+- `check --verbose` no longer calls a Nexus seed stale only because
+  `.multiverse/passdown.state` flipped from `pending` to `up`, a handoff
+  card changed, or standing directives changed. Seeds now record per-part
+  digests (dispatch table, role prompt, review policy, fleet rules), and
+  the note names whichever part differs. A seed written before this
+  change reads as stale once, saying it predates per-part digests.
+  `start --reseed` still rewrites on any body change.
+- Sweep: a short follow-up message left unsent in a Claude lane's
+  composer below its finished banner is now submitted with a single Enter
+  after two sweeps find the pane idle and unchanged. Each message is
+  submitted at most once, even if dispatch already used its own Enter
+  retry. Dialogs, changing panes and busy agents are never touched, and
+  `--dry-run` changes nothing.
+- Dispatch: when the chosen seat fills up between selection and the final
+  admission check, dispatch now tries the next seat in the role's chain,
+  as the role's `on_exhausted` policy allows, at most once per seat,
+  instead of refusing with "seat … is now at its open-agent cap". If every
+  seat it tries is full, the refusal lists each one (exit 1, as before). A
+  single-seat chain keeps its original refusal, and a fleet-wide
+  `max_concurrent` or per-project limit still refuses at once.
+- `workers` and the board now show a Claude lane that is sitting at its
+  prompt while a background shell it started is still running as
+  `waiting-on-shell` instead of `done` or `stalled`. The lane's footer
+  shows `N shell(s)` or `N monitor`. Sweep's stall wake never wakes such
+  a lane.
+- CLI: `worktrees --merge` no longer refuses a lane that is held only by
+  known-benign leftovers. These are a `caffeinate` or ssh ControlMaster
+  that is orphaned or whose pane is gone, an orphaned `tail`, `ugrep` or
+  `grep`, and a shell whose pane is gone. `--merge` ends each one, prints
+  what it ended and retries the merge once. Any other holder still refuses
+  the merge, and nothing is ended. The refusal now names every holder's
+  pid, full command, cwd and why it is not a known leftover, for lanes
+  whose pane is still open too. Ending a leftover ssh master now reads its
+  full command line, so `ssh -O exit` also runs on macOS, where the process
+  snapshot shows only `ssh`.
+- CLI: `worktrees --merge` now honours a `tasks --supersede` correction of a
+  lane's newest recorded outcome even when a later `dispatch --into` round
+  never recorded one of its own, so an abandoned lane corrected to `done`
+  merges without hand-writing a status file or `result.md`. A `done`
+  recorded in the routing log no longer needs a `result.md` on disk, and
+  every refusal over a missing status file or a missing or empty
+  `result.md` names the exact path instead of a bare
+  "No such file or directory (os error 2)".
+
 ## [0.1.16] - 2026-11-19
 
 ### Added
@@ -1409,6 +1658,7 @@ section for the exact, current boundary between the two.
   the new keys.
 
 [Unreleased]: https://github.com/BamBam4275/herdr-multiverse/compare/main...HEAD
+[0.1.17]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.17
 [0.1.16]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.16
 [0.1.15]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.15
 [0.1.14]: https://github.com/BamBam4275/herdr-multiverse/releases/tag/v0.1.14

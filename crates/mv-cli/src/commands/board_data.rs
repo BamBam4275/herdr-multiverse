@@ -603,7 +603,10 @@ enum Resolved {
 /// `active` scope kind applies.
 fn scope_header(projects: &[Project]) -> String {
     if projects.len() == 1 {
-        format!("project: {} only", projects[0].name)
+        format!(
+            "project: {} only (one-project view; --all for the fleet)",
+            projects[0].name
+        )
     } else {
         format!(
             "projects: {}",
@@ -951,7 +954,7 @@ impl LiveSource {
                 }
             }
             None => quota_windows.push(if account.kind == "claude" {
-                "window: n/a (API billing)".to_string()
+                "window: n/a (no usage gauge)".to_string()
             } else {
                 "window: n/a (not reported)".to_string()
             }),
@@ -1375,6 +1378,10 @@ impl LiveSource {
 }
 
 impl BoardDataSource for LiveSource {
+    fn force_color(&self) -> bool {
+        self.config.board.color
+    }
+
     fn fingerprint(&self, view: &BoardView) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2529,7 +2536,14 @@ fn probe_task_prompt(
     let Some(text) = read_pane_visible(binary, pane) else {
         return;
     };
-    let rule = if account.kind == "codex" && text.to_lowercase().contains("trust and continue") {
+    // Card `20261122-b-97e7c2`: only the dialog region counts, so a codex
+    // report quoting "trust and continue" above an idle composer is not a
+    // live folder-trust dialog.
+    let rule = if account.kind == "codex"
+        && mv_engine::blocking_prompt::dialog_region(&text)
+            .to_lowercase()
+            .contains("trust and continue")
+    {
         Some("codex_directory_trust_prompt".to_string())
     } else {
         mv_engine::blocking_prompt::classify_prompt(&text, &account.kind).map(|prompt| prompt.rule)
@@ -2537,6 +2551,21 @@ fn probe_task_prompt(
     if let Some(rule) = rule {
         task.live_status = Some(LiveAgentStatus::PromptBlocked);
         task.state_note = Some(format!("blocked on prompt: {rule}"));
+    } else if account.kind == "claude"
+        && matches!(current.status.as_str(), "idle" | "done")
+        && mv_engine::sweep_nudges::waiting_on_shell(&text)
+    {
+        // Card `20261122-b-e98304`: Herdr reads this pane idle/done, but
+        // its footer still shows a background shell or monitor running —
+        // the lane is waiting on its own job, not stalled. Same pane read
+        // as the prompt probe above; display only, like `workers`'s own
+        // STATUS cell.
+        task.live_status = Some(LiveAgentStatus::Running);
+        task.state_note = Some(
+            "waiting-on-shell: a background shell is still running \u{2014} not finished, \
+             do not reclaim"
+                .to_string(),
+        );
     }
 }
 
@@ -3526,7 +3555,10 @@ mod tests {
             max_slots: None,
             autostart: true,
         };
-        assert_eq!(scope_header(&[project]), "project: sandbox only");
+        assert_eq!(
+            scope_header(&[project]),
+            "project: sandbox only (one-project view; --all for the fleet)"
+        );
     }
 
     #[test]
@@ -4740,6 +4772,122 @@ esac"#,
         );
     }
 
+    /// Card `20261122-b-97e7c2`: a codex pane that quotes the folder-trust
+    /// dialog's "Trust and continue" in report prose above its idle `›`
+    /// composer is not blocked on a prompt; the captured dialog itself
+    /// still is. Revert check: search the whole pane again in
+    /// `probe_task_prompt` and the quoted pane reads as
+    /// `codex_directory_trust_prompt`.
+    #[test]
+    fn codex_trust_prose_above_an_idle_composer_is_not_a_blocking_prompt() {
+        let root = temp_project("board-trust-prose");
+        let task = "20000101-scout-aaaaaa";
+        task_dir(&root, task);
+        let stamp = mv_core::time::now_stamp();
+        let history = format!("{stamp}\tevent=dispatch\ttask={task}\trole=scout\taccount=seat\tagent=mv-scout-cx\n{stamp}\tevent=started\ttask={task}\tpane=w1:p1\n");
+        std::fs::write(root.join(".multiverse/routing.log"), &history).unwrap();
+        let config = mv_config::load::load_config_str(&format!("[accounts.seat]\nkind = 'codex'\nconfig_dir_var = 'CODEX_HOME'\nconfig_dir = {:?}\nshort = 'cx'\n[projects.demo]\npath = {:?}\n", root.join("vendor").to_str().unwrap(), root.to_str().unwrap()), Path::new("config.toml")).unwrap();
+        let source = live_source(config, &root.join("state"));
+        let fake = fake_board_herdr(
+            &root,
+            r#"cd "$(dirname "$0")" || exit 1
+case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"mv-scout-cx","agent_status":"idle"}]}}' ;;
+'agent read') cat pane-text ;;
+*) exit 1 ;;
+esac"#,
+        );
+        let probe = |text: &str| {
+            std::fs::write(root.join("pane-text"), text).unwrap();
+            let (_, view) = source
+                .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
+                .unwrap();
+            let BoardView::Project(snapshot) = view else {
+                panic!("one project")
+            };
+            let task = &snapshot.project.tasks[0];
+            (task.live_status, task.state_note.clone())
+        };
+
+        let prose = "\u{2022} Closed the trust card. The lane had parked on:\n\n  Trust this folder?\n  \u{203a} 1. Trust and continue\n  2. Cancel\n\n  The seat's folder trust is now pre-written at dispatch.\n\n\u{203a} Ask Codex to do anything\n\n  ? for shortcuts\n";
+        assert!(prose.to_lowercase().contains("trust and continue"));
+        let (status, note) = probe(prose);
+        assert_eq!(status, Some(LiveAgentStatus::Stalled), "{note:?}");
+        assert_eq!(
+            note.as_deref(),
+            Some("stalled, agent is live but not working")
+        );
+
+        let (status, note) = probe(include_str!(
+            "../../../../tests/fixtures/sandbox-dialog/codex-directory-trust-prompt.txt"
+        ));
+        assert_eq!(status, Some(LiveAgentStatus::PromptBlocked));
+        assert_eq!(
+            note.as_deref(),
+            Some("blocked on prompt: codex_directory_trust_prompt")
+        );
+    }
+
+    /// Card `20261122-b-e98304`: a Claude lane Herdr reports `done` whose
+    /// footer still shows a background shell running reads as
+    /// `waiting-on-shell`, from the same `agent read` the prompt probe
+    /// already makes, not as stalled. Revert check: drop the
+    /// `waiting_on_shell` arm of `probe_task_prompt` and the card keeps the
+    /// plain "stalled, agent is live but not working" note.
+    #[test]
+    fn a_claude_pane_with_a_running_shell_footer_reads_as_waiting_on_shell() {
+        let root = temp_project("board-waiting-on-shell");
+        let task = "20000101-scout-aaaaaa";
+        task_dir(&root, task);
+        let stamp = mv_core::time::now_stamp();
+        let history = format!("{stamp}\tevent=dispatch\ttask={task}\trole=scout\taccount=seat\tagent=mv-scout-cl\n{stamp}\tevent=started\ttask={task}\tpane=w1:p1\n");
+        std::fs::write(root.join(".multiverse/routing.log"), &history).unwrap();
+        let config = mv_config::load::load_config_str(&format!("[accounts.seat]\nkind = 'claude'\nconfig_dir_var = 'CLAUDE_CONFIG_DIR'\nconfig_dir = {:?}\nshort = 'cl'\n[projects.demo]\npath = {:?}\n", root.join("vendor").to_str().unwrap(), root.to_str().unwrap()), Path::new("config.toml")).unwrap();
+        let source = live_source(config, &root.join("state"));
+        let fixture = include_str!(
+            "../../../../tests/fixtures/stall-cause/claude-shell-still-running-idle.txt"
+        );
+        let fake = fake_board_herdr(
+            &root,
+            r#"cd "$(dirname "$0")" || exit 1
+case "$1 $2" in
+'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","name":"mv-scout-cl","agent_status":"done"}]}}' ;;
+'agent read') cat pane-text ;;
+*) exit 1 ;;
+esac"#,
+        );
+        let note_for = |text: &str| {
+            std::fs::write(root.join("pane-text"), text).unwrap();
+            let (_, view) = source
+                .snapshot_with(&BoardScope::All, fake.to_str().unwrap())
+                .unwrap();
+            let BoardView::Project(snapshot) = view else {
+                panic!("one project")
+            };
+            let (blocked, progress) = mv_board::card::split_dispatched(&snapshot.project.tasks);
+            assert!(blocked.is_empty());
+            assert_eq!(progress.len(), 1);
+            let task = &snapshot.project.tasks[0];
+            (task.live_status, task.state_note.clone())
+        };
+
+        let (status, note) = note_for(fixture);
+        assert_eq!(status, Some(LiveAgentStatus::Running));
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.starts_with("waiting-on-shell")),
+            "{note:?}"
+        );
+
+        // The same pane with no running shell in its footer stays stalled.
+        let (status, note) = note_for(&fixture.replace(" · 1 shell", ""));
+        assert_eq!(status, Some(LiveAgentStatus::Stalled));
+        assert_eq!(
+            note.as_deref(),
+            Some("stalled, agent is live but not working")
+        );
+    }
+
     /// Card `20261118-b-9226e1`: `probe_task_prompt` used to read
     /// `events.started` alone for `pane` (unlike `resolve_one_task`, which
     /// already fell back to `events.pane` for card `20261118-b-c328a3` M2)
@@ -5142,6 +5290,15 @@ short = "cl"
         }
     }
 
+    #[test]
+    fn config_board_color_becomes_force_color() {
+        let dir = tempfile::tempdir().unwrap();
+        let off = live_source(one_account_config(""), dir.path());
+        assert!(!off.force_color());
+        let on = live_source(one_account_config("[board]\ncolor = true\n"), dir.path());
+        assert!(on.force_color());
+    }
+
     /// Critic finding 6: a seat's cap/lend are written keyed by its
     /// *name* (`accounts limit`/`accounts lend`, via
     /// `commands::accounts::LiveConfig::seat_name`), not its `short`
@@ -5249,7 +5406,15 @@ short = "cl"
             .unwrap()
             .clone();
         let snapshot = source.account_snapshot(&account, None, "12:00", now_utc());
-        assert_eq!(snapshot.quota_windows, vec!["window: n/a (API billing)"]);
+        assert_eq!(snapshot.quota_windows, vec!["window: n/a (no usage gauge)"]);
+        assert!(
+            !snapshot
+                .quota_windows
+                .iter()
+                .any(|line| line.contains("API billing")),
+            "{:?}",
+            snapshot.quota_windows
+        );
     }
 
     /// A claude seat whose pool already has a recorded gauge (written by

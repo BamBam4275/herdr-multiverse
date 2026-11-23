@@ -57,6 +57,19 @@ impl From<WorktreeError> for MergeError {
     }
 }
 
+/// What [`Worktrees::rescue`] copied, and what it skipped as a regenerable
+/// cache inside `.multiverse/tasks/<task>/` (card `20261122-b-4961e4`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RescueReport {
+    /// Destination paths actually written — or, under `dry_run`, that
+    /// would be written. Directories themselves are never listed, matching
+    /// `copy_without_overwrite`.
+    pub copied: Vec<PathBuf>,
+    /// Source paths skipped as regenerable cache (a `venv`, `__pycache__`,
+    /// `*.egg-info`, …) rather than copied or followed.
+    pub skipped: Vec<PathBuf>,
+}
+
 /// [`Worktrees::merge`]'s success case: the merge commit it made, plus any
 /// warning lines a caller should print (`required = false` proceeding
 /// unscanned past a missing `gitleaks`) even though nothing was refused.
@@ -65,6 +78,10 @@ pub struct MergeResult {
     /// The merge commit's own sha, after `git merge --no-ff --no-edit`
     /// landed `task`'s branch onto `HEAD`.
     pub sha: String,
+    /// The branch that landed — the worktree's own `multiverse/<lane>`,
+    /// which for an adopted (`dispatch --into`) task id names the lane it
+    /// adopted, not that id.
+    pub branch: String,
     /// Lines a caller should print even though nothing was refused — e.g.
     /// a non-required `gitleaks` that could not be run, so the merge went
     /// ahead unscanned (see [`Worktrees::merge`]'s own doc).
@@ -179,6 +196,83 @@ pub fn lane_id(date: &str, role: &str, digest: &str) -> Result<String> {
         return Err(WorktreeError::Refused("invalid new lane identity".into()));
     }
     Ok(format!("{date}-{role}-{digest}"))
+}
+
+/// The lane (worktree) `task` works in, by the lane's own task id: `task`
+/// itself when `.multiverse/worktrees/<task>` exists, else the lane its
+/// newest `event=dispatch` record adopted — a `dispatch --into <owner>`
+/// round records `branch=multiverse/<owner>` under its own new task id, so
+/// that branch is how an adopted id finds the worktree it ran in. `None`
+/// when neither names an existing worktree (a reader dispatched to `main`,
+/// or a lane already pruned).
+pub fn lane_task_for(project_root: &Path, task: &str) -> Result<Option<String>> {
+    validate_id(task)?;
+    let lane_exists = |id: &str| -> Result<bool> {
+        Ok(guarded_path(
+            project_root,
+            &Path::new(".multiverse/worktrees").join(id),
+            true,
+        )?
+        .is_dir())
+    };
+    if lane_exists(task)? {
+        return Ok(Some(task.to_string()));
+    }
+    let records = crate::index::records(
+        &project_root.join(".multiverse/routing.log"),
+        crate::index::Selector::Tasks,
+    )
+    .unwrap_or_default();
+    let adopted = records.iter().rev().find_map(|record| {
+        let parsed = record.parse().ok()?;
+        (parsed.event() == "dispatch"
+            && parsed.fields.get("task").map(String::as_str) == Some(task))
+        .then(|| parsed.fields.get("branch").cloned().unwrap_or_default())
+    });
+    let Some(owner) = adopted
+        .as_deref()
+        .and_then(|branch| branch.strip_prefix("multiverse/"))
+        .filter(|owner| validate_id(owner).is_ok())
+    else {
+        return Ok(None);
+    };
+    Ok(lane_exists(owner)?.then(|| owner.to_string()))
+}
+
+/// Rewrites `task`'s status file inside the worktree it ran in
+/// ([`lane_task_for`]) to `status`, so the lane's own copy agrees with a
+/// `tasks --supersede` correction the routing log just recorded. Only
+/// when that worktree still exists *and* already holds
+/// `.multiverse/tasks/<task>/` (the directory the dispatched agent wrote
+/// its status into) — returns the rewritten path, or `None` when there
+/// was nothing to rewrite. Refuses a symlinked leaf rather than writing
+/// through it.
+pub fn rewrite_lane_status(
+    project_root: &Path,
+    task: &str,
+    status: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(owner) = lane_task_for(project_root, task)? else {
+        return Ok(None);
+    };
+    let lane = guarded_path(
+        project_root,
+        &Path::new(".multiverse/worktrees").join(&owner),
+        false,
+    )?;
+    let task_dir = guarded_path(&lane, &Path::new(".multiverse/tasks").join(task), true)?;
+    if !task_dir.is_dir() {
+        return Ok(None);
+    }
+    let path = task_dir.join("status");
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(WorktreeError::Refused(format!(
+            "symlink at {}",
+            path.display()
+        )));
+    }
+    mv_core::atomic::write_atomic(&path, format!("{status}\n").as_bytes())?;
+    Ok(Some(path))
 }
 
 /// Whether a RECORDED task's lane is clean enough for `multiverse sweep`
@@ -693,15 +787,87 @@ fn utf8_path(path: &Path) -> Result<&str> {
         .ok_or_else(|| WorktreeError::Refused("non-UTF-8 lane path".into()))
 }
 
+/// The built-in regenerable list: ignored paths every lane may hold
+/// without them counting as unrescued work — build output and caches a
+/// fresh checkout (or the project's `lane_setup`) recreates. A project
+/// adds its own entries with `[lane_setup] regenerable` in its
+/// `.multiverse/roster.toml`, which only [`Worktrees::merge`] reads
+/// ([`regenerable_ignored`]).
 fn disposable_ignored(path: &str) -> bool {
+    let components: Vec<&str> = path.split('/').collect();
+    // Only directory components count for the `*.egg-info` and
+    // `prisma/generated` defaults, never a final file name.
+    let directories = &components[..components.len().saturating_sub(1)];
     path.starts_with(".multiverse/")
         || path.ends_with(".pyc")
-        || path.split('/').any(|component| {
-            component == "target" || component == "__pycache__" || component == "node_modules"
+        || components.iter().any(|component| {
+            *component == "target" || *component == "__pycache__" || *component == "node_modules"
         })
+        || directories
+            .iter()
+            .any(|component| component.ends_with(".egg-info"))
+        || directories
+            .windows(2)
+            .any(|pair| pair == ["prisma", "generated"])
         || ["bin/", ".venv/", ".pytest_cache/"]
             .iter()
             .any(|prefix| path.starts_with(prefix))
+}
+
+/// Whether `path` (a repository-relative ignored path, `/`-separated) is
+/// one [`disposable_ignored`] already accepts or one `extra` declares —
+/// `extra` being a project's own `[lane_setup] regenerable` list
+/// ([`mv_config::roster::RosterOverride::lane_setup_regenerable`]).
+fn regenerable_ignored(path: &str, extra: &[String]) -> bool {
+    disposable_ignored(path)
+        || extra
+            .iter()
+            .any(|pattern| regenerable_pattern_matches(pattern, path))
+}
+
+/// Gitignore-shaped matching for one `[lane_setup] regenerable` entry: a
+/// trailing `/` makes the pattern match only a directory (some component
+/// of `path` other than its last, plus everything under it); a leading or
+/// inner `/` anchors it at the repository root, while a single-component
+/// pattern matches at any depth; `*` and `?` glob within one component.
+/// A pattern without a trailing `/` matches a file of that name or a
+/// directory of that name and everything under it.
+fn regenerable_pattern_matches(pattern: &str, path: &str) -> bool {
+    let (body, directory_only) = match pattern.strip_suffix('/') {
+        Some(body) => (body, true),
+        None => (pattern, false),
+    };
+    let anchored = body.contains('/');
+    let wanted: Vec<&str> = body.trim_start_matches('/').split('/').collect();
+    let components: Vec<&str> = path.split('/').collect();
+    if wanted.is_empty() || wanted.len() > components.len() {
+        return false;
+    }
+    let last_start = if anchored {
+        0
+    } else {
+        components.len() - wanted.len()
+    };
+    (0..=last_start).any(|start| {
+        let end = start + wanted.len();
+        (!directory_only || end < components.len())
+            && wanted
+                .iter()
+                .zip(&components[start..end])
+                .all(|(glob, name)| glob_component(glob.as_bytes(), name.as_bytes()))
+    })
+}
+
+/// `*` (any run, possibly empty) and `?` (exactly one byte) within one
+/// path component; every other byte matches itself.
+fn glob_component(glob: &[u8], name: &[u8]) -> bool {
+    match glob.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => (0..=name.len()).any(|skip| glob_component(rest, &name[skip..])),
+        Some((&first, rest)) => name.split_first().is_some_and(|(&byte, name_rest)| {
+            (first == b'?' || first == byte) && glob_component(rest, name_rest)
+        }),
+    }
 }
 
 fn lock(root: &Path) -> Result<LockGuard> {
@@ -789,6 +955,15 @@ pub enum PruneOutcome {
         /// The hash dir `build_dir_freed`/`build_dir_kept` describes, when
         /// one was resolved — see `BuildDirReclaim::path`.
         build_dir: Option<PathBuf>,
+        /// Card `20261122-b-78bcf9`: this lane's own agent is gone — the
+        /// one Herdr check this pass made found no live pane for any
+        /// occupant, and either some occupant has a recorded pane (so it
+        /// was dispatched and that pane is now closed) or every occupant
+        /// has a terminal outcome. A process whose cwd is still inside a
+        /// dead lane is a leftover `worktrees --prune --reap` may end,
+        /// whatever this lane's `reason` for being kept. Never set under
+        /// `force`, which can bypass that pane check.
+        lane_dead: bool,
     },
     WouldRemove {
         task: String,
@@ -880,7 +1055,7 @@ pub enum QuarantineOutcome {
 /// A full workspace hash dir under the shared build root (see
 /// `hash_dir_candidates`) that `prune_orphaned_build_dirs` reclaimed — or,
 /// under `dry_run`, would reclaim — because every workspace root its own
-/// build evidence names (see `hash_dir_is_orphaned`) no longer exists on
+/// build evidence names (see `OrphanVerdict::orphaned`) no longer exists on
 /// disk. Distinct from a lane's own `build_dir_freed` (see `PruneOutcome`):
 /// this hash dir need not belong to any lane this project's own state ever
 /// tracked — a worktree removed outside `--prune` entirely, or one this
@@ -891,11 +1066,15 @@ pub struct OrphanedBuildDir {
     /// The full workspace hash directory under the shared build root that
     /// was reclaimed (or, under `dry_run`, would be).
     pub path: PathBuf,
-    /// Bytes `deep_prune_size` measured under `path` before removal.
+    /// Bytes `deep_prune_size` measured under `path` before removal; `0`
+    /// for a dir the sweep's scan budget ran out on (see `kept`), which
+    /// was never measured.
     pub bytes: u64,
-    /// Why `path` is still on disk despite being proven orphaned — its
-    /// removal failed (card `20261119-b-a9f95f`). `None` when it was
-    /// freed, or under `dry_run`, would be.
+    /// Why `path` is still on disk: its removal failed (card
+    /// `20261119-b-a9f95f`), or the sweep's whole-scan deadline ran out
+    /// before its evidence was read in full, so it was neither proven
+    /// orphaned nor measured (card `20261122-b-a5e62d`). `None` when it
+    /// was freed, or under `dry_run`, would be.
     pub kept: Option<String>,
 }
 
@@ -1273,6 +1452,13 @@ pub fn shared_build_root(project_root: &Path) -> Option<PathBuf> {
 /// out to `PerDirFileBudget`, reset fresh for every candidate, means one
 /// big dir can only ever exhaust its own cap, never borrow against the
 /// dirs sorted after it.
+///
+/// Card `20261122-b-40b12b`: the remaining whole-scan *deadline* had the
+/// same starvation under host load — two junk-laden live dirs sorted
+/// first could burn the shared 2.5 s slice, and `exhausted` then skipped
+/// every vanished dir after them. `ensure_dir_slice` gives each candidate
+/// its own floor from the moment that dir is started, so a slow earlier
+/// dir can only cut *itself* short.
 struct BuildDirScanBudget {
     deadline: Instant,
 }
@@ -1319,6 +1505,34 @@ impl BuildDirScanBudget {
 
     fn exhausted(&self) -> bool {
         Instant::now() >= self.deadline
+    }
+
+    /// Runs `work` without charging its time to this budget: the deadline
+    /// moves out by however long `work` took. Card `20261122-b-a5e62d`:
+    /// on 0.1.16 the orphan sweep measured and deleted each proven-orphan
+    /// hash dir on the scan's own clock, so one multi-GB delete used up a
+    /// deadline sized for *reading* evidence, and every candidate after it
+    /// was dropped without a line — the dry run, which deletes nothing,
+    /// had listed them all. This deadline bounds the scan, not the
+    /// reclaim.
+    fn paused<T>(&mut self, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let result = work();
+        self.deadline += started.elapsed();
+        result
+    }
+
+    /// Guarantee this candidate at least `for_candidates(1)` of wall-clock
+    /// time from *now*, even when an earlier dir already spent the
+    /// whole-scan deadline (card `20261122-b-40b12b`). Does not shrink a
+    /// still-generous remainder. A dir whose own walk then overruns this
+    /// floor is still cut short (`OrphanVerdict::cut_short`); the next
+    /// candidate gets its own floor in turn.
+    fn ensure_dir_slice(&mut self) {
+        let floor = Instant::now() + Self::TIME_PER_HASH_DIR.max(Self::MIN_TIME_BUDGET);
+        if self.deadline < floor {
+            self.deadline = floor;
+        }
     }
 }
 
@@ -2057,7 +2271,7 @@ fn names_an_existing_workspace(file_path: &Path) -> bool {
     file_path.exists()
 }
 
-/// Accumulates `hash_dir_is_orphaned`'s own verdict across a hash dir's
+/// Accumulates `hash_dir_orphan_verdict`'s own verdict across a hash dir's
 /// evidence files: `saw_live` once any line proves a still-existing
 /// workspace root (at which point the scan stops — nothing further can
 /// change the outcome), `saw_dead` once any line names one that no longer
@@ -2197,31 +2411,44 @@ fn scan_orphan_evidence(
     }
 }
 
-/// Whether `candidate` (a full workspace hash dir — see
-/// `hash_dir_candidates`) is safe to reclaim: its own build evidence names
-/// at least one workspace root, and every one it names has vanished (card
-/// `20261115-b-673528`). `false` the moment any line names a still-existing
-/// workspace root, there is no readable (non-registry) evidence at all,
-/// the scan was cut short before finishing, or its relative sources leave
-/// a still-existing directory that could be the workspace's root (see
-/// `workspace_root_may_survive`) — a scan this inconclusive must never
-/// license a delete. `per_dir` bounds this one dir's own evidence
-/// read, independent of every other candidate `budget`'s whole-scan
-/// deadline also spans (card `20261116-b-891676`).
-fn hash_dir_is_orphaned(
+/// Scans `dir` (a full workspace hash dir — see `hash_dir_candidates`)
+/// for `OrphanVerdict::orphaned` to decide. `per_dir` bounds this one
+/// dir's own evidence read, independent of every other candidate
+/// `budget`'s whole-scan deadline also spans (card `20261116-b-891676`).
+/// The whole verdict, not just its answer, lets the sweep tell a dir the
+/// whole-scan deadline cut short (see `OrphanVerdict::cut_short`) from
+/// one it decided (card `20261122-b-a5e62d`).
+fn hash_dir_orphan_verdict(
     dir: &Path,
     cargo_home: Option<&Path>,
     shared_root: Option<&Path>,
     budget: &mut BuildDirScanBudget,
     per_dir: &mut PerDirFileBudget,
-) -> bool {
+) -> OrphanVerdict {
     let mut verdict = OrphanVerdict::default();
     scan_orphan_evidence(dir, cargo_home, shared_root, budget, per_dir, &mut verdict);
-    verdict.saw_dead
-        && !verdict.saw_live
-        && !verdict.cut_short
-        && !workspace_root_may_survive(&verdict)
+    verdict
 }
+
+impl OrphanVerdict {
+    /// Whether the hash dir this verdict scanned is safe to reclaim: its
+    /// own build evidence names at least one workspace root, and every one
+    /// it names has vanished (card `20261115-b-673528`). `false` the moment
+    /// any line names a still-existing workspace root, there is no
+    /// readable (non-registry) evidence at all, the scan was cut short
+    /// before finishing, or its relative sources leave a still-existing
+    /// directory that could be the workspace's root (see
+    /// `workspace_root_may_survive`) — a scan this inconclusive must never
+    /// license a delete.
+    fn orphaned(&self) -> bool {
+        self.saw_dead && !self.saw_live && !self.cut_short && !workspace_root_may_survive(self)
+    }
+}
+
+/// Why the orphan sweep kept a candidate its whole-scan deadline cut off
+/// before its evidence was read in full (card `20261122-b-a5e62d`).
+const ORPHAN_SCAN_OUT_OF_TIME: &str =
+    "scan budget ran out before its build evidence was read in full; a later --prune decides it";
 
 /// Measures `dir`, a hash dir the orphan sweep already proved orphaned,
 /// and, unless `dry_run`, deletes it — confined to `shared_root` (see
@@ -2580,7 +2807,7 @@ impl Worktrees {
         // never-used lane from a bare `create` stays freely adoptable.
         self.terminal_statuses(&lane, false, true, false, &self.task_records())?;
         if has_process_cwd(&lane.path)? {
-            return Err(WorktreeError::Refused("lane has a live process cwd".into()));
+            return Err(WorktreeError::Refused(LIVE_CWD_REFUSAL.into()));
         }
         Ok(lane)
     }
@@ -2637,7 +2864,7 @@ impl Worktrees {
             }
         }
         if has_process_cwd(&lane.path)? {
-            return Err(WorktreeError::Refused("lane has a live process cwd".into()));
+            return Err(WorktreeError::Refused(LIVE_CWD_REFUSAL.into()));
         }
         Ok(())
     }
@@ -2832,13 +3059,18 @@ impl Worktrees {
         Ok(created < SystemTime::now() - WORKTREE_STATE_RETENTION)
     }
 
-    /// Rescue never overwrites: different bytes, symlinks, and special files
-    /// refuse removal. The source remains available after rescue. `dry_run`
-    /// returns the same artifact list this would copy, without copying a
-    /// byte, creating a directory, or taking the worktree lock — the lock
-    /// file is itself a write, so acquiring it here would make `--rescue
-    /// --dry-run` mutate the very state it claims only to preview.
-    pub fn rescue(&self, task: &str, dry_run: bool) -> Result<Vec<PathBuf>> {
+    /// Rescue never overwrites: different bytes, remaining symlinks, and
+    /// special files refuse the copy, naming the path and the rule.
+    /// Regenerable caches inside `.multiverse/tasks/<task>/` (a `venv`,
+    /// `__pycache__`, `*.egg-info`, …) are skipped rather than copied or
+    /// followed, so a pip venv's `python -> python3.15` symlink cannot
+    /// refuse the whole lane (card `20261122-b-4961e4`). The source remains
+    /// available after rescue. `dry_run` returns the same copied/skipped
+    /// lists this would produce, without copying a byte, creating a
+    /// directory, or taking the worktree lock — the lock file is itself a
+    /// write, so acquiring it here would make `--rescue --dry-run` mutate
+    /// the very state it claims only to preview.
+    pub fn rescue(&self, task: &str, dry_run: bool) -> Result<RescueReport> {
         let lane = self.lane(task, false)?;
         self.registered(&lane)?;
         if dry_run {
@@ -2848,29 +3080,36 @@ impl Worktrees {
         self.rescue_state(&lane.path.join(".multiverse"))
     }
 
-    /// Returns every artifact path actually copied — see
-    /// `copy_without_overwrite`, whose result this passes through unchanged.
-    fn rescue_state(&self, state: &Path) -> Result<Vec<PathBuf>> {
+    /// Returns every artifact path actually copied and every regenerable
+    /// cache skipped — see `copy_without_overwrite`, whose result this
+    /// passes through unchanged.
+    fn rescue_state(&self, state: &Path) -> Result<RescueReport> {
         match fs::symlink_metadata(state) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
                 copy_without_overwrite(state, &self.project.join(".multiverse"))
             }
-            Ok(_) => Err(WorktreeError::Refused("unsafe lane state".into())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Ok(_) => Err(WorktreeError::Refused(format!(
+                "unsafe lane state: {} is a symlink or not a directory",
+                state.display()
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RescueReport::default()),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// [`rescue_state`]'s own preview: the same artifact list and the same
-    /// conflict refusals, via [`would_copy_without_overwrite`], but no
-    /// directory is created and no byte of `destination` is written.
-    fn rescue_state_preview(&self, state: &Path) -> Result<Vec<PathBuf>> {
+    /// [`rescue_state`]'s own preview: the same copied/skipped lists and
+    /// the same conflict refusals, via [`would_copy_without_overwrite`],
+    /// but no directory is created and no byte of `destination` is written.
+    fn rescue_state_preview(&self, state: &Path) -> Result<RescueReport> {
         match fs::symlink_metadata(state) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
                 would_copy_without_overwrite(state, &self.project.join(".multiverse"))
             }
-            Ok(_) => Err(WorktreeError::Refused("unsafe lane state".into())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Ok(_) => Err(WorktreeError::Refused(format!(
+                "unsafe lane state: {} is a symlink or not a directory",
+                state.display()
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RescueReport::default()),
             Err(e) => Err(e.into()),
         }
     }
@@ -3008,8 +3247,10 @@ impl Worktrees {
                         build_scope.as_ref(),
                         &task_records,
                     );
+                    let lane_dead = !force && self.lane_dead(&lane, pane_clear, &task_records);
                     outcomes.push(PruneOutcome::Kept {
                         task: lane.task,
+                        lane_dead,
                         reason: error.to_string(),
                         target_freed,
                         build_dir_freed: build_dir.freed,
@@ -3066,8 +3307,9 @@ impl Worktrees {
                 // only to catch a late write in the swap race, and is never
                 // itself surfaced as "rescued" — Python's own CLI reports
                 // only its single `rescue()` call the same way.
-                let mut rescued = self.rescue_state(&lane.path.join(".multiverse"))?;
-                rescued.sort();
+                let mut report = self.rescue_state(&lane.path.join(".multiverse"))?;
+                report.copied.sort();
+                let rescued = report.copied;
                 let build_dir = build_scope.as_ref().map(|(root, main_dir)| {
                     (
                         root.clone(),
@@ -3116,6 +3358,39 @@ impl Worktrees {
             }
         }
         Ok(outcomes)
+    }
+
+    /// [`PruneOutcome::Kept::lane_dead`]'s own test. `pane_clear` is the
+    /// same flag `kept_target_bytes` takes — the result of the one
+    /// `observer.check` this pass already made — so this never adds a
+    /// second Herdr call. A lane with no recorded pane and an unsettled
+    /// occupant (a bare `create`, or a lane a human works in by hand) is
+    /// never dead: nothing says its owner is gone.
+    fn lane_dead(
+        &self,
+        lane: &Lane,
+        pane_clear: bool,
+        task_records: &[crate::index::IndexedRecord],
+    ) -> bool {
+        if !pane_clear {
+            return false;
+        }
+        if self
+            .terminal_statuses(lane, false, false, false, task_records)
+            .is_ok()
+        {
+            return true;
+        }
+        occupant_tasks(&self.project, lane)
+            .map(|tasks| {
+                tasks.iter().any(|task| {
+                    dispatch_pane(&self.project, task)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|pane| !pane.is_empty())
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// For a lane this `prune` is keeping, the lane-root `target/` it no
@@ -3517,7 +3792,7 @@ impl Worktrees {
 
     /// Every full workspace hash dir under the shared build root whose own
     /// build evidence names only workspace roots that no longer exist on
-    /// disk (see `hash_dir_is_orphaned`) — card `20261115-b-673528`'s own
+    /// disk (see `OrphanVerdict::orphaned`) — card `20261115-b-673528`'s own
     /// global sweep, run independently of `prune_with_ignored`'s per-lane
     /// one: a hash dir here need not belong to any lane this project's own
     /// `lanes()` still lists, so it also reclaims a worktree removed
@@ -3532,9 +3807,11 @@ impl Worktrees {
     /// build-dir namespacing configured (see `shared_build_root`).
     /// `dry_run` measures bytes without deleting anything, sizing one
     /// whole-sweep `BuildDirScanBudget` off the full candidate count and
-    /// deciding each candidate off its own fresh `PerDirFileBudget` — see
+    /// deciding each candidate off its own fresh `PerDirFileBudget` plus a
+    /// per-dir time floor (`BuildDirScanBudget::ensure_dir_slice`) — see
     /// both types' own doc comments for why a single shared budget across
-    /// every hash dir (card `20261116-b-891676`) let big dirs sorted first
+    /// every hash dir (card `20261116-b-891676` for files,
+    /// `20261122-b-40b12b` for wall-clock) let big dirs sorted first
     /// starve the small vanished ones after them.
     pub fn prune_orphaned_build_dirs(&self, dry_run: bool) -> Result<Vec<OrphanedBuildDir>> {
         self.prune_orphaned_build_dirs_skipping(dry_run, &[])
@@ -3551,6 +3828,39 @@ impl Worktrees {
         dry_run: bool,
         skip: &[PathBuf],
     ) -> Result<Vec<OrphanedBuildDir>> {
+        self.prune_orphaned_build_dirs_within(
+            dry_run,
+            skip,
+            BuildDirScanBudget::for_candidates,
+            &mut free_orphaned_build_dir,
+            &mut |_| {},
+        )
+    }
+
+    /// [`Self::prune_orphaned_build_dirs_skipping`] with the generic
+    /// sweep's whole-scan budget sized by `scan_budget`, each proven
+    /// orphan measured and freed by `free`, and `after_candidate` run on
+    /// the budget after each generic candidate's per-dir slice is granted
+    /// — seams for tests to stand in a slow multi-GB delete, a deadline
+    /// that runs out partway (card `20261122-b-a5e62d`), or a whole-scan
+    /// budget that is already spent (card `20261122-b-40b12b`).
+    ///
+    /// Every generic candidate this returns no line for was decided not
+    /// orphaned. `free` runs off the scan's clock (see
+    /// `BuildDirScanBudget::paused`), so a real run reaches the same
+    /// candidates its dry run did. Each candidate gets its own time floor
+    /// (`BuildDirScanBudget::ensure_dir_slice`) before it is scanned, so
+    /// an earlier dir can only cut itself short. A candidate the deadline
+    /// still cuts off is returned as kept with `ORPHAN_SCAN_OUT_OF_TIME`,
+    /// never dropped without a line.
+    fn prune_orphaned_build_dirs_within(
+        &self,
+        dry_run: bool,
+        skip: &[PathBuf],
+        scan_budget: fn(usize) -> BuildDirScanBudget,
+        free: &mut dyn FnMut(&Path, PathBuf, bool) -> Option<OrphanedBuildDir>,
+        after_candidate: &mut dyn FnMut(&mut BuildDirScanBudget),
+    ) -> Result<Vec<OrphanedBuildDir>> {
         let Some(shared_root) = shared_build_root(&self.project) else {
             return Ok(Vec::new());
         };
@@ -3564,29 +3874,42 @@ impl Worktrees {
         let mut handled = skip.to_vec();
         for dir in self.vanished_lane_build_dirs(&shared_root, cargo_home.as_deref(), skip) {
             handled.push(dir.clone());
-            if let Some(outcome) = free_orphaned_build_dir(&shared_root, dir, dry_run) {
+            if let Some(outcome) = free(&shared_root, dir, dry_run) {
                 outcomes.push(outcome);
             }
         }
         let mut candidates = hash_dir_candidates(&shared_root);
         candidates.retain(|candidate| !handled.contains(candidate));
-        let mut budget = BuildDirScanBudget::for_candidates(candidates.len());
+        let mut budget = scan_budget(candidates.len());
         for candidate in candidates {
+            budget.ensure_dir_slice();
+            after_candidate(&mut budget);
             if budget.exhausted() {
-                break;
+                outcomes.push(OrphanedBuildDir {
+                    path: candidate,
+                    bytes: 0,
+                    kept: Some(ORPHAN_SCAN_OUT_OF_TIME.into()),
+                });
+                continue;
             }
             let mut per_dir = PerDirFileBudget::new();
-            if !hash_dir_is_orphaned(
+            let verdict = hash_dir_orphan_verdict(
                 &candidate,
                 cargo_home.as_deref(),
                 Some(&shared_root),
                 &mut budget,
                 &mut per_dir,
-            ) {
-                continue;
-            }
-            if let Some(outcome) = free_orphaned_build_dir(&shared_root, candidate, dry_run) {
-                outcomes.push(outcome);
+            );
+            if verdict.orphaned() {
+                if let Some(outcome) = budget.paused(|| free(&shared_root, candidate, dry_run)) {
+                    outcomes.push(outcome);
+                }
+            } else if verdict.cut_short && budget.exhausted() {
+                outcomes.push(OrphanedBuildDir {
+                    path: candidate,
+                    bytes: 0,
+                    kept: Some(ORPHAN_SCAN_OUT_OF_TIME.into()),
+                });
             }
         }
         Ok(outcomes)
@@ -4121,7 +4444,10 @@ impl Worktrees {
         let path = guarded_path(root, &relative, true)?;
         if !path.try_exists()? {
             return Err(WorktreeError::Refused(format!(
-                "{task} has no recorded terminal status; refusing to merge"
+                "{task} has no recorded terminal status: neither {} nor {} exists; refusing to \
+                 merge",
+                root_path.display(),
+                path.display()
             )));
         }
         let status = read_regular(root, &relative)?;
@@ -4131,10 +4457,19 @@ impl Worktrees {
                 status.trim()
             )));
         }
-        let result = read_regular(root, &relative.with_file_name("result.md"))?;
+        let result_relative = relative.with_file_name("result.md");
+        let result_path = guarded_path(root, &result_relative, true)?;
+        if !result_path.try_exists()? {
+            return Err(WorktreeError::Refused(format!(
+                "{task}'s status is done but {} is missing; refusing to merge",
+                result_path.display()
+            )));
+        }
+        let result = read_regular(root, &result_relative)?;
         if result.trim().is_empty() {
             return Err(WorktreeError::Refused(format!(
-                "{task}'s result.md is empty; refusing to merge"
+                "{task}'s result.md is empty ({}); refusing to merge",
+                result_path.display()
             )));
         }
         Ok(())
@@ -4246,13 +4581,21 @@ impl Worktrees {
     /// `git merge --no-ff --no-edit`, so an agent-authored lane cannot reach
     /// `main` carrying a planted key the way raw `git merge` always could.
     ///
-    /// Refuses (never merges) unless `task` has a recorded terminal `done`
-    /// status with a non-empty `result.md`, and the lane itself is clean —
-    /// the same bar `clean` already holds a lane to before
+    /// `task` may name the worktree's own id or any `dispatch --into` round
+    /// that adopted it ([`lane_task_for`]); either way the worktree's own
+    /// branch is what lands ([`MergeResult::branch`]). Refuses (never
+    /// merges) unless the worktree's newest recorded outcome is `done`
+    /// with no empty `result.md` — the routing log, `supersede`
+    /// corrections included, is the authority and the status file (then
+    /// with a non-empty `result.md`) only a fallback
+    /// (`newest_outcome_done`) — and the lane itself is
+    /// clean — the same bar `clean` already holds a lane to before
     /// `prune` will touch it, reused here rather than invented fresh: no
-    /// uncommitted changes, no committed `.multiverse/` state, no
-    /// non-disposable ignored file, no live process still using the lane as
-    /// its cwd.
+    /// uncommitted changes, no committed `.multiverse/` state, no live
+    /// process still using the lane as its cwd — and holds no ignored file
+    /// that is neither on the built-in regenerable list nor declared in
+    /// `regenerable` (the project's `[lane_setup] regenerable`,
+    /// `refuse_unrescued_ignored`).
     ///
     /// A finding from either scanner refuses the merge outright (exit 1 at
     /// the `mv-cli` boundary) with its own redacted evidence file named in
@@ -4270,14 +4613,23 @@ impl Worktrees {
         &self,
         task: &str,
         secrets: &SecretsScan,
+        regenerable: &[String],
     ) -> std::result::Result<MergeResult, MergeError> {
         self.refuse_if_trunk_mid_merge()?;
-        let lane = self.lane(task, false)?;
+        let owner = lane_task_for(&self.project, task)?.ok_or_else(|| {
+            WorktreeError::Refused(format!(
+                "{task} has no worktree: neither .multiverse/worktrees/{task} exists nor does \
+                 its dispatch record adopt another lane; refusing to merge"
+            ))
+        })?;
+        let lane = self.lane(&owner, false)?;
         self.registered(&lane)?;
-        self.task_terminal_done(&lane, task)?;
-        self.clean(&lane, false, false)?;
+        self.newest_outcome_done(&lane)?;
+        self.clean(&lane, false, true)
+            .map_err(|error| name_cwd_holders(&self.project, &lane.path, error))?;
+        self.refuse_unrescued_ignored(&lane, regenerable)?;
 
-        let branch = branch_name(task)?;
+        let branch = lane.branch.clone();
         let trunk = git(&self.project, &["rev-parse", "--verify", "HEAD"], None)?
             .trim()
             .to_string();
@@ -4354,7 +4706,176 @@ impl Worktrees {
         let sha = git(&self.project, &["rev-parse", "--verify", "HEAD"], None)?
             .trim()
             .to_string();
-        Ok(MergeResult { sha, warnings })
+        Ok(MergeResult {
+            sha,
+            branch,
+            warnings,
+        })
+    }
+
+    /// [`Self::merge`]'s outcome gate, judged per worktree rather than per
+    /// status file: every task that has owned `lane` ([`occupant_tasks`] —
+    /// the lane's own id plus every `dispatch --into` round recorded onto
+    /// its branch) is folded through the routing log in append order, and
+    /// the newest round decides. A `dispatch` opens a round with no outcome
+    /// yet; a `result` (other than the never-real `status=none`) records
+    /// one; a `supersede` replaces it only when it targets that round's
+    /// current outcome line (`supersedes=<line>`), so correcting an older
+    /// round's record never overrides a newer round's *own* recorded
+    /// outcome. A newer round that never recorded one (a `dispatch --into`
+    /// resume that was abandoned or never reconciled) is no such outcome:
+    /// a `supersede` of the lane's newest recorded outcome line, appended
+    /// after that round opened, decides instead (card `20261123-b-970200`
+    /// — otherwise the correction `tasks --supersede` exists for could
+    /// never reach the gate, since an outcome-less round has no line of its
+    /// own to supersede). A recorded `done` needs no `result.md` — the
+    /// routing log is the authority — but one that exists must be
+    /// non-empty. Only when the newest round has no recorded outcome yet
+    /// (an agent that wrote its status file before any reconcile ran), or
+    /// the log names no owner at all, does the status file decide —
+    /// [`Self::task_terminal_done`], for that round's task or the lane's
+    /// own. Every refusal over a missing or empty file names its path.
+    fn newest_outcome_done(&self, lane: &Lane) -> Result<()> {
+        struct Round {
+            task: String,
+            outcome: Option<(String, u64)>,
+        }
+        let owners: BTreeSet<String> = occupant_tasks(&self.project, lane)?.into_iter().collect();
+        let mut newest: Option<Round> = None;
+        // The lane's newest recorded outcome line and its task, across
+        // every round — what a supersede must target to decide for an
+        // outcome-less newer round.
+        let mut latest_outcome: Option<(String, u64)> = None;
+        for record in &self.task_records() {
+            let Ok(parsed) = record.parse() else {
+                continue;
+            };
+            let Some(task) = parsed.fields.get("task").filter(|t| owners.contains(*t)) else {
+                continue;
+            };
+            let line = record.entry.ordinal + 1;
+            let status = parsed.fields.get("status").cloned().unwrap_or_default();
+            match parsed.event() {
+                "dispatch" => {
+                    newest = Some(Round {
+                        task: task.clone(),
+                        outcome: None,
+                    })
+                }
+                "result" if status != "none" => {
+                    latest_outcome = Some((task.clone(), line));
+                    newest = Some(Round {
+                        task: task.clone(),
+                        outcome: Some((status, line)),
+                    })
+                }
+                "supersede" => {
+                    let target = parsed
+                        .fields
+                        .get("supersedes")
+                        .and_then(|v| v.parse::<u64>().ok());
+                    if let Some(round) = newest.as_mut().filter(|round| {
+                        round.task == *task && round.outcome.as_ref().map(|(_, l)| *l) == target
+                    }) {
+                        round.outcome = Some((status, line));
+                        latest_outcome = Some((task.clone(), line));
+                    } else if newest.as_ref().is_some_and(|round| round.outcome.is_none())
+                        && latest_outcome
+                            .as_ref()
+                            .is_some_and(|(t, l)| t == task && Some(*l) == target)
+                    {
+                        latest_outcome = Some((task.clone(), line));
+                        newest = Some(Round {
+                            task: task.clone(),
+                            outcome: Some((status, line)),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        match newest {
+            Some(Round {
+                task,
+                outcome: Some((status, _)),
+            }) => {
+                if status != "done" {
+                    return Err(WorktreeError::Refused(format!(
+                        "{task}'s newest recorded outcome is {status:?}, not done; refusing to \
+                         merge (correct a wrong record with `multiverse tasks --supersede`)"
+                    )));
+                }
+                self.task_result_not_empty(lane, &task)
+            }
+            Some(Round {
+                task,
+                outcome: None,
+            }) => self.task_terminal_done(lane, &task),
+            None => self.task_terminal_done(lane, &lane.task),
+        }
+    }
+
+    /// For a task whose `done` is recorded in the routing log: its
+    /// `result.md` — the project's copy or, failing that, the lane's own,
+    /// the same two places [`Self::task_terminal_done`] reads — is either
+    /// absent from both (tolerated: the recorded outcome is the authority,
+    /// and an abandoned round corrected by `tasks --supersede` never wrote
+    /// one) or non-empty in at least one. Only a copy that exists and is
+    /// empty everywhere it exists refuses, naming that path.
+    fn task_result_not_empty(&self, lane: &Lane, task: &str) -> Result<()> {
+        let relative = Path::new(".multiverse/tasks").join(task).join("result.md");
+        let mut empty = None;
+        for root in [&self.project, &lane.path] {
+            let path = guarded_path(root, &relative, true)?;
+            if path.try_exists()? {
+                if !read_regular(root, &relative)?.trim().is_empty() {
+                    return Ok(());
+                }
+                empty.get_or_insert(path);
+            }
+        }
+        match empty {
+            Some(path) => Err(WorktreeError::Refused(format!(
+                "{task}'s result.md is empty ({}); refusing to merge",
+                path.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::merge`]'s ignored-file gate: the first gitignored file in
+    /// `lane` that is neither on the built-in regenerable list
+    /// ([`disposable_ignored`]) nor declared by the project's own
+    /// `[lane_setup] regenerable` (`regenerable`) refuses the merge, naming
+    /// the path and how to declare it when it is a `lane_setup` output.
+    fn refuse_unrescued_ignored(&self, lane: &Lane, regenerable: &[String]) -> Result<()> {
+        let ignored = git(
+            &lane.path,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+            None,
+        )?;
+        let Some(path) = ignored
+            .split('\0')
+            .find(|path| !path.is_empty() && !regenerable_ignored(path, regenerable))
+        else {
+            return Ok(());
+        };
+        let declare = match path.rsplit_once('/') {
+            Some((directory, _)) => format!("{directory}/"),
+            None => path.to_string(),
+        };
+        Err(WorktreeError::Refused(format!(
+            "unrescued ignored file: {path}; if {declare} is regenerated by lane_setup, \
+             declare it in {project}/.multiverse/roster.toml as [lane_setup] regenerable = \
+             [\"{declare}\"], otherwise rescue or remove it before merging",
+            project = self.project.display(),
+        )))
     }
 
     /// Refuses before touching anything when this checkout is already
@@ -4427,26 +4948,29 @@ fn lane_ignored_files(lane_path: &Path) -> Vec<String> {
 /// module has no equivalent tracked-and-clean lookup at this call site, so
 /// a committed, byte-identical roster would be double-counted here if its
 /// lane copy ever diverged from the project's. Walks the same exclusions
-/// as [`copy_without_overwrite`]/`check_copy` ([`is_rescue_excluded`]), at
-/// every depth, so a conflict this flags is the same one `--prune` itself
-/// would refuse on.
+/// as [`copy_without_overwrite`]/`check_copy` ([`is_rescue_excluded`] and
+/// [`is_task_regenerable_cache`]), at every depth, so a conflict this
+/// flags is the same one `--prune` itself would refuse on.
 fn lane_pending_artifacts(project: &Path, lane: &Lane) -> usize {
-    fn count(source: &Path, destination: &Path) -> usize {
+    fn count(source: &Path, destination: &Path, relative: &Path) -> usize {
         let Ok(entries) = fs::read_dir(source) else {
             return 0;
         };
         let mut pending = 0;
         for entry in entries.flatten() {
-            if is_rescue_excluded(&entry.file_name()) {
-                continue;
+            let name = entry.file_name();
+            let child = join_relative(relative, &name);
+            match rescue_skip(&name, &child) {
+                RescueSkip::Excluded | RescueSkip::Regenerable => continue,
+                RescueSkip::None => {}
             }
             let src = entry.path();
-            let dst = destination.join(entry.file_name());
+            let dst = destination.join(&name);
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             if file_type.is_dir() {
-                pending += count(&src, &dst);
+                pending += count(&src, &dst, &child);
             } else if file_type.is_file() {
                 let identical = fs::read(&src)
                     .ok()
@@ -4459,7 +4983,11 @@ fn lane_pending_artifacts(project: &Path, lane: &Lane) -> usize {
         }
         pending
     }
-    count(&lane.path.join(".multiverse"), &project.join(".multiverse"))
+    count(
+        &lane.path.join(".multiverse"),
+        &project.join(".multiverse"),
+        Path::new(""),
+    )
 }
 
 /// Every task considered to occupy `lane`: the lane directory's own name
@@ -4983,6 +5511,74 @@ fn is_rescue_excluded(name: &std::ffi::OsStr) -> bool {
     matches!(name.to_str(), Some(".gitignore" | "worktrees" | "input"))
 }
 
+/// Whether `relative` (from the lane's `.multiverse/` root) is a
+/// regenerable cache inside `.multiverse/tasks/<task>/` — a venv, a
+/// `__pycache__`, `*.egg-info`, and the rest of the built-in list.
+/// Rescue skips these (never copies or follows them) rather than refusing
+/// the whole lane on the symlinks they contain (card `20261122-b-4961e4`).
+fn is_task_regenerable_cache(relative: &Path) -> bool {
+    let mut comps = relative.components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(tasks)), Some(Component::Normal(_id))) if tasks == "tasks" => comps
+            .any(|component| {
+                matches!(component, Component::Normal(name) if is_regenerable_cache_name(name))
+            }),
+        _ => false,
+    }
+}
+
+/// Basename of one regenerable cache directory rescue skips inside a
+/// task dir: the same set the builder brief names (`venv`/`.venv`,
+/// `__pycache__`, `node_modules`, `*.egg-info`, `.pytest_cache`, `target`).
+fn is_regenerable_cache_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| {
+        matches!(
+            n,
+            "venv" | ".venv" | "__pycache__" | "node_modules" | ".pytest_cache" | "target"
+        ) || n.ends_with(".egg-info")
+    })
+}
+
+/// How [`check_copy`]/[`copy_without_overwrite`] treat one directory
+/// entry, given its name and its path relative to the `.multiverse/` root.
+enum RescueSkip {
+    None,
+    Excluded,
+    Regenerable,
+}
+
+fn rescue_skip(name: &std::ffi::OsStr, relative: &Path) -> RescueSkip {
+    if is_rescue_excluded(name) {
+        RescueSkip::Excluded
+    } else if is_task_regenerable_cache(relative) {
+        RescueSkip::Regenerable
+    } else {
+        RescueSkip::None
+    }
+}
+
+fn join_relative(relative: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    if relative.as_os_str().is_empty() {
+        PathBuf::from(name)
+    } else {
+        relative.join(name)
+    }
+}
+
+fn unsafe_state_artifact(src: &Path, kind: fs::FileType) -> WorktreeError {
+    if kind.is_symlink() {
+        WorktreeError::Refused(format!(
+            "unsafe state artifact: symlink at {}; refuses to follow symlinks out of the lane",
+            src.display()
+        ))
+    } else {
+        WorktreeError::Refused(format!(
+            "unsafe state artifact: {} is not a regular file or directory; refusing to copy it",
+            src.display()
+        ))
+    }
+}
+
 /// How long `Worktrees::prune_quarantine` keeps a `.multiverse/worktree-state/`
 /// copy it cannot prove redundant (card `20261106-b-3d2774`): `remove_lane`'s
 /// own "never delete quarantine" guard protects against a write still
@@ -5037,35 +5633,51 @@ fn quarantine_is_redundant(quarantine: &Path, project_state: &Path) -> Result<bo
 }
 
 fn check_copy(source: &Path, destination: &Path) -> Result<()> {
+    check_copy_from(source, destination, Path::new(""))
+}
+
+fn check_copy_from(source: &Path, destination: &Path, relative: &Path) -> Result<()> {
     match fs::symlink_metadata(source) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
         Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
-            return Err(WorktreeError::Refused("unsafe state directory".into()))
+            return Err(WorktreeError::Refused(format!(
+                "unsafe state directory: {} is a symlink or not a directory",
+                source.display()
+            )))
         }
         Ok(_) => (),
     }
     match fs::symlink_metadata(destination) {
         Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
-            return Err(WorktreeError::Refused("unsafe rescue directory".into()))
+            return Err(WorktreeError::Refused(format!(
+                "unsafe rescue directory: {} is a symlink or not a directory",
+                destination.display()
+            )))
         }
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => (),
     }
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        if is_rescue_excluded(&entry.file_name()) {
-            continue;
+        let name = entry.file_name();
+        let child = join_relative(relative, &name);
+        match rescue_skip(&name, &child) {
+            RescueSkip::Excluded | RescueSkip::Regenerable => continue,
+            RescueSkip::None => {}
         }
         let src = entry.path();
-        let dst = destination.join(entry.file_name());
+        let dst = destination.join(&name);
         let meta = entry.file_type()?;
         if meta.is_symlink() || (!meta.is_file() && !meta.is_dir()) {
-            return Err(WorktreeError::Refused("unsafe state artifact".into()));
+            return Err(unsafe_state_artifact(&src, meta));
         }
         if let Ok(target) = fs::symlink_metadata(&dst) {
             if target.file_type().is_symlink() || target.is_dir() != meta.is_dir() {
-                return Err(WorktreeError::Refused("unsafe rescue destination".into()));
+                return Err(WorktreeError::Refused(format!(
+                    "unsafe rescue destination: {} is a symlink or does not match the source type",
+                    dst.display()
+                )));
             }
             if meta.is_file() && fs::read(&src)? != fs::read(&dst)? {
                 return Err(WorktreeError::Refused(format!(
@@ -5075,7 +5687,7 @@ fn check_copy(source: &Path, destination: &Path) -> Result<()> {
             }
         }
         if meta.is_dir() {
-            check_copy(&src, &dst)?;
+            check_copy_from(&src, &dst, &child)?;
         }
     }
     Ok(())
@@ -5085,20 +5697,40 @@ fn check_copy(source: &Path, destination: &Path) -> Result<()> {
 /// `rescue`'s own `copied` list, which only names a freshly-created file,
 /// never one already present with identical bytes (`rescue_plan`'s
 /// `to_copy`/conflict split). Directories are never themselves reported,
-/// matching `lane_artifacts`'s file-only `rglob`.
-fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
+/// matching `lane_artifacts`'s file-only `rglob`. Regenerable caches
+/// inside `.multiverse/tasks/<task>/` are listed on [`RescueReport::skipped`]
+/// instead of being copied.
+fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<RescueReport> {
     check_copy(source, destination)?;
+    copy_without_overwrite_from(source, destination, Path::new(""))
+}
+
+fn copy_without_overwrite_from(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+) -> Result<RescueReport> {
     private_dir(destination)?;
     let mut copied = Vec::new();
+    let mut skipped = Vec::new();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        if is_rescue_excluded(&entry.file_name()) {
-            continue;
-        }
+        let name = entry.file_name();
+        let child = join_relative(relative, &name);
         let src = entry.path();
-        let dst = destination.join(entry.file_name());
+        match rescue_skip(&name, &child) {
+            RescueSkip::Excluded => continue,
+            RescueSkip::Regenerable => {
+                skipped.push(src);
+                continue;
+            }
+            RescueSkip::None => {}
+        }
+        let dst = destination.join(&name);
         if entry.file_type()?.is_dir() {
-            copied.extend(copy_without_overwrite(&src, &dst)?);
+            let nested = copy_without_overwrite_from(&src, &dst, &child)?;
+            copied.extend(nested.copied);
+            skipped.extend(nested.skipped);
         } else {
             let mut input = File::open(&src)?;
             match OpenOptions::new()
@@ -5128,35 +5760,125 @@ fn copy_without_overwrite(source: &Path, destination: &Path) -> Result<Vec<PathB
         }
     }
     fsync_dir(destination)?;
-    Ok(copied)
+    Ok(RescueReport { copied, skipped })
 }
 
 /// [`copy_without_overwrite`]'s own preview: the same traversal and the
 /// same conflict refusal (via [`check_copy`]), reporting the paths that
 /// would be freshly written without creating a directory or a byte of
-/// `destination`.
-fn would_copy_without_overwrite(source: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
+/// `destination`, plus the regenerable caches that would be skipped.
+fn would_copy_without_overwrite(source: &Path, destination: &Path) -> Result<RescueReport> {
     check_copy(source, destination)?;
-    let mut planned = Vec::new();
+    would_copy_without_overwrite_from(source, destination, Path::new(""))
+}
+
+fn would_copy_without_overwrite_from(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+) -> Result<RescueReport> {
+    let mut copied = Vec::new();
+    let mut skipped = Vec::new();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        if is_rescue_excluded(&entry.file_name()) {
-            continue;
-        }
+        let name = entry.file_name();
+        let child = join_relative(relative, &name);
         let src = entry.path();
-        let dst = destination.join(entry.file_name());
+        match rescue_skip(&name, &child) {
+            RescueSkip::Excluded => continue,
+            RescueSkip::Regenerable => {
+                skipped.push(src);
+                continue;
+            }
+            RescueSkip::None => {}
+        }
+        let dst = destination.join(&name);
         if entry.file_type()?.is_dir() {
-            planned.extend(would_copy_without_overwrite(&src, &dst)?);
+            let nested = would_copy_without_overwrite_from(&src, &dst, &child)?;
+            copied.extend(nested.copied);
+            skipped.extend(nested.skipped);
         } else if !dst.exists() {
-            planned.push(dst);
+            copied.push(dst);
         }
     }
-    Ok(planned)
+    Ok(RescueReport { copied, skipped })
 }
 
 /// Process inspection fails closed on an unavailable probe. Individual gone
 /// processes are normal races; other processes with unreadable cwd are unknown.
 fn has_process_cwd(lane: &Path) -> Result<bool> {
+    Ok(!process_cwd_holders(lane)?.is_empty())
+}
+
+/// The refusal [`Worktrees::clean`] (and [`Worktrees::adopt`]) return for a
+/// lane some process still uses as its cwd — matched by [`Worktrees::merge`]
+/// to name those holders, and by `worktrees --prune`'s own reaper notes.
+const LIVE_CWD_REFUSAL: &str = "lane has a live process cwd";
+
+/// One process [`process_cwd_holders`] found with its cwd at or under a
+/// lane: its pid, that cwd, and its command line (empty when `ps` could not
+/// name it — the process may have exited since the cwd probe ran).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CwdHolder {
+    pid: u32,
+    cwd: PathBuf,
+    command: String,
+}
+
+/// Card `20261122-b-78bcf9`: `merge`'s "live process cwd" refusal used to
+/// name nothing, so a dead lane's leftovers (`tail -f`, a `zsh -c`, an ssh
+/// mux master reparented to pid 1) blocked it with no way to tell which
+/// pids to end. Replaces a [`LIVE_CWD_REFUSAL`] from `clean` with one that
+/// lists every holder's pid, command and cwd and names the reap verb; any
+/// other error, or a holder probe that now fails or finds nothing (the
+/// holder exited in between), passes the original error through.
+fn name_cwd_holders(project: &Path, lane: &Path, error: WorktreeError) -> WorktreeError {
+    if !matches!(&error, WorktreeError::Refused(message) if message == LIVE_CWD_REFUSAL) {
+        return error;
+    }
+    let Ok(holders) = process_cwd_holders(lane) else {
+        return error;
+    };
+    if holders.is_empty() {
+        return error;
+    }
+    let named = holders
+        .iter()
+        .map(|holder| {
+            let command: String = holder
+                .command
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(160)
+                .collect();
+            let command = if command.is_empty() {
+                "?".to_string()
+            } else {
+                command
+            };
+            format!(
+                "pid {} `{command}` (cwd {})",
+                holder.pid,
+                holder.cwd.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    WorktreeError::Refused(format!(
+        "{LIVE_CWD_REFUSAL}: {named}; end them with `multiverse worktrees {} --prune --reap \
+         --yes` (preview first with --dry-run), then retry the merge",
+        project.display()
+    ))
+}
+
+/// Every process whose cwd is at or under `lane` (path components, so a
+/// sibling `<lane>-other` never matches), with the same fail-closed rules
+/// [`has_process_cwd`] documents. Never includes this process itself.
+fn process_cwd_holders(lane: &Path) -> Result<Vec<CwdHolder>> {
+    let own = std::process::id();
+    let mut found: Vec<(u32, PathBuf)> = Vec::new();
     #[cfg(target_os = "linux")]
     {
         // Our own effective uid: `/proc/<pid>/cwd` is only readable for a
@@ -5178,12 +5900,10 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
         let own_uid = fs::metadata("/proc/self")?.uid();
         for entry in fs::read_dir("/proc")? {
             let entry = entry?;
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-            {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == own {
                 continue;
             }
             match fs::metadata(entry.path()) {
@@ -5200,7 +5920,7 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
                 Err(e) => return Err(e.into()),
             }
             match fs::read_link(entry.path().join("cwd")) {
-                Ok(path) if path.starts_with(lane) => return Ok(true),
+                Ok(path) if path.starts_with(lane) => found.push((pid, path)),
                 Ok(_) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                 // A same-uid process can still deny this: the kernel's
@@ -5215,7 +5935,6 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(false)
     }
     #[cfg(target_os = "macos")]
     {
@@ -5226,18 +5945,49 @@ fn has_process_cwd(lane: &Path) -> Result<bool> {
         if !output.status.success() {
             return Err(WorktreeError::Refused("cannot inspect process cwd".into()));
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.strip_prefix('n'))
-            .any(|path| Path::new(path).starts_with(lane)))
+        // `-F n` output: a `p<pid>` line opens each process's own record,
+        // followed by its `f`/`n` lines for the one `cwd` descriptor.
+        let mut pid = None;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(value) = line.strip_prefix('p') {
+                pid = value.parse::<u32>().ok();
+            } else if let (Some(path), Some(pid)) = (line.strip_prefix('n'), pid) {
+                if pid != own && Path::new(path).starts_with(lane) {
+                    found.push((pid, PathBuf::from(path)));
+                }
+            }
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = lane;
-        Err(WorktreeError::Refused(
+        let _ = (lane, own);
+        return Err(WorktreeError::Refused(
             "process cwd inspection unsupported".into(),
-        ))
+        ));
     }
+    Ok(found
+        .into_iter()
+        .map(|(pid, cwd)| CwdHolder {
+            pid,
+            command: process_command(pid),
+            cwd,
+        })
+        .collect())
+}
+
+/// `pid`'s own command line via `ps -o command=`, or empty when `ps`
+/// cannot name it (already exited, or no `ps` at all). Descriptive only:
+/// nothing decides anything from it.
+fn process_command(pid: u32) -> String {
+    Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -5288,6 +6038,34 @@ pub(crate) mod tests {
             | PruneOutcome::WouldArchive { task, .. }
             | PruneOutcome::Removed { task, .. }
             | PruneOutcome::Archived { task, .. } => task,
+        }
+    }
+
+    /// A `sleep 3600` with its cwd in a lane, killed and reaped on drop so
+    /// a failed assertion never leaks it. Card `20261123-b-491c58`: a
+    /// shorter sleep can exit on its own while a loaded host's prune or
+    /// merge is still running, leaving no live process to keep or refuse
+    /// the lane for.
+    struct LaneChild(std::process::Child);
+    impl LaneChild {
+        fn sleep_in(dir: &Path) -> Self {
+            Self(
+                Command::new("sleep")
+                    .arg("3600")
+                    .current_dir(dir)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+    }
+    impl Drop for LaneChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 
@@ -6369,6 +7147,34 @@ pub(crate) mod tests {
         }
     }
 
+    /// A throwaway workspace directory in `TMPDIR` that a build-evidence
+    /// fixture names, removed on drop — including unwind — so a panic
+    /// cannot leak `mv-live-workspace-*` dirs (card `20261122-b-40b12b`).
+    struct TempWorkspace(PathBuf);
+    impl TempWorkspace {
+        fn live(bucket: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mv-live-workspace-{bucket}-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+            let guard = Self(path);
+            write_workspace_marker(&guard.0);
+            guard
+        }
+    }
+    impl std::ops::Deref for TempWorkspace {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A `CARGO_BUILD_BUILD_DIR` override root a test points `{workspace-
     /// path-hash}` templates at — never created directly, only implied by
     /// `write_build_evidence`'s own `create_dir_all` underneath it, but
@@ -7293,6 +8099,74 @@ pub(crate) mod tests {
         }
     }
 
+    /// Card `20261116-b-891676` / `20261122-b-40b12b`: two junk-laden live
+    /// hash dirs sorted first (`"00"`, `"01"`), each with 2200 junk
+    /// evidence files in front of a live-workspace marker that sorts last
+    /// within its own dir, then three small vanished-lane hash dirs
+    /// (`"02"`..`"04"`) sorted after both. The live workspace dirs are
+    /// owned so a panic cannot leak `mv-live-workspace-*` into `TMPDIR`.
+    fn two_big_live_then_three_vanished(
+        shared_root: &Path,
+    ) -> (Vec<TempWorkspace>, Vec<PathBuf>, Vec<(PathBuf, u64)>) {
+        let mut live_workspaces = Vec::new();
+        let mut live_hash_dirs = Vec::new();
+        for bucket in ["00", "01"] {
+            let live = TempWorkspace::live(bucket);
+            let big_hash_dir = hash_dir(shared_root, bucket, "1");
+            write_junk_evidence_files(&big_hash_dir, 2200);
+            fs::write(
+                big_hash_dir.join("debug/deps/zzz-live.d"),
+                format!("{}/src/lib.rs\n", live.display()),
+            )
+            .unwrap();
+            live_hash_dirs.push(big_hash_dir);
+            live_workspaces.push(live);
+        }
+
+        let mut vanished_dirs = Vec::new();
+        for (bucket, leaf) in [("02", "1"), ("03", "1"), ("04", "1")] {
+            let vanished = std::env::temp_dir().join(format!(
+                "mv-vanished-workspace-{bucket}-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+            write_workspace_marker(&vanished);
+            let hash_dir_path = hash_dir(shared_root, bucket, leaf);
+            write_build_evidence(&hash_dir_path, &[&vanished]);
+            let size = deep_prune_size(&hash_dir_path);
+            fs::remove_dir_all(&vanished).unwrap();
+            vanished_dirs.push((hash_dir_path, size));
+        }
+        (live_workspaces, live_hash_dirs, vanished_dirs)
+    }
+
+    fn assert_vanished_dirs_reclaimed(
+        outcomes: &[OrphanedBuildDir],
+        vanished_dirs: &[(PathBuf, u64)],
+        live_hash_dirs: &[PathBuf],
+    ) {
+        let reclaimed_paths: std::collections::BTreeSet<_> =
+            outcomes.iter().map(|o| o.path.clone()).collect();
+        for (path, size) in vanished_dirs {
+            assert!(
+                reclaimed_paths.contains(path),
+                "{} must be reclaimed in the same pass as the two big dirs ahead of it",
+                path.display()
+            );
+            assert!(!path.exists(), "a reclaimed vanished dir must be deleted");
+            assert_eq!(
+                outcomes.iter().find(|o| &o.path == path).unwrap().bytes,
+                *size
+            );
+        }
+        for path in live_hash_dirs {
+            assert!(
+                path.exists(),
+                "a big dir sorted ahead of the vanished ones must survive"
+            );
+        }
+    }
+
     /// Card `20261116-b-891676`: on the installed release, `--prune --yes`
     /// removed 5 merged lanes but froze none of their shared-build hash
     /// dirs in that same run — two big live hash dirs, sorted before the
@@ -7300,16 +8174,12 @@ pub(crate) mod tests {
     /// `BuildDirScanBudget` (4000 files total) before the vanished ones
     /// were ever read, and a dir this scan never finishes reading is
     /// always kept (`OrphanVerdict::cut_short`), never reclaimed. Rebuilds
-    /// that exact shape: two hash dirs sorted first (`"00"`, `"01"`),
-    /// each with 2200 junk evidence files (4400 total — over the old
-    /// 4000-file cap) in front of one real live-workspace marker that
-    /// sorts last within its own dir, then three small vanished-lane hash
-    /// dirs (`"02"`..`"04"`) sorted after both. One reclaim pass must
-    /// delete all three vanished dirs and keep both candidates sorted
-    /// ahead of them — whether a candidate is kept because it is proven
-    /// live or merely because its own per-dir cap cut the scan short
-    /// before proving anything, either is the same safe "never deleted on
-    /// a guess" outcome `OrphanVerdict::cut_short` already guarantees.
+    /// that exact shape. One reclaim pass must delete all three vanished
+    /// dirs and keep both candidates sorted ahead of them — whether a
+    /// candidate is kept because it is proven live or merely because its
+    /// own per-dir cap cut the scan short before proving anything, either
+    /// is the same safe "never deleted on a guess" outcome
+    /// `OrphanVerdict::cut_short` already guarantees.
     #[test]
     fn prune_orphaned_build_dirs_reclaims_vanished_dirs_sorted_after_two_big_live_dirs() {
         let repo = TempRepo::new();
@@ -7322,62 +8192,74 @@ pub(crate) mod tests {
 
         let store = repo.store();
         let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
-
-        let mut live_dirs = Vec::new();
-        for bucket in ["00", "01"] {
-            let live = std::env::temp_dir().join(format!(
-                "mv-live-workspace-{bucket}-{}-{}",
-                std::process::id(),
-                nonce()
-            ));
-            write_workspace_marker(&live);
-            let big_hash_dir = hash_dir(&shared_root, bucket, "1");
-            write_junk_evidence_files(&big_hash_dir, 2200);
-            fs::write(
-                big_hash_dir.join("debug/deps/zzz-live.d"),
-                format!("{}/src/lib.rs\n", live.display()),
-            )
-            .unwrap();
-            live_dirs.push((big_hash_dir, live));
-        }
-
-        let mut vanished_dirs = Vec::new();
-        for (bucket, leaf) in [("02", "1"), ("03", "1"), ("04", "1")] {
-            let vanished = std::env::temp_dir().join(format!(
-                "mv-vanished-workspace-{bucket}-{}-{}",
-                std::process::id(),
-                nonce()
-            ));
-            write_workspace_marker(&vanished);
-            let hash_dir_path = hash_dir(&shared_root, bucket, leaf);
-            write_build_evidence(&hash_dir_path, &[&vanished]);
-            let size = deep_prune_size(&hash_dir_path);
-            fs::remove_dir_all(&vanished).unwrap();
-            vanished_dirs.push((hash_dir_path, size));
-        }
+        let (_live_workspaces, live_hash_dirs, vanished_dirs) =
+            two_big_live_then_three_vanished(&shared_root);
 
         let outcomes = store.prune_orphaned_build_dirs(false).unwrap();
-        let reclaimed_paths: std::collections::BTreeSet<_> =
-            outcomes.iter().map(|o| o.path.clone()).collect();
-        for (path, size) in &vanished_dirs {
-            assert!(
-                reclaimed_paths.contains(path),
-                "{} must be reclaimed in the same pass as the two big dirs ahead of it",
-                path.display()
-            );
-            assert!(!path.exists(), "a reclaimed vanished dir must be deleted");
-            assert_eq!(
-                outcomes.iter().find(|o| &o.path == path).unwrap().bytes,
-                *size
-            );
-        }
-        for (path, live) in &live_dirs {
-            assert!(
-                path.exists(),
-                "a big dir sorted ahead of the vanished ones must survive"
-            );
-            fs::remove_dir_all(live).unwrap();
-        }
+        assert_vanished_dirs_reclaimed(&outcomes, &vanished_dirs, &live_hash_dirs);
+    }
+
+    /// Card `20261122-b-40b12b`: the load flake was the whole-scan
+    /// wall-clock deadline expiring while the two junk-laden dirs sorted
+    /// first were still being walked, so the vanished dirs after them
+    /// were never started (`if budget.exhausted() { break }`). Injecting
+    /// a budget that is already spent is that slow path without sleeping
+    /// or raising timeouts. After the per-dir time-slice fix, the same
+    /// spent budget still reclaims every vanished dir.
+    #[test]
+    fn prune_orphaned_build_dirs_reclaims_vanished_dirs_when_the_whole_scan_deadline_is_already_spent(
+    ) {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+
+        let store = repo.store();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let (_live_workspaces, live_hash_dirs, vanished_dirs) =
+            two_big_live_then_three_vanished(&shared_root);
+
+        let spent: fn(usize) -> BuildDirScanBudget = |_| BuildDirScanBudget {
+            deadline: Instant::now(),
+        };
+        let outcomes = store
+            .prune_orphaned_build_dirs_within(
+                false,
+                &[],
+                spent,
+                &mut free_orphaned_build_dir,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_vanished_dirs_reclaimed(&outcomes, &vanished_dirs, &live_hash_dirs);
+    }
+
+    /// Card `20261122-b-40b12b`: a panic while the live-workspace fixtures
+    /// are still held must not leave `mv-live-workspace-*` in `TMPDIR`.
+    #[test]
+    fn temp_workspace_guard_removes_its_dir_on_panic() {
+        let path = std::env::temp_dir().join(format!(
+            "mv-live-workspace-panic-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _live = {
+                let guard = TempWorkspace(path.clone());
+                write_workspace_marker(&path);
+                guard
+            };
+            assert!(path.exists());
+            panic!("forced");
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            !path.exists(),
+            "TempWorkspace Drop must remove the dir after panic"
+        );
     }
 
     /// Card `20261116-b-891676`'s second half: a lane `--prune --yes`
@@ -8281,6 +9163,130 @@ pub(crate) mod tests {
         assert!(orphan_hash_dir.join("debug/deps/fixture.d").exists());
     }
 
+    /// Two orphan shared-build hash dirs, each naming only a lane of
+    /// `repo` that no longer exists on disk (and that the routing log
+    /// never recorded, so only the generic sweep can decide them) — the
+    /// shape card `20261122-b-a5e62d` saw on 0.1.16, sorted the same way.
+    fn two_vanished_lane_hash_dirs(repo: &TempRepo, shared_root: &Path) -> [PathBuf; 2] {
+        let worktrees = repo.0.join(".multiverse/worktrees");
+        let first = hash_dir(shared_root, "29", "5a434937c16426");
+        let second = hash_dir(shared_root, "e7", "bb1edf3e1ddaa3");
+        write_build_evidence(&first, &[&worktrees.join("20261121-builder-aaaaaa")]);
+        write_build_evidence(&second, &[&worktrees.join("20261121-builder-bbbbbb")]);
+        [first, second]
+    }
+
+    /// Card `20261122-b-a5e62d`: on 0.1.16 `--prune --dry-run` listed two
+    /// orphan hash dirs, `--prune --yes` freed the first and printed
+    /// nothing about the second. The sweep measured and deleted each dir
+    /// on its own scan deadline, so one multi-GB delete used it up and the
+    /// next candidate was dropped without a line. A `free` that takes
+    /// longer than the whole deadline stands in for that delete here: one
+    /// real run must still free both, and agree with its own dry run.
+    #[test]
+    fn prune_orphaned_build_dirs_frees_every_orphan_its_dry_run_lists_despite_a_slow_delete() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        let store = repo.store();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let [first, second] = two_vanished_lane_hash_dirs(&repo, &shared_root);
+        let expected = vec![
+            OrphanedBuildDir {
+                path: first.clone(),
+                bytes: deep_prune_size(&first),
+                kept: None,
+            },
+            OrphanedBuildDir {
+                path: second.clone(),
+                bytes: deep_prune_size(&second),
+                kept: None,
+            },
+        ];
+
+        let deadline: fn(usize) -> BuildDirScanBudget = |_| BuildDirScanBudget {
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let mut slow_free = |root: &Path, dir: PathBuf, dry_run: bool| {
+            let outcome = free_orphaned_build_dir(root, dir, dry_run);
+            if !dry_run {
+                std::thread::sleep(Duration::from_millis(1200));
+            }
+            outcome
+        };
+        let preview = store
+            .prune_orphaned_build_dirs_within(true, &[], deadline, &mut slow_free, &mut |_| {})
+            .unwrap();
+        assert_eq!(preview, expected, "the dry run lists both orphans");
+        let real = store
+            .prune_orphaned_build_dirs_within(false, &[], deadline, &mut slow_free, &mut |_| {})
+            .unwrap();
+        assert_eq!(real, preview, "one real run frees what its dry run listed");
+        assert!(!first.exists() && !second.exists());
+    }
+
+    /// Card `20261122-b-a5e62d`: a candidate the whole-scan deadline cuts
+    /// off is reported kept with its reason — in the dry run and the real
+    /// run alike — never dropped without a line. Combined with card
+    /// `20261122-b-40b12b`, `ensure_dir_slice` would un-expire a deadline
+    /// that ran out after the first candidate was handled, so this expires
+    /// the budget as the second candidate is started, after its per-dir
+    /// slice is granted.
+    #[test]
+    fn prune_orphaned_build_dirs_reports_a_candidate_past_the_scan_deadline_as_kept() {
+        let repo = TempRepo::new();
+        write_build_dir_template(
+            &repo,
+            "{cargo-cache-home}/shared-build/{workspace-path-hash}",
+        );
+        let _cargo_home = CargoHomeEnvGuard::new();
+        let _build_dir = BuildDirEnvGuard::cleared();
+        let store = repo.store();
+        let shared_root = shared_build_root(&repo.0).expect("shared root resolves");
+        let [first, second] = two_vanished_lane_hash_dirs(&repo, &shared_root);
+        let expected = vec![
+            OrphanedBuildDir {
+                path: first.clone(),
+                bytes: deep_prune_size(&first),
+                kept: None,
+            },
+            OrphanedBuildDir {
+                path: second.clone(),
+                bytes: 0,
+                kept: Some(ORPHAN_SCAN_OUT_OF_TIME.into()),
+            },
+        ];
+
+        let run = |dry_run: bool| {
+            let mut handled = 0;
+            store
+                .prune_orphaned_build_dirs_within(
+                    dry_run,
+                    &[],
+                    BuildDirScanBudget::for_candidates,
+                    &mut free_orphaned_build_dir,
+                    &mut |budget| {
+                        handled += 1;
+                        if handled == 2 {
+                            budget.deadline = Instant::now();
+                        }
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(run(true), expected);
+        assert_eq!(run(false), expected);
+        assert!(!first.exists(), "the first orphan is freed");
+        assert!(
+            second.join("debug/deps/fixture.d").exists(),
+            "an orphan the scan never decided stays on disk"
+        );
+    }
+
     /// `dep_info_paths` reads rustc's own dep-info shape: rule targets and
     /// prerequisites alike, `\ `-escaped spaces kept inside one path, and
     /// `#` lines skipped whole.
@@ -8361,8 +9367,8 @@ pub(crate) mod tests {
         assert!(lane_hash_dir.exists());
     }
 
-    /// Nexus mutated `hash_dir_is_orphaned` to ignore `verdict.cut_short`
-    /// entirely (`verdict.saw_dead && !verdict.saw_live`), and every
+    /// Nexus mutated `hash_dir_is_orphaned` (now `OrphanVerdict::orphaned`)
+    /// to ignore `verdict.cut_short` entirely (`verdict.saw_dead && !verdict.saw_live`), and every
     /// existing test still passed — none of them ever exhausted the
     /// budget mid-scan. A per-dir cut-short scan is a real risk on a real,
     /// multi-GB shared root (card `20261115-b-673528`, fix round): a hash
@@ -8413,7 +9419,7 @@ pub(crate) mod tests {
         let mut budget = BuildDirScanBudget::for_candidates(1);
         let mut per_dir = PerDirFileBudget { files_remaining: 1 };
         assert!(
-            !hash_dir_is_orphaned(&dir, None, None, &mut budget, &mut per_dir),
+            !hash_dir_orphan_verdict(&dir, None, None, &mut budget, &mut per_dir).orphaned(),
             "a scan cut short before reaching its live evidence must never read as orphaned"
         );
 
@@ -8489,14 +9495,8 @@ pub(crate) mod tests {
         assert!(
             matches!(&outcomes[0], PruneOutcome::Kept { reason, .. } if reason.contains("live"))
         );
-        let mut child = Command::new("sleep")
-            .arg("20")
-            .current_dir(&lane.path)
-            .spawn()
-            .unwrap();
+        let _child = LaneChild::sleep_in(&lane.path);
         let outcomes = store.prune_with_ignored(&mut Observer::idle(), true, false, true, true);
-        child.kill().unwrap();
-        child.wait().unwrap();
         assert!(
             matches!(&outcomes.unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("live process"))
         );
@@ -8508,17 +9508,51 @@ pub(crate) mod tests {
         let repo = TempRepo::new();
         let store = repo.store();
         let lane = store.create("owner", "HEAD").unwrap();
-        let mut child = Command::new("sleep")
-            .arg("20")
-            .current_dir(&lane.path)
-            .spawn()
-            .unwrap();
+        let _child = LaneChild::sleep_in(&lane.path);
         let result = store.prune(&mut Observer::idle(), true, false);
-        child.kill().unwrap();
-        child.wait().unwrap();
         assert!(
             matches!(&result.unwrap()[0], PruneOutcome::Kept { reason, .. } if reason.contains("live process"))
         );
+    }
+
+    /// Card `20261122-b-78bcf9`: a lane kept for any reason — here an
+    /// unmerged branch with no archive authority, the exact "holds work"
+    /// shape a done, unmerged lane has — is `lane_dead` once its pane check
+    /// passes and its outcome is settled, so `--prune --reap` can offer to
+    /// end its leftovers; a still-live pane, or a never-dispatched lane
+    /// with no recorded pane and no terminal status, never is.
+    #[test]
+    fn prune_marks_a_kept_lane_dead_only_once_its_pane_is_gone_and_it_settled() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        done_lane(&store, "finished");
+        let pristine = store.create("pristine", "HEAD").unwrap();
+        fs::write(pristine.path.join("dirty.txt"), "x").unwrap();
+
+        let dead = |outcomes: &[PruneOutcome], task: &str| {
+            outcomes
+                .iter()
+                .find_map(|outcome| match outcome {
+                    PruneOutcome::Kept {
+                        task: kept,
+                        lane_dead,
+                        ..
+                    } if kept == task => Some(*lane_dead),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{task} was not kept: {outcomes:?}"))
+        };
+
+        let outcomes = store.prune(&mut Observer::idle(), false, true).unwrap();
+        assert!(dead(&outcomes, "finished"), "{outcomes:?}");
+        assert!(!dead(&outcomes, "pristine"), "{outcomes:?}");
+
+        let mut live = Observer {
+            live: true,
+            recorded: 0,
+        };
+        let outcomes = store.prune(&mut live, false, true).unwrap();
+        assert!(!dead(&outcomes, "finished"), "{outcomes:?}");
     }
 
     // A same-uid process that has made itself non-dumpable (e.g. a runner
@@ -8773,12 +9807,121 @@ pub(crate) mod tests {
         );
         assert!(lane.path.exists());
         fs::remove_file(lane.path.join(".multiverse/tasks/owner/result.md")).unwrap();
-        std::os::unix::fs::symlink(
-            repo.0.join("README.md"),
-            lane.path.join(".multiverse/tasks/owner/result.md"),
-        )
-        .unwrap();
-        assert!(store.rescue("owner", false).is_err());
+        let link = lane.path.join(".multiverse/tasks/owner/result.md");
+        std::os::unix::fs::symlink(repo.0.join("README.md"), &link).unwrap();
+        let err = store.rescue("owner", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsafe state artifact")
+                && msg.contains(&link.display().to_string())
+                && msg.contains("refuses to follow symlinks out of the lane"),
+            "{msg}"
+        );
+    }
+
+    /// Card `20261122-b-4961e4`: a pip venv inside the task dir (with a
+    /// `python -> python3.15` symlink) plus an `*.egg-info` cache must not
+    /// refuse rescue. Real artifacts still copy; the caches are skipped.
+    fn plant_task_venv_and_egg_info(lane: &Lane, task: &str) {
+        let task_dir = lane.path.join(".multiverse/tasks").join(task);
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("status"), "done\n").unwrap();
+        fs::write(task_dir.join("result.md"), "findings\n").unwrap();
+        fs::write(task_dir.join("brief.md"), "brief\n").unwrap();
+        let venv_bin = task_dir.join("venv/bin");
+        fs::create_dir_all(&venv_bin).unwrap();
+        std::os::unix::fs::symlink("python3.15", venv_bin.join("python")).unwrap();
+        let egg = task_dir.join("pkg/foo.egg-info");
+        fs::create_dir_all(&egg).unwrap();
+        fs::write(egg.join("PKG-INFO"), "Name: foo\n").unwrap();
+    }
+
+    #[test]
+    fn rescue_skips_a_task_dir_venv_and_egg_info_and_still_copies_artifacts() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("owner", "HEAD").unwrap();
+        plant_task_venv_and_egg_info(&lane, "owner");
+
+        let report = store.rescue("owner", false).unwrap();
+        let mut skipped: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        skipped.sort();
+        assert_eq!(skipped, ["foo.egg-info", "venv"]);
+        let project_task = repo.0.join(".multiverse/tasks/owner");
+        assert_eq!(
+            fs::read_to_string(project_task.join("result.md")).unwrap(),
+            "findings\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project_task.join("status")).unwrap(),
+            "done\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project_task.join("brief.md")).unwrap(),
+            "brief\n"
+        );
+        assert!(
+            !project_task.join("venv").exists(),
+            "rescue must not copy the venv"
+        );
+        assert!(
+            !project_task.join("pkg/foo.egg-info").exists(),
+            "rescue must not copy egg-info"
+        );
+        assert!(
+            report
+                .copied
+                .iter()
+                .any(|p| p.file_name() == Some(std::ffi::OsStr::new("result.md"))),
+            "{:?}",
+            report.copied
+        );
+    }
+
+    #[test]
+    fn prune_dry_run_lists_a_lane_with_a_task_dir_venv_as_removable_after_rescue() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("owner", "HEAD").unwrap();
+        plant_task_venv_and_egg_info(&lane, "owner");
+        store.rescue("owner", false).unwrap();
+        let outcomes = store.prune(&mut Observer::idle(), true, true).unwrap();
+        assert!(
+            matches!(&outcomes[0], PruneOutcome::WouldRemove { .. }),
+            "expected WouldRemove after skipping the venv, got {:?}",
+            outcomes[0]
+        );
+    }
+
+    #[test]
+    fn rescue_refuses_a_symlink_pointing_outside_the_lane_and_names_the_path() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = store.create("owner", "HEAD").unwrap();
+        let task_dir = lane.path.join(".multiverse/tasks/owner");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("status"), "done\n").unwrap();
+        fs::write(task_dir.join("result.md"), "findings\n").unwrap();
+        let outside = repo.0.join("outside-secret");
+        fs::write(&outside, "secret\n").unwrap();
+        let link = task_dir.join("leaked.md");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = store.rescue("owner", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsafe state artifact")
+                && msg.contains(&link.display().to_string())
+                && msg.contains("refuses to follow symlinks out of the lane"),
+            "{msg}"
+        );
+        assert!(
+            !repo.0.join(".multiverse/tasks/owner/leaked.md").exists(),
+            "must not copy through a symlink out of the lane"
+        );
     }
 
     /// Recursively backdates every entry under `path`, including `path`
@@ -9142,6 +10285,7 @@ pub(crate) mod tests {
         let mut previewed: Vec<PathBuf> = store
             .rescue("owner", true)
             .unwrap()
+            .copied
             .into_iter()
             .map(|p| p.strip_prefix(&project_state).unwrap().to_path_buf())
             .collect();
@@ -10467,7 +11611,7 @@ pub(crate) mod tests {
         let store = repo.store();
         store.create("task", "HEAD").unwrap();
         let secrets = secrets_scan_with(Path::new("gitleaks"));
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         assert!(
             matches!(&error, MergeError::Refused(m) if m.contains("no recorded terminal status")),
             "{error}"
@@ -10483,7 +11627,7 @@ pub(crate) mod tests {
         fs::create_dir_all(&task_dir).unwrap();
         fs::write(task_dir.join("status"), "blocked\n").unwrap();
         let secrets = secrets_scan_with(Path::new("gitleaks"));
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         assert!(
             matches!(&error, MergeError::Refused(m) if m.contains("not done")),
             "{error}"
@@ -10501,7 +11645,7 @@ pub(crate) mod tests {
         fs::write(task_dir.join("result.md"), "findings\n").unwrap();
         fs::write(lane.path.join("dirty.txt"), "oops").unwrap();
         let secrets = secrets_scan_with(Path::new("gitleaks"));
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         assert!(
             matches!(&error, MergeError::Refused(m) if m.contains("uncommitted")),
             "{error}"
@@ -10521,7 +11665,7 @@ pub(crate) mod tests {
         let script = fake_scanner("echo 'README.md:3: AKIA-REDACTED'\nexit 1");
         let secrets = secrets_scan_with(&script);
 
-        let error = store.merge("secret-task", &secrets).unwrap_err();
+        let error = store.merge("secret-task", &secrets, &[]).unwrap_err();
         match &error {
             MergeError::Refused(message) => {
                 assert!(
@@ -10555,13 +11699,45 @@ pub(crate) mod tests {
         let script = fake_scanner("exit 0");
         let secrets = secrets_scan_with(&script);
 
-        let result = store.merge("clean-task", &secrets).unwrap();
+        let result = store.merge("clean-task", &secrets, &[]).unwrap();
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         let message = git(&repo.0, &["log", "-1", "--format=%B"], None).unwrap();
         assert_eq!(message.trim(), "Merge branch 'multiverse/clean-task'");
         let sha = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
         assert_eq!(sha.trim(), result.sha);
         fs::remove_file(&script).ok();
+    }
+
+    /// Card `20261122-b-78bcf9`: a done lane some leftover still uses as
+    /// its cwd is refused with that holder's own pid, command and cwd named,
+    /// plus the reap verb that ends it — never the bare "live process cwd"
+    /// that named nothing. Skips (never fails) where this host's process
+    /// cwd probe is unavailable, e.g. a sandbox that hides `lsof`/`/proc`.
+    #[test]
+    fn merge_refusal_names_each_live_cwd_holder_and_the_reap_verb() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "held-task");
+        let script = fake_scanner("exit 0");
+        let secrets = secrets_scan_with(&script);
+        let child = LaneChild::sleep_in(&lane.path);
+        if !matches!(has_process_cwd(&lane.path), Ok(true)) {
+            eprintln!("skipped: this host's process cwd probe cannot see a spawned child");
+            return;
+        }
+
+        let error = store.merge("held-task", &secrets, &[]).unwrap_err();
+        fs::remove_file(&script).ok();
+        let MergeError::Refused(message) = &error else {
+            panic!("expected Refused, got {error:?}");
+        };
+        assert!(message.contains("live process cwd"), "{message}");
+        assert!(
+            message.contains(&format!("pid {} `sleep 3600`", child.id())),
+            "{message}"
+        );
+        assert!(message.contains("(cwd "), "{message}");
+        assert!(message.contains("--prune --reap --yes"), "{message}");
     }
 
     /// Proof item: gitleaks missing + `required = true` (the default)
@@ -10579,7 +11755,7 @@ pub(crate) mod tests {
         ));
         let secrets = secrets_scan_with(&missing);
 
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         assert!(
             matches!(&error, MergeError::ScannerMissing(m) if m.contains("install")),
             "{error}"
@@ -10606,7 +11782,7 @@ pub(crate) mod tests {
         let mut secrets = secrets_scan_with(&missing);
         secrets.required = false;
 
-        let result = store.merge("task", &secrets).unwrap();
+        let result = store.merge("task", &secrets, &[]).unwrap();
         assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
         assert!(
             result.warnings[0].starts_with("WARNING:"),
@@ -10633,7 +11809,7 @@ pub(crate) mod tests {
         let mut secrets = secrets_scan_with(&gitleaks);
         secrets.trufflehog = Some(trufflehog.display().to_string());
 
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         match &error {
             MergeError::Refused(message) => {
                 assert!(message.contains("trufflehog"), "{message}");
@@ -10661,7 +11837,7 @@ pub(crate) mod tests {
                 .to_string(),
         );
 
-        let result = store.merge("task", &secrets).unwrap();
+        let result = store.merge("task", &secrets, &[]).unwrap();
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         fs::remove_file(&gitleaks).ok();
     }
@@ -10690,7 +11866,7 @@ pub(crate) mod tests {
         secrets.trufflehog = Some(trufflehog.display().to_string());
 
         let before = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         let message = match &error {
             MergeError::Refused(message) => message.clone(),
             other => panic!("expected Refused, got {other:?}"),
@@ -10737,7 +11913,7 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&sentinel, &leaf).unwrap();
 
         let before = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         assert!(
             matches!(&error, MergeError::Refused(m) if m.contains("symlink")),
             "{error}"
@@ -10782,7 +11958,7 @@ pub(crate) mod tests {
 
         let before = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
         let secrets = secrets_scan_with(Path::new("gitleaks"));
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         assert!(
             matches!(&error, MergeError::Refused(m) if m.contains("MERGE_HEAD") && m.contains("git -C")),
             "{error}"
@@ -10826,7 +12002,7 @@ pub(crate) mod tests {
         let script = fake_scanner("exit 0");
         let secrets = secrets_scan_with(&script);
 
-        let error = store.merge("task", &secrets).unwrap_err();
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
         match &error {
             MergeError::Refused(message) => {
                 assert!(message.contains("README.md"), "{message}");
@@ -10850,5 +12026,511 @@ pub(crate) mod tests {
         );
 
         fs::remove_file(&script).ok();
+    }
+
+    // -- card 20261122-b-40cb46: newest outcome, adopted ids, regenerable --
+
+    /// Writes `lines` as `repo`'s whole routing log, one record per line.
+    fn write_routing_log(repo: &Path, lines: &[&str]) {
+        fs::create_dir_all(repo.join(".multiverse")).unwrap();
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(repo.join(".multiverse/routing.log"), text).unwrap();
+    }
+
+    /// `task`'s own status and result files inside `lane`.
+    fn write_lane_task(lane: &Lane, task: &str, status: &str) {
+        let task_dir = lane.path.join(".multiverse/tasks").join(task);
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("status"), format!("{status}\n")).unwrap();
+        fs::write(task_dir.join("result.md"), "findings\n").unwrap();
+    }
+
+    /// A lane whose round 1 (`owner`) ended blocked and whose round 2 —
+    /// `dispatch --into owner` under the new id `round-two`, recorded onto
+    /// `multiverse/owner` — ended done, both reconciled into the log, and
+    /// round 1's own status file still reads `blocked`.
+    fn redone_lane(repo: &TempRepo, store: &Worktrees) -> Lane {
+        let lane = done_lane(store, "owner");
+        write_lane_task(&lane, "owner", "blocked");
+        write_lane_task(&lane, "round-two", "done");
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-22T01:00:00+00:00\tevent=dispatch\ttask=owner\trole=builder\tbranch=multiverse/owner",
+                "2026-11-22T01:10:00+00:00\tevent=result\ttask=owner\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p1",
+                "2026-11-22T02:00:00+00:00\tevent=dispatch\ttask=round-two\trole=builder\tbranch=multiverse/owner",
+                "2026-11-22T02:10:00+00:00\tevent=result\ttask=round-two\tstatus=done\tstate=reconciled\trevisions=0\tpane=p2",
+            ],
+        );
+        lane
+    }
+
+    /// Case 1: a lane redone with `dispatch --into` merges under its
+    /// original id — the newest round's recorded `done` decides, not round
+    /// 1's stale `blocked` status file.
+    #[test]
+    fn merge_takes_the_newest_round_of_a_lane_redone_with_into() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        redone_lane(&repo, &store);
+        let script = fake_scanner("exit 0");
+        let result = store
+            .merge("owner", &secrets_scan_with(&script), &[])
+            .unwrap();
+        assert_eq!(result.branch, "multiverse/owner");
+        let message = git(&repo.0, &["log", "-1", "--format=%B"], None).unwrap();
+        assert_eq!(message.trim(), "Merge branch 'multiverse/owner'");
+        fs::remove_file(&script).ok();
+    }
+
+    /// Case 1, adopted id: `--merge <round-two>` resolves to the worktree
+    /// it adopted and lands that worktree's branch, rather than failing on
+    /// a `.multiverse/worktrees/round-two` that never existed.
+    #[test]
+    fn merge_resolves_an_adopted_task_id_to_the_worktree_it_adopted() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        redone_lane(&repo, &store);
+        assert_eq!(
+            lane_task_for(&repo.0, "round-two").unwrap().as_deref(),
+            Some("owner")
+        );
+        let script = fake_scanner("exit 0");
+        let result = store
+            .merge("round-two", &secrets_scan_with(&script), &[])
+            .unwrap();
+        assert_eq!(result.branch, "multiverse/owner");
+        let head = git(&repo.0, &["rev-parse", "HEAD"], None).unwrap();
+        assert_eq!(head.trim(), result.sha);
+        fs::remove_file(&script).ok();
+    }
+
+    /// An id with no worktree and no adopting dispatch record is refused
+    /// by name, not with a bare "No such file or directory".
+    #[test]
+    fn merge_refuses_a_task_id_that_owns_no_worktree_by_name() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let error = store
+            .merge("ghost", &secrets_scan_with(Path::new("gitleaks")), &[])
+            .unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m) if m.contains("ghost has no worktree")),
+            "{error}"
+        );
+    }
+
+    /// A newer round still refuses when *its* recorded outcome is not
+    /// done, even though an older round's was — the newest round decides
+    /// in both directions.
+    #[test]
+    fn merge_refuses_when_the_newest_round_is_blocked_after_an_older_done() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "owner");
+        write_lane_task(&lane, "round-two", "blocked");
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-22T01:00:00+00:00\tevent=dispatch\ttask=owner\tbranch=multiverse/owner",
+                "2026-11-22T01:10:00+00:00\tevent=result\ttask=owner\tstatus=done\tstate=reconciled\trevisions=0\tpane=p1",
+                "2026-11-22T02:00:00+00:00\tevent=dispatch\ttask=round-two\tbranch=multiverse/owner",
+                "2026-11-22T02:10:00+00:00\tevent=result\ttask=round-two\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p2",
+            ],
+        );
+        let error = store
+            .merge("owner", &secrets_scan_with(Path::new("gitleaks")), &[])
+            .unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m) if m.contains("round-two's newest recorded outcome is \"blocked\"")),
+            "{error}"
+        );
+    }
+
+    /// Case 2: a blocked outcome corrected with `tasks --supersede
+    /// --status done` merges even though the lane's status file still
+    /// reads `blocked` — the correction targets the newest outcome line.
+    #[test]
+    fn merge_honors_a_supersede_correction_over_the_status_file() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "task");
+        write_lane_task(&lane, "task", "blocked");
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-22T01:00:00+00:00\tevent=dispatch\ttask=task\tbranch=multiverse/task",
+                "2026-11-22T01:10:00+00:00\tevent=result\ttask=task\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p1",
+                "2026-11-22T01:20:00+00:00\tevent=supersede\ttask=task\tsupersedes=2\tsupersedes_when=2026-11-22T01:10:00+00:00\tstatus=done\tstate=verified\trevisions=0\treason=\"checked\"",
+            ],
+        );
+        let script = fake_scanner("exit 0");
+        store
+            .merge("task", &secrets_scan_with(&script), &[])
+            .unwrap();
+        fs::remove_file(&script).ok();
+    }
+
+    /// A supersede that corrects an *older* round's line never overrides
+    /// the newer round's own recorded outcome.
+    #[test]
+    fn merge_ignores_a_supersede_of_an_older_rounds_outcome() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "owner");
+        write_lane_task(&lane, "round-two", "blocked");
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-22T01:00:00+00:00\tevent=dispatch\ttask=owner\tbranch=multiverse/owner",
+                "2026-11-22T01:10:00+00:00\tevent=result\ttask=owner\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p1",
+                "2026-11-22T02:00:00+00:00\tevent=dispatch\ttask=round-two\tbranch=multiverse/owner",
+                "2026-11-22T02:10:00+00:00\tevent=result\ttask=round-two\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p2",
+                "2026-11-22T02:20:00+00:00\tevent=supersede\ttask=owner\tsupersedes=2\tsupersedes_when=2026-11-22T01:10:00+00:00\tstatus=done\tstate=verified\trevisions=0\treason=\"old\"",
+            ],
+        );
+        let error = store
+            .merge("owner", &secrets_scan_with(Path::new("gitleaks")), &[])
+            .unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m) if m.contains("\"blocked\", not done")),
+            "{error}"
+        );
+    }
+
+    /// The status file is still the fallback while the newest round has no
+    /// recorded outcome yet (written by the agent, not yet reconciled).
+    #[test]
+    fn merge_falls_back_to_the_newest_rounds_status_file_before_reconcile() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "owner");
+        write_lane_task(&lane, "owner", "blocked");
+        write_lane_task(&lane, "round-two", "done");
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-22T01:00:00+00:00\tevent=dispatch\ttask=owner\tbranch=multiverse/owner",
+                "2026-11-22T01:10:00+00:00\tevent=result\ttask=owner\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p1",
+                "2026-11-22T02:00:00+00:00\tevent=dispatch\ttask=round-two\tbranch=multiverse/owner",
+            ],
+        );
+        let script = fake_scanner("exit 0");
+        store
+            .merge("owner", &secrets_scan_with(&script), &[])
+            .unwrap();
+        fs::remove_file(&script).ok();
+    }
+
+    // -- card 20261123-b-970200: --merge honours supersede, names paths --
+
+    /// A lane with one committed change and no task files at all — what
+    /// an abandoned round leaves behind (no status file, no result.md).
+    fn abandoned_lane(store: &Worktrees, task: &str) -> Lane {
+        let lane = store.create(task, "HEAD").unwrap();
+        fs::write(lane.path.join("change.txt"), "lane work\n").unwrap();
+        git(&lane.path, &["add", "change.txt"], None).unwrap();
+        git(&lane.path, &["commit", "-m", "lane work"], None).unwrap();
+        lane
+    }
+
+    /// `owner` abandoned at line 2, then resumed by a `dispatch --into`
+    /// round (`round-two`) that never recorded an outcome or wrote a
+    /// status file — the shape `tasks --supersede owner` must still be
+    /// able to correct.
+    const ABANDONED_THEN_RESUMED: &[&str] = &[
+        "2026-11-23T01:00:00+00:00\tevent=dispatch\ttask=owner\trole=builder\tbranch=multiverse/owner",
+        "2026-11-23T01:10:00+00:00\tevent=result\ttask=owner\tstatus=failed\tstate=abandoned: pane gone, no status file, lease expired after 60m\trevisions=0\tpane=p1",
+        "2026-11-23T02:00:00+00:00\tevent=dispatch\ttask=round-two\trole=builder\tbranch=multiverse/owner",
+    ];
+
+    /// Card `20261123-b-970200` (1): abandoned -> resumed `--into` with
+    /// no outcome -> `tasks --supersede owner --supersedes 2 --status
+    /// done` merges without anyone hand-writing a status file or
+    /// `result.md`. Before the supersede the refusal names both status
+    /// paths it looked for.
+    #[test]
+    fn merge_honors_a_supersede_after_an_outcome_less_into_round() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = abandoned_lane(&store, "owner");
+        write_routing_log(&repo.0, ABANDONED_THEN_RESUMED);
+        let script = fake_scanner("exit 0");
+        let secrets = secrets_scan_with(&script);
+
+        let error = store.merge("owner", &secrets, &[]).unwrap_err();
+        let missing = lane.path.join(".multiverse/tasks/round-two/status");
+        assert!(
+            matches!(&error, MergeError::Refused(m)
+                if m.contains("round-two has no recorded terminal status")
+                    && m.contains(&missing.display().to_string())),
+            "{error}"
+        );
+
+        assert!(crate::tasks::append_supersede_if_absent(
+            &repo.0,
+            "owner",
+            2,
+            "done",
+            "verified",
+            "work checked by hand",
+            0,
+            None,
+        )
+        .unwrap());
+        let result = store.merge("owner", &secrets, &[]).unwrap();
+        assert_eq!(result.branch, "multiverse/owner");
+        fs::remove_file(&script).ok();
+    }
+
+    /// The outcome-less round still decides against a supersede that
+    /// corrects anything but the lane's newest recorded outcome line.
+    #[test]
+    fn merge_ignores_a_supersede_of_a_stale_line_after_an_outcome_less_round() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        abandoned_lane(&store, "owner");
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-23T01:00:00+00:00\tevent=dispatch\ttask=owner\tbranch=multiverse/owner",
+                "2026-11-23T01:10:00+00:00\tevent=result\ttask=owner\tstatus=failed\tstate=reconciled\trevisions=0\tpane=p1",
+                "2026-11-23T02:00:00+00:00\tevent=dispatch\ttask=round-two\tbranch=multiverse/owner",
+                "2026-11-23T02:10:00+00:00\tevent=result\ttask=round-two\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p2",
+                "2026-11-23T03:00:00+00:00\tevent=dispatch\ttask=round-three\tbranch=multiverse/owner",
+                "2026-11-23T03:10:00+00:00\tevent=supersede\ttask=owner\tsupersedes=2\tsupersedes_when=2026-11-23T01:10:00+00:00\tstatus=done\tstate=verified\trevisions=0\treason=\"stale\"",
+            ],
+        );
+        let error = store
+            .merge("owner", &secrets_scan_with(Path::new("gitleaks")), &[])
+            .unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m) if m.contains("round-three has no recorded terminal status")),
+            "{error}"
+        );
+    }
+
+    /// Card `20261123-b-970200` (2): a lane resumed by an `--into` round
+    /// whose round is recorded `done` merges as done for the lane, even
+    /// with no `result.md` on disk for either round.
+    #[test]
+    fn merge_takes_an_into_round_recorded_done_without_a_result_file() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        abandoned_lane(&store, "owner");
+        let mut log = ABANDONED_THEN_RESUMED.to_vec();
+        log.push("2026-11-23T02:10:00+00:00\tevent=result\ttask=round-two\tstatus=done\tstate=reconciled\trevisions=0\tpane=p2");
+        write_routing_log(&repo.0, &log);
+        let script = fake_scanner("exit 0");
+        let result = store
+            .merge("round-two", &secrets_scan_with(&script), &[])
+            .unwrap();
+        assert_eq!(result.branch, "multiverse/owner");
+        fs::remove_file(&script).ok();
+    }
+
+    /// Card `20261123-b-970200` (3): a recorded `done` whose `result.md`
+    /// exists but is empty refuses by that file's path.
+    #[test]
+    fn merge_names_an_empty_result_md_under_a_recorded_done() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "task");
+        let result_md = lane.path.join(".multiverse/tasks/task/result.md");
+        fs::write(&result_md, "\n").unwrap();
+        write_routing_log(
+            &repo.0,
+            &[
+                "2026-11-23T01:00:00+00:00\tevent=dispatch\ttask=task\tbranch=multiverse/task",
+                "2026-11-23T01:10:00+00:00\tevent=result\ttask=task\tstatus=done\tstate=reconciled\trevisions=0\tpane=p1",
+            ],
+        );
+        let error = store
+            .merge("task", &secrets_scan_with(Path::new("gitleaks")), &[])
+            .unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m)
+                if m.contains("result.md is empty") && m.contains(&result_md.display().to_string())),
+            "{error}"
+        );
+    }
+
+    /// Card `20261123-b-970200` (3): on the status-file fallback, a
+    /// `done` status with no `result.md` beside it refuses naming the
+    /// exact missing path — never a bare "No such file or directory".
+    #[test]
+    fn merge_names_the_missing_result_md_behind_a_done_status_file() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "task");
+        let result_md = lane.path.join(".multiverse/tasks/task/result.md");
+        fs::remove_file(&result_md).unwrap();
+        let error = store
+            .merge("task", &secrets_scan_with(Path::new("gitleaks")), &[])
+            .unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m)
+                if m.contains(&format!("{} is missing", result_md.display()))),
+            "{error}"
+        );
+    }
+
+    /// `rewrite_lane_status` rewrites the copy inside the worktree a task
+    /// ran in — its own, or the one an adopted id ran in — and does
+    /// nothing for a task with no worktree.
+    #[test]
+    fn rewrite_lane_status_rewrites_the_worktree_copy_for_own_and_adopted_ids() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = redone_lane(&repo, &store);
+        let written = rewrite_lane_status(&repo.0, "owner", "done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, lane.path.join(".multiverse/tasks/owner/status"));
+        assert_eq!(fs::read_to_string(&written).unwrap(), "done\n");
+        let adopted = rewrite_lane_status(&repo.0, "round-two", "done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            adopted,
+            lane.path.join(".multiverse/tasks/round-two/status")
+        );
+        assert_eq!(rewrite_lane_status(&repo.0, "ghost", "done").unwrap(), None);
+    }
+
+    /// Card `20261122-b-4961e4` / `44d217a`: a gitignored `*.egg-info/`
+    /// directory is on the built-in regenerable list, so `--merge` does
+    /// not refuse it as an unrescued ignored file.
+    #[test]
+    fn merge_does_not_refuse_an_ignored_egg_info_directory() {
+        let repo = TempRepo::new();
+        fs::write(
+            repo.0.join(".gitignore"),
+            ".multiverse/\nignored/\n*.egg-info/\n",
+        )
+        .unwrap();
+        git(&repo.0, &["commit", "-am", "ignore egg-info"], None).unwrap();
+        let store = repo.store();
+        let lane = done_lane(&store, "task");
+        let egg = lane.path.join("pkg/foo.egg-info");
+        fs::create_dir_all(&egg).unwrap();
+        fs::write(egg.join("PKG-INFO"), "Name: foo\n").unwrap();
+        let script = fake_scanner("exit 0");
+        store
+            .merge("task", &secrets_scan_with(&script), &[])
+            .unwrap();
+        fs::remove_file(&script).ok();
+    }
+
+    /// Case 3: a gitignored `lane_setup` output (`prisma/generated/**`) is
+    /// on the built-in regenerable list and never blocks a merge.
+    #[test]
+    fn merge_ignores_a_regenerable_prisma_client() {
+        let repo = TempRepo::new();
+        fs::write(
+            repo.0.join(".gitignore"),
+            ".multiverse/\nprisma/generated/\n",
+        )
+        .unwrap();
+        git(&repo.0, &["commit", "-am", "ignore prisma client"], None).unwrap();
+        let store = repo.store();
+        let lane = done_lane(&store, "task");
+        let client = lane.path.join("prisma/generated/prisma");
+        fs::create_dir_all(&client).unwrap();
+        fs::write(client.join("browser.ts"), "export {}\n").unwrap();
+        let script = fake_scanner("exit 0");
+        store
+            .merge("task", &secrets_scan_with(&script), &[])
+            .unwrap();
+        fs::remove_file(&script).ok();
+    }
+
+    /// Case 3, declared: an ignored path off the built-in list refuses by
+    /// name with the `[lane_setup] regenerable` hint, and merges once the
+    /// project declares it.
+    #[test]
+    fn merge_refuses_an_undeclared_ignored_file_and_accepts_it_once_declared() {
+        let repo = TempRepo::new();
+        let store = repo.store();
+        let lane = done_lane(&store, "task");
+        fs::create_dir_all(lane.path.join("ignored/gen")).unwrap();
+        fs::write(lane.path.join("ignored/gen/client.ts"), "x\n").unwrap();
+        let script = fake_scanner("exit 0");
+        let secrets = secrets_scan_with(&script);
+        let error = store.merge("task", &secrets, &[]).unwrap_err();
+        assert!(
+            matches!(&error, MergeError::Refused(m)
+                if m.contains("unrescued ignored file: ignored/gen/client.ts")
+                    && m.contains("[lane_setup] regenerable = [\"ignored/gen/\"]")
+                    && m.contains("roster.toml")),
+            "{error}"
+        );
+        store
+            .merge("task", &secrets, &["ignored/gen/".to_string()])
+            .unwrap();
+        fs::remove_file(&script).ok();
+    }
+
+    #[test]
+    fn regenerable_defaults_and_patterns_match_like_gitignore() {
+        for path in [
+            "prisma/generated/prisma/browser.ts",
+            "apps/api/prisma/generated/index.js",
+            "node_modules/x/index.js",
+            "pkg/__pycache__/m.cpython-312.pyc",
+            "src/mv.egg-info/PKG-INFO",
+            "target/debug/x",
+        ] {
+            assert!(disposable_ignored(path), "{path}");
+        }
+        for path in ["prisma/generated", "notes.egg-info", "src/secret.env"] {
+            assert!(!disposable_ignored(path), "{path}");
+        }
+        for relative in [
+            "tasks/owner/venv",
+            "tasks/owner/venv/bin/python",
+            "tasks/owner/.venv",
+            "tasks/owner/pkg/foo.egg-info",
+            "tasks/owner/pkg/foo.egg-info/PKG-INFO",
+            "tasks/owner/__pycache__",
+            "tasks/owner/node_modules",
+            "tasks/owner/.pytest_cache",
+            "tasks/owner/target",
+        ] {
+            assert!(is_task_regenerable_cache(Path::new(relative)), "{relative}");
+        }
+        for relative in [
+            "tasks/owner/result.md",
+            "tasks/owner/status",
+            "tasks/owner/brief.md",
+            "venv",
+            "worktree-state/owner/venv",
+        ] {
+            assert!(
+                !is_task_regenerable_cache(Path::new(relative)),
+                "{relative}"
+            );
+        }
+        let cases: &[(&str, &str, bool)] = &[
+            ("gen/", "gen/a.ts", true),
+            ("gen/", "pkg/gen/a.ts", true),
+            ("gen/", "gen", false),
+            ("/gen/", "pkg/gen/a.ts", false),
+            ("pkg/gen/", "pkg/gen/a.ts", true),
+            ("pkg/gen/", "other/pkg/gen/a.ts", false),
+            ("*.log", "logs/run.log", true),
+            ("*.log", "run.log.txt", false),
+            ("build-?/", "build-1/out", true),
+            ("dist", "dist", true),
+            ("dist", "dist/app.js", true),
+        ];
+        for (pattern, path, expected) in cases {
+            assert_eq!(
+                regenerable_pattern_matches(pattern, path),
+                *expected,
+                "{pattern} vs {path}"
+            );
+        }
     }
 }

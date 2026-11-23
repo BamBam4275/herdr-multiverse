@@ -1222,6 +1222,35 @@ fn composer_hold_notes(
     notes
 }
 
+/// Stall-wake fragment for one project's summary line (card
+/// `20261122-b-3acaeb`): [`mv_engine::sweep_nudges::NudgeOutcome::stall_wake`]
+/// as `woke stalled: <ids>`, or `would wake stalled: <ids>` under dry-run
+/// or halt. Same visibility as the finish/resume/cap blocks in
+/// [`run_with`]: a failed send is omitted.
+fn stall_wake_notes(
+    nudges: &mv_engine::sweep_nudges::NudgeOutcome,
+    dry_run: bool,
+    halted: bool,
+) -> Vec<String> {
+    let visible_as = |sent: bool| dry_run || halted || sent;
+    let mut woke_ids: Vec<&str> = nudges
+        .stall_wake
+        .iter()
+        .filter(|wake| visible_as(wake.sent))
+        .map(|wake| wake.task_id.as_str())
+        .collect();
+    woke_ids.sort_unstable();
+    if woke_ids.is_empty() {
+        return Vec::new();
+    }
+    let label = if dry_run || halted {
+        "would wake stalled"
+    } else {
+        "woke stalled"
+    };
+    vec![format!("{label}: {}", woke_ids.join(", "))]
+}
+
 fn run_with(
     args: &ArgMatches,
     agents: &mut impl AgentPanes,
@@ -1486,6 +1515,7 @@ fn run_with(
             };
             notes.push(format!("{label}: {}", capped_ids.join(", ")));
         }
+        notes.extend(stall_wake_notes(&nudges, dry_run, halted));
         notes.extend(composer_hold_notes(&nudges, dry_run, halted));
 
         if !report.superseded.is_empty() {
@@ -4723,6 +4753,42 @@ mod tests {
             composer_hold_notes(&nudges, false, false).is_empty(),
             "an unsent hold is invisible outside dry-run/halt, matching finish/resume/cap"
         );
+    }
+
+    // --- stall-wake outcome printing (card 20261122-b-3acaeb) --------------
+
+    #[test]
+    fn stall_wake_notes_print_woke_would_wake_and_omit_a_failed_send() {
+        let mut nudges = mv_engine::sweep_nudges::NudgeOutcome::default();
+        for (task_id, sent) in [
+            ("20250101-builder-bbbbbb", true),
+            ("20250101-builder-aaaaaa", true),
+            ("20250101-builder-cccccc", false),
+        ] {
+            nudges.stall_wake.push(mv_engine::sweep_nudges::StallWake {
+                task_id: task_id.to_string(),
+                pane: "w1:p1".to_string(),
+                sent,
+            });
+        }
+        assert_eq!(
+            stall_wake_notes(&nudges, false, false),
+            ["woke stalled: 20250101-builder-aaaaaa, 20250101-builder-bbbbbb"]
+        );
+        assert_eq!(
+            stall_wake_notes(&nudges, true, false),
+            ["would wake stalled: 20250101-builder-aaaaaa, 20250101-builder-bbbbbb, 20250101-builder-cccccc"]
+        );
+        assert_eq!(
+            stall_wake_notes(&nudges, false, true),
+            ["would wake stalled: 20250101-builder-aaaaaa, 20250101-builder-bbbbbb, 20250101-builder-cccccc"]
+        );
+        assert!(stall_wake_notes(
+            &mv_engine::sweep_nudges::NudgeOutcome::default(),
+            false,
+            false
+        )
+        .is_empty());
     }
 
     // --- codex-pool recovery probe wiring (leg 3 of this module's own

@@ -430,8 +430,16 @@ pub struct DispatchRequest<'a> {
     pub fleet_min_quota_percent: Option<f64>,
     /// `--wait-for-seat`.
     pub wait_for_capacity: bool,
-    /// `None` waits indefinitely; `Some(1800.0)` is the CLI default.
+    /// `None` waits indefinitely; `Some(1800.0)` is the CLI default. One
+    /// budget for the whole dispatch: fleet-capacity and seat waits both
+    /// draw on it, counted from [`DispatchRequest::already_waited`].
     pub capacity_timeout: Option<f64>,
+    /// Seconds this same dispatch already spent waiting before this
+    /// [`plan_dispatch`] call — `0.0` on a first attempt, the elapsed wait
+    /// when a caller re-plans after admission found the fleet full again
+    /// (card `20261122-b-4c82c5`), so `capacity_timeout` stays a bound on
+    /// the whole wait and a timed-out refusal reports all of it.
+    pub already_waited: f64,
     pub force: bool,
     pub dry_run: bool,
 }
@@ -537,6 +545,24 @@ pub enum DispatchError {
     /// selector's own wait error.
     #[error(transparent)]
     Wait(#[from] WaitError),
+
+    /// `--wait-for-seat` spent its whole budget waiting on fleet or
+    /// project capacity and `refusal` still stood (card
+    /// `20261122-b-4c82c5`): the same refusal a synchronous check raises,
+    /// plus how long this dispatch waited for it to clear.
+    #[error("{refusal}{}", waited_note(*.waited_secs))]
+    CapacityWaitTimedOut {
+        refusal: Box<DispatchError>,
+        waited_secs: f64,
+    },
+}
+
+/// The suffix a `--wait-for-seat` refusal carries once its wait ran out —
+/// [`DispatchError::CapacityWaitTimedOut`]'s own, shared with a timed-out
+/// seat wait ([`WaitError::TimedOut`]) and `mv-cli`'s admission-time
+/// refusal so all three say it the same way.
+pub fn waited_note(waited_secs: f64) -> String {
+    format!(" (gave up after waiting {waited_secs:.0}s with --wait-for-seat)")
 }
 
 /// Polls `capacity` — a fresh re-count on every call, never a frozen
@@ -546,24 +572,35 @@ pub enum DispatchError {
 /// run `check_fleet_capacity` exactly once, against the snapshot taken
 /// before this dispatch asked to wait at all, so `--wait-for-seat`
 /// refused a full fleet immediately instead of waiting for a slot the
-/// same way it already waits for a capped seat. On timeout this returns
-/// the same [`DispatchError`] a synchronous `check_fleet_capacity` call
-/// would have raised — same refusal text, same exit code.
+/// same way it already waits for a capped seat. A fleet already *over*
+/// its cap (the cap lowered under live agents) waits the same way: the
+/// check is `open + batch > cap`, so it refuses — and is retried — at
+/// and above the cap alike.
+///
+/// `already_waited` is counted against `timeout` (one budget per
+/// dispatch). Returns the total waited so far on success; on timeout,
+/// [`DispatchError::CapacityWaitTimedOut`] wrapping the refusal a
+/// synchronous `check_fleet_capacity` call would have raised, with how
+/// long was waited (card `20261122-b-4c82c5`).
 fn wait_for_fleet_capacity(
     capacity: &mut dyn FnMut() -> FleetCapacityInputs,
     timeout: Option<f64>,
+    already_waited: f64,
     poll_interval: f64,
     sleeper: &mut dyn selector::Sleeper,
     on_wait: &mut dyn FnMut(&str),
-) -> Result<(), DispatchError> {
-    let mut waited = 0.0_f64;
+) -> Result<f64, DispatchError> {
+    let mut waited = already_waited.max(0.0);
     loop {
         match check_fleet_capacity(&capacity()) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(waited),
             Err(err) => {
                 if let Some(timeout) = timeout {
                     if waited >= timeout {
-                        return Err(err);
+                        return Err(DispatchError::CapacityWaitTimedOut {
+                            refusal: Box::new(err),
+                            waited_secs: waited,
+                        });
                     }
                 }
                 on_wait(&format!("waiting for fleet capacity: {err}"));
@@ -589,6 +626,14 @@ fn wait_for_fleet_capacity(
 /// `20261110-b-c314f9`) — a caller that is not waiting still only ever
 /// calls it once.
 ///
+/// `chain_source` is the same idea for the seat chain (card
+/// `20261123-b-31b32b`): a `--wait-for-seat` dispatch hands it to
+/// [`selector::select_or_wait`], which calls it fresh on every poll, so a
+/// capped seat whose open count drops mid-wait is seen on the next poll.
+/// It used to get a static copy of `req.chain`, so a seat full when the
+/// wait began stayed full until the timeout. A dispatch that does not
+/// wait selects from `req.chain` and never calls it.
+///
 /// `sleeper` is the same injectable seam [`selector::select_or_wait`]
 /// already takes — a real caller passes `&mut selector::RealSleeper`, a
 /// test passes a fake that records calls instead of blocking (card
@@ -602,6 +647,7 @@ pub fn plan_dispatch(
     accounts: &dyn AccountLookup,
     budget: &dyn ReviewBudget,
     capacity: &mut dyn FnMut() -> FleetCapacityInputs,
+    chain_source: &mut dyn FnMut() -> Vec<Seat>,
     halt: &dyn HaltQuery,
     breaker: &dyn BreakerQuery,
     sleeper: &mut dyn selector::Sleeper,
@@ -619,17 +665,19 @@ pub fn plan_dispatch(
     // exemption below (`dispatch.py`'s `plan`: `False` is passed for
     // dry-run) — it plans and renders only, so it always takes the
     // no-wait path regardless of `--wait-for-seat`.
-    if req.wait_for_capacity && !req.dry_run {
+    let waited = if req.wait_for_capacity && !req.dry_run {
         wait_for_fleet_capacity(
             capacity,
             req.capacity_timeout,
+            req.already_waited,
             selector::DEFAULT_POLL_INTERVAL_SECS,
             sleeper,
             &mut |_msg: &str| {},
-        )?;
+        )?
     } else {
         check_fleet_capacity(&capacity())?;
-    }
+        req.already_waited
+    };
     check_reviewer_preconditions(
         req.role,
         req.reviewer_role,
@@ -674,20 +722,28 @@ pub fn plan_dispatch(
     // takes the no-wait path regardless of `--wait-for-seat`
     // (`dispatch.py`'s `plan`: `False` is passed for dry-run).
     if req.wait_for_capacity && !req.dry_run {
-        let chain = req.chain.to_vec();
         let opts = selector::WaitOptions {
-            timeout: req.capacity_timeout,
+            // Whatever the fleet-capacity wait above already spent comes
+            // out of the same `--wait-for-seat-seconds` budget.
+            timeout: req.capacity_timeout.map(|t| (t - waited).max(0.0)),
             poll_interval: selector::DEFAULT_POLL_INTERVAL_SECS,
             sleeper,
             on_wait: &mut |_msg: &str| {},
         };
-        Ok(selector::select_or_wait(
-            &params,
-            breaker,
-            move || chain.clone(),
-            opts,
-            Instant::now,
-        )?)
+        // A timed-out seat wait reports the whole dispatch's wait (card
+        // `20261123-b-853616`), not only the seat-level part of it — the
+        // same budget [`DispatchError::CapacityWaitTimedOut`] counts.
+        selector::select_or_wait(&params, breaker, chain_source, opts, Instant::now).map_err(
+            |err| match err {
+                WaitError::TimedOut { error, waited_secs } => {
+                    DispatchError::Wait(WaitError::TimedOut {
+                        error,
+                        waited_secs: waited + waited_secs,
+                    })
+                }
+                other => DispatchError::Wait(other),
+            },
+        )
     } else {
         Ok(selector::select(req.chain, &params, breaker, now)?)
     }
@@ -1372,6 +1428,7 @@ mod tests {
             fleet_min_quota_percent: None,
             wait_for_capacity: false,
             capacity_timeout: None,
+            already_waited: 0.0,
             force: false,
             dry_run: false,
         };
@@ -1381,6 +1438,7 @@ mod tests {
             &accounts,
             &budget,
             &mut || capacity(),
+            &mut || chain.to_vec(),
             &halt,
             &AlwaysOpenBreaker,
             &mut selector::RealSleeper,
@@ -1414,6 +1472,7 @@ mod tests {
             fleet_min_quota_percent: None,
             wait_for_capacity: false,
             capacity_timeout: None,
+            already_waited: 0.0,
             force: false,
             dry_run: false,
         };
@@ -1423,6 +1482,7 @@ mod tests {
             &accounts,
             &budget,
             &mut || capacity(),
+            &mut || chain.to_vec(),
             &halt,
             &AlwaysOpenBreaker,
             &mut selector::RealSleeper,
@@ -1459,6 +1519,7 @@ mod tests {
             fleet_min_quota_percent: None,
             wait_for_capacity: true, // requested, but...
             capacity_timeout: Some(0.01),
+            already_waited: 0.0,
             force: false,
             dry_run: true, // ...dry-run must still return immediately, never wait.
         };
@@ -1471,6 +1532,7 @@ mod tests {
             &accounts,
             &budget,
             &mut || capacity(),
+            &mut || chain.to_vec(),
             &halt,
             &AlwaysOpenBreaker,
             &mut selector::RealSleeper,
@@ -1524,8 +1586,15 @@ mod tests {
         let mut messages = Vec::new();
         let mut on_wait = |msg: &str| messages.push(msg.to_string());
 
-        wait_for_fleet_capacity(&mut capacity, Some(100.0), 1.0, &mut sleeper, &mut on_wait)
-            .expect("capacity frees on the third re-count");
+        wait_for_fleet_capacity(
+            &mut capacity,
+            Some(100.0),
+            0.0,
+            1.0,
+            &mut sleeper,
+            &mut on_wait,
+        )
+        .expect("capacity frees on the third re-count");
 
         assert_eq!(polls.get(), 3);
         assert_eq!(sleeper.calls.len(), 2);
@@ -1534,22 +1603,64 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_fleet_capacity_times_out_with_the_original_refusal_when_never_freed() {
+    fn wait_for_fleet_capacity_times_out_with_the_original_refusal_and_how_long_it_waited() {
         let mut capacity = full_capacity;
         let mut sleeper = FakeSleeper { calls: vec![] };
         let mut on_wait = |_: &str| {};
 
-        let err =
-            wait_for_fleet_capacity(&mut capacity, Some(5.0), 2.0, &mut sleeper, &mut on_wait)
-                .unwrap_err();
+        let err = wait_for_fleet_capacity(
+            &mut capacity,
+            Some(5.0),
+            0.0,
+            2.0,
+            &mut sleeper,
+            &mut on_wait,
+        )
+        .unwrap_err();
 
+        let DispatchError::CapacityWaitTimedOut {
+            refusal,
+            waited_secs,
+        } = &err
+        else {
+            panic!("expected a timed-out wait, got {err:?}");
+        };
         assert!(matches!(
-            err,
+            **refusal,
             DispatchError::FleetCapExceeded { running: 1, cap: 1 }
         ));
+        assert_eq!(*waited_secs, 5.0);
         assert_eq!(
             err.to_string(),
-            "1 agent(s) already running and max_concurrent is 1; nothing was started"
+            "1 agent(s) already running and max_concurrent is 1; nothing was started \
+             (gave up after waiting 5s with --wait-for-seat)"
+        );
+    }
+
+    /// Card `20261122-b-4c82c5`: a re-plan after admission found the fleet
+    /// full again carries the wait it already spent, so the budget bounds
+    /// the whole dispatch and the refusal reports all of it.
+    #[test]
+    fn wait_for_fleet_capacity_counts_an_earlier_wait_against_the_same_budget() {
+        let mut capacity = full_capacity;
+        let mut sleeper = FakeSleeper { calls: vec![] };
+        let mut on_wait = |_: &str| {};
+
+        let err = wait_for_fleet_capacity(
+            &mut capacity,
+            Some(10.0),
+            8.0,
+            30.0,
+            &mut sleeper,
+            &mut on_wait,
+        )
+        .unwrap_err();
+
+        assert_eq!(sleeper.calls, vec![std::time::Duration::from_secs(2)]);
+        assert!(
+            err.to_string()
+                .ends_with("(gave up after waiting 10s with --wait-for-seat)"),
+            "{err}"
         );
     }
 
@@ -1582,6 +1693,7 @@ mod tests {
             fleet_min_quota_percent: None,
             wait_for_capacity,
             capacity_timeout: Some(100.0),
+            already_waited: 0.0,
             force: false,
             dry_run,
         }
@@ -1616,6 +1728,7 @@ mod tests {
             &accounts,
             &budget,
             &mut capacity,
+            &mut || chain.to_vec(),
             &halt,
             &AlwaysOpenBreaker,
             &mut sleeper,
@@ -1649,6 +1762,7 @@ mod tests {
             &accounts,
             &budget,
             &mut full_capacity,
+            &mut || chain.to_vec(),
             &halt,
             &AlwaysOpenBreaker,
             &mut sleeper,
@@ -1678,6 +1792,7 @@ mod tests {
             &accounts,
             &budget,
             &mut full_capacity,
+            &mut || chain.to_vec(),
             &halt,
             &AlwaysOpenBreaker,
             &mut sleeper,
@@ -1687,5 +1802,213 @@ mod tests {
 
         assert!(matches!(err, DispatchError::FleetCapExceeded { .. }));
         assert!(sleeper.calls.is_empty());
+    }
+
+    /// Card `20261122-b-4c82c5`: a fleet already *over* its cap (the cap
+    /// lowered under live agents — 12/10 in the report) waits exactly like
+    /// a fleet at its cap, re-counting each poll until the count drops
+    /// below the cap, then selects.
+    #[test]
+    fn plan_dispatch_waits_on_a_fleet_over_its_cap_until_the_count_drops() {
+        let chain = [plain_seat("a")];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        let req = base_wait_req(&chain, true, false);
+
+        let polls = std::cell::Cell::new(0u32);
+        let mut capacity = || {
+            let n = polls.get();
+            polls.set(n + 1);
+            let mut inputs = full_capacity();
+            inputs.max_concurrent = 10;
+            // cap + 1 for the first three re-counts, then cap - 1.
+            inputs.fleet_open = if n < 3 { 11 } else { 9 };
+            inputs
+        };
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let selection = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut capacity,
+            &mut || chain.to_vec(),
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .expect("the over-cap fleet drops below its cap on the fourth re-count");
+
+        assert_eq!(selection.seat.name, "a");
+        assert_eq!(polls.get(), 4);
+        assert_eq!(sleeper.calls.len(), 3);
+    }
+
+    /// Card `20261122-b-4c82c5`: a short limit against a fleet that stays
+    /// over its cap refuses with the capacity refusal and how long it
+    /// waited, after polling rather than at once.
+    #[test]
+    fn plan_dispatch_over_cap_with_a_short_limit_reports_how_long_it_waited() {
+        let chain = [plain_seat("a")];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        let mut req = base_wait_req(&chain, true, false);
+        req.capacity_timeout = Some(45.0);
+        let mut capacity = || {
+            let mut inputs = full_capacity();
+            inputs.max_concurrent = 10;
+            inputs.fleet_open = 12;
+            inputs
+        };
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let err = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut capacity,
+            &mut || chain.to_vec(),
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            sleeper.calls,
+            vec![
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(15)
+            ]
+        );
+        assert_eq!(
+            err.to_string(),
+            "12 agent(s) already running and max_concurrent is 10; nothing was started \
+             (gave up after waiting 45s with --wait-for-seat)"
+        );
+    }
+
+    /// Card `20261123-b-31b32b`: a `--wait-for-seat` dispatch whose only
+    /// seat is at its open-agent cap re-reads the chain every poll, so the
+    /// seat is picked up once its count drops. Handing the selector a
+    /// static copy of `req.chain` (the old wiring) polls the at-cap
+    /// snapshot until the timeout instead.
+    #[test]
+    fn plan_dispatch_picks_up_a_capped_seat_whose_count_drops_mid_wait() {
+        let mut capped = plain_seat("capped");
+        capped.cap = Some(2);
+        capped.open_count = Some(2);
+        let chain = [capped];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        let mut req = base_wait_req(&chain, true, false);
+        req.policy = FallbackPolicy::Queue;
+        req.capacity_timeout = Some(120.0);
+
+        let reads = std::cell::Cell::new(0u32);
+        let mut chain_source = || {
+            let n = reads.get();
+            reads.set(n + 1);
+            let mut seats = chain.to_vec();
+            if n >= 2 {
+                seats[0].open_count = Some(1);
+            }
+            seats
+        };
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let selection = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut capacity,
+            &mut chain_source,
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .expect("the seat's live count drops below its cap on the third read");
+
+        assert_eq!(selection.seat.name, "capped");
+        assert_eq!(reads.get(), 3);
+        assert_eq!(sleeper.calls.len(), 2);
+    }
+
+    /// Card `20261122-b-4c82c5`: time spent waiting on fleet capacity comes
+    /// out of the same budget the seat wait then gets.
+    #[test]
+    fn plan_dispatch_seat_wait_gets_only_what_the_fleet_wait_left() {
+        let mut capped = plain_seat("capped");
+        capped.cap = Some(1);
+        capped.open_count = Some(1);
+        let chain = [capped];
+        let accounts = fake_accounts();
+        let routing = FakeRouting {
+            entries: HashMap::new(),
+        };
+        let budget = FakeBudget(0);
+        let halt = FakeHalt(Ok(None));
+        let mut req = base_wait_req(&chain, true, false);
+        req.policy = FallbackPolicy::Queue;
+        req.capacity_timeout = Some(40.0);
+        let polls = std::cell::Cell::new(0u32);
+        let mut capacity = || {
+            let n = polls.get();
+            polls.set(n + 1);
+            let mut inputs = full_capacity();
+            if n >= 1 {
+                inputs.fleet_open = 0;
+            }
+            inputs
+        };
+        let mut sleeper = FakeSleeper { calls: vec![] };
+
+        let err = plan_dispatch(
+            &req,
+            &routing,
+            &accounts,
+            &budget,
+            &mut capacity,
+            &mut || chain.to_vec(),
+            &halt,
+            &AlwaysOpenBreaker,
+            &mut sleeper,
+            Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DispatchError::Wait(_)), "{err:?}");
+        assert_eq!(
+            sleeper.calls,
+            vec![
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(10)
+            ]
+        );
+        // Card `20261123-b-853616`: the refusal says how long the whole
+        // dispatch waited — fleet wait and seat wait together.
+        assert!(
+            err.to_string()
+                .ends_with(" (gave up after waiting 40s with --wait-for-seat)"),
+            "{err}"
+        );
     }
 }

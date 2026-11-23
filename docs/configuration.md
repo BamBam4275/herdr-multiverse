@@ -62,7 +62,8 @@ The example file, [`config.example.toml`](../config.example.toml), is the
 intended fleet-wide schema:
 
 - Top-level knobs such as `max_concurrent`, quota floors, and board
-  settings.
+  settings. Board colour is off by default until the terminal is
+  confirmed — see [Board colour](#board-colour).
 - `[accounts.<name>]` — one seat per vendor login (`kind`,
   `config_dir_var`, `config_dir`, `pool`, `available`, optional `short`,
   `interactive`, `command`, `model`, `nexus_slots`). `kind` must be one of
@@ -129,6 +130,107 @@ intended fleet-wide schema:
   the config still loads and the value is still passed through. An empty
   string is still a load-time config error.
 
+**Sweep stall wake.** A Claude lane can end its turn to wait on its own
+background shell, and Herdr reports it idle exactly like a finished lane.
+If the job's completion notification then fails to wake it, `multiverse
+sweep` sends one stall wake (printing `woke stalled: <id>`, or `would wake
+stalled: <id>` under `--dry-run` or a fleet halt), but only after that
+lane's one-shot `finish: write result.md and status` nudge is spent and
+only while it still has no result. The pane must show
+`⏺ Background command "…" completed (exit code N)` below its last turn-end
+line, with only an empty composer after it, and that pane text must have
+stayed unchanged for 15 minutes, not counting host sleep. The wait is a
+fixed constant, not a config key. The wake is claimed once per task in
+`.multiverse/stall-wake-memory.json`. The pane-unchanged clock lives in
+`.multiverse/idle-pane-memory.json` (`idle_pane_since` in
+`crates/mv-state/src/nudge_memory.rs`): an applying sweep pass seeds and
+rewrites it; `--dry-run`, a fleet halt, and `MULTIVERSE_READ_ONLY=1`
+read an existing clock and never write the file. Codex lanes are not
+woken this way yet. A lane whose footer still shows a running background
+shell or monitor (below) is never stall-woken: the job it waits on has
+not finished, even when an earlier background command's completion line
+is on screen.
+
+**Stuck resume.** A lane past the stuck threshold with a matching pane
+banner is not resumed on the first observation. `sweep` records that
+read in `.multiverse/stuck-signal-memory.json` and only confirms stuck
+on a later pass that sees the same fingerprint
+(`stuck_signal_confirmed` in `crates/mv-state/src/nudge_memory.rs`).
+
+**Waiting on a shell.** A Claude lane back at its prompt while a
+background shell or monitor it started is still running shows a footer
+segment such as `· 1 shell ·`, `2 shells still running`, or `1 monitor
+still running` below its composer, and Herdr reports it idle/done exactly
+like a finished lane. `multiverse workers` prints such a lane's STATUS as
+`waiting-on-shell`, and the board card reads `waiting-on-shell: a
+background shell is still running — not finished, do not reclaim` instead
+of `stalled`. Both read the pane text they already read (`workers` for its
+`stalled` check, the board for its blocking-prompt probe), so neither
+makes an extra Herdr call. The label is display only and takes precedence
+over `stalled`, since a long, quiet test run is the lane waiting rather
+than frozen. Only lines below the pane's last `❯` composer line are read,
+so the same words in the transcript never count. The `workers N/CAP` line
+and the dispatch gate are one number, computed by one function from the
+same Herdr listing. It counts every unrecorded worker lane whose agent
+Herdr still lists, whatever its STATUS reads — working,
+`waiting-on-shell`, any other idle/done lane whose OUTCOME is `running`,
+and `done-unrecorded` rows until they are reconciled — and any live pane
+carrying a dispatched worker name that no task history accounts for. A
+lane dispatched within its seat's startup grace (default 600 seconds)
+counts even before Herdr lists it, so `N` can be one more than the table
+has rows for a minute after a dispatch. Nexus sessions are excluded, as
+the `nexus sessions` line says, and so are recorded lanes whose pane
+Herdr has not reaped yet (they still print a row). Several tasks under
+one reissued agent name count once. At admission, under the fleet lock,
+dispatch always asks Herdr for a fresh listing and refuses (or, with
+`--wait-for-seat`, waits) whenever this count is at or above
+`max_concurrent`. Planning, including `--dry-run`, makes that call only
+when its cheaper count from task history alone is already full, so a dry
+run can report room that admission then refuses. If Herdr cannot be asked, the gate counts
+every unrecorded worker lane instead. A refusal names the count the way
+the panel does:
+`workers N/CAP: N agent(s) already running and max_concurrent is CAP;
+nothing was started`. `tasks --reclaimable` and the reclaim pass every
+dispatch runs first keep a recorded Claude lane's pane open while its
+footer still shows a running shell (`kept … waiting-on-shell` in
+`--reclaimable`'s report, `kept N waiting-on-shell pane(s)` before a
+dispatch), and also keep a Claude pane whose text cannot be read.
+
+A finished lane can leave processes behind whose cwd is still inside its
+worktree: a `tail -f` of its suite log, a `zsh -c`, a `ugrep`, an ssh
+ControlMaster, each reparented to pid 1. Such a process makes
+`worktrees --merge` refuse with "lane has a live process cwd". The refusal
+lists each holder's pid, command and cwd, and names the command that ends
+them, `worktrees <path> --prune --reap --yes`. `--prune` checks every
+*dead* lane for leftovers, whatever its reason for being kept. A dead lane
+is one whose pane Herdr no longer lists and that either has a recorded
+pane or a terminal outcome for every task in it. A plain `--prune` names
+each leftover. `--reap --dry-run` prints `would reap` for each one.
+`--reap` with `--yes`, or without `--dry-run`, ends them: an ssh master
+gets `ssh -O exit -S <socket>` first, then each process gets SIGTERM, a
+short wait, a re-check of its command and cwd, and SIGKILL only if it is
+still the same process. `tasks --reclaimable --yes` does the same for a
+lane right after it closes that lane's pane, `--reap` or not, printing
+what it ended. Without `--yes` it prints only `would reap`.
+`--reclaimable --reap` also covers a stale entry whose pane was already
+gone. In a dead lane, a shell is reaped like any other leftover. Pid 1,
+Herdr, the running command and every ancestor of it are never reaped,
+and nothing is reaped under `--force`.
+
+`worktrees --merge` ends known-benign leftovers itself, whether or not
+the lane's pane is gone. A holder is benign only when its command name
+and its parent agree, never because of its cwd alone: a `caffeinate` or
+an ssh ControlMaster that is orphaned (parent pid 1) or whose lane's pane
+is gone; a `tail`, `ugrep` or `grep` that is orphaned; a shell whose
+lane's pane is gone. When every holder is benign, `--merge` prints
+`ending leftover pid …` for each, ends it the way `--reap` does, and
+retries the merge once. A holder that is still there after that one pass
+refuses the merge again, named. Any other holder, such as a stopped
+pane's own shell or a running build, refuses the merge without ending
+anything. The refusal lists each holder's pid, full command, cwd and why
+it is not a known leftover. To keep ssh masters out of lanes, give lane
+ssh sessions a short `ControlPersist` or a `ControlPath` outside the lane.
+
 A `<<PLACEHOLDER: ...>>` marker is carried through, never guessed at, by
 any tool that loads the file (`mv_config::placeholder::MaybePlaceholder`)
 — a run against an unfilled placeholder fails with a configuration error
@@ -173,12 +275,91 @@ passes the result through `mv-core::redact` (see [Redaction](#redaction)
 below) as a second pass. `multiverse check` reports when `[secrets_scan]`
 is required and `gitleaks` cannot be found.
 
+## Merge gate: outcome and ignored files
+
+Apart from the secrets scan, `worktrees --merge <task>` checks two more
+things before it lands a lane:
+
+- **Outcome.** `<task>` can be the lane's own task id or the id of any
+  `dispatch --into` round that adopted the lane. In both cases the lane's
+  own branch, `multiverse/<lane>`, is what merges. The gate looks at every
+  task that has owned the lane and takes the newest outcome the
+  project's `routing.log` records for them. That includes
+  `tasks --supersede` corrections, but only when the correction targets
+  that newest outcome line. The merge goes ahead only if that outcome is
+  `done` and the task has a non-empty `result.md`. The status file is a
+  fallback, used only when the newest round has no recorded outcome yet
+  or the log names no owner. `tasks --supersede --status done --yes` also
+  rewrites the task's status file inside its worktree (when the worktree
+  still exists), so the file matches the corrected record.
+- **Ignored files.** The merge refuses on a gitignored file in the lane
+  unless that file is regenerable. The built-in list is `.multiverse/`,
+  `*.pyc`, any `target/`, `__pycache__/`, `node_modules/`,
+  `prisma/generated/` or `*.egg-info/` directory, and root-level `bin/`,
+  `.venv/` and `.pytest_cache/`. If a project's `lane_setup` produces
+  other ignored output, declare it in the project's own
+  `.multiverse/roster.toml`:
+
+  ```toml
+  [lane_setup]
+  regenerable = ["src/generated/", "*.tsbuildinfo"]
+  ```
+
+  Entries follow gitignore rules: a trailing `/` matches only a directory;
+  a pattern with a leading or inner `/` is anchored at the repository root;
+  a single-component pattern matches at any depth; `*` and `?` match
+  within one path component. An entry that is empty, contains a `..`
+  component or contains a control character, an unknown key in
+  `[lane_setup]`, or a non-list value is a load error (exit code 3). For
+  any other ignored file, the refusal names the path and shows the
+  `regenerable` entry that would declare it. This list applies only to
+  `--merge`; `--prune` still uses just the built-in list.
+
+## Board colour
+
+`multiverse board` emits ANSI SGR color only when the terminal is
+confirmed. A first Linux install inside a Herdr board tab otherwise
+prints fragments like `[92m` / `[0m` as text: the renderer emits a
+real ESC byte (`0x1b`) in front of every SGR sequence, `visible_width`
+skips those sequences, and if the pane then drops the ESC the leftover
+brackets become visible characters the width math did not count, so
+cards overlap.
+
+Color stays **off** unless every one of these is true:
+
+- stdout is a tty
+- `TERM` is unset or is not `dumb`
+- the process is not inside a Herdr pane (`HERDR_ENV=1` or a non-empty
+  `HERDR_PANE_ID` — plugin-directory variables and `HERDR_BIN_PATH` do
+  not count)
+- the terminal names color support: a non-empty `COLORTERM`, or `TERM`
+  containing `color`, `256`, or `xterm` (matched case-insensitively)
+
+`--no-color` and a non-empty `NO_COLOR` always suppress color, including
+when the terminal is confirmed and when `--color always` is passed.
+`--color {always,auto,never}` (default `auto`) is the board flag:
+`always` forces color on even inside a Herdr pane and even when stdout
+is not a tty; `never` is the same as `--no-color`. `--no-color` wins if
+both are passed. `[board].color` is a boolean (default `false`); `true`
+is the config equivalent of `--color always`, for a fleet that wants
+color in the dashboard / home board tabs Herdr starts. A non-boolean
+value such as `"always"` is a load-time type error.
+
+The home `board` tab and per-project dashboard tab that `multiverse
+start` opens do **not** pass `--color` or `--no-color` on the pane-run
+script; the board process applies the rules above itself, so an
+operator can opt in with `--color always` or `[board].color = true`
+without the launch argv fighting them.
+
 ## Roster files
 
 Accounts and roles both live in `config.toml` — there is no separate
 fleet-wide roster file. The one `roster.toml` the loader reads is
 per-project: **`<project>/.multiverse/roster.toml`**, inside the
-project's own repository, naming chain overrides only. An override
+project's own repository, naming chain overrides (`[chains]`) and,
+optionally, the merge gate's `[lane_setup] regenerable` list (see
+[Merge gate: outcome and ignored files](#merge-gate-outcome-and-ignored-files)).
+An override
 replaces the named role's chain entirely; roles the file does not
 mention keep the chain from `config.toml`. An unknown top-level table
 there is a hard error, not a warning or a silently ignored key. A
@@ -232,12 +413,139 @@ the root counts as a per-lane cache.
 - **Authorization:** caches are freed only with `--yes` (or `--force`).
   Plain `--prune` and `--dry-run` only report `would free`.
 - **Output:** `freed`/`would free build-dir (N bytes)` under a lane, or
-  `kept build-dir — <reason>` / `build-dir unresolved — <reason>`. The sweep
-  prints `cargo shared-build <dir>` followed by the same freed / would-free
-  line.
+  `kept build-dir — <reason>` / `build-dir unresolved — <reason>`. The
+  orphan sweep prints `cargo shared-build <dir>` followed by the same
+  freed / would-free line, or `kept build-dir — <reason>` when a delete
+  failed (`crates/mv-cli/src/commands/worktrees.rs`).
 
 The full rules are in the `--prune` row of
 [`docs/parity.md`](parity.md#worktrees).
+
+## Codex lane isolation
+
+Every dispatched or council Codex seat launches with
+`-c default_permissions="fleet"` and defines that `fleet` permission
+profile on the same command line (`apply_codex_worktree_permissions` in
+`crates/mv-engine/src/runner.rs` always emits
+`permissions.fleet.extends=":workspace"` even when the filesystem table
+cannot be built), so no `~/.codex/config.toml` setting is needed or
+consulted for it:
+
+- `permissions.fleet.extends=":workspace"` — reads anywhere, writes to the
+  workspace root (`-C <worktree>`) and temp directories.
+- `permissions.fleet.filesystem={...}` — `write` on the worktree, the
+  project's common `.git` and the lane's own gitdir, `~/.docker/buildx`,
+  and Go's hardcoded caches `$HOME/Library/Caches/go-build` and
+  `$HOME/go/pkg/mod` (`crates/mv-engine/src/codex_worktree_permissions.rs`);
+  `deny` on every entry *beside* the path from the project's parent
+  directory down to the worktree — sibling projects, the main checkout's
+  own files and `.multiverse` state, and other lanes' worktrees. Other
+  lanes' gitdirs under `<common>/.git/worktrees/` are denied the same
+  way, and `.git/hooks` is always denied, so a seat cannot retarget
+  another lane's HEAD/index or plant a hook that later runs unsandboxed.
+- For a writer lane, `write` on the project's `.multiverse` directory
+  itself, so the lane-side commands its brief names keep working:
+  `multiverse activity update` and `activity inbox --peek` append to
+  `routing.log` under `routing.log.lock`, maintain the
+  `routing.log.index`/`routing.log.index.fp` sidecars and rewrite
+  `activity.lastseen`, and `multiverse scratch open|read|close` takes the
+  same lock. Those entries are left undenied; `worktrees` and
+  `activity.cursor` are narrowed back to `read` (a lane may read the
+  Nexus's inbox cursor but never advance it), and every other entry
+  there — `tasks` (other tasks), `briefs`, `inputs`, `evidence`,
+  `rescued`, `worktree-state`, the Nexus seed, `PASSDOWN.md` — stays
+  `deny`, which also refuses renaming or deleting it. The lane's own
+  `result.md` and `status` live in `<worktree>/.multiverse/tasks/<task>`,
+  inside the worktree's own grant. Directory-level `write` is needed
+  because the lock path sets the directory's mode and the sidecars are
+  replaced through a temp file beside them.
+- For a reader dispatch (no worktree), `write` on `.multiverse` (the
+  lock `chmod` and sidecar temp files), `.multiverse/tasks/<task-id>`,
+  and the lane-state files (`routing.log` and its lock/index,
+  `activity.lastseen`); `read` on every other existing child of
+  `.multiverse` and of the project. `:workspace` already writes the
+  project cwd, and a same-path `read` loses to that `write`, so the
+  project root is not listed; the child `read` entries are the
+  carve-out that stops a rewrite of `PASSDOWN.md`, other tasks, briefs,
+  or the checkout. The task directory stays writable as a child `write`
+  under `tasks` `read`. That seat can still write its own
+  `result.md`/`status` and append to the routing log.
+
+A profile with a `deny` entry is the only Codex setting that restricts
+reads: Codex's macOS Seatbelt policy then drops its blanket read allow, so
+a denied path is unreadable to every command the agent runs. The parent
+directories themselves stay readable (git needs them to resolve the
+worktree's real path), so a lane can list sibling names but not open
+them. The deny list is computed when the lane launches; anything created
+after that — a later lane's worktree — stays readable, and a new entry
+directly under the project's `.multiverse` is also writable. Ancestors of
+`$HOME` are never listed. A project sitting directly in `$HOME` does
+deny its HOME-level siblings (`~/other-project`, `~/.ssh`) except the
+toolchain directories the builder already names (`~/.cargo`,
+`~/.rustup`, `~/.codex`, and the ancestors of the HOME-relative write
+grants). If `$HOME` does not resolve, those HOME-relative grants are
+omitted rather than rewritten under `/`. Sibling names that contain C0
+control characters are escaped in the table so a planted newline cannot
+drop the filesystem map. The profile is never combined with
+`--sandbox`/`sandbox_mode`, which cannot deny reads. The builder is
+`crates/mv-engine/src/codex_worktree_permissions.rs`.
+
+## Vendor folder trust
+
+Codex and Grok both ask, the first time they open a folder, whether to
+trust it, and park there until someone answers. A dispatch answers that
+question ahead of time in the seat's own config directory, for the
+project root and the lane worktree (one entry when they are the same
+path), immediately before the seat starts:
+
+- Codex: `[projects."<path>"] trust_level = "trusted"` in
+  `$CODEX_HOME/config.toml` (`crates/mv-engine/src/codex_trust.rs`).
+- Grok: `[folders."<path>"] trusted = true` (plus `decided_at`, the Unix
+  time) in `$GROK_HOME/trusted_folders.toml`, under the
+  `trusted_folders.toml.lock` lock Grok itself uses
+  (`crates/mv-engine/src/grok_trust.rs`). This is Grok's own folder-trust
+  store, the one `grok --trust` and an interactive `y` write. A nested
+  git checkout counts as a separate folder to Grok, so the lane gets its
+  own entry.
+
+Paths are canonicalized (`/private/var/...`, not `/var/...`, on macOS).
+Entries already marked trusted are left alone and everything else in
+the file is kept as it was. An explicit "not trusted" entry
+(`trust_level` other than `"trusted"`, or `trusted = false`) is never
+overwritten: the dispatch is refused and names the folder. Remove or
+change that entry to dispatch there. A Grok seat with no `GROK_HOME` in
+its launch environment is skipped rather than falling back to `~/.grok`.
+
+If a trust dialog shows up anyway (a seat not configured as above, or a
+Claude "Do you trust the files in this folder?"), the dispatch never
+answers it. It waits up to the readiness budget for someone to clear it,
+then delivers the brief. If the dialog swallowed a brief that had
+already been typed, the brief is sent again once. If the dialog is still
+up when the wait ends, the pane is kept, the task is **not** recorded
+`failed-to-start` (it stays awaiting on that live pane), and
+`.multiverse/evidence/<task>-failed-to-start.txt` is written with
+`reason: needs-attention:trust-dialog`. If the pane has left the dialog
+by then, the dispatch is recorded `failed-to-start` with that reason as
+usual.
+
+**Failed-to-start evidence.** When a dispatch fails after a pane exists,
+`finalize_dispatch_attempt` writes
+`.multiverse/evidence/<task>-failed-to-start.txt`
+(`capture_failed_to_start_evidence` in `crates/mv-engine/src/runner.rs`)
+unless a tripped breaker already wrote pane evidence under that
+directory. A failure before the pane exists writes none. The file
+starts with `reason: <tag>`. The same tag is the routing-log `reason=`
+field (`failed_to_start_reason`):
+
+- `needs-attention` — a parked dialog or menu other than a still-up
+  trust dialog
+- `needs-attention:trust-dialog` — a trust dialog (evidence is written;
+  the task is not recorded `failed-to-start` while the dialog is still
+  up)
+- `not-ready-timeout` — the pane did not become readable and ready
+- `unreadable-pane` — the pane is unreadable
+- `blank-after-prompt` — the pane went blank after the prompt was typed
+- `start-error` — every other start failure
 
 ## Redaction
 

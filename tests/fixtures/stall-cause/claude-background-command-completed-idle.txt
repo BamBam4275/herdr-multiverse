@@ -1,0 +1,11 @@
+⏺ I'll wait for this background run to finish before continuing.
+
+⏺ Still running — I'll wait for its completion notification rather than poll further.
+
+✻ Worked for 50s · done 7:42 PM
+
+⏺ Background command "Run the full conformance suite against the rust binary" completed (exit code 0)
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────

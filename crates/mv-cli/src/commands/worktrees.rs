@@ -38,7 +38,9 @@
 //! previews cleanup paths and byte totals without deleting them; with
 //! `--prune` its removable set matches what `--yes` would remove, and with
 //! `--rescue` it names what each lane's rescue would copy without copying
-//! anything.
+//! anything, and prints `skipped (regenerable)` for a venv/`*.egg-info`/
+//! similar cache inside `.multiverse/tasks/<task>/` rather than refusing
+//! the lane on the symlinks those caches contain (card `20261122-b-4961e4`).
 //!
 //! Card `20261115-b-9815fe`: `--prune --reap` is an opt-in reaper, report by
 //! default. A kept lane whose only refusal is "lane has a live process cwd"
@@ -55,8 +57,8 @@ use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
 use mv_state::worktrees::{
-    BranchOutcome, HerdrLaneObserver, MergeError, PruneOutcome, QuarantineOutcome,
-    QuarantineReason, Worktrees,
+    BranchOutcome, HerdrLaneObserver, MergeError, OrphanedBuildDir, PruneOutcome,
+    QuarantineOutcome, QuarantineReason, RescueReport, Worktrees,
 };
 
 use super::doctor::resolve_config_path;
@@ -88,6 +90,26 @@ fn action_line(outcome: &PruneOutcome) -> String {
     }
 }
 
+/// The lines `--prune` prints for the orphaned shared-build sweep: each
+/// hash dir it returned, then whether it was freed (or, under `preview`,
+/// would be) or kept and why. Card `20261119-b-a9f95f`: a delete that
+/// failed leaves the dir on disk, so it is never reported as freed. Card
+/// `20261122-b-a5e62d`: every dir the sweep returns gets its own pair of
+/// lines, including one its scan budget ran out on, which it now returns
+/// as kept rather than dropping.
+fn orphaned_build_dir_lines(build_dirs: &[OrphanedBuildDir], preview: bool) -> Vec<String> {
+    let verb = if preview { "would free" } else { "freed" };
+    let mut lines = Vec::new();
+    for build_dir in build_dirs {
+        lines.push(format!("  cargo shared-build {}", build_dir.path.display()));
+        lines.push(match &build_dir.kept {
+            Some(reason) => format!("    kept build-dir — {reason}"),
+            None => format!("    {verb} build-dir ({} bytes)", build_dir.bytes),
+        });
+    }
+    lines
+}
+
 /// `lane_path`'s own lingering host processes, under `--reap` on
 /// `worktrees --prune` (card `20261115-b-9815fe`). Pulled out of `prune`
 /// as a pure function of one lane's own process snapshot so it is directly
@@ -100,16 +122,25 @@ fn action_line(outcome: &PruneOutcome) -> String {
 /// true previews "would reap" and signals nothing — both are the same
 /// "report, never kill" shape `--reap --dry-run`/plain `--prune` already
 /// promise. `reap` true and `dry_run` false is the one path that calls
-/// [`mv_engine::dockerreport::reap`]. A process [`mv_engine::dockerreport::protected`]
-/// names (a shell, Herdr itself, pid 1, or this process's own ancestor) is
-/// never reaped regardless of `reap`/`dry_run`.
+/// [`end_leftover`].
+///
+/// `snapshot` is one [`mv_engine::dockerreport::process_cwds`] read the
+/// caller shares across every lane in its pass; `None` means the probe
+/// failed. `dead` (card `20261122-b-78bcf9`, [`PruneOutcome::Kept`]'s
+/// `lane_dead`) picks which processes are never reaped: in a dead lane
+/// only [`leftover_protected`]'s own short list (pid 1, Herdr, this
+/// process and its ancestors), since a shell left behind there (`zsh -c`)
+/// is exactly the leftover that blocks `--merge`; otherwise the wider
+/// [`mv_engine::dockerreport::protected`] list, which also spares shells.
 fn reap_lane_notes(
     lane_path: &Path,
+    snapshot: Option<&[mv_engine::dockerreport::ProcessCwd]>,
+    dead: bool,
     reap: bool,
     dry_run: bool,
     ancestors: &[u32],
 ) -> (Vec<String>, bool) {
-    let Some(snapshot) = mv_engine::dockerreport::process_cwds() else {
+    let Some(snapshot) = snapshot else {
         return (
             vec!["    warning: process-cwd probe unknown".to_string()],
             false,
@@ -117,9 +148,14 @@ fn reap_lane_notes(
     };
     let mut notes = Vec::new();
     let mut any_reaped = false;
-    for process in mv_engine::dockerreport::processes_under(lane_path, &snapshot) {
+    for process in mv_engine::dockerreport::processes_under(lane_path, snapshot) {
         let label = mv_engine::dockerreport::process_label(&process);
-        if mv_engine::dockerreport::protected(&process, ancestors) {
+        let protected = if dead {
+            leftover_protected(&process, ancestors)
+        } else {
+            mv_engine::dockerreport::protected(&process, ancestors)
+        };
+        if protected {
             notes.push(format!(
                 "    lane process {label} (protected, never reaped)"
             ));
@@ -131,11 +167,429 @@ fn reap_lane_notes(
             notes.push(format!("    would reap {label}"));
         } else {
             notes.push(format!("    reaping {label}"));
-            mv_engine::dockerreport::reap(&process, mv_engine::dockerreport::DEFAULT_REAP_GRACE);
+            notes.push(format!(
+                "      {}",
+                reap_outcome_text(end_leftover(&process))
+            ));
             any_reaped = true;
         }
     }
     (notes, any_reaped)
+}
+
+/// Card `20261122-b-78bcf9`: never a reap target in a *dead* lane — one
+/// whose own pane is gone (`worktrees --prune`'s `lane_dead`) or was just
+/// closed by `tasks --reclaimable --yes`. Narrower than
+/// [`mv_engine::dockerreport::protected`] on purpose: a shell whose cwd is
+/// still inside a lane nobody occupies any more is a leftover too, and
+/// sparing it left `--merge` refused with nothing able to end it. Pid 1,
+/// Herdr itself, this process, and every ancestor of it are still never
+/// signaled, whatever cwd they report.
+pub(crate) fn leftover_protected(
+    process: &mv_engine::dockerreport::ProcessCwd,
+    ancestors: &[u32],
+) -> bool {
+    let first = process.command.split_whitespace().next().unwrap_or("");
+    let name = first.rsplit('/').next().unwrap_or(first);
+    process.pid <= 1
+        || process.pid == std::process::id()
+        || ancestors.contains(&process.pid)
+        || matches!(name, "herdr" | "herdr-server")
+}
+
+/// Ends one reap candidate: for an ssh ControlMaster
+/// ([`ssh_mux_master_socket`]) first asks it to exit cleanly with `ssh -O
+/// exit -S <socket>`, then always [`mv_engine::dockerreport::reap`] —
+/// SIGTERM, a short wait, pid identity (command and cwd) re-confirmed,
+/// SIGKILL only if it is still the same process. A master the `-O exit`
+/// already ended makes that SIGTERM a no-op.
+///
+/// Card `20261123-b-ccc2cc`: a snapshot's `command` is `ps`'s `comm=`
+/// column, which on macOS is only the executable (`ssh`), never the
+/// master's own `[mux]` title or its `-S` socket — so an `ssh` whose
+/// snapshot command alone does not show a master has its full argument
+/// list read ([`mv_engine::dockerreport::process_parent`]) before the
+/// `-O exit` decision.
+pub(crate) fn end_leftover(
+    process: &mv_engine::dockerreport::ProcessCwd,
+) -> mv_engine::dockerreport::ReapOutcome {
+    let socket = ssh_mux_master_socket(&process.command).or_else(|| {
+        (leftover_command_name(&process.command) == "ssh")
+            .then(|| mv_engine::dockerreport::process_parent(process.pid))
+            .flatten()
+            .and_then(|parent| ssh_mux_master_socket(&parent.args))
+    });
+    if let Some(socket) = socket {
+        ssh_mux_exit(&socket);
+    }
+    mv_engine::dockerreport::reap(process, mv_engine::dockerreport::DEFAULT_REAP_GRACE)
+}
+
+/// One line saying what [`end_leftover`] found, printed under its own
+/// "reaping" line so the operator sees what actually ended.
+pub(crate) fn reap_outcome_text(outcome: mv_engine::dockerreport::ReapOutcome) -> &'static str {
+    use mv_engine::dockerreport::ReapOutcome;
+    match outcome {
+        ReapOutcome::Reaped => "ended",
+        ReapOutcome::Killed => "ended (SIGKILL after the grace window)",
+        ReapOutcome::StillAlive => "NOT ended: still alive after SIGKILL",
+        ReapOutcome::IdentityChanged => "ended (its pid now names a different process, left alone)",
+    }
+}
+
+/// The control socket of an ssh ControlMaster `command` describes, when
+/// it is visibly one: OpenSSH's own `ssh: <socket> [mux]` process title for
+/// a backgrounded master, or an `ssh` command line that both asks to be a
+/// master (`-M`, or `-o ControlMaster=yes`) and names its socket (`-S
+/// <socket>`, or `-o ControlPath=<socket>`). A plain client using some
+/// other master's socket is deliberately never matched: `-O exit` on it
+/// would close a master that may be shared outside this lane, while a
+/// SIGTERM ends only the client.
+fn ssh_mux_master_socket(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let first = *tokens.first()?;
+    if first == "ssh:" {
+        return (tokens.len() >= 3 && tokens.last() == Some(&"[mux]"))
+            .then(|| tokens[1..tokens.len() - 1].join(" "));
+    }
+    if first.rsplit('/').next() != Some("ssh") {
+        return None;
+    }
+    let mut master = false;
+    let mut socket = None;
+    // ssh's own option grammar: a cluster of flags, the first of these
+    // that takes an argument consuming the rest of its token (or, when
+    // that is empty, the next token). The first non-option token is the
+    // destination; everything after it is the remote command, never read.
+    const TAKES_ARG: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    let mut rest = tokens[1..].iter();
+    while let Some(token) = rest.next() {
+        let Some(cluster) = token.strip_prefix('-') else {
+            break;
+        };
+        if cluster.is_empty() || cluster == "-" {
+            break;
+        }
+        for (at, flag) in cluster.char_indices() {
+            if !TAKES_ARG.contains(flag) {
+                master |= flag == 'M';
+                continue;
+            }
+            let inline = &cluster[at + flag.len_utf8()..];
+            let value = if inline.is_empty() {
+                rest.next().copied().unwrap_or("").to_string()
+            } else {
+                inline.to_string()
+            };
+            match flag {
+                'S' => socket = Some(value),
+                'o' => {
+                    if let Some((key, val)) = value.split_once('=') {
+                        if key.eq_ignore_ascii_case("ControlMaster") {
+                            master |= val.eq_ignore_ascii_case("yes");
+                        } else if key.eq_ignore_ascii_case("ControlPath") {
+                            socket = Some(val.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
+    socket.filter(|s| master && !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+}
+
+/// `ssh -O exit -S <socket>` with no config file read (`-F /dev/null`), so
+/// nothing in the operator's own `~/.ssh/config` runs; the destination is
+/// a placeholder `-O` never connects to. Bounded to a few seconds and its
+/// result ignored: [`end_leftover`]'s SIGTERM follows regardless.
+fn ssh_mux_exit(socket: &str) {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = Command::new("ssh")
+        .args(["-F", "/dev/null", "-S", socket, "-O", "exit", "mux"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The executable name of a snapshot `command`: its first word, path
+/// stripped, and a login shell's leading `-` (`-zsh`) dropped.
+fn leftover_command_name(command: &str) -> &str {
+    let first = command.split_whitespace().next().unwrap_or("");
+    let name = first.rsplit('/').next().unwrap_or(first);
+    name.strip_prefix('-').unwrap_or(name)
+}
+
+/// The refusal prefix `mv_state`'s own `clean` returns for a lane some
+/// process still uses as its cwd, and the one `--merge` refusal
+/// [`merge_through_leftovers`] acts on.
+const LIVE_CWD_REFUSAL: &str = "lane has a live process cwd";
+
+/// Card `20261123-b-ccc2cc`: the known-benign leftover class `process`
+/// belongs to, or `None` when it is anything else. Matched by command
+/// name *and* by being orphaned (`parent.ppid` 1) or its lane's pane
+/// being gone — never by cwd alone, which is all that made it a holder:
+///
+/// - `caffeinate` (an agent's own `caffeinate -t 300`), orphaned or with
+///   its pane gone;
+/// - an ssh ControlMaster ([`ssh_mux_master_socket`] on its full argument
+///   list), orphaned or with its pane gone — a plain ssh client never;
+/// - a Monitor's `tail`/`ugrep`/`grep`, only once orphaned;
+/// - a shell, only once its pane is gone.
+///
+/// `parent` `None` (the pid is gone, or `ps` could not read it) is never
+/// benign; neither is anything [`leftover_protected`] spares. `pane_gone`
+/// is only asked when a class needs it — it is one Herdr round trip.
+fn benign_leftover(
+    process: &mv_engine::dockerreport::ProcessCwd,
+    parent: Option<&mv_engine::dockerreport::ProcessParent>,
+    ancestors: &[u32],
+    pane_gone: &mut dyn FnMut() -> bool,
+) -> Option<&'static str> {
+    let parent = parent?;
+    if leftover_protected(process, ancestors) {
+        return None;
+    }
+    let orphaned = parent.ppid == 1;
+    match leftover_command_name(&process.command) {
+        "caffeinate" if orphaned || pane_gone() => Some("caffeinate"),
+        "ssh" if ssh_mux_master_socket(&parent.args).is_some() && (orphaned || pane_gone()) => {
+            Some("ssh mux master")
+        }
+        "tail" | "ugrep" | "grep" if orphaned => Some("orphaned monitor"),
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "csh" | "tcsh" | "nu" if pane_gone() => {
+            Some("shell of a gone pane")
+        }
+        _ => None,
+    }
+}
+
+/// What [`merge_through_leftovers`] reads and signals, so a test can drive
+/// it with an injected process table instead of the real host's `lsof`/
+/// `ps` (card `20261123-b-c2b3f1`'s flake) or a real Herdr.
+pub(crate) trait MergeLeftovers {
+    /// The lane the merging task works in, or `None` when it has none.
+    fn lane_path(&mut self) -> Option<PathBuf>;
+    /// One [`mv_engine::dockerreport::process_cwds`] snapshot.
+    fn snapshot(&mut self) -> Option<Vec<mv_engine::dockerreport::ProcessCwd>>;
+    /// [`mv_engine::dockerreport::process_parent`] for one holder.
+    fn parent(&mut self, pid: u32) -> Option<mv_engine::dockerreport::ProcessParent>;
+    /// Whether every pane the lane's occupants recorded is gone.
+    fn pane_gone(&mut self) -> bool;
+    /// This process's own ancestors, never benign
+    /// ([`mv_engine::dockerreport::own_ancestor_pids`]).
+    fn ancestors(&mut self) -> Vec<u32>;
+    /// Ends one benign holder — [`end_leftover`].
+    fn end(
+        &mut self,
+        process: &mv_engine::dockerreport::ProcessCwd,
+    ) -> mv_engine::dockerreport::ReapOutcome;
+}
+
+/// The real host: `lsof`/`ps` snapshots, [`end_leftover`], and the same
+/// pane check `--prune` uses for a dead lane (one Herdr `agent list`,
+/// asked at most once, and only when a holder's class depends on it).
+struct HostMergeLeftovers<'a> {
+    worktrees: &'a Worktrees,
+    task: &'a str,
+    lane: Option<Option<mv_state::worktrees::Lane>>,
+    pane_gone: Option<bool>,
+}
+
+impl HostMergeLeftovers<'_> {
+    /// The lane `task` merges from — its own, or the one a `dispatch
+    /// --into` round adopted — resolved once, on first use.
+    fn lane(&mut self) -> Option<&mv_state::worktrees::Lane> {
+        let (worktrees, task) = (self.worktrees, self.task);
+        self.lane
+            .get_or_insert_with(|| {
+                let owner = mv_state::worktrees::lane_task_for(worktrees.project(), task)
+                    .ok()
+                    .flatten()?;
+                worktrees
+                    .lanes()
+                    .ok()?
+                    .into_iter()
+                    .find(|lane| lane.task == owner)
+            })
+            .as_ref()
+    }
+}
+
+impl MergeLeftovers for HostMergeLeftovers<'_> {
+    fn lane_path(&mut self) -> Option<PathBuf> {
+        self.lane().map(|lane| lane.path.clone())
+    }
+
+    fn snapshot(&mut self) -> Option<Vec<mv_engine::dockerreport::ProcessCwd>> {
+        mv_engine::dockerreport::process_cwds()
+    }
+
+    fn parent(&mut self, pid: u32) -> Option<mv_engine::dockerreport::ProcessParent> {
+        mv_engine::dockerreport::process_parent(pid)
+    }
+
+    fn ancestors(&mut self) -> Vec<u32> {
+        mv_engine::dockerreport::own_ancestor_pids()
+    }
+
+    fn pane_gone(&mut self) -> bool {
+        use mv_state::worktrees::LaneObserver;
+        if let Some(gone) = self.pane_gone {
+            return gone;
+        }
+        let project = self.worktrees.project().to_path_buf();
+        let gone = self
+            .lane()
+            .is_some_and(|lane| HerdrLaneObserver::new(project).check(lane, false).is_ok());
+        self.pane_gone = Some(gone);
+        gone
+    }
+
+    fn end(
+        &mut self,
+        process: &mv_engine::dockerreport::ProcessCwd,
+    ) -> mv_engine::dockerreport::ReapOutcome {
+        end_leftover(process)
+    }
+}
+
+/// One holder named in a `--merge` refusal: pid, full command line when
+/// `ps` could read it (else the snapshot's own), cwd, and its leftover
+/// class or why it is not one.
+fn holder_text(
+    process: &mv_engine::dockerreport::ProcessCwd,
+    parent: Option<&mv_engine::dockerreport::ProcessParent>,
+    class: Option<&str>,
+) -> String {
+    let command = parent
+        .map(|parent| parent.args.as_str())
+        .filter(|args| !args.trim().is_empty())
+        .unwrap_or(&process.command);
+    let command: String = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect();
+    let class = class.unwrap_or("not a known leftover");
+    format!(
+        "pid {} `{command}` (cwd {}; {class})",
+        process.pid,
+        process.cwd.display()
+    )
+}
+
+/// The "live process cwd" refusal naming every holder `holders` lists.
+fn holders_refusal(project: &Path, holders: &[String], suffix: &str) -> MergeError {
+    MergeError::Refused(format!(
+        "{LIVE_CWD_REFUSAL}: {}{suffix}; end them with `multiverse worktrees {} --prune \
+         --reap --yes` (preview first with --dry-run), then retry the merge",
+        holders.join("; "),
+        project.display()
+    ))
+}
+
+/// Card `20261123-b-ccc2cc`: `--merge` past a lane's known-benign
+/// leftovers. Runs `attempt` (the real [`Worktrees::merge`]); a refusal
+/// other than "live process cwd" — or a success — returns unchanged.
+/// Otherwise reads the holders under `lane_path` from one snapshot and:
+///
+/// - if any holder is not a [`benign_leftover`], refuses naming every
+///   holder's pid, command and class, signaling nothing;
+/// - else ends each one with [`MergeLeftovers::end`] — SIGTERM, the reap
+///   grace, identity re-checked, SIGKILL — and re-checks once by running
+///   `attempt` again. A second live-cwd refusal names whatever still
+///   holds the lane; it is never retried further.
+///
+/// A failed snapshot, or one that no longer sees any holder, returns the
+/// original refusal (which already names what `mv_state` saw). Returns
+/// the lines to print ahead of the result, one pair per holder ended.
+fn merge_through_leftovers<T>(
+    project: &Path,
+    leftovers: &mut impl MergeLeftovers,
+    attempt: &mut impl FnMut() -> Result<T, MergeError>,
+) -> (Vec<String>, Result<T, MergeError>) {
+    let first = attempt();
+    if !matches!(&first, Err(MergeError::Refused(message)) if message.starts_with(LIVE_CWD_REFUSAL))
+    {
+        return (Vec::new(), first);
+    }
+    let Some(lane_path) = leftovers.lane_path() else {
+        return (Vec::new(), first);
+    };
+    let lane_path = lane_path.as_path();
+    let Some(snapshot) = leftovers.snapshot() else {
+        return (Vec::new(), first);
+    };
+    let holders = mv_engine::dockerreport::processes_under(lane_path, &snapshot);
+    if holders.is_empty() {
+        return (Vec::new(), first);
+    }
+    let ancestors = leftovers.ancestors();
+    let mut classified = Vec::new();
+    for holder in holders {
+        let parent = leftovers.parent(holder.pid);
+        let class = benign_leftover(&holder, parent.as_ref(), &ancestors, &mut || {
+            leftovers.pane_gone()
+        });
+        classified.push((holder, parent, class));
+    }
+    if classified.iter().any(|(_, _, class)| class.is_none()) {
+        let named: Vec<String> = classified
+            .iter()
+            .map(|(holder, parent, class)| holder_text(holder, parent.as_ref(), *class))
+            .collect();
+        return (Vec::new(), Err(holders_refusal(project, &named, "")));
+    }
+
+    let mut notes = Vec::new();
+    for (holder, parent, class) in &classified {
+        notes.push(format!(
+            "ending leftover {}",
+            holder_text(holder, parent.as_ref(), *class)
+        ));
+        notes.push(format!("  {}", reap_outcome_text(leftovers.end(holder))));
+    }
+    let second = attempt();
+    if !matches!(&second, Err(MergeError::Refused(message)) if message.starts_with(LIVE_CWD_REFUSAL))
+    {
+        return (notes, second);
+    }
+    let still: Vec<String> = leftovers
+        .snapshot()
+        .map(|snapshot| mv_engine::dockerreport::processes_under(lane_path, &snapshot))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|holder| {
+            let parent = leftovers.parent(holder.pid);
+            let class = benign_leftover(&holder, parent.as_ref(), &ancestors, &mut || {
+                leftovers.pane_gone()
+            });
+            holder_text(&holder, parent.as_ref(), class)
+        })
+        .collect();
+    if still.is_empty() {
+        return (notes, second);
+    }
+    let refusal = holders_refusal(project, &still, " (still there after one reap pass)");
+    (notes, Err(refusal))
 }
 
 /// `worktrees`'s entry point: dispatches to `--restore`, `--merge`,
@@ -219,21 +673,49 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     // passed, but `--force` can have bypassed exactly that check, so the
     // process this lane still shows may belong to a pane this run never
     // actually confirmed gone.
+    //
+    // Card `20261122-b-78bcf9`: a *dead* lane (`lane_dead`: its pane is
+    // gone) is checked whatever its keep-reason — a done, unmerged lane is
+    // kept for "not merged" long before `clean`'s own live-cwd check runs,
+    // so its leftovers (`tail -f`, a `zsh -c`, an ssh mux master) were
+    // never even listed. One process snapshot serves the whole pass, taken
+    // only once some lane actually needs it.
     let mut reap_notes: HashMap<String, Vec<String>> = HashMap::new();
     let mut reaped_tasks: Vec<String> = Vec::new();
     if !force {
         let ancestors = mv_engine::dockerreport::own_ancestor_pids();
+        let mut snapshot: Option<Option<Vec<mv_engine::dockerreport::ProcessCwd>>> = None;
         for outcome in &outcomes {
-            let PruneOutcome::Kept { task, reason, .. } = outcome else {
+            let PruneOutcome::Kept {
+                task,
+                reason,
+                lane_dead,
+                ..
+            } = outcome
+            else {
                 continue;
             };
-            if !reason.contains("live process cwd") {
+            let live_cwd = reason.contains("live process cwd");
+            if !live_cwd && !*lane_dead {
                 continue;
             }
             let Some(lane_path) = lane_paths.get(task) else {
                 continue;
             };
-            let (notes, any_reaped) = reap_lane_notes(lane_path, reap, dry_run, &ancestors);
+            let processes = snapshot
+                .get_or_insert_with(mv_engine::dockerreport::process_cwds)
+                .as_deref();
+            if processes.is_none() && !live_cwd {
+                // Only a lane already refused for a live cwd warns that the
+                // probe failed; a dead lane kept for another reason stays
+                // as quiet as it always was.
+                continue;
+            }
+            let (notes, any_reaped) =
+                reap_lane_notes(lane_path, processes, *lane_dead, reap, dry_run, &ancestors);
+            if notes.is_empty() {
+                continue;
+            }
             reap_notes.insert(task.clone(), notes);
             if any_reaped {
                 reaped_tasks.push(task.clone());
@@ -431,20 +913,8 @@ fn prune(worktrees: &Worktrees, args: &ArgMatches) -> Result<(), Failure> {
     let orphaned_build_dirs = worktrees
         .prune_orphaned_build_dirs_skipping(preview_caches, &reported_build_dirs)
         .map_err(fail)?;
-    for build_dir in &orphaned_build_dirs {
-        println!("  cargo shared-build {}", build_dir.path.display());
-        // Card `20261119-b-a9f95f`: a delete that failed leaves the dir on
-        // disk, so it is never reported as freed.
-        if let Some(reason) = &build_dir.kept {
-            println!("    kept build-dir — {reason}");
-            continue;
-        }
-        let verb = if preview_caches {
-            "would free"
-        } else {
-            "freed"
-        };
-        println!("    {verb} build-dir ({} bytes)", build_dir.bytes);
+    for line in orphaned_build_dir_lines(&orphaned_build_dirs, preview_caches) {
+        println!("{line}");
     }
     let lanes = outcomes.len();
 
@@ -551,18 +1021,43 @@ fn print_quarantine_outcomes(worktrees: &Worktrees, dry_run: bool) -> Result<(),
 /// inspect it, and cleanly `git merge --abort`s a lane merge that itself
 /// conflicts rather than leaving the checkout mid-merge for the next
 /// caller to trip over.
+///
+/// Also reads the project's own `.multiverse/roster.toml` for
+/// `[lane_setup] regenerable` — gitignored `lane_setup` outputs the merge
+/// gate treats like `target/` (a malformed roster is a config error, exit
+/// 3) — and prints the branch that actually landed, which for an adopted
+/// (`dispatch --into`) task id is the adopted lane's own.
 fn merge(worktrees: &Worktrees, args: &ArgMatches, task: &str) -> Result<(), Failure> {
     let (config_path, _source) =
         resolve_config_path(args.get_one::<String>("config").map(String::as_str))?;
     let config = mv_config::load::load_config(&config_path)
         .map_err(|error| Failure::Config(error.to_string()))?;
 
-    match worktrees.merge(task, &config.secrets_scan) {
+    let regenerable = mv_config::roster::lane_setup_regenerable(worktrees.project())
+        .map_err(|error| Failure::Config(error.to_string()))?;
+
+    // Card `20261123-b-ccc2cc`: a refusal for a live process cwd is
+    // checked for known-benign leftovers, ended, and retried once.
+    let mut leftovers = HostMergeLeftovers {
+        worktrees,
+        task,
+        lane: None,
+        pane_gone: None,
+    };
+    let (notes, outcome) =
+        merge_through_leftovers(worktrees.project(), &mut leftovers, &mut || {
+            worktrees.merge(task, &config.secrets_scan, &regenerable)
+        });
+    for note in notes {
+        println!("{note}");
+    }
+
+    match outcome {
         Ok(result) => {
             for warning in &result.warnings {
                 println!("{warning}");
             }
-            println!("merged multiverse/{task} at {}", result.sha);
+            println!("merged {} at {}", result.branch, result.sha);
             Ok(())
         }
         Err(MergeError::ScannerMissing(message)) => Err(Failure::Config(message)),
@@ -574,7 +1069,8 @@ fn merge(worktrees: &Worktrees, args: &ArgMatches, task: &str) -> Result<(), Fai
 /// — the bulk-maintenance reading, not a single-lane operation (the only
 /// one consistent with `worktrees`'s own argument list, which has no
 /// `--task` alongside `--rescue`). `dry_run` previews what each lane's
-/// rescue would copy without copying anything.
+/// rescue would copy without copying anything, including caches it would
+/// skip as regenerable.
 fn rescue(worktrees: &Worktrees, dry_run: bool) -> Result<(), Failure> {
     let lanes = worktrees.lanes().map_err(fail)?;
     if lanes.is_empty() {
@@ -585,11 +1081,9 @@ fn rescue(worktrees: &Worktrees, dry_run: bool) -> Result<(), Failure> {
     let mut failures = 0;
     for lane in &lanes {
         match worktrees.rescue(&lane.task, dry_run) {
-            Ok(rescued) => {
-                for path in &rescued {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let parent = path.parent().unwrap_or(path).display();
-                    println!("  {verb} {name} -> {parent}");
+            Ok(report) => {
+                for line in rescue_item_lines(&report, dry_run) {
+                    println!("{line}");
                 }
                 println!("{verb} {}", lane.task);
             }
@@ -611,6 +1105,24 @@ fn rescue(worktrees: &Worktrees, dry_run: bool) -> Result<(), Failure> {
             lanes.len()
         )))
     }
+}
+
+/// One line per skipped regenerable cache and one per copied artifact —
+/// pulled out of [`rescue`] so the `skipped (regenerable)` wording is
+/// unit-testable without capturing stdout (card `20261122-b-4961e4`).
+fn rescue_item_lines(report: &RescueReport, dry_run: bool) -> Vec<String> {
+    let verb = if dry_run { "would rescue" } else { "rescued" };
+    let mut lines = Vec::new();
+    for path in &report.skipped {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        lines.push(format!("  skipped (regenerable) {name}"));
+    }
+    for path in &report.copied {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let parent = path.parent().unwrap_or(path).display();
+        lines.push(format!("  {verb} {name} -> {parent}"));
+    }
+    lines
 }
 
 fn inspect(worktrees: &Worktrees, path: &str) -> Result<(), Failure> {
@@ -707,9 +1219,86 @@ pub(crate) mod herdr_env {
     }
 }
 
+/// A test-spawned stand-in for a lane's lingering process, shared by the
+/// `worktrees` and `tasks` reap tests. Card `20261123-b-491c58`: a
+/// `sleep 60` exited on its own while a loaded host's `--prune` ran past
+/// a minute, and `try_wait().is_none()` read that normal exit as the
+/// prune having signalled it. An hour outlives any prune, and the checks
+/// below tell a signal from a timer, so load can no longer fake either.
+#[cfg(test)]
+pub(crate) mod lane_child {
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Owns the child: dropping it — a failed assertion included — kills
+    /// and reaps it, so a test can never leak an hour-long `sleep`.
+    pub(crate) struct LaneChild(Child);
+
+    impl LaneChild {
+        /// `sleep 3600` with its cwd in `dir`.
+        pub(crate) fn sleep_in(dir: &Path) -> Self {
+            Self::spawn(Command::new("sleep").arg("3600").current_dir(dir))
+        }
+
+        /// Spawns an already-configured `command` under the guard.
+        pub(crate) fn spawn(command: &mut Command) -> Self {
+            Self(command.spawn().unwrap())
+        }
+
+        pub(crate) fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// Nothing has signalled the child: it is still running, or it
+        /// exited on its own. Only a signal fails this, never a timer
+        /// that a slow host let run out.
+        pub(crate) fn not_signalled(&mut self) -> bool {
+            self.0
+                .try_wait()
+                .unwrap()
+                .is_none_or(|status| status.signal().is_none())
+        }
+
+        /// The signal that ended the child within `secs`, or `None` when
+        /// it is still running by then or exited on its own.
+        pub(crate) fn signalled_within(&mut self, secs: u64) -> Option<i32> {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    return status.signal();
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for LaneChild {
+        fn drop(&mut self) {
+            // A resident shell's own `sleep` would otherwise outlive it by
+            // the hour. Only while the child is unreaped, so its pid
+            // cannot yet belong to anyone else.
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = Command::new("pkill")
+                    .args(["-KILL", "-P", &self.0.id().to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::herdr_env::HerdrEnvGuard;
+    use super::lane_child::LaneChild;
     use super::*;
     use mv_state::worktrees::{Lane, LaneObserver};
     use std::process::Command;
@@ -843,6 +1432,51 @@ mod tests {
         }
     }
 
+    /// Card `20261122-b-a5e62d`: on 0.1.16 `--prune --yes` printed a line
+    /// for only the first of two orphan shared-build dirs its dry run had
+    /// listed. Every dir the sweep returns gets its own line — both freed
+    /// ones, and one its scan budget ran out on, kept with the reason.
+    #[test]
+    fn orphaned_build_dir_lines_print_every_swept_dir_freed_or_kept_with_its_reason() {
+        let first = OrphanedBuildDir {
+            path: PathBuf::from("/shared-build/29/5a434937c16426"),
+            bytes: 3_681_883_433,
+            kept: None,
+        };
+        let second = OrphanedBuildDir {
+            path: PathBuf::from("/shared-build/e7/bb1edf3e1ddaa3"),
+            bytes: 2_050_041_399,
+            kept: None,
+        };
+        let both = [first.clone(), second.clone()];
+        assert_eq!(
+            orphaned_build_dir_lines(&both, false),
+            [
+                "  cargo shared-build /shared-build/29/5a434937c16426",
+                "    freed build-dir (3681883433 bytes)",
+                "  cargo shared-build /shared-build/e7/bb1edf3e1ddaa3",
+                "    freed build-dir (2050041399 bytes)",
+            ]
+        );
+        assert_eq!(
+            orphaned_build_dir_lines(&both, true)[3],
+            "    would free build-dir (2050041399 bytes)"
+        );
+
+        let out_of_time = OrphanedBuildDir {
+            bytes: 0,
+            kept: Some("scan budget ran out before its build evidence was read in full".into()),
+            ..second
+        };
+        assert_eq!(
+            orphaned_build_dir_lines(&[first, out_of_time], false)[2..],
+            [
+                "  cargo shared-build /shared-build/e7/bb1edf3e1ddaa3",
+                "    kept build-dir — scan budget ran out before its build evidence was read in full",
+            ]
+        );
+    }
+
     #[test]
     fn inspect_lists_a_created_lane_and_archived_is_empty() {
         let repo = TempRepo::new();
@@ -935,6 +1569,90 @@ mod tests {
                 .join(".multiverse/tasks/20261101-fixer-abcdef/result.md")
                 .exists(),
             "--rescue --dry-run must not actually copy anything into the project"
+        );
+    }
+
+    /// Card `20261122-b-4961e4`: `--rescue` copies real task artifacts and
+    /// skips a task-dir venv rather than refusing the lane on its python
+    /// symlink. The printed `skipped (regenerable)` line is pinned on
+    /// [`rescue_item_lines`].
+    #[test]
+    fn cli_rescue_skips_a_task_dir_venv_and_copies_artifacts() {
+        let repo = TempRepo::new();
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let task = "20261101-builder-4961e4";
+        let lane = worktrees.create(task, "HEAD").unwrap();
+        let task_dir = lane.path.join(".multiverse/tasks").join(task);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(task_dir.join("status"), "done\n").unwrap();
+        std::fs::write(task_dir.join("result.md"), "findings\n").unwrap();
+        let venv_bin = task_dir.join("venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        std::os::unix::fs::symlink("python3.15", venv_bin.join("python")).unwrap();
+        let egg = task_dir.join("pkg/foo.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(egg.join("PKG-INFO"), "Name: foo\n").unwrap();
+
+        let path = repo.0.to_str().unwrap();
+        let matches = crate::args::command()
+            .try_get_matches_from(["multiverse", "worktrees", path, "--rescue", "--yes"])
+            .unwrap();
+        let (_, sub) = matches.subcommand().unwrap();
+        assert!(run(sub).is_ok());
+
+        let rescued = repo.0.join(".multiverse/tasks").join(task);
+        assert_eq!(
+            std::fs::read_to_string(rescued.join("result.md")).unwrap(),
+            "findings\n"
+        );
+        assert!(
+            !rescued.join("venv").exists(),
+            "CLI rescue must not copy the venv"
+        );
+        assert!(
+            !rescued.join("pkg/foo.egg-info").exists(),
+            "CLI rescue must not copy egg-info"
+        );
+
+        let _herdr = HerdrEnvGuard::unreachable();
+        let mut observer = HerdrLaneObserver::new(&repo.0);
+        let outcomes = worktrees.prune(&mut observer, true, true).unwrap();
+        assert!(
+            matches!(&outcomes[0], PruneOutcome::WouldRemove { .. }),
+            "expected prune --dry-run to list the lane removable after skipping the venv, got {:?}",
+            outcomes[0]
+        );
+
+        let report = worktrees.rescue(task, true).unwrap();
+        let lines = rescue_item_lines(&report, true);
+        assert!(
+            lines.iter().any(|l| l == "  skipped (regenerable) venv"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  skipped (regenerable) foo.egg-info"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn rescue_item_lines_name_skipped_regenerable_caches() {
+        let report = RescueReport {
+            copied: vec![PathBuf::from("/proj/.multiverse/tasks/t/result.md")],
+            skipped: vec![
+                PathBuf::from("/lane/.multiverse/tasks/t/venv"),
+                PathBuf::from("/lane/.multiverse/tasks/t/pkg/foo.egg-info"),
+            ],
+        };
+        assert_eq!(
+            rescue_item_lines(&report, false),
+            [
+                "  skipped (regenerable) venv",
+                "  skipped (regenerable) foo.egg-info",
+                "  rescued result.md -> /proj/.multiverse/tasks/t",
+            ]
         );
     }
 
@@ -1089,6 +1807,201 @@ mod tests {
         let _ = sha;
     }
 
+    /// Runs `worktrees <repo> --merge <task>` through the real CLI entry
+    /// point against a config whose gitleaks is the fake `scanner`.
+    fn cli_merge(repo: &TempRepo, task: &str, scanner: &Path) -> Result<(), Failure> {
+        let config_path = repo.0.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[secrets_scan]\ngitleaks = \"{}\"\n", scanner.display()),
+        )
+        .unwrap();
+        let matches = crate::args::command()
+            .try_get_matches_from([
+                "multiverse",
+                "worktrees",
+                repo.0.to_str().unwrap(),
+                "--merge",
+                task,
+                "--config",
+                config_path.to_str().unwrap(),
+            ])
+            .unwrap();
+        let (_, sub) = matches.subcommand().unwrap();
+        run(sub)
+    }
+
+    fn head_message(repo: &TempRepo) -> String {
+        String::from_utf8(
+            Command::new("git")
+                .current_dir(&repo.0)
+                .args(["log", "-1", "--format=%B"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    /// Card 20261122-b-40cb46 proof item: `--merge <adopted id>` — a
+    /// `dispatch --into` round whose own id has no worktree directory —
+    /// resolves to the lane it adopted and lands that lane's branch, even
+    /// though round 1's own status file still reads `blocked`.
+    #[test]
+    fn cli_merge_of_an_adopted_task_id_lands_the_adopted_lanes_branch() {
+        let repo = TempRepo::new();
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let owner = "20261101-builder-aaaaaa";
+        let adopted = "20261101-builder-bbbbbb";
+        let lane = done_lane(&worktrees, owner);
+        let tasks = lane.path.join(".multiverse/tasks");
+        std::fs::write(tasks.join(owner).join("status"), "blocked\n").unwrap();
+        std::fs::create_dir_all(tasks.join(adopted)).unwrap();
+        std::fs::write(tasks.join(adopted).join("status"), "done\n").unwrap();
+        std::fs::write(tasks.join(adopted).join("result.md"), "redone\n").unwrap();
+        std::fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={owner}\tbranch=multiverse/{owner}\n\
+                 2026-11-01T00:10:00+00:00\tevent=result\ttask={owner}\tstatus=blocked\tstate=reconciled\trevisions=0\tpane=p1\n\
+                 2026-11-01T01:00:00+00:00\tevent=dispatch\ttask={adopted}\tbranch=multiverse/{owner}\n\
+                 2026-11-01T01:10:00+00:00\tevent=result\ttask={adopted}\tstatus=done\tstate=reconciled\trevisions=0\tpane=p2\n"
+            ),
+        )
+        .unwrap();
+
+        let script = fake_scanner("exit 0");
+        cli_merge(&repo, adopted, &script).unwrap();
+        assert_eq!(
+            head_message(&repo),
+            format!("Merge branch 'multiverse/{owner}'")
+        );
+    }
+
+    /// Card `20261123-b-970200` proof item: a lane abandoned, resumed by
+    /// a `dispatch --into` round that never recorded an outcome, then
+    /// corrected with `tasks --supersede <owner> --supersedes 2 --status
+    /// done` merges through the CLI with no status file or `result.md`
+    /// written by hand.
+    #[test]
+    fn cli_merge_honors_a_supersede_of_an_abandoned_lane() {
+        let repo = TempRepo::new();
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let owner = "20261101-builder-dddddd";
+        let round = "20261101-builder-eeeeee";
+        let lane = done_lane(&worktrees, owner);
+        std::fs::remove_dir_all(lane.path.join(".multiverse/tasks").join(owner)).unwrap();
+        std::fs::write(
+            repo.0.join(".multiverse/routing.log"),
+            format!(
+                "2026-11-01T00:00:00+00:00\tevent=dispatch\ttask={owner}\tbranch=multiverse/{owner}\n\
+                 2026-11-01T01:10:00+00:00\tevent=result\ttask={owner}\tstatus=failed\tstate=abandoned\trevisions=0\tpane=p1\n\
+                 2026-11-01T02:00:00+00:00\tevent=dispatch\ttask={round}\tbranch=multiverse/{owner}\n"
+            ),
+        )
+        .unwrap();
+        let script = fake_scanner("exit 0");
+
+        let error = cli_merge(&repo, owner, &script).unwrap_err();
+        assert_eq!(error.code(), crate::exit::ERROR);
+        assert!(
+            error.to_string().contains("no recorded terminal status"),
+            "{error}"
+        );
+
+        mv_state::tasks::append_supersede_if_absent(
+            &repo.0,
+            owner,
+            2,
+            "done",
+            "verified",
+            "work checked by hand",
+            0,
+            None,
+        )
+        .unwrap();
+        cli_merge(&repo, owner, &script).unwrap();
+        assert_eq!(
+            head_message(&repo),
+            format!("Merge branch 'multiverse/{owner}'")
+        );
+    }
+
+    /// Card 20261122-b-40cb46: `--merge` reads the project's own
+    /// `.multiverse/roster.toml` `[lane_setup] regenerable` list, so a
+    /// declared gitignored `lane_setup` output no longer refuses the merge.
+    #[test]
+    fn cli_merge_honors_the_projects_declared_regenerable_paths() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join(".gitignore"), "gen/\n").unwrap();
+        for args in [
+            ["add", ".gitignore"].as_slice(),
+            &["commit", "-q", "-m", "ignore gen"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&repo.0)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let task = "20261101-builder-cccccc";
+        let lane = done_lane(&worktrees, task);
+        std::fs::create_dir_all(lane.path.join("gen")).unwrap();
+        std::fs::write(lane.path.join("gen/client.ts"), "x\n").unwrap();
+        let script = fake_scanner("exit 0");
+
+        let error = cli_merge(&repo, task, &script).unwrap_err();
+        assert_eq!(error.code(), crate::exit::ERROR);
+        assert!(error.to_string().contains("gen/client.ts"), "{error}");
+
+        std::fs::write(
+            repo.0.join(".multiverse/roster.toml"),
+            "[lane_setup]\nregenerable = [\"gen/\"]\n",
+        )
+        .unwrap();
+        cli_merge(&repo, task, &script).unwrap();
+        assert_eq!(
+            head_message(&repo),
+            format!("Merge branch 'multiverse/{task}'")
+        );
+    }
+
+    /// Card `20261122-b-4961e4`: `--merge` treats a gitignored
+    /// `*.egg-info/` directory as regenerable (built-in list from
+    /// `44d217a`) instead of refusing it as an unrescued ignored file.
+    #[test]
+    fn cli_merge_does_not_refuse_an_ignored_egg_info_directory() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join(".gitignore"), "*.egg-info/\n").unwrap();
+        for args in [
+            ["add", ".gitignore"].as_slice(),
+            &["commit", "-q", "-m", "ignore egg-info"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&repo.0)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let task = "20261101-builder-4961e4";
+        let lane = done_lane(&worktrees, task);
+        let egg = lane.path.join("pkg/foo.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(egg.join("PKG-INFO"), "Name: foo\n").unwrap();
+        let script = fake_scanner("exit 0");
+        cli_merge(&repo, task, &script).unwrap();
+        assert_eq!(
+            head_message(&repo),
+            format!("Merge branch 'multiverse/{task}'")
+        );
+    }
+
     /// Proof item: a missing required scanner exits 3 (needs config) with
     /// an install hint, and merges nothing.
     #[test]
@@ -1188,17 +2101,51 @@ mod tests {
         git(&["merge", "--abort"]);
     }
 
+    /// One real process snapshot taken after `pid` was spawned with its cwd
+    /// in `dir`, or `None` — after printing why — when this host's probe
+    /// cannot see it (e.g. a sandbox that hides `lsof`/`/proc`), so a test
+    /// needing real process cwd visibility skips rather than fails.
+    ///
+    /// Polls briefly: a snapshot taken the instant after `spawn` can still
+    /// show the child under this test binary's own command line, before
+    /// its `exec`, which would make every by-name check meaningless.
+    fn lane_snapshot(dir: &Path, pid: u32) -> Option<Vec<mv_engine::dockerreport::ProcessCwd>> {
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snapshot = mv_engine::dockerreport::process_cwds();
+            let visible = snapshot.as_deref().is_some_and(|processes| {
+                mv_engine::dockerreport::processes_under(dir, processes)
+                    .iter()
+                    .any(|process| {
+                        process.pid == pid && (own.is_empty() || !process.command.contains(&own))
+                    })
+            });
+            if visible {
+                return snapshot;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("skipped: this host's process cwd probe cannot see spawned pid {pid}");
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// Proof item 1: a kept lane names the lingering pid without `--reap`,
     /// and kills nothing.
     #[test]
     fn reap_lane_notes_without_reap_names_the_pid_and_signals_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
-        let (notes, any_reaped) = reap_lane_notes(dir.path(), false, false, &[]);
+        let mut child = LaneChild::sleep_in(dir.path());
+        let Some(snapshot) = lane_snapshot(dir.path(), child.id()) else {
+            return;
+        };
+        let (notes, any_reaped) =
+            reap_lane_notes(dir.path(), Some(&snapshot), false, false, false, &[]);
         assert!(!any_reaped);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
@@ -1207,11 +2154,9 @@ mod tests {
         );
         assert!(notes[0].contains("rerun with --reap"), "{notes:?}");
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.not_signalled(),
             "no --reap must never signal the process"
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 
     /// Proof item 3: `--reap --dry-run` previews "would reap" and kills
@@ -1219,21 +2164,19 @@ mod tests {
     #[test]
     fn reap_lane_notes_dry_run_previews_and_signals_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
-        let (notes, any_reaped) = reap_lane_notes(dir.path(), true, true, &[]);
+        let mut child = LaneChild::sleep_in(dir.path());
+        let Some(snapshot) = lane_snapshot(dir.path(), child.id()) else {
+            return;
+        };
+        let (notes, any_reaped) =
+            reap_lane_notes(dir.path(), Some(&snapshot), false, true, true, &[]);
         assert!(!any_reaped);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("would reap"), "{notes:?}");
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.not_signalled(),
             "--reap --dry-run must never signal the process"
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 
     /// Proof item 2: `--reap` without `--dry-run` actually ends the
@@ -1241,16 +2184,18 @@ mod tests {
     #[test]
     fn reap_lane_notes_reaps_a_real_spawned_child() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
-        let (notes, any_reaped) = reap_lane_notes(dir.path(), true, false, &[]);
+        let mut child = LaneChild::sleep_in(dir.path());
+        let Some(snapshot) = lane_snapshot(dir.path(), child.id()) else {
+            return;
+        };
+        let (notes, any_reaped) =
+            reap_lane_notes(dir.path(), Some(&snapshot), false, true, false, &[]);
         assert!(any_reaped);
         assert!(notes.iter().any(|n| n.contains("reaping")), "{notes:?}");
-        let status = child.wait().unwrap();
-        assert!(!status.success(), "{status:?}");
+        assert!(
+            child.signalled_within(30).is_some(),
+            "--reap must signal the process"
+        );
     }
 
     /// Proof item 4: a sibling directory's process is never matched, even
@@ -1262,20 +2207,17 @@ mod tests {
         let sibling = dir.path().join("lane-other");
         std::fs::create_dir_all(&lane).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .current_dir(&sibling)
-            .spawn()
-            .unwrap();
-        let (notes, any_reaped) = reap_lane_notes(&lane, true, false, &[]);
+        let mut child = LaneChild::sleep_in(&sibling);
+        let Some(snapshot) = lane_snapshot(&sibling, child.id()) else {
+            return;
+        };
+        let (notes, any_reaped) = reap_lane_notes(&lane, Some(&snapshot), true, true, false, &[]);
         assert!(!any_reaped);
         assert!(notes.is_empty(), "{notes:?}");
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.not_signalled(),
             "a sibling directory's process must never be touched"
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 
     // Decision 6's by-name denylist (shell/herdr/pid 1) is exercised
@@ -1295,20 +2237,210 @@ mod tests {
     #[test]
     fn reap_lane_notes_never_reaps_a_pid_in_the_ancestor_list() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .current_dir(dir.path())
-            .spawn()
-            .unwrap();
-        let (notes, any_reaped) = reap_lane_notes(dir.path(), true, false, &[child.id()]);
+        let mut child = LaneChild::sleep_in(dir.path());
+        let Some(snapshot) = lane_snapshot(dir.path(), child.id()) else {
+            return;
+        };
+        let (notes, any_reaped) = reap_lane_notes(
+            dir.path(),
+            Some(&snapshot),
+            true,
+            true,
+            false,
+            &[child.id()],
+        );
         assert!(!any_reaped);
         assert!(notes.iter().any(|n| n.contains("protected")), "{notes:?}");
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.not_signalled(),
             "a pid the caller named as an ancestor must never be reaped"
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+    }
+
+    /// Card `20261122-b-78bcf9`: a shell left behind in a *dead* lane (the
+    /// `zsh -c` the card saw) is a reap target there, while the same shell
+    /// in a lane not known dead stays protected by name. `; :` keeps the
+    /// shell resident instead of exec-ing straight into `sleep`.
+    #[test]
+    fn reap_lane_notes_reaps_a_leftover_shell_only_in_a_dead_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = LaneChild::spawn(
+            Command::new("sh")
+                .args(["-c", "sleep 3600; :"])
+                .current_dir(dir.path()),
+        );
+        let Some(snapshot) = lane_snapshot(dir.path(), child.id()) else {
+            return;
+        };
+        let shell = format!("pid {} ", child.id());
+
+        // A preview: its `sleep` child shares the cwd and is no shell, so a
+        // real reap here would end it, and the shell with it.
+        let (notes, _) = reap_lane_notes(dir.path(), Some(&snapshot), false, true, true, &[]);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains(&shell) && n.contains("protected")),
+            "{notes:?}"
+        );
+        assert!(
+            child.not_signalled(),
+            "a shell in a lane not known dead must never be reaped"
+        );
+
+        let (notes, any_reaped) =
+            reap_lane_notes(dir.path(), Some(&snapshot), true, true, false, &[]);
+        assert!(any_reaped, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains(&format!("reaping {shell}"))),
+            "{notes:?}"
+        );
+        assert!(
+            child.signalled_within(30).is_some(),
+            "a dead lane's leftover shell must be ended"
+        );
+    }
+
+    /// The ssh ControlMaster parse `end_leftover` uses before its SIGTERM:
+    /// OpenSSH's own `[mux]` title and an explicit master with a visible
+    /// socket match; a plain client on some other master's socket, a
+    /// master with no socket, and anything after the destination never do.
+    #[test]
+    fn ssh_mux_master_socket_matches_only_a_visible_master() {
+        assert_eq!(
+            ssh_mux_master_socket("ssh: /home/u/.ssh/cm-u@host:22 [mux]").as_deref(),
+            Some("/home/u/.ssh/cm-u@host:22")
+        );
+        assert_eq!(
+            ssh_mux_master_socket("/usr/bin/ssh -fNM -S /tmp/cm.sock host").as_deref(),
+            Some("/tmp/cm.sock")
+        );
+        assert_eq!(
+            ssh_mux_master_socket(
+                "ssh -o ControlMaster=yes -oControlPath=/tmp/cm.sock -l u host docker"
+            )
+            .as_deref(),
+            Some("/tmp/cm.sock")
+        );
+        assert_eq!(ssh_mux_master_socket("ssh -S /tmp/cm.sock host"), None);
+        assert_eq!(
+            ssh_mux_master_socket("ssh -o ControlMaster=auto -o ControlPath=/tmp/c host"),
+            None
+        );
+        assert_eq!(ssh_mux_master_socket("ssh -M host"), None);
+        assert_eq!(
+            ssh_mux_master_socket("ssh -S /tmp/cm.sock host run -M"),
+            None
+        );
+        assert_eq!(ssh_mux_master_socket("ssh -M -S none host"), None);
+        assert_eq!(ssh_mux_master_socket("sshd: u [priv]"), None);
+    }
+
+    /// Card `20261122-b-78bcf9`, through the real CLI: a done lane whose
+    /// branch is *not* merged is kept for that, not for its live cwd — the
+    /// exact shape that used to print no "would reap" at all. Its pane is
+    /// gone (no live Herdr), so `--prune --reap --dry-run` and a plain
+    /// `--prune` leave the leftover alone, and `--prune --reap --yes` ends
+    /// it while still keeping the unmerged lane for `--merge`.
+    #[test]
+    fn cli_prune_reap_ends_a_dead_unmerged_lane_leftover_and_keeps_the_lane() {
+        let repo = TempRepo::new();
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let task = "20261101-fixer-bcdefa";
+        let lane = done_lane(&worktrees, task);
+        let _herdr = HerdrEnvGuard::unreachable();
+
+        let mut child = LaneChild::sleep_in(&lane.path);
+        if lane_snapshot(&lane.path, child.id()).is_none() {
+            return;
+        }
+
+        let path = repo.0.to_str().unwrap();
+        for preview in [
+            vec!["multiverse", "worktrees", path, "--prune"],
+            vec![
+                "multiverse",
+                "worktrees",
+                path,
+                "--prune",
+                "--reap",
+                "--dry-run",
+            ],
+        ] {
+            let matches = crate::args::command()
+                .try_get_matches_from(&preview)
+                .unwrap();
+            let (_, sub) = matches.subcommand().unwrap();
+            assert!(run(sub).is_ok());
+            assert!(
+                child.not_signalled(),
+                "{preview:?} must never signal the process"
+            );
+        }
+
+        let reaping = crate::args::command()
+            .try_get_matches_from([
+                "multiverse",
+                "worktrees",
+                path,
+                "--prune",
+                "--reap",
+                "--yes",
+            ])
+            .unwrap();
+        let (_, sub) = reaping.subcommand().unwrap();
+        assert!(run(sub).is_ok());
+        assert!(
+            child.signalled_within(30).is_some(),
+            "--prune --reap --yes must end a dead lane's leftover"
+        );
+        assert!(
+            lane.path.exists(),
+            "an unmerged lane is still kept after its leftover is reaped"
+        );
+    }
+
+    /// Card `20261122-b-78bcf9`, through the real CLI: `--merge`'s
+    /// live-cwd refusal names the holder's pid and the reap verb.
+    #[test]
+    fn cli_merge_refusal_names_the_live_cwd_holder_pid() {
+        let repo = TempRepo::new();
+        let worktrees = Worktrees::new(&repo.0).unwrap();
+        let task = "20261101-fixer-cdefab";
+        let lane = done_lane(&worktrees, task);
+        let child = LaneChild::sleep_in(&lane.path);
+        if lane_snapshot(&lane.path, child.id()).is_none() {
+            return;
+        }
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[secrets_scan]\ngitleaks = \"true\"\nrequired = false\n",
+        )
+        .unwrap();
+        let matches = crate::args::command()
+            .try_get_matches_from([
+                "multiverse",
+                "worktrees",
+                repo.0.to_str().unwrap(),
+                "--merge",
+                task,
+                "--config",
+                config_path.to_str().unwrap(),
+            ])
+            .unwrap();
+        let (_, sub) = matches.subcommand().unwrap();
+        let error = run(sub).unwrap_err();
+        assert_eq!(error.code(), crate::exit::ERROR);
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("pid {}", child.id())),
+            "{message}"
+        );
+        assert!(message.contains("--prune --reap --yes"), "{message}");
     }
 
     /// Full `--prune --reap --yes` CLI path: a done, pane-clear lane with a
@@ -1337,11 +2469,7 @@ mod tests {
             .success());
         let _herdr = HerdrEnvGuard::unreachable();
 
-        let mut child = Command::new("sleep")
-            .arg("60")
-            .current_dir(&lane.path)
-            .spawn()
-            .unwrap();
+        let mut child = LaneChild::sleep_in(&lane.path);
 
         let path = repo.0.to_str().unwrap();
         let plain = crate::args::command()
@@ -1354,7 +2482,7 @@ mod tests {
             "a plain --prune must keep a lane with a live process cwd"
         );
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.not_signalled(),
             "a plain --prune must never signal the process"
         );
 
@@ -1371,8 +2499,10 @@ mod tests {
         let (_, sub) = reaping.subcommand().unwrap();
         assert!(run(sub).is_ok());
 
-        let status = child.wait().unwrap();
-        assert!(!status.success(), "{status:?}");
+        assert!(
+            child.signalled_within(30).is_some(),
+            "--prune --reap must signal the process"
+        );
         assert!(
             !lane.path.exists(),
             "--prune --reap must remove the lane once its process is gone"
@@ -1483,5 +2613,298 @@ mod tests {
         let mut observer =
             HerdrLaneObserver::with_herdr_binary(&*project, script.to_string_lossy());
         assert!(observer.check(&lane, false).is_ok());
+    }
+
+    /// Card `20261123-b-ccc2cc`: an injected process table and pane
+    /// answer for [`merge_through_leftovers`] — `snapshots` is read in
+    /// order (the last one repeating), and every [`MergeLeftovers::end`]
+    /// only records the pid it was asked to end. Nothing here reads the
+    /// real host's `lsof`/`ps` or asks a real Herdr.
+    struct FakeLeftovers {
+        lane: PathBuf,
+        snapshots: Vec<Vec<mv_engine::dockerreport::ProcessCwd>>,
+        parents: HashMap<u32, mv_engine::dockerreport::ProcessParent>,
+        ancestors: Vec<u32>,
+        pane_gone: bool,
+        pane_asked: u32,
+        ended: Vec<u32>,
+    }
+
+    impl FakeLeftovers {
+        /// `rows` are `(pid, comm, ppid, args)`, all with their cwd in `lane`.
+        fn new(lane: &Path, rows: &[(u32, &str, u32, &str)]) -> Self {
+            let mut fake = Self {
+                lane: lane.to_path_buf(),
+                snapshots: Vec::new(),
+                parents: HashMap::new(),
+                ancestors: Vec::new(),
+                pane_gone: false,
+                pane_asked: 0,
+                ended: Vec::new(),
+            };
+            let first = fake.rows(rows);
+            fake.snapshots.push(first);
+            fake
+        }
+
+        fn rows(
+            &mut self,
+            rows: &[(u32, &str, u32, &str)],
+        ) -> Vec<mv_engine::dockerreport::ProcessCwd> {
+            rows.iter()
+                .map(|(pid, comm, ppid, args)| {
+                    self.parents.insert(
+                        *pid,
+                        mv_engine::dockerreport::ProcessParent {
+                            ppid: *ppid,
+                            args: args.to_string(),
+                        },
+                    );
+                    mv_engine::dockerreport::ProcessCwd {
+                        pid: *pid,
+                        cwd: self.lane.clone(),
+                        command: comm.to_string(),
+                        cpu_percent: "0.0".into(),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl MergeLeftovers for FakeLeftovers {
+        fn lane_path(&mut self) -> Option<PathBuf> {
+            Some(self.lane.clone())
+        }
+        fn snapshot(&mut self) -> Option<Vec<mv_engine::dockerreport::ProcessCwd>> {
+            let next = if self.snapshots.len() > 1 {
+                self.snapshots.remove(0)
+            } else {
+                self.snapshots.first().cloned().unwrap_or_default()
+            };
+            Some(next)
+        }
+        fn parent(&mut self, pid: u32) -> Option<mv_engine::dockerreport::ProcessParent> {
+            self.parents.get(&pid).cloned()
+        }
+        fn ancestors(&mut self) -> Vec<u32> {
+            self.ancestors.clone()
+        }
+        fn pane_gone(&mut self) -> bool {
+            self.pane_asked += 1;
+            self.pane_gone
+        }
+        fn end(
+            &mut self,
+            process: &mv_engine::dockerreport::ProcessCwd,
+        ) -> mv_engine::dockerreport::ReapOutcome {
+            self.ended.push(process.pid);
+            mv_engine::dockerreport::ReapOutcome::Reaped
+        }
+    }
+
+    /// The real refusal `mv_state`'s `merge` returns for a held lane.
+    fn live_cwd_refusal() -> MergeError {
+        MergeError::Refused(format!("{LIVE_CWD_REFUSAL}: pid 1 `x` (cwd /x); end them"))
+    }
+
+    /// `attempt` refusing for a live cwd `refusals` times, then merging;
+    /// returns the result and how many attempts ran.
+    fn merge_with(
+        fake: &mut FakeLeftovers,
+        refusals: u32,
+    ) -> (Vec<String>, Result<&'static str, MergeError>, u32) {
+        let mut attempts = 0;
+        let (notes, outcome) = merge_through_leftovers(Path::new("/proj"), fake, &mut || {
+            attempts += 1;
+            if attempts <= refusals {
+                Err(live_cwd_refusal())
+            } else {
+                Ok("merged")
+            }
+        });
+        (notes, outcome, attempts)
+    }
+
+    /// Card `20261123-b-ccc2cc` proof: an orphaned `caffeinate -t 300`, ssh
+    /// mux master, Monitor `tail -F` and `ugrep` in the lane cwd are ended
+    /// and the merge goes through on its one retry — with the pane still
+    /// open, since being orphaned is enough for these classes.
+    #[test]
+    fn merge_ends_orphaned_benign_leftovers_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = FakeLeftovers::new(
+            dir.path(),
+            &[
+                (101, "/usr/bin/caffeinate", 1, "caffeinate -t 300"),
+                (102, "ssh", 1, "ssh: /tmp/cm-u@host:22 [mux]"),
+                (103, "tail", 1, "tail -F /tmp/task/log"),
+                (104, "ugrep", 1, "ugrep --line-buffered done"),
+            ],
+        );
+        let (notes, outcome, attempts) = merge_with(&mut fake, 1);
+        assert_eq!(outcome.unwrap(), "merged");
+        assert_eq!(attempts, 2, "exactly one retry after the reap pass");
+        assert_eq!(fake.ended, vec![101, 102, 103, 104]);
+        assert_eq!(fake.pane_asked, 0, "orphans never need the pane check");
+        let printed = notes.join("\n");
+        for expected in [
+            "pid 101 `caffeinate -t 300`",
+            "(cwd ",
+            "; caffeinate)",
+            "ssh mux master",
+            "orphaned monitor",
+            "ended",
+        ] {
+            assert!(printed.contains(expected), "{expected}: {printed}");
+        }
+    }
+
+    /// Card `20261123-b-ccc2cc` proof: an unknown live process among the
+    /// holders refuses the merge naming every holder's pid and command —
+    /// and ends nothing, not even the benign `caffeinate` beside it.
+    #[test]
+    fn merge_refuses_an_unknown_holder_naming_pid_and_command_and_ends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = FakeLeftovers::new(
+            dir.path(),
+            &[
+                (201, "caffeinate", 1, "caffeinate -t 300"),
+                (202, "cargo", 1, "cargo test --locked"),
+            ],
+        );
+        fake.pane_gone = true;
+        let (notes, outcome, attempts) = merge_with(&mut fake, 1);
+        let Err(MergeError::Refused(message)) = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(message.starts_with(LIVE_CWD_REFUSAL), "{message}");
+        assert!(
+            message.contains("pid 202 `cargo test --locked`")
+                && message.contains("not a known leftover"),
+            "{message}"
+        );
+        assert!(message.contains("pid 201 `caffeinate -t 300`"), "{message}");
+        assert!(message.contains("--prune --reap --yes"), "{message}");
+        assert!(
+            fake.ended.is_empty(),
+            "nothing is signaled: {:?}",
+            fake.ended
+        );
+        assert!(notes.is_empty());
+        assert_eq!(attempts, 1, "a refusal is never retried");
+    }
+
+    /// Never by cwd alone: a shell is benign only once its pane is gone; a
+    /// `tail` or `caffeinate` still parented by a live shell is not; a
+    /// plain ssh client is never a mux master; and this process's own
+    /// ancestor is never a leftover, whatever its name.
+    #[test]
+    fn benign_leftover_needs_command_name_plus_orphaned_or_pane_gone() {
+        let process = |pid: u32, comm: &str| mv_engine::dockerreport::ProcessCwd {
+            pid,
+            cwd: PathBuf::from("/lane"),
+            command: comm.into(),
+            cpu_percent: "0.0".into(),
+        };
+        let parent = |ppid: u32, args: &str| mv_engine::dockerreport::ProcessParent {
+            ppid,
+            args: args.into(),
+        };
+        let class = |pid: u32, comm: &str, ppid: u32, args: &str, gone: bool, ancestors: &[u32]| {
+            benign_leftover(
+                &process(pid, comm),
+                Some(&parent(ppid, args)),
+                ancestors,
+                &mut || gone,
+            )
+        };
+        assert_eq!(
+            class(9, "-zsh", 500, "-zsh", true, &[]),
+            Some("shell of a gone pane")
+        );
+        assert_eq!(class(9, "zsh", 1, "zsh -c x", false, &[]), None);
+        assert_eq!(class(9, "zsh", 500, "zsh", true, &[9]), None, "an ancestor");
+        assert_eq!(class(9, "tail", 500, "tail -F log", true, &[]), None);
+        assert_eq!(
+            class(9, "caffeinate", 500, "caffeinate -t 300", false, &[]),
+            None
+        );
+        assert_eq!(
+            class(9, "caffeinate", 500, "caffeinate -t 300", true, &[]),
+            Some("caffeinate")
+        );
+        assert_eq!(
+            class(9, "ssh", 1, "ssh -tt build-host make", true, &[]),
+            None
+        );
+        assert_eq!(
+            class(9, "ssh", 500, "ssh -fNM -S /tmp/cm.sock host", true, &[]),
+            Some("ssh mux master")
+        );
+        assert_eq!(class(9, "sleep", 1, "sleep 300", true, &[]), None);
+        assert_eq!(
+            benign_leftover(&process(9, "caffeinate"), None, &[], &mut || true),
+            None,
+            "an unreadable parent is never benign"
+        );
+    }
+
+    /// A stopped pane's own shell (pane still open) refuses with its pid
+    /// named; once the pane is gone the same shell is ended and merged.
+    #[test]
+    fn merge_ends_a_shell_only_once_its_pane_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [(301, "zsh", 900, "zsh -c sleep 1")];
+        let mut open = FakeLeftovers::new(dir.path(), &rows);
+        let (_, outcome, _) = merge_with(&mut open, 1);
+        assert!(
+            matches!(&outcome, Err(MergeError::Refused(m)) if m.contains("pid 301 `zsh -c sleep 1`")),
+            "{outcome:?}"
+        );
+        assert!(open.ended.is_empty());
+
+        let mut gone = FakeLeftovers::new(dir.path(), &rows);
+        gone.pane_gone = true;
+        let (_, outcome, _) = merge_with(&mut gone, 1);
+        assert_eq!(outcome.unwrap(), "merged");
+        assert_eq!(gone.ended, vec![301]);
+    }
+
+    /// Bounded: one reap pass and one retry. A holder still there after it
+    /// is named in the refusal, and nothing is ended a second time.
+    #[test]
+    fn merge_reaps_once_and_names_what_is_still_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake =
+            FakeLeftovers::new(dir.path(), &[(401, "caffeinate", 1, "caffeinate -t 300")]);
+        let (_, outcome, attempts) = merge_with(&mut fake, 99);
+        assert_eq!(attempts, 2);
+        assert_eq!(fake.ended, vec![401]);
+        let Err(MergeError::Refused(message)) = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(message.contains("pid 401 `caffeinate -t 300`"), "{message}");
+        assert!(
+            message.contains("still there after one reap pass"),
+            "{message}"
+        );
+    }
+
+    /// Any other refusal, or a merge that succeeds outright, never takes
+    /// a snapshot or ends anything.
+    #[test]
+    fn merge_leaves_every_other_outcome_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = FakeLeftovers::new(dir.path(), &[(501, "caffeinate", 1, "caffeinate")]);
+        let (_, outcome) = merge_through_leftovers(Path::new("/proj"), &mut fake, &mut || {
+            Err::<(), _>(MergeError::Refused("lane has uncommitted changes".into()))
+        });
+        assert!(
+            matches!(outcome, Err(MergeError::Refused(m)) if m == "lane has uncommitted changes")
+        );
+        let (_, outcome, attempts) = merge_with(&mut fake, 0);
+        assert_eq!(outcome.unwrap(), "merged");
+        assert_eq!(attempts, 1);
+        assert!(fake.ended.is_empty());
     }
 }
